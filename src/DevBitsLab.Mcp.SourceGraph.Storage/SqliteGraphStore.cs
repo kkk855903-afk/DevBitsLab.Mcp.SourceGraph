@@ -33,16 +33,26 @@ public sealed class SqliteGraphStore : IGraphStore
         await _writeLock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
+            // Read current version (if any). schema_version is created idempotently in V1.
+            await _connection.ExecuteAsync(new CommandDefinition(
+                "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY);",
+                cancellationToken: ct)).ConfigureAwait(false);
+            var current = await _connection.ExecuteScalarAsync<int?>(
+                new CommandDefinition("SELECT MAX(version) FROM schema_version;", cancellationToken: ct)).ConfigureAwait(false);
+
+            if (current is not null && current < Schema.Version)
+            {
+                _logger.LogInformation("On-disk graph schema is v{Old}; rebuilding to v{New}", current, Schema.Version);
+                await _connection.ExecuteAsync(new CommandDefinition(Schema.DropAll, cancellationToken: ct)).ConfigureAwait(false);
+                await _connection.ExecuteAsync(new CommandDefinition(
+                    "DELETE FROM schema_version;", cancellationToken: ct)).ConfigureAwait(false);
+            }
+
             using var tx = _connection.BeginTransaction();
             await _connection.ExecuteAsync(new CommandDefinition(Schema.V1, transaction: tx, cancellationToken: ct)).ConfigureAwait(false);
             await _connection.ExecuteAsync(new CommandDefinition(Schema.V2, transaction: tx, cancellationToken: ct)).ConfigureAwait(false);
-            var current = await _connection.ExecuteScalarAsync<int?>(
-                new CommandDefinition("SELECT MAX(version) FROM schema_version;", transaction: tx, cancellationToken: ct)).ConfigureAwait(false);
-            if (current is null || current < Schema.Version)
-            {
-                await _connection.ExecuteAsync(
-                    new CommandDefinition("INSERT OR REPLACE INTO schema_version(version) VALUES (@v);", new { v = Schema.Version }, transaction: tx, cancellationToken: ct)).ConfigureAwait(false);
-            }
+            await _connection.ExecuteAsync(
+                new CommandDefinition("INSERT OR REPLACE INTO schema_version(version) VALUES (@v);", new { v = Schema.Version }, transaction: tx, cancellationToken: ct)).ConfigureAwait(false);
             tx.Commit();
         }
         finally
@@ -85,12 +95,20 @@ public sealed class SqliteGraphStore : IGraphStore
 
     public async Task ClearFileAsync(long fileId, CancellationToken ct = default)
     {
+        // The schema no longer has FK cascade — do the cleanup explicitly here:
+        //   1. drop edges that reference any symbol defined in this file
+        //   2. drop refs whose source file is this file (refs FROM here)
+        //   3. drop refs whose target symbol lives in this file (refs TO here)
+        //   4. drop the file's own symbols
         await _writeLock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
             using var tx = _connection.BeginTransaction();
             await _connection.ExecuteAsync(new CommandDefinition(
-                "DELETE FROM refs WHERE file_id = @id;",
+                "DELETE FROM edges WHERE src IN (SELECT id FROM symbols WHERE file_id = @id) OR dst IN (SELECT id FROM symbols WHERE file_id = @id);",
+                new { id = fileId }, transaction: tx, cancellationToken: ct)).ConfigureAwait(false);
+            await _connection.ExecuteAsync(new CommandDefinition(
+                "DELETE FROM refs WHERE file_id = @id OR symbol_id IN (SELECT id FROM symbols WHERE file_id = @id);",
                 new { id = fileId }, transaction: tx, cancellationToken: ct)).ConfigureAwait(false);
             await _connection.ExecuteAsync(new CommandDefinition(
                 "DELETE FROM symbols WHERE file_id = @id;",
