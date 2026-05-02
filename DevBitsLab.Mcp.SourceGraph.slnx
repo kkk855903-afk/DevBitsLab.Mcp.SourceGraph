@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/DevBitsLab.Mcp.SourceGraph.Core/DevBitsLab.Mcp.SourceGraph.Core.csproj" />
+    <Project Path="src/DevBitsLab.Mcp.SourceGraph.Indexing/DevBitsLab.Mcp.SourceGraph.Indexing.csproj" />
+    <Project Path="src/DevBitsLab.Mcp.SourceGraph.Server/DevBitsLab.Mcp.SourceGraph.Server.csproj" />
+    <Project Path="src/DevBitsLab.Mcp.SourceGraph.Storage/DevBitsLab.Mcp.SourceGraph.Storage.csproj" />
+    <Project Path="src/DevBitsLab.Mcp.SourceGraph.Watcher/DevBitsLab.Mcp.SourceGraph.Watcher.csproj" />
+  </Folder>
+</Solution>
