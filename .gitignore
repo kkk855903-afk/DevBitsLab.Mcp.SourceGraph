@@ -486,3 +486,6 @@ $RECYCLE.BIN/
 
 # IntelliSense cache
 *.lscache
+
+# Claude Code session worktrees
+.claude/worktrees/
