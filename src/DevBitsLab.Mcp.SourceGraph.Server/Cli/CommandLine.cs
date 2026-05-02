@@ -81,11 +81,47 @@ internal sealed class CommandLine
           sourcegraph-mcp serve --solution ./MySln.sln
         """;
 
+    /// <summary>
+    /// Resolves the SQLite database path with this priority:
+    ///   1. --db &lt;path&gt; if provided.
+    ///   2. Beside --solution as &lt;solution-dir&gt;/.sourcegraph/graph.db. This is the common case
+    ///      and gives each registered solution its own graph file regardless of CWD.
+    ///   3. A per-user cache directory: ~/.cache/sourcegraph-mcp/graph.db (Linux/macOS) or
+    ///      %LOCALAPPDATA%/sourcegraph-mcp/graph.db (Windows). Used when no solution is given.
+    ///   4. Last resort: $TMPDIR/sourcegraph-mcp/graph.db.
+    /// CWD is never used: when Claude Code or another MCP host spawns this process, CWD may be
+    /// the filesystem root (read-only on macOS), which made the previous default `/.sourcegraph`
+    /// fail with IOException.
+    /// </summary>
     public string ResolvedDbPath()
     {
-        if (!string.IsNullOrEmpty(DatabasePath)) return Path.GetFullPath(DatabasePath);
-        var dir = Path.Combine(Environment.CurrentDirectory, ".sourcegraph");
-        Directory.CreateDirectory(dir);
-        return Path.Combine(dir, "graph.db");
+        if (!string.IsNullOrEmpty(DatabasePath)) return EnsureDir(Path.GetFullPath(DatabasePath));
+
+        if (!string.IsNullOrEmpty(SolutionPath))
+        {
+            var solutionDir = Path.GetDirectoryName(Path.GetFullPath(SolutionPath));
+            if (!string.IsNullOrEmpty(solutionDir))
+            {
+                return EnsureDir(Path.Combine(solutionDir, ".sourcegraph", "graph.db"));
+            }
+        }
+
+        var userCache =
+            Environment.GetEnvironmentVariable("XDG_CACHE_HOME")
+            ?? Environment.GetEnvironmentVariable("LOCALAPPDATA")
+            ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile, Environment.SpecialFolderOption.DoNotVerify), ".cache");
+        if (!string.IsNullOrEmpty(userCache))
+        {
+            return EnsureDir(Path.Combine(userCache, "sourcegraph-mcp", "graph.db"));
+        }
+
+        return EnsureDir(Path.Combine(Path.GetTempPath(), "sourcegraph-mcp", "graph.db"));
+    }
+
+    private static string EnsureDir(string filePath)
+    {
+        var dir = Path.GetDirectoryName(filePath);
+        if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+        return filePath;
     }
 }
