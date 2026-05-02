@@ -93,25 +93,20 @@ public sealed class SqliteGraphStore : IGraphStore
             cancellationToken: ct)).ConfigureAwait(false);
     }
 
-    public async Task ClearFileAsync(long fileId, CancellationToken ct = default)
+    public async Task ClearFileOutgoingAsync(long fileId, CancellationToken ct = default)
     {
-        // The schema no longer has FK cascade — do the cleanup explicitly here:
-        //   1. drop edges that reference any symbol defined in this file
-        //   2. drop refs whose source file is this file (refs FROM here)
-        //   3. drop refs whose target symbol lives in this file (refs TO here)
-        //   4. drop the file's own symbols
+        // Wipe outgoing-only: refs whose file_id is this file, and edges whose src is one of this
+        // file's symbols. Symbol rows themselves are NOT touched here — they're upserted by
+        // canonical key in pass-1 to keep stable ids, which keeps incoming refs/edges valid.
         await _writeLock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
             using var tx = _connection.BeginTransaction();
             await _connection.ExecuteAsync(new CommandDefinition(
-                "DELETE FROM edges WHERE src IN (SELECT id FROM symbols WHERE file_id = @id) OR dst IN (SELECT id FROM symbols WHERE file_id = @id);",
+                "DELETE FROM edges WHERE src IN (SELECT id FROM symbols WHERE file_id = @id);",
                 new { id = fileId }, transaction: tx, cancellationToken: ct)).ConfigureAwait(false);
             await _connection.ExecuteAsync(new CommandDefinition(
-                "DELETE FROM refs WHERE file_id = @id OR symbol_id IN (SELECT id FROM symbols WHERE file_id = @id);",
-                new { id = fileId }, transaction: tx, cancellationToken: ct)).ConfigureAwait(false);
-            await _connection.ExecuteAsync(new CommandDefinition(
-                "DELETE FROM symbols WHERE file_id = @id;",
+                "DELETE FROM refs WHERE file_id = @id;",
                 new { id = fileId }, transaction: tx, cancellationToken: ct)).ConfigureAwait(false);
             tx.Commit();
         }
@@ -121,11 +116,81 @@ public sealed class SqliteGraphStore : IGraphStore
         }
     }
 
-    public async Task<long> InsertSymbolAsync(Symbol symbol, CancellationToken ct = default)
+    public async Task DeleteSymbolsForFileNotInAsync(long fileId, IReadOnlyCollection<string> keysToKeep, CancellationToken ct = default)
     {
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            using var tx = _connection.BeginTransaction();
+            // Stage the keep-set in a temp table so we don't have to inline a giant IN clause.
+            await _connection.ExecuteAsync(new CommandDefinition(
+                "CREATE TEMP TABLE IF NOT EXISTS keep_keys(key TEXT PRIMARY KEY);",
+                transaction: tx, cancellationToken: ct)).ConfigureAwait(false);
+            await _connection.ExecuteAsync(new CommandDefinition(
+                "DELETE FROM keep_keys;", transaction: tx, cancellationToken: ct)).ConfigureAwait(false);
+            if (keysToKeep.Count > 0)
+            {
+                await _connection.ExecuteAsync(new CommandDefinition(
+                    "INSERT OR IGNORE INTO keep_keys(key) VALUES (@key);",
+                    keysToKeep.Select(k => new { key = k }),
+                    transaction: tx, cancellationToken: ct)).ConfigureAwait(false);
+            }
+
+            // Find symbols to remove for this file:
+            // those declared in @id whose canonical_key isn't in keep_keys.
+            const string deleteRefsSql = """
+                DELETE FROM refs
+                WHERE symbol_id IN (
+                    SELECT id FROM symbols
+                    WHERE file_id = @id AND canonical_key NOT IN (SELECT key FROM keep_keys)
+                );
+                """;
+            const string deleteEdgesSql = """
+                DELETE FROM edges
+                WHERE src IN (
+                    SELECT id FROM symbols
+                    WHERE file_id = @id AND canonical_key NOT IN (SELECT key FROM keep_keys)
+                ) OR dst IN (
+                    SELECT id FROM symbols
+                    WHERE file_id = @id AND canonical_key NOT IN (SELECT key FROM keep_keys)
+                );
+                """;
+            const string deleteSymbolsSql = """
+                DELETE FROM symbols
+                WHERE file_id = @id AND canonical_key NOT IN (SELECT key FROM keep_keys);
+                """;
+            await _connection.ExecuteAsync(new CommandDefinition(deleteRefsSql, new { id = fileId }, transaction: tx, cancellationToken: ct)).ConfigureAwait(false);
+            await _connection.ExecuteAsync(new CommandDefinition(deleteEdgesSql, new { id = fileId }, transaction: tx, cancellationToken: ct)).ConfigureAwait(false);
+            await _connection.ExecuteAsync(new CommandDefinition(deleteSymbolsSql, new { id = fileId }, transaction: tx, cancellationToken: ct)).ConfigureAwait(false);
+            await _connection.ExecuteAsync(new CommandDefinition("DELETE FROM keep_keys;", transaction: tx, cancellationToken: ct)).ConfigureAwait(false);
+
+            tx.Commit();
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public async Task<long> UpsertSymbolAsync(string canonicalKey, Symbol symbol, CancellationToken ct = default)
+    {
+        // Stable id by canonical_key. On conflict we update the location/signature/etc but the
+        // integer id is preserved, so refs/edges from other files that point to this symbol stay
+        // correct across edits.
         const string sql = """
-            INSERT INTO symbols(name, fqn, kind, file_id, start_line, start_col, end_line, end_col, signature, container_id)
-            VALUES (@Name, @Fqn, @Kind, @FileId, @StartLine, @StartCol, @EndLine, @EndCol, @Signature, @ContainerId)
+            INSERT INTO symbols(canonical_key, name, fqn, kind, file_id, start_line, start_col, end_line, end_col, signature, container_id)
+            VALUES (@Key, @Name, @Fqn, @Kind, @FileId, @StartLine, @StartCol, @EndLine, @EndCol, @Signature, @ContainerId)
+            ON CONFLICT(canonical_key) DO UPDATE SET
+                name        = excluded.name,
+                fqn         = excluded.fqn,
+                kind        = excluded.kind,
+                file_id     = excluded.file_id,
+                start_line  = excluded.start_line,
+                start_col   = excluded.start_col,
+                end_line    = excluded.end_line,
+                end_col     = excluded.end_col,
+                signature   = excluded.signature,
+                container_id = excluded.container_id
             RETURNING id;
             """;
         await _writeLock.WaitAsync(ct).ConfigureAwait(false);
@@ -133,6 +198,7 @@ public sealed class SqliteGraphStore : IGraphStore
         {
             return await _connection.ExecuteScalarAsync<long>(new CommandDefinition(sql, new
             {
+                Key = canonicalKey,
                 symbol.Name,
                 symbol.Fqn,
                 Kind = (int)symbol.Kind,

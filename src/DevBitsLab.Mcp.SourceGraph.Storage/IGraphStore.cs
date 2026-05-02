@@ -9,9 +9,18 @@ public interface IGraphStore : IAsyncDisposable
     Task<long> UpsertFileAsync(string path, byte[] contentSha256, DateTimeOffset indexedAt, CancellationToken ct = default);
     Task<byte[]?> GetFileContentHashAsync(string path, CancellationToken ct = default);
 
-    Task ClearFileAsync(long fileId, CancellationToken ct = default);
+    /// <summary>Wipes refs and edges that originate IN this file (ref.file_id = id, edge.src in file's symbols).
+    /// Does NOT delete the symbols themselves — they're upserted by canonical key so their integer ids stay
+    /// stable across edits, keeping incoming refs/edges from other files valid.</summary>
+    Task ClearFileOutgoingAsync(long fileId, CancellationToken ct = default);
 
-    Task<long> InsertSymbolAsync(Symbol symbol, CancellationToken ct = default);
+    /// <summary>Delete every symbol declared in <paramref name="fileId"/> whose canonical key is not in
+    /// <paramref name="keysToKeep"/>, plus all refs/edges that touch those removed symbols.</summary>
+    Task DeleteSymbolsForFileNotInAsync(long fileId, IReadOnlyCollection<string> keysToKeep, CancellationToken ct = default);
+
+    /// <summary>Upsert a symbol by canonical key. Returns the symbol's stable id (existing or newly created).</summary>
+    Task<long> UpsertSymbolAsync(string canonicalKey, Symbol symbol, CancellationToken ct = default);
+
     Task BulkInsertReferencesAsync(IEnumerable<SymbolReference> references, CancellationToken ct = default);
     Task BulkInsertEdgesAsync(IEnumerable<Edge> edges, CancellationToken ct = default);
 

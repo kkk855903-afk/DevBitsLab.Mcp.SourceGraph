@@ -7,7 +7,7 @@ internal static class Schema
     /// drops all data tables when the on-disk version is below this, since the index can always be
     /// rebuilt from source.
     /// </summary>
-    public const int Version = 3;
+    public const int Version = 4;
 
     /// <summary>
     /// V3 removes the foreign-key constraints from <c>refs</c> and <c>edges</c> that we previously
@@ -31,6 +31,7 @@ internal static class Schema
 
         CREATE TABLE IF NOT EXISTS symbols (
             id INTEGER PRIMARY KEY,
+            canonical_key TEXT UNIQUE NOT NULL,
             name TEXT NOT NULL,
             fqn TEXT NOT NULL,
             kind INTEGER NOT NULL,

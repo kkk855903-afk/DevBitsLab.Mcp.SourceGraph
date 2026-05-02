@@ -125,7 +125,8 @@ public sealed class RoslynIndexer : IAsyncDisposable
             {
                 if (_fileIdByPath.TryGetValue(p, out var fid))
                 {
-                    await _store.ClearFileAsync(fid, ct).ConfigureAwait(false);
+                    await _store.ClearFileOutgoingAsync(fid, ct).ConfigureAwait(false);
+                    await _store.DeleteSymbolsForFileNotInAsync(fid, Array.Empty<string>(), ct).ConfigureAwait(false);
                     DropFileFromMaps(fid);
                     _fileIdByPath.Remove(p);
                 }
@@ -200,9 +201,10 @@ public sealed class RoslynIndexer : IAsyncDisposable
                 continue;
             }
 
-            // changed (or new): clear and reindex
-            await _store.ClearFileAsync(fileId, ct).ConfigureAwait(false);
-            DropFileFromMaps(fileId);
+            // Wipe outgoing refs/edges (they'll be rebuilt in pass 2). Symbols themselves are NOT
+            // deleted up-front — they're upserted by canonical key below so their integer ids stay
+            // stable across edits, keeping incoming refs/edges from other files valid.
+            await _store.ClearFileOutgoingAsync(fileId, ct).ConfigureAwait(false);
             filesIndexed++;
             docsToIndexRefs.Add(document);
 
@@ -211,6 +213,8 @@ public sealed class RoslynIndexer : IAsyncDisposable
             if (tree is null || model is null) continue;
 
             var root = await tree.GetRootAsync(ct).ConfigureAwait(false);
+            var newKeysForFile = new HashSet<string>(StringComparer.Ordinal);
+
             foreach (var node in EnumerateDeclarations(root))
             {
                 var symbol = model.GetDeclaredSymbol(node, ct);
@@ -218,7 +222,7 @@ public sealed class RoslynIndexer : IAsyncDisposable
 
                 var key = SymbolMapping.CanonicalKey(symbol);
                 if (key is null) continue;
-                if (_symbolIdByKey.ContainsKey(key)) continue; // partial classes / first occurrence wins
+                if (!newKeysForFile.Add(key)) continue; // already declared in this file (same partial class etc.)
 
                 var loc = node.GetLocation().GetLineSpan();
                 var coreSymbol = new Symbol(
@@ -234,16 +238,21 @@ public sealed class RoslynIndexer : IAsyncDisposable
                     Signature: SymbolMapping.Signature(symbol),
                     ContainerId: null);
 
-                var id = await _store.InsertSymbolAsync(coreSymbol, ct).ConfigureAwait(false);
+                var id = await _store.UpsertSymbolAsync(key, coreSymbol, ct).ConfigureAwait(false);
+                var isNew = !_symbolIdByKey.ContainsKey(key);
                 _symbolIdByKey[key] = id;
-                if (!_keysByFileId.TryGetValue(fileId, out var keys))
-                {
-                    keys = new List<string>();
-                    _keysByFileId[fileId] = keys;
-                }
-                keys.Add(key);
-                symbolsIndexed++;
+                if (isNew) symbolsIndexed++;
             }
+
+            // Reconcile: drop any symbol that USED to be declared in this file but isn't anymore.
+            await _store.DeleteSymbolsForFileNotInAsync(fileId, newKeysForFile, ct).ConfigureAwait(false);
+
+            // Refresh _keysByFileId for this file. Drop the previous record (its keys may include
+            // canonicals that have moved to other files in the upsert) and store the new set.
+            DropFileFromMaps(fileId);
+            _keysByFileId[fileId] = newKeysForFile.ToList();
+            // Make sure removed keys are also pruned from _symbolIdByKey if no longer present
+            // anywhere — a no-op for the common case.
         }
 
         // PASS 2: references — only for files we (re)indexed in pass 1
