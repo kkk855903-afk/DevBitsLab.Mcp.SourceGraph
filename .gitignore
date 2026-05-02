@@ -483,3 +483,6 @@ $RECYCLE.BIN/
 
 # Local source graph database
 .sourcegraph/
+
+# IntelliSense cache
+*.lscache
