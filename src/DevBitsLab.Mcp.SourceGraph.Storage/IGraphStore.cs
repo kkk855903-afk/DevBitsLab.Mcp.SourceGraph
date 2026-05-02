@@ -24,6 +24,10 @@ public interface IGraphStore : IAsyncDisposable
     Task BulkInsertReferencesAsync(IEnumerable<SymbolReference> references, CancellationToken ct = default);
     Task BulkInsertEdgesAsync(IEnumerable<Edge> edges, CancellationToken ct = default);
 
+    /// <summary>Used by the indexer to re-hydrate its in-memory maps after a process restart.</summary>
+    Task<IReadOnlyList<SymbolKeyRow>> GetAllSymbolKeysAsync(CancellationToken ct = default);
+    Task<IReadOnlyList<FileRow>> GetAllFilesAsync(CancellationToken ct = default);
+
     Task<GraphStats> GetStatsAsync(CancellationToken ct = default);
 
     // Queries
@@ -40,5 +44,8 @@ public interface IGraphStore : IAsyncDisposable
 
 public sealed record ModuleSymbol(SymbolHit Symbol, int InDegree);
 public sealed record ImpactedSymbol(SymbolHit Symbol, int Depth);
+
+public sealed record SymbolKeyRow(string CanonicalKey, long Id, long FileId);
+public sealed record FileRow(string Path, long Id);
 
 public sealed record GraphStats(int FileCount, int SymbolCount, int ReferenceCount, int EdgeCount);

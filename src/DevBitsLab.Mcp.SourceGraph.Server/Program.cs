@@ -1,6 +1,7 @@
 using DevBitsLab.Mcp.SourceGraph.Indexing;
 using DevBitsLab.Mcp.SourceGraph.Server;
 using DevBitsLab.Mcp.SourceGraph.Server.Cli;
+using DevBitsLab.Mcp.SourceGraph.Server.Observability;
 using DevBitsLab.Mcp.SourceGraph.Storage;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -48,6 +49,8 @@ static async Task<int> RunServeAsync(CommandLine cli)
     builder.Logging.AddConsole(o => o.LogToStandardErrorThreshold = LogLevel.Trace);
 
     var dbPath = cli.ResolvedDbPath();
+    var dbDir = Path.GetDirectoryName(dbPath) ?? Path.GetTempPath();
+    ToolMetrics.Configure(Path.Combine(dbDir, "usage.jsonl"));
     builder.Services.AddSingleton<IGraphStore>(sp =>
         new SqliteGraphStore(dbPath, sp.GetRequiredService<ILogger<SqliteGraphStore>>()));
     builder.Services.AddSingleton(sp =>

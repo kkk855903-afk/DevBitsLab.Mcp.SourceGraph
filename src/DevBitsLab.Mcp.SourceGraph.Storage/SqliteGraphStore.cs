@@ -484,6 +484,22 @@ public sealed class SqliteGraphStore : IGraphStore
         public ReferenceHit ToHit() => new(Id, SymbolId, FilePath, (int)Line, (int)Col, (Core.ReferenceKind)Kind);
     }
 
+    public async Task<IReadOnlyList<SymbolKeyRow>> GetAllSymbolKeysAsync(CancellationToken ct = default)
+    {
+        var rows = await _connection.QueryAsync<SymbolKeyRow>(new CommandDefinition(
+            "SELECT canonical_key AS CanonicalKey, id AS Id, file_id AS FileId FROM symbols;",
+            cancellationToken: ct)).ConfigureAwait(false);
+        return rows.AsList();
+    }
+
+    public async Task<IReadOnlyList<FileRow>> GetAllFilesAsync(CancellationToken ct = default)
+    {
+        var rows = await _connection.QueryAsync<FileRow>(new CommandDefinition(
+            "SELECT path AS Path, id AS Id FROM files;",
+            cancellationToken: ct)).ConfigureAwait(false);
+        return rows.AsList();
+    }
+
     public async Task<GraphStats> GetStatsAsync(CancellationToken ct = default)
     {
         var files = await _connection.ExecuteScalarAsync<int>(new CommandDefinition("SELECT COUNT(*) FROM files;", cancellationToken: ct)).ConfigureAwait(false);

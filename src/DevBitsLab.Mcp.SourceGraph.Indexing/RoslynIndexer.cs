@@ -81,7 +81,9 @@ public sealed class RoslynIndexer : IAsyncDisposable
         await _lock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
-            // Refresh in-workspace text for any path that maps to a Document
+            // Build an updated Solution snapshot in memory. We do NOT call
+            // _workspace.TryApplyChanges — MSBuildWorkspace refuses ChangeDocument by default and
+            // would throw. The local `solution` value is what IndexCoreAsync walks.
             var solution = _workspace!.CurrentSolution;
             var pathSet = new HashSet<string>(paths.Select(Path.GetFullPath), StringComparer.OrdinalIgnoreCase);
             var docs = new List<Document>();
@@ -100,22 +102,34 @@ public sealed class RoslynIndexer : IAsyncDisposable
                     deleted.Add(p);
                     continue;
                 }
-                var text = SourceText.From(await File.ReadAllTextAsync(p, ct).ConfigureAwait(false));
+                string content;
+                try
+                {
+                    // Editor saves can briefly expose a 0-byte view of the file; treat read errors
+                    // as "skip this file for this batch". The watcher will fire again once the save
+                    // settles.
+                    content = await File.ReadAllTextAsync(p, ct).ConfigureAwait(false);
+                }
+                catch (IOException ex)
+                {
+                    _logger.LogDebug(ex, "Skipping {Path} for this batch (read failed; will retry)", p);
+                    continue;
+                }
+                var text = SourceText.From(content);
                 foreach (var did in docIds)
                 {
                     solution = solution.WithDocumentText(did, text);
                 }
             }
-            _workspace.TryApplyChanges(solution);
 
-            // recompute the document set from the updated solution
+            // Resolve documents from the LOCAL updated solution (not _workspace.CurrentSolution).
             foreach (var p in pathSet)
             {
                 if (deleted.Contains(p, StringComparer.OrdinalIgnoreCase)) continue;
-                var docIds = _workspace.CurrentSolution.GetDocumentIdsWithFilePath(p);
+                var docIds = solution.GetDocumentIdsWithFilePath(p);
                 foreach (var did in docIds)
                 {
-                    var d = _workspace.CurrentSolution.GetDocument(did);
+                    var d = solution.GetDocument(did);
                     if (d is not null && d.SourceCodeKind == SourceCodeKind.Regular) docs.Add(d);
                 }
             }
@@ -174,9 +188,24 @@ public sealed class RoslynIndexer : IAsyncDisposable
     {
         var sw = Stopwatch.StartNew();
 
-        // PASS 1: declarations — only for files whose hash changed
-        var docsToIndexRefs = new List<Document>();
-        var filesIndexed = 0;
+        // Hydrate in-memory maps from store on first run (or after a fullReset). This means
+        // unchanged files don't need any DB hits — we already know their symbol ids.
+        if (fullReset)
+        {
+            _symbolIdByKey.Clear();
+            _keysByFileId.Clear();
+            _fileIdByPath.Clear();
+        }
+        if (_symbolIdByKey.Count == 0)
+        {
+            await HydrateMapsFromStoreAsync(ct).ConfigureAwait(false);
+        }
+
+        // PASS 1 — phase A: SHA scan. Identify which files changed; clear their outgoing
+        // refs/edges (will be rebuilt in pass 2). Group docs per fileId so we walk every TFM /
+        // linked-project iteration of the same path before reconciling.
+        var changedFileIds = new HashSet<long>();
+        var docsByChangedFile = new Dictionary<long, List<Document>>();
         var symbolsIndexed = 0;
 
         foreach (var document in documents)
@@ -185,78 +214,115 @@ public sealed class RoslynIndexer : IAsyncDisposable
             var path = document.FilePath;
             if (path is null || !File.Exists(path)) continue;
 
-            var bytes = await File.ReadAllBytesAsync(path, ct).ConfigureAwait(false);
+            byte[] bytes;
+            try
+            {
+                bytes = await File.ReadAllBytesAsync(path, ct).ConfigureAwait(false);
+            }
+            catch (IOException ex)
+            {
+                // Editor save in progress, antivirus, etc. Skip; the watcher will fire again.
+                _logger.LogDebug(ex, "Skipping {Path} (read failed; will retry on next event)", path);
+                continue;
+            }
             var sha = SHA256.HashData(bytes);
-
             var stored = await _store.GetFileContentHashAsync(path, ct).ConfigureAwait(false);
             var unchanged = stored is not null && stored.AsSpan().SequenceEqual(sha);
 
-            // upsert file row regardless (updates indexedAt)
             var fileId = await _store.UpsertFileAsync(path, sha, DateTimeOffset.UtcNow, ct).ConfigureAwait(false);
             _fileIdByPath[path] = fileId;
 
             if (unchanged && !fullReset && _keysByFileId.ContainsKey(fileId))
             {
-                // Already in maps from a prior pass; nothing to do for this file's declarations.
+                // DB and in-memory map are already consistent for this file — skip entirely.
                 continue;
             }
 
-            // Wipe outgoing refs/edges (they'll be rebuilt in pass 2). Symbols themselves are NOT
-            // deleted up-front — they're upserted by canonical key below so their integer ids stay
-            // stable across edits, keeping incoming refs/edges from other files valid.
-            await _store.ClearFileOutgoingAsync(fileId, ct).ConfigureAwait(false);
-            filesIndexed++;
-            docsToIndexRefs.Add(document);
-
-            var tree = await document.GetSyntaxTreeAsync(ct).ConfigureAwait(false);
-            var model = await document.GetSemanticModelAsync(ct).ConfigureAwait(false);
-            if (tree is null || model is null) continue;
-
-            var root = await tree.GetRootAsync(ct).ConfigureAwait(false);
-            var newKeysForFile = new HashSet<string>(StringComparer.Ordinal);
-
-            foreach (var node in EnumerateDeclarations(root))
+            if (changedFileIds.Add(fileId))
             {
-                var symbol = model.GetDeclaredSymbol(node, ct);
-                if (symbol is null || !SymbolMapping.IsIndexable(symbol)) continue;
-
-                var key = SymbolMapping.CanonicalKey(symbol);
-                if (key is null) continue;
-                if (!newKeysForFile.Add(key)) continue; // already declared in this file (same partial class etc.)
-
-                var loc = node.GetLocation().GetLineSpan();
-                var coreSymbol = new Symbol(
-                    Id: 0,
-                    Name: symbol.Name,
-                    Fqn: SymbolMapping.Fqn(symbol),
-                    Kind: SymbolMapping.ToCoreKind(symbol),
-                    FileId: fileId,
-                    StartLine: loc.StartLinePosition.Line + 1,
-                    StartCol: loc.StartLinePosition.Character + 1,
-                    EndLine: loc.EndLinePosition.Line + 1,
-                    EndCol: loc.EndLinePosition.Character + 1,
-                    Signature: SymbolMapping.Signature(symbol),
-                    ContainerId: null);
-
-                var id = await _store.UpsertSymbolAsync(key, coreSymbol, ct).ConfigureAwait(false);
-                var isNew = !_symbolIdByKey.ContainsKey(key);
-                _symbolIdByKey[key] = id;
-                if (isNew) symbolsIndexed++;
+                await _store.ClearFileOutgoingAsync(fileId, ct).ConfigureAwait(false);
             }
-
-            // Reconcile: drop any symbol that USED to be declared in this file but isn't anymore.
-            await _store.DeleteSymbolsForFileNotInAsync(fileId, newKeysForFile, ct).ConfigureAwait(false);
-
-            // Refresh _keysByFileId for this file. Drop the previous record (its keys may include
-            // canonicals that have moved to other files in the upsert) and store the new set.
-            DropFileFromMaps(fileId);
-            _keysByFileId[fileId] = newKeysForFile.ToList();
-            // Make sure removed keys are also pruned from _symbolIdByKey if no longer present
-            // anywhere — a no-op for the common case.
+            if (!docsByChangedFile.TryGetValue(fileId, out var list))
+            {
+                list = new List<Document>();
+                docsByChangedFile[fileId] = list;
+            }
+            list.Add(document);
         }
 
-        // PASS 2: references — only for files we (re)indexed in pass 1
+        // PASS 1 — phase B: walk every iteration of each changed file (one path may have N
+        // iterations across multi-target / linked / shared projects), upserting symbols and
+        // accumulating the union of canonical keys per fileId before we reconcile.
+        var newKeysForFile = new Dictionary<long, HashSet<string>>();
+        foreach (var (fileId, docs) in docsByChangedFile)
+        {
+            var fileKeys = new HashSet<string>(StringComparer.Ordinal);
+            newKeysForFile[fileId] = fileKeys;
+
+            foreach (var document in docs)
+            {
+                var tree = await document.GetSyntaxTreeAsync(ct).ConfigureAwait(false);
+                var model = await document.GetSemanticModelAsync(ct).ConfigureAwait(false);
+                if (tree is null || model is null) continue;
+
+                var root = await tree.GetRootAsync(ct).ConfigureAwait(false);
+                foreach (var node in EnumerateDeclarations(root))
+                {
+                    var symbol = model.GetDeclaredSymbol(node, ct);
+                    if (symbol is null || !SymbolMapping.IsIndexable(symbol)) continue;
+
+                    var key = SymbolMapping.CanonicalKey(symbol);
+                    if (key is null) continue;
+                    if (!fileKeys.Add(key)) continue;
+
+                    var loc = node.GetLocation().GetLineSpan();
+                    var coreSymbol = new Symbol(
+                        Id: 0,
+                        Name: symbol.Name,
+                        Fqn: SymbolMapping.Fqn(symbol),
+                        Kind: SymbolMapping.ToCoreKind(symbol),
+                        FileId: fileId,
+                        StartLine: loc.StartLinePosition.Line + 1,
+                        StartCol: loc.StartLinePosition.Character + 1,
+                        EndLine: loc.EndLinePosition.Line + 1,
+                        EndCol: loc.EndLinePosition.Character + 1,
+                        Signature: SymbolMapping.Signature(symbol),
+                        ContainerId: null);
+
+                    var id = await _store.UpsertSymbolAsync(key, coreSymbol, ct).ConfigureAwait(false);
+                    var isNew = !_symbolIdByKey.ContainsKey(key);
+                    _symbolIdByKey[key] = id;
+                    if (isNew) symbolsIndexed++;
+                }
+            }
+        }
+
+        // Reconcile per changed fileId: delete any symbol attributed to this file in DB whose
+        // canonical key is no longer declared anywhere in the file's tree (across all iterations).
+        foreach (var (fileId, fileKeys) in newKeysForFile)
+        {
+            // Remove orphaned keys from in-memory map (best-effort; full correctness comes from
+            // the next process restart's hydrate).
+            if (_keysByFileId.TryGetValue(fileId, out var prevKeys))
+            {
+                foreach (var k in prevKeys)
+                {
+                    if (!fileKeys.Contains(k)) _symbolIdByKey.Remove(k);
+                }
+            }
+            await _store.DeleteSymbolsForFileNotInAsync(fileId, fileKeys, ct).ConfigureAwait(false);
+            _keysByFileId[fileId] = fileKeys.ToList();
+        }
+
+        // PASS 2: references — only for files we (re)indexed in pass 1.
+        // IMPORTANT: walk one document per fileId. The same source file appears once per project /
+        // TFM in a multi-targeted solution; walking each iteration would emit duplicate refs and
+        // inflate counts. The first doc's tree+model is sufficient since the source file's
+        // declarations and references are the same across TFMs (modulo #if-conditional code, which
+        // we accept losing visibility into for now).
         var refsIndexed = 0;
+        var docsToIndexRefs = docsByChangedFile.Values.Select(list => list[0]).ToList();
+        var filesIndexed = changedFileIds.Count;
         foreach (var document in docsToIndexRefs)
         {
             ct.ThrowIfCancellationRequested();
@@ -374,6 +440,30 @@ public sealed class RoslynIndexer : IAsyncDisposable
             filesIndexed, symbolsIndexed, refsIndexed, sw.Elapsed, stats.FileCount, stats.SymbolCount, stats.ReferenceCount);
 
         return new IndexResult(filesIndexed, symbolsIndexed, refsIndexed, sw.Elapsed);
+    }
+
+    private async Task HydrateMapsFromStoreAsync(CancellationToken ct)
+    {
+        var symbolRows = await _store.GetAllSymbolKeysAsync(ct).ConfigureAwait(false);
+        foreach (var row in symbolRows)
+        {
+            _symbolIdByKey[row.CanonicalKey] = row.Id;
+            if (!_keysByFileId.TryGetValue(row.FileId, out var keys))
+            {
+                keys = new List<string>();
+                _keysByFileId[row.FileId] = keys;
+            }
+            keys.Add(row.CanonicalKey);
+        }
+        var fileRows = await _store.GetAllFilesAsync(ct).ConfigureAwait(false);
+        foreach (var fr in fileRows)
+        {
+            _fileIdByPath[fr.Path] = fr.Id;
+        }
+        if (symbolRows.Count > 0)
+        {
+            _logger.LogInformation("Hydrated {Symbols} symbol(s) and {Files} file(s) from graph store", symbolRows.Count, fileRows.Count);
+        }
     }
 
     private static ISymbol? FindEnclosingMember(SemanticModel model, int position, CancellationToken ct)
