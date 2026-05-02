@@ -38,14 +38,30 @@ A persistent JSONL log of every tool call lives at
 ## Project-scoped MCP config
 
 `.mcp.json` at the repo root registers the `sourcegraph` server automatically when
-Claude Code (or any client that honours the convention) opens the project. The
-`${workspaceFolder}` token is expanded by the client; if your client doesn't
-expand it, the server expands `${workspaceFolder}` itself by reading
-`WORKSPACE_FOLDER` / `CLAUDE_PROJECT_DIR` / `MCP_WORKSPACE_FOLDER` env vars
-(set whichever one is convenient on your machine).
+Claude Code (or any client that honours the convention) opens the project.
 
-To register the server in another `.NET` solution, copy `.mcp.json` and change
-the relative path:
+The committed `.mcp.json` runs the **in-repo source** via `dotnet run`, so a
+fresh clone doesn't need a global `dotnet tool install`. The only prerequisite
+is that the project has been built once:
+
+```bash
+git clone https://github.com/Jak3b0/DevBitsLab.Mcp.SourceGraph
+cd DevBitsLab.Mcp.SourceGraph
+dotnet build              # one-time; rebuild after pulls
+```
+
+Then opening the directory in Claude Code surfaces the `sourcegraph` server,
+which Claude Code launches via `dotnet run --no-build --project src/.../Server`.
+After every code change, `dotnet build` again so the next launch picks it up.
+
+The `${workspaceFolder}` token is expanded by Claude Code; if your client doesn't
+expand it, the server expands `${workspaceFolder}` itself by reading
+`WORKSPACE_FOLDER` / `CLAUDE_PROJECT_DIR` / `MCP_WORKSPACE_FOLDER` env vars.
+
+### Alternative: global `dotnet tool` install
+
+If you prefer the published tool over the in-repo source (smaller startup
+overhead, no `dotnet build` step), swap the `.mcp.json` body to:
 
 ```json
 {
@@ -58,9 +74,21 @@ the relative path:
 }
 ```
 
-Prerequisites on the developer's box:
-- `dotnet tool install -g DevBitsLab.Mcp.SourceGraph.Tool` (or whatever build distribution you use).
-- `~/.dotnet/tools` on `PATH` so `sourcegraph-mcp` resolves.
+and `dotnet tool install -g DevBitsLab.Mcp.SourceGraph.Tool` (with
+`~/.dotnet/tools` on `PATH`).
+
+### Using `sourcegraph-mcp` in a different repo
+
+Three patterns:
+
+1. **Global tool** — `dotnet tool install -g DevBitsLab.Mcp.SourceGraph.Tool`,
+   then `.mcp.json` invokes `sourcegraph-mcp serve --solution ...`.
+2. **Git submodule** — `git submodule add <this-repo-url> tools/sourcegraph-mcp`.
+   Their `.mcp.json` invokes
+   `dotnet run --project ${workspaceFolder}/tools/sourcegraph-mcp/src/.../Server --no-build -- serve --solution ${workspaceFolder}/Their.slnx`.
+3. **Local tool manifest** — `dotnet new tool-manifest && dotnet tool install
+   DevBitsLab.Mcp.SourceGraph.Tool`. Commits `.config/dotnet-tools.json`. Each
+   collaborator runs `dotnet tool restore` once.
 
 Any `${X}` placeholder in `--solution` / `--db` values that isn't expanded by
 the client is also resolved by the server against the process env, so paths like
