@@ -48,20 +48,55 @@ public sealed class SolutionWatcher : IAsyncDisposable
         _csWatcher.Renamed += OnFileRenamed;
         _csWatcher.EnableRaisingEvents = true;
 
-        var gitDir = Path.Combine(_root, ".git");
-        if (Directory.Exists(gitDir))
+        var gitHeadDir = ResolveGitHeadDir(_root, _logger);
+        if (gitHeadDir is not null)
         {
-            _gitHeadWatcher = new FileSystemWatcher(gitDir)
+            _gitHeadWatcher = new FileSystemWatcher(gitHeadDir)
             {
                 IncludeSubdirectories = false,
-                NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.FileName,
+                NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.FileName | NotifyFilters.CreationTime,
                 Filter = "HEAD",
             };
             _gitHeadWatcher.Changed += OnGitHeadEvent;
+            _gitHeadWatcher.Created += OnGitHeadEvent;
+            _gitHeadWatcher.Renamed += (s, e) => OnGitHeadEvent(s, e);
             _gitHeadWatcher.EnableRaisingEvents = true;
+            _logger.LogInformation("Watching git HEAD at {Path}", Path.Combine(gitHeadDir, "HEAD"));
         }
 
         _processor = Task.Run(() => ProcessAsync(_cts.Token));
+    }
+
+    /// <summary>
+    /// Resolve the directory whose <c>HEAD</c> file represents the current branch for the given
+    /// solution root. In a normal checkout this is <c>&lt;root&gt;/.git</c>. In a git worktree,
+    /// <c>&lt;root&gt;/.git</c> is a file containing <c>gitdir: &lt;path&gt;</c> that points at
+    /// <c>&lt;main-repo&gt;/.git/worktrees/&lt;name&gt;</c>; that's where the worktree's HEAD lives.
+    /// Returns <c>null</c> if the path is neither a git directory nor a worktree pointer.
+    /// </summary>
+    internal static string? ResolveGitHeadDir(string solutionRoot, ILogger logger)
+    {
+        var dotGit = Path.Combine(solutionRoot, ".git");
+        if (Directory.Exists(dotGit)) return dotGit;
+        if (!File.Exists(dotGit)) return null;
+
+        try
+        {
+            var content = File.ReadAllText(dotGit).Trim();
+            const string prefix = "gitdir:";
+            if (!content.StartsWith(prefix, StringComparison.Ordinal)) return null;
+            var dir = content[prefix.Length..].Trim();
+            if (!Path.IsPathRooted(dir))
+            {
+                dir = Path.GetFullPath(Path.Combine(solutionRoot, dir));
+            }
+            return Directory.Exists(dir) ? dir : null;
+        }
+        catch (IOException ex)
+        {
+            logger.LogDebug(ex, "Could not resolve git worktree HEAD location for {Root}", solutionRoot);
+            return null;
+        }
     }
 
     /// <summary>Returns an async stream of debounced change batches. Stops when disposed.</summary>
