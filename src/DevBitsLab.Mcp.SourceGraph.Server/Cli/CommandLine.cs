@@ -24,15 +24,15 @@ internal sealed class CommandLine
                 case "-h" or "--help":
                     return new CommandLine { Subcommand = subcommand, ShowHelp = true };
                 case "--solution" or "-s":
-                    solution = RequireArg(args, ref i, a);
+                    solution = ExpandTokens(RequireArg(args, ref i, a));
                     break;
                 case "--db":
-                    db = RequireArg(args, ref i, a);
+                    db = ExpandTokens(RequireArg(args, ref i, a));
                     break;
                 default:
                     if (subcommand == "index" && solution is null && !a.StartsWith('-'))
                     {
-                        solution = a;
+                        solution = ExpandTokens(a);
                     }
                     else
                     {
@@ -41,6 +41,9 @@ internal sealed class CommandLine
                     break;
             }
         }
+
+        if (solution is not null) AssertExpanded(solution, "--solution");
+        if (db is not null) AssertExpanded(db, "--db");
 
         return new CommandLine
         {
@@ -54,6 +57,41 @@ internal sealed class CommandLine
     {
         if (++i >= args.Length) throw new ArgumentException($"{flag} requires a value");
         return args[i];
+    }
+
+    /// <summary>
+    /// Expand <c>${VAR}</c> placeholders in a CLI value. Handles the special <c>${workspaceFolder}</c>
+    /// token that some MCP clients (Claude Code, Cursor) substitute themselves; if the client
+    /// didn't, we fall back to <c>WORKSPACE_FOLDER</c> / <c>CLAUDE_PROJECT_DIR</c> /
+    /// <c>MCP_WORKSPACE_FOLDER</c> env vars, in that order. Generic <c>${X}</c> expands to
+    /// <c>$X</c> from the process env.
+    /// </summary>
+    internal static string ExpandTokens(string value)
+    {
+        if (string.IsNullOrEmpty(value) || !value.Contains("${", StringComparison.Ordinal)) return value;
+        return System.Text.RegularExpressions.Regex.Replace(value, @"\$\{([^}]+)\}", match =>
+        {
+            var name = match.Groups[1].Value;
+            if (string.Equals(name, "workspaceFolder", StringComparison.Ordinal))
+            {
+                return Environment.GetEnvironmentVariable("WORKSPACE_FOLDER")
+                    ?? Environment.GetEnvironmentVariable("CLAUDE_PROJECT_DIR")
+                    ?? Environment.GetEnvironmentVariable("MCP_WORKSPACE_FOLDER")
+                    ?? match.Value;
+            }
+            return Environment.GetEnvironmentVariable(name) ?? match.Value;
+        });
+    }
+
+    private static void AssertExpanded(string value, string flag)
+    {
+        if (value.Contains("${", StringComparison.Ordinal))
+        {
+            throw new ArgumentException(
+                $"{flag} value '{value}' contains an unresolved placeholder. Either set the env var, " +
+                "or pass an absolute path. For .mcp.json with project-scoped servers, use ${workspaceFolder} " +
+                "(supported by Claude Code/Cursor) or set MCP_WORKSPACE_FOLDER yourself.");
+        }
     }
 
     public static string HelpText => """

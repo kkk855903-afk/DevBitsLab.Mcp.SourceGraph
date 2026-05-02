@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "sourcegraph": {
+      "command": "sourcegraph-mcp",
+      "args": [
+        "serve",
+        "--solution",
+        "${workspaceFolder}/DevBitsLab.Mcp.SourceGraph.slnx"
+      ]
+    }
+  }
+}

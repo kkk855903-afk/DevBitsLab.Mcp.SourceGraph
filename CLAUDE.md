@@ -35,6 +35,37 @@ or `search_symbols` next time.
 A persistent JSONL log of every tool call lives at
 `<solution>/.sourcegraph/usage.jsonl` for offline analysis.
 
+## Project-scoped MCP config
+
+`.mcp.json` at the repo root registers the `sourcegraph` server automatically when
+Claude Code (or any client that honours the convention) opens the project. The
+`${workspaceFolder}` token is expanded by the client; if your client doesn't
+expand it, the server expands `${workspaceFolder}` itself by reading
+`WORKSPACE_FOLDER` / `CLAUDE_PROJECT_DIR` / `MCP_WORKSPACE_FOLDER` env vars
+(set whichever one is convenient on your machine).
+
+To register the server in another `.NET` solution, copy `.mcp.json` and change
+the relative path:
+
+```json
+{
+  "mcpServers": {
+    "sourcegraph": {
+      "command": "sourcegraph-mcp",
+      "args": ["serve", "--solution", "${workspaceFolder}/MySolution.slnx"]
+    }
+  }
+}
+```
+
+Prerequisites on the developer's box:
+- `dotnet tool install -g DevBitsLab.Mcp.SourceGraph.Tool` (or whatever build distribution you use).
+- `~/.dotnet/tools` on `PATH` so `sourcegraph-mcp` resolves.
+
+Any `${X}` placeholder in `--solution` / `--db` values that isn't expanded by
+the client is also resolved by the server against the process env, so paths like
+`${HOME}/repos/my.slnx` work too.
+
 ## Project layout
 
 - `src/DevBitsLab.Mcp.SourceGraph.Core/` — domain types
