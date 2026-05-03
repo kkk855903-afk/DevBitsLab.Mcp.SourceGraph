@@ -1,6 +1,7 @@
 using System.ComponentModel;
 using System.Text;
 using DevBitsLab.Mcp.SourceGraph.Core;
+using DevBitsLab.Mcp.SourceGraph.Server.Tools;
 using DevBitsLab.Mcp.SourceGraph.Storage;
 using ModelContextProtocol.Server;
 
@@ -33,6 +34,7 @@ public static class GraphResources
 
         var callers = await store.ListCallersAsync(id, 10, ct: ct).ConfigureAwait(false);
         var callees = await store.ListCalleesAsync(id, 10, ct: ct).ConfigureAwait(false);
+        var attrs = await store.GetAttributesForSymbolAsync(id, ct).ConfigureAwait(false);
 
         var sb = new StringBuilder();
         sb.AppendLine($"# {hit.Fqn}");
@@ -54,6 +56,10 @@ public static class GraphResources
                 sb.AppendLine(line.TrimEnd());
             }
         }
+        sb.AppendLine();
+        sb.AppendLine($"## Attributes ({attrs.Count})");
+        if (attrs.Count == 0) sb.AppendLine("_(none)_");
+        else foreach (var a in attrs) sb.AppendLine(AttributeFormat.Card(a));
         sb.AppendLine();
         sb.AppendLine($"## Callers ({callers.Count})");
         if (callers.Count == 0) sb.AppendLine("_(none)_");

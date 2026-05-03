@@ -7,7 +7,7 @@ internal static class Schema
     /// drops all data tables when the on-disk version is below this, since the index can always be
     /// rebuilt from source.
     /// </summary>
-    public const int Version = 5;
+    public const int Version = 6;
 
     /// <summary>
     /// V5 enriches the symbol row with metadata that Roslyn already exposes per symbol but which
@@ -25,6 +25,10 @@ internal static class Schema
     /// multiple times in a single index pass; the <c>ON DELETE CASCADE</c> would race with our
     /// in-memory <c>_symbolIdByKey</c> map and produce FK violations on insert. Cleanup is now
     /// done explicitly in <see cref="SqliteGraphStore.ClearFileAsync"/>.
+    ///
+    /// V6 adds the <c>attributes</c> table + <c>attributes_fts</c> trigram index on top of V5,
+    /// so the indexer can record every <c>[Attribute]</c> attached to a symbol and answer
+    /// <c>find_by_attribute</c> queries (with optional argument-substring filtering).
     /// </summary>
     public const string V1 = """
         CREATE TABLE IF NOT EXISTS schema_version (
@@ -78,6 +82,18 @@ internal static class Schema
             PRIMARY KEY (src, dst, kind)
         );
         CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(dst, kind);
+
+        CREATE TABLE IF NOT EXISTS attributes (
+            id INTEGER PRIMARY KEY,
+            symbol_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            full_name TEXT NOT NULL,
+            args_json TEXT,
+            attribute_symbol_id INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_attributes_symbol ON attributes(symbol_id);
+        CREATE INDEX IF NOT EXISTS idx_attributes_name ON attributes(name);
+        CREATE INDEX IF NOT EXISTS idx_attributes_attribute_symbol_id ON attributes(attribute_symbol_id);
         """;
 
     /// <summary>FTS5 trigram-tokenized index over symbols.name/fqn/signature/xml_summary, kept in sync via triggers.</summary>
@@ -108,6 +124,47 @@ internal static class Schema
             INSERT INTO symbols_fts(rowid, name, fqn, signature, xml_summary)
             VALUES (new.id, new.name, new.fqn, new.signature, new.xml_summary);
         END;
+
+        -- FTS5 trigram index over the synthesised args_text column for an attribute.
+        -- Triggers on `attributes` push every insert/delete into the virtual table.
+        -- Note: `args_text` is not a real column on `attributes`; it's computed on the fly
+        -- from `args_json` by stripping JSON punctuation. This keeps the schema simple
+        -- (no second column to maintain) while still letting `find_by_attribute(argValue=...)`
+        -- run a trigram match over the values that appear in attribute arguments.
+        CREATE VIRTUAL TABLE IF NOT EXISTS attributes_fts USING fts5(
+            args_text,
+            content='',
+            tokenize='trigram'
+        );
+
+        CREATE TRIGGER IF NOT EXISTS attributes_ai AFTER INSERT ON attributes BEGIN
+            INSERT INTO attributes_fts(rowid, args_text)
+            VALUES (
+                new.id,
+                COALESCE(
+                    REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(
+                        new.args_json,
+                        '{', ' '), '}', ' '), '[', ' '), ']', ' '),
+                        '"', ' '), ':', ' '), ',', ' '), '\\', ' '),
+                    ''
+                )
+            );
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS attributes_ad AFTER DELETE ON attributes BEGIN
+            INSERT INTO attributes_fts(attributes_fts, rowid, args_text)
+            VALUES (
+                'delete',
+                old.id,
+                COALESCE(
+                    REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(
+                        old.args_json,
+                        '{', ' '), '}', ' '), '[', ' '), ']', ' '),
+                        '"', ' '), ':', ' '), ',', ' '), '\\', ' '),
+                    ''
+                )
+            );
+        END;
         """;
 
     /// <summary>
@@ -116,6 +173,10 @@ internal static class Schema
     /// <see cref="Version"/>. The index always rebuilds from source on next pass.
     /// </summary>
     public const string DropAll = """
+        DROP TRIGGER IF EXISTS attributes_ad;
+        DROP TRIGGER IF EXISTS attributes_ai;
+        DROP TABLE   IF EXISTS attributes_fts;
+        DROP TABLE   IF EXISTS attributes;
         DROP TRIGGER IF EXISTS symbols_au;
         DROP TRIGGER IF EXISTS symbols_ad;
         DROP TRIGGER IF EXISTS symbols_ai;

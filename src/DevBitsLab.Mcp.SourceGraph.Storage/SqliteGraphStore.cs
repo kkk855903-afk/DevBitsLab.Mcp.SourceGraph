@@ -155,12 +155,21 @@ public sealed class SqliteGraphStore : IGraphStore
                     WHERE file_id = @id AND canonical_key NOT IN (SELECT key FROM keep_keys)
                 );
                 """;
+            // Wipe attributes for every symbol attributed to this file. The indexer rebuilds
+            // the attribute set per-file in pass 1 and bulk-inserts immediately after this
+            // reconcile step, so dropping the rows for surviving symbols too is correct (and
+            // avoids stale rows when a `[Foo]` is removed from a method that itself stays).
+            const string deleteAttributesSql = """
+                DELETE FROM attributes
+                WHERE symbol_id IN (SELECT id FROM symbols WHERE file_id = @id);
+                """;
             const string deleteSymbolsSql = """
                 DELETE FROM symbols
                 WHERE file_id = @id AND canonical_key NOT IN (SELECT key FROM keep_keys);
                 """;
             await _connection.ExecuteAsync(new CommandDefinition(deleteRefsSql, new { id = fileId }, transaction: tx, cancellationToken: ct)).ConfigureAwait(false);
             await _connection.ExecuteAsync(new CommandDefinition(deleteEdgesSql, new { id = fileId }, transaction: tx, cancellationToken: ct)).ConfigureAwait(false);
+            await _connection.ExecuteAsync(new CommandDefinition(deleteAttributesSql, new { id = fileId }, transaction: tx, cancellationToken: ct)).ConfigureAwait(false);
             await _connection.ExecuteAsync(new CommandDefinition(deleteSymbolsSql, new { id = fileId }, transaction: tx, cancellationToken: ct)).ConfigureAwait(false);
             await _connection.ExecuteAsync(new CommandDefinition("DELETE FROM keep_keys;", transaction: tx, cancellationToken: ct)).ConfigureAwait(false);
 
@@ -586,6 +595,83 @@ public sealed class SqliteGraphStore : IGraphStore
         var refs = await _connection.ExecuteScalarAsync<int>(new CommandDefinition("SELECT COUNT(*) FROM refs;", cancellationToken: ct)).ConfigureAwait(false);
         var edges = await _connection.ExecuteScalarAsync<int>(new CommandDefinition("SELECT COUNT(*) FROM edges;", cancellationToken: ct)).ConfigureAwait(false);
         return new GraphStats(files, symbols, refs, edges);
+    }
+
+    public async Task BulkInsertAttributesAsync(IEnumerable<AttributeRecord> attributes, CancellationToken ct = default)
+    {
+        const string sql = """
+            INSERT INTO attributes(symbol_id, name, full_name, args_json, attribute_symbol_id)
+            VALUES (@SymbolId, @Name, @FullName, @ArgsJson, @AttributeSymbolId);
+            """;
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            using var tx = _connection.BeginTransaction();
+            foreach (var a in attributes)
+            {
+                await _connection.ExecuteAsync(new CommandDefinition(sql, new
+                {
+                    a.SymbolId,
+                    a.Name,
+                    a.FullName,
+                    a.ArgsJson,
+                    a.AttributeSymbolId,
+                }, transaction: tx, cancellationToken: ct)).ConfigureAwait(false);
+            }
+            tx.Commit();
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public async Task<IReadOnlyList<SymbolHit>> FindByAttributeAsync(string name, string? argSubstring, Core.SymbolKind? kindFilter, int limit, CancellationToken ct = default)
+    {
+        // Strict match on attribute short name. When argSubstring is supplied we also join
+        // attributes_fts on the row id and run a trigram MATCH; otherwise we skip that join
+        // entirely. Trigrams need >= 3 characters to do anything useful, so we silently
+        // ignore short substrings rather than producing zero matches.
+        var useFts = !string.IsNullOrWhiteSpace(argSubstring) && argSubstring.Trim().Length >= 3;
+        var ftsTerm = useFts ? "\"" + argSubstring!.Trim().Replace("\"", "\"\"") + "\"" : null;
+
+        var sql = $"""
+            SELECT s.id, s.name, s.fqn, s.kind, f.path AS FilePath, s.start_line AS StartLine, s.start_col AS StartCol,
+                   s.end_line AS EndLine, s.end_col AS EndCol, s.signature,
+                   s.modifiers AS Modifiers, s.accessibility AS Accessibility, s.xml_summary AS XmlSummary
+            FROM attributes a
+            JOIN symbols s ON s.id = a.symbol_id
+            JOIN files   f ON f.id = s.file_id
+            {(useFts ? "JOIN attributes_fts t ON t.rowid = a.id" : "")}
+            WHERE a.name = @name
+              {(useFts ? "AND t.attributes_fts MATCH @fts" : "")}
+              {(kindFilter is null ? "" : "AND s.kind = @kind")}
+            GROUP BY s.id
+            ORDER BY f.path, s.start_line
+            LIMIT @limit;
+            """;
+        var rows = await _connection.QueryAsync<RawSymbolHit>(new CommandDefinition(
+            sql,
+            new { name, fts = ftsTerm, kind = (int?)kindFilter, limit },
+            cancellationToken: ct)).ConfigureAwait(false);
+        return rows.Select(r => r.ToHit()).ToList();
+    }
+
+    public async Task<IReadOnlyList<AttributeRecord>> GetAttributesForSymbolAsync(long symbolId, CancellationToken ct = default)
+    {
+        const string sql = """
+            SELECT symbol_id    AS SymbolId,
+                   name         AS Name,
+                   full_name    AS FullName,
+                   args_json    AS ArgsJson,
+                   attribute_symbol_id AS AttributeSymbolId
+            FROM attributes
+            WHERE symbol_id = @id
+            ORDER BY id;
+            """;
+        var rows = await _connection.QueryAsync<AttributeRecord>(new CommandDefinition(
+            sql, new { id = symbolId }, cancellationToken: ct)).ConfigureAwait(false);
+        return rows.AsList();
     }
 
     public async ValueTask DisposeAsync()

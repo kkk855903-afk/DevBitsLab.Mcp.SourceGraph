@@ -31,4 +31,8 @@ public class Greeter : IGreeter
     private static void Bump(ref int n) => n++;
 
     private static void TrySet(out int n) => n = 1;
+
+    [System.Obsolete("legacy")]
+    [Legacy("use Greet instead", Severity = 2)]
+    public string LegacyGreet(string name) => Greet(name);
 }
