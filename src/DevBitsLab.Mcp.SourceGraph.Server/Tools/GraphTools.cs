@@ -96,20 +96,24 @@ public static class GraphTools
         });
 
     [McpServerTool]
-    [Description("List the named methods/properties that call into a target symbol. Use for impact-of-change or trace-the-callers analysis.")]
+    [Description("List inbound edges into a target symbol. Default kind=calls (i.e. callers). Use kind=uses_type to find consumers of a type, kind=overrides for derived implementations, kind=implements_member for members satisfying an interface, kind=instantiates for `new T()` sites, kind=throws for throw sites, or kind=all for every edge kind.")]
     public static Task<string> ListCallersAsync(
         IGraphStore store,
         [Description("Target symbol name or FQN")] string symbol,
-        [Description("Maximum number of callers to return (default 50)")] int limit = 50,
+        [Description("Maximum number of results to return (default 50)")] int limit = 50,
+        [Description("Edge kind to walk: calls (default) | uses_type | overrides | implements_member | instantiates | throws | all")] string? kind = null,
         CancellationToken ct = default) =>
-        ToolMetrics.TrackAsync("list_callers", new { symbol, limit }, async () =>
+        ToolMetrics.TrackAsync("list_callers", new { symbol, limit, kind }, async () =>
         {
+            var (edgeKind, label, errorMsg) = ParseEdgeKind(kind);
+            if (errorMsg is not null) return errorMsg;
+
             var hits = await store.FindSymbolsAsync(symbol, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
             if (hits.Count == 0) return $"No symbol found for '{symbol}'.";
             var top = hits[0];
-            var callers = await store.ListCallersAsync(top.Id, limit, ct).ConfigureAwait(false);
+            var callers = await store.ListCallersAsync(top.Id, limit, edgeKind, ct).ConfigureAwait(false);
             var sb = new StringBuilder();
-            sb.AppendLine($"Callers of **{top.Fqn}** ({KindLabel(top.Kind)}):");
+            sb.AppendLine($"Inbound `{label}` to **{top.Fqn}** ({KindLabel(top.Kind)}):");
             if (callers.Count == 0) { sb.AppendLine("- (none)"); return sb.ToString(); }
             foreach (var c in callers)
             {
@@ -119,22 +123,53 @@ public static class GraphTools
         });
 
     [McpServerTool]
-    [Description("List every named method/property the target symbol calls. Inverse of list_callers.")]
+    [Description("List outbound edges from the target symbol. Default kind=calls (callees). Use kind=uses_type for types touched in this member's signature/body, kind=overrides for the base it overrides, kind=implements_member for the interface member it satisfies, kind=instantiates for types it constructs, kind=throws for exception types it throws, or kind=all.")]
     public static Task<string> ListCalleesAsync(
         IGraphStore store,
         [Description("Source symbol name or FQN")] string symbol,
-        [Description("Maximum number of callees to return (default 50)")] int limit = 50,
+        [Description("Maximum number of results to return (default 50)")] int limit = 50,
+        [Description("Edge kind to walk: calls (default) | uses_type | overrides | implements_member | instantiates | throws | all")] string? kind = null,
         CancellationToken ct = default) =>
-        ToolMetrics.TrackAsync("list_callees", new { symbol, limit }, async () =>
+        ToolMetrics.TrackAsync("list_callees", new { symbol, limit, kind }, async () =>
+        {
+            var (edgeKind, label, errorMsg) = ParseEdgeKind(kind);
+            if (errorMsg is not null) return errorMsg;
+
+            var hits = await store.FindSymbolsAsync(symbol, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
+            if (hits.Count == 0) return $"No symbol found for '{symbol}'.";
+            var top = hits[0];
+            var callees = await store.ListCalleesAsync(top.Id, limit, edgeKind, ct).ConfigureAwait(false);
+            var sb = new StringBuilder();
+            sb.AppendLine($"Outbound `{label}` from **{top.Fqn}** ({KindLabel(top.Kind)}):");
+            if (callees.Count == 0) { sb.AppendLine("- (none)"); return sb.ToString(); }
+            foreach (var c in callees)
+            {
+                sb.AppendLine($"- **{c.Fqn}** ({KindLabel(c.Kind)}) at {Format.Location(c.FilePath, c.StartLine, c.StartCol)}");
+            }
+            return sb.ToString();
+        });
+
+    [McpServerTool]
+    [Description("Find every concrete member that implements an interface member (uses ImplementsMember edges). Use for 'who implements IGreeter.Greet?'.")]
+    public static Task<string> FindImplementationsAsync(
+        IGraphStore store,
+        [Description("Interface member name or FQN, e.g. 'IGreeter.Greet'")] string symbol,
+        [Description("Include abstract base members in the result (default false)")] bool includeAbstract = false,
+        [Description("Maximum results (default 50)")] int limit = 50,
+        CancellationToken ct = default) =>
+        ToolMetrics.TrackAsync("find_implementations", new { symbol, includeAbstract, limit }, async () =>
         {
             var hits = await store.FindSymbolsAsync(symbol, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
             if (hits.Count == 0) return $"No symbol found for '{symbol}'.";
             var top = hits[0];
-            var callees = await store.ListCalleesAsync(top.Id, limit, ct).ConfigureAwait(false);
+            var impls = await store.ListImplementationsAsync(top.Id, limit, ct).ConfigureAwait(false);
+            var filtered = includeAbstract
+                ? impls
+                : impls.Where(h => !(h.Signature?.Contains("abstract", StringComparison.Ordinal) ?? false)).ToList();
             var sb = new StringBuilder();
-            sb.AppendLine($"Callees of **{top.Fqn}** ({KindLabel(top.Kind)}):");
-            if (callees.Count == 0) { sb.AppendLine("- (none)"); return sb.ToString(); }
-            foreach (var c in callees)
+            sb.AppendLine($"Implementations of **{top.Fqn}** ({KindLabel(top.Kind)}):");
+            if (filtered.Count == 0) { sb.AppendLine("- (none)"); return sb.ToString(); }
+            foreach (var c in filtered)
             {
                 sb.AppendLine($"- **{c.Fqn}** ({KindLabel(c.Kind)}) at {Format.Location(c.FilePath, c.StartLine, c.StartCol)}");
             }
@@ -167,27 +202,31 @@ public static class GraphTools
         });
 
     [McpServerTool]
-    [Description("Get the immediate graph neighborhood of a symbol: callers, callees, and inheritance/implements edges. Use to orient yourself around a symbol before diving in.")]
+    [Description("Get the immediate graph neighborhood of a symbol: callers, callees, and inheritance/implements edges. Use to orient yourself around a symbol before diving in. Default kind=calls; pass kind=uses_type, overrides, implements_member, instantiates, throws, or all to inspect other edge layers.")]
     public static Task<string> NeighborhoodAsync(
         IGraphStore store,
         [Description("Symbol name or FQN")] string symbol,
         [Description("Max items per category (default 20)")] int perCategory = 20,
+        [Description("Edge kind to walk: calls (default) | uses_type | overrides | implements_member | instantiates | throws | all")] string? kind = null,
         CancellationToken ct = default) =>
-        ToolMetrics.TrackAsync("neighborhood", new { symbol, perCategory }, async () =>
+        ToolMetrics.TrackAsync("neighborhood", new { symbol, perCategory, kind }, async () =>
         {
+            var (edgeKind, label, errorMsg) = ParseEdgeKind(kind);
+            if (errorMsg is not null) return errorMsg;
+
             var hits = await store.FindSymbolsAsync(symbol, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
             if (hits.Count == 0) return $"No symbol found for '{symbol}'.";
             var top = hits[0];
-            var callers = await store.ListCallersAsync(top.Id, perCategory, ct).ConfigureAwait(false);
-            var callees = await store.ListCalleesAsync(top.Id, perCategory, ct).ConfigureAwait(false);
+            var callers = await store.ListCallersAsync(top.Id, perCategory, edgeKind, ct).ConfigureAwait(false);
+            var callees = await store.ListCalleesAsync(top.Id, perCategory, edgeKind, ct).ConfigureAwait(false);
 
             var sb = new StringBuilder();
-            sb.AppendLine($"Neighborhood of **{top.Fqn}** ({Format.KindWithAttrs(top)})");
+            sb.AppendLine($"Neighborhood of **{top.Fqn}** ({Format.KindWithAttrs(top)}) [kind={label}]");
             sb.AppendLine($"definition: {Format.Location(top.FilePath, top.StartLine, top.StartCol)}");
             var topSummary = Format.OneLineSummary(top.XmlSummary);
             if (!string.IsNullOrEmpty(topSummary)) sb.AppendLine($"_{topSummary}_");
             sb.AppendLine();
-            sb.AppendLine($"### Callers ({callers.Count})");
+            sb.AppendLine($"### Inbound ({callers.Count})");
             foreach (var c in callers)
             {
                 sb.Append($"- {c.Fqn} ({Format.KindWithAttrs(c)}) — {Format.Location(c.FilePath, c.StartLine, c.StartCol)}");
@@ -197,7 +236,7 @@ public static class GraphTools
             }
             if (callers.Count == 0) sb.AppendLine("- (none)");
             sb.AppendLine();
-            sb.AppendLine($"### Callees ({callees.Count})");
+            sb.AppendLine($"### Outbound ({callees.Count})");
             foreach (var c in callees)
             {
                 sb.Append($"- {c.Fqn} ({Format.KindWithAttrs(c)}) — {Format.Location(c.FilePath, c.StartLine, c.StartCol)}");
@@ -233,21 +272,25 @@ public static class GraphTools
         });
 
     [McpServerTool]
-    [Description("Compute the transitive set of upstream callers for a symbol (impact of changing it). Walks the call graph backward up to maxDepth.")]
+    [Description("Compute the transitive set of upstream callers for a symbol (impact of changing it). Walks the call graph backward up to maxDepth. Default kind=calls; pass kind=uses_type, overrides, implements_member, instantiates, throws, or all to traverse other edge layers.")]
     public static Task<string> ImpactOfChangeAsync(
         IGraphStore store,
         [Description("Symbol name or FQN")] string symbol,
         [Description("Maximum traversal depth (default 4)")] int maxDepth = 4,
         [Description("Maximum results (default 100)")] int limit = 100,
+        [Description("Edge kind to walk: calls (default) | uses_type | overrides | implements_member | instantiates | throws | all")] string? kind = null,
         CancellationToken ct = default) =>
-        ToolMetrics.TrackAsync("impact_of_change", new { symbol, maxDepth, limit }, async () =>
+        ToolMetrics.TrackAsync("impact_of_change", new { symbol, maxDepth, limit, kind }, async () =>
         {
+            var (edgeKind, label, errorMsg) = ParseEdgeKind(kind);
+            if (errorMsg is not null) return errorMsg;
+
             var hits = await store.FindSymbolsAsync(symbol, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
             if (hits.Count == 0) return $"No symbol found for '{symbol}'.";
             var top = hits[0];
-            var rows = await store.ImpactOfChangeAsync(top.Id, maxDepth, limit, ct).ConfigureAwait(false);
+            var rows = await store.ImpactOfChangeAsync(top.Id, maxDepth, limit, edgeKind, ct).ConfigureAwait(false);
             var sb = new StringBuilder();
-            sb.AppendLine($"Upstream impact of **{top.Fqn}** ({KindLabel(top.Kind)}) up to depth {maxDepth}:");
+            sb.AppendLine($"Upstream impact of **{top.Fqn}** ({KindLabel(top.Kind)}) [kind={label}] up to depth {maxDepth}:");
             if (rows.Count == 0) { sb.AppendLine("- (no upstream callers found in graph)"); return sb.ToString(); }
             foreach (var r in rows)
             {
@@ -363,6 +406,8 @@ public static class GraphTools
         ReferenceKind.Call => "call",
         ReferenceKind.Implements => "impl",
         ReferenceKind.Inherits => "inherit",
+        ReferenceKind.Read => "read",
+        ReferenceKind.Write => "write",
         _ => "?",
     };
 
@@ -382,6 +427,29 @@ public static class GraphTools
     }
 
     internal static string KindLabelOf(SymbolKind kind) => KindLabel(kind);
+
+    /// <summary>
+    /// Parses the optional `kind` parameter accepted by list_callers/list_callees/neighborhood/impact_of_change.
+    /// Returns (edgeKind, label, errorMsg). errorMsg non-null means caller should short-circuit with it.
+    /// edgeKind null means "walk every kind" (kind = "all"). label is the canonical lowercase token.
+    /// </summary>
+    private static (EdgeKind? edgeKind, string label, string? errorMsg) ParseEdgeKind(string? kind)
+    {
+        if (string.IsNullOrEmpty(kind)) return (EdgeKind.Calls, "calls", null);
+        var normalised = kind.Trim().ToLowerInvariant();
+        return normalised switch
+        {
+            "calls" or "call" => (EdgeKind.Calls, "calls", null),
+            "uses_type" or "usestype" or "uses-type" => (EdgeKind.UsesType, "uses_type", null),
+            "overrides" or "overrides_member" or "override" => (EdgeKind.OverridesMember, "overrides_member", null),
+            "implements" or "implements_member" or "impl" => (EdgeKind.ImplementsMember, "implements_member", null),
+            "instantiates" or "new" => (EdgeKind.Instantiates, "instantiates", null),
+            "throws" or "throw" => (EdgeKind.Throws, "throws", null),
+            "inherits" or "inherit" => (EdgeKind.Inherits, "inherits", null),
+            "all" or "any" or "*" => (null, "all", null),
+            _ => (EdgeKind.Calls, "calls", $"Unknown kind '{kind}'. Expected one of: calls | uses_type | overrides | implements_member | instantiates | throws | all."),
+        };
+    }
 }
 
 internal static class Format
