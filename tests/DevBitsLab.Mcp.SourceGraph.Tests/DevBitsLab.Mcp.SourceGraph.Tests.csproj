@@ -1,0 +1,37 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+    <!-- Roslyn's xml doc helpers occasionally pull XmlException through; tests use cref-rich
+         summaries so this isn't a concern. -->
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" />
+    <PackageReference Include="xunit" />
+    <PackageReference Include="xunit.runner.visualstudio">
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+      <PrivateAssets>all</PrivateAssets>
+    </PackageReference>
+    <PackageReference Include="FluentAssertions" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\DevBitsLab.Mcp.SourceGraph.Core\DevBitsLab.Mcp.SourceGraph.Core.csproj" />
+    <ProjectReference Include="..\..\src\DevBitsLab.Mcp.SourceGraph.Storage\DevBitsLab.Mcp.SourceGraph.Storage.csproj" />
+    <ProjectReference Include="..\..\src\DevBitsLab.Mcp.SourceGraph.Indexing\DevBitsLab.Mcp.SourceGraph.Indexing.csproj" />
+  </ItemGroup>
+
+  <!-- MSBuildLocator requires that Microsoft.Build.* assemblies are not loaded from the project's
+       output dir; instead they're resolved at runtime from the SDK install. Mirror the dance the
+       Indexing/Server projects do so test runs of RoslynIndexer.IndexSolutionOnceAsync work. -->
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Build" ExcludeAssets="runtime" PrivateAssets="all" />
+    <PackageReference Include="Microsoft.Build.Framework" ExcludeAssets="runtime" PrivateAssets="all" />
+    <PackageReference Include="Microsoft.Build.Tasks.Core" ExcludeAssets="runtime" PrivateAssets="all" />
+    <PackageReference Include="Microsoft.Build.Utilities.Core" ExcludeAssets="runtime" PrivateAssets="all" />
+    <PackageReference Include="System.Security.Cryptography.Xml" ExcludeAssets="runtime" PrivateAssets="all" />
+  </ItemGroup>
+
+</Project>

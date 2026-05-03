@@ -21,6 +21,14 @@ public interface IGraphStore : IAsyncDisposable
     /// <summary>Upsert a symbol by canonical key. Returns the symbol's stable id (existing or newly created).</summary>
     Task<long> UpsertSymbolAsync(string canonicalKey, Symbol symbol, CancellationToken ct = default);
 
+    /// <summary>
+    /// Pass-1c container-id reconciliation: for each <c>(childId, parentId)</c> pair, set
+    /// <c>symbols.container_id = parentId WHERE id = childId</c>. Runs inside a single
+    /// <c>BEGIN/COMMIT</c>. Pairs whose <c>parentId</c> doesn't exist are skipped (the schema
+    /// has no FK on <c>container_id</c>, so the row simply remains uncorrelated).
+    /// </summary>
+    Task BatchUpdateContainerIdsAsync(IReadOnlyList<(long ChildId, long ParentId)> pairs, CancellationToken ct = default);
+
     Task BulkInsertReferencesAsync(IEnumerable<SymbolReference> references, CancellationToken ct = default);
     Task BulkInsertEdgesAsync(IEnumerable<Edge> edges, CancellationToken ct = default);
 
@@ -40,6 +48,13 @@ public interface IGraphStore : IAsyncDisposable
     Task<IReadOnlyList<SymbolHit>> SearchSymbolsAsync(string ftsQuery, Core.SymbolKind? kindFilter = null, int limit = 25, CancellationToken ct = default);
     Task<IReadOnlyList<ModuleSymbol>> ModuleSummaryAsync(string namespaceOrPathPrefix, int limit = 25, CancellationToken ct = default);
     Task<IReadOnlyList<ImpactedSymbol>> ImpactOfChangeAsync(long symbolId, int maxDepth = 4, int limit = 100, CancellationToken ct = default);
+
+    /// <summary>
+    /// Direct children of a container (rows whose <c>container_id = containerId</c>),
+    /// optionally filtered by <see cref="Microsoft.CodeAnalysis.Accessibility"/> integer value,
+    /// ordered by file path then <c>start_line</c>.
+    /// </summary>
+    Task<IReadOnlyList<SymbolHit>> ListMembersAsync(long containerId, int? accessibilityFilter = null, int limit = 200, CancellationToken ct = default);
 }
 
 public sealed record ModuleSymbol(SymbolHit Symbol, int InDegree);

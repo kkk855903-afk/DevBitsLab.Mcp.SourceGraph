@@ -253,7 +253,10 @@ public sealed class RoslynIndexer : IAsyncDisposable
         // PASS 1 — phase B: walk every iteration of each changed file (one path may have N
         // iterations across multi-target / linked / shared projects), upserting symbols and
         // accumulating the union of canonical keys per fileId before we reconcile.
+        // Per fileId we also record (childKey -> parentKey) so pass-1c can resolve the parent
+        // canonical key into its row id (which only exists after the corresponding upsert).
         var newKeysForFile = new Dictionary<long, HashSet<string>>();
+        var parentKeyByChildKey = new Dictionary<string, string>(StringComparer.Ordinal);
         foreach (var (fileId, docs) in docsByChangedFile)
         {
             var fileKeys = new HashSet<string>(StringComparer.Ordinal);
@@ -275,6 +278,14 @@ public sealed class RoslynIndexer : IAsyncDisposable
                     if (key is null) continue;
                     if (!fileKeys.Add(key)) continue;
 
+                    // Remember parent canonical key for the pass-1c container_id batch update.
+                    var parentSym = symbol.ContainingSymbol;
+                    if (parentSym is not null && SymbolMapping.IsIndexable(parentSym))
+                    {
+                        var parentKey = SymbolMapping.CanonicalKey(parentSym);
+                        if (parentKey is not null) parentKeyByChildKey[key] = parentKey;
+                    }
+
                     var loc = node.GetLocation().GetLineSpan();
                     var coreSymbol = new Symbol(
                         Id: 0,
@@ -287,7 +298,10 @@ public sealed class RoslynIndexer : IAsyncDisposable
                         EndLine: loc.EndLinePosition.Line + 1,
                         EndCol: loc.EndLinePosition.Character + 1,
                         Signature: SymbolMapping.Signature(symbol),
-                        ContainerId: null);
+                        ContainerId: null,
+                        Modifiers: SymbolMapping.Modifiers(symbol),
+                        Accessibility: SymbolMapping.Accessibility(symbol),
+                        XmlSummary: SymbolMapping.XmlSummary(symbol));
 
                     var id = await _store.UpsertSymbolAsync(key, coreSymbol, ct).ConfigureAwait(false);
                     var isNew = !_symbolIdByKey.ContainsKey(key);
@@ -312,6 +326,28 @@ public sealed class RoslynIndexer : IAsyncDisposable
             }
             await _store.DeleteSymbolsForFileNotInAsync(fileId, fileKeys, ct).ConfigureAwait(false);
             _keysByFileId[fileId] = fileKeys.ToList();
+        }
+
+        // PASS 1 — phase C: resolve every recorded (childKey -> parentKey) into row ids and
+        // batch-update symbols.container_id. Lookups can fail if the parent isn't indexable
+        // (e.g., the global namespace) or if the parent lives in a file we didn't reprocess
+        // this round but isn't in _symbolIdByKey for some reason — those rows are skipped.
+        if (parentKeyByChildKey.Count > 0)
+        {
+            var pairs = new List<(long ChildId, long ParentId)>(parentKeyByChildKey.Count);
+            foreach (var (childKey, parentKey) in parentKeyByChildKey)
+            {
+                if (_symbolIdByKey.TryGetValue(childKey, out var childId)
+                    && _symbolIdByKey.TryGetValue(parentKey, out var parentId)
+                    && childId != parentId)
+                {
+                    pairs.Add((childId, parentId));
+                }
+            }
+            if (pairs.Count > 0)
+            {
+                await _store.BatchUpdateContainerIdsAsync(pairs, ct).ConfigureAwait(false);
+            }
         }
 
         // PASS 2: references — only for files we (re)indexed in pass 1.

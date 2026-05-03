@@ -7,9 +7,18 @@ internal static class Schema
     /// drops all data tables when the on-disk version is below this, since the index can always be
     /// rebuilt from source.
     /// </summary>
-    public const int Version = 4;
+    public const int Version = 5;
 
     /// <summary>
+    /// V5 enriches the symbol row with metadata that Roslyn already exposes per symbol but which
+    /// previously required a Read-the-source round-trip to surface to an agent: a comma-joined
+    /// <c>modifiers</c> token string (canonically ordered: <c>static, async, virtual, abstract,
+    /// sealed, override, extern, readonly, partial</c>), the <c>DeclaredAccessibility</c> as an
+    /// integer enum, and the parsed <c>&lt;summary&gt;</c> text from the XML doc comment (with
+    /// <c>&lt;inheritdoc/&gt;</c> resolved up the override chain). The <c>xml_summary</c> column
+    /// also feeds the FTS5 virtual table so <c>search_symbols</c> matches against documented
+    /// behaviour, not just identifiers.
+    ///
     /// V3 removes the foreign-key constraints from <c>refs</c> and <c>edges</c> that we previously
     /// relied on for cascade-on-delete behaviour. In real-world solutions (multi-target,
     /// linked files, shared projects, source generators) the same source path can be processed
@@ -41,11 +50,15 @@ internal static class Schema
             end_line INTEGER NOT NULL,
             end_col INTEGER NOT NULL,
             signature TEXT,
-            container_id INTEGER
+            container_id INTEGER,
+            modifiers TEXT,
+            accessibility INTEGER NOT NULL DEFAULT 0,
+            xml_summary TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_symbols_fqn ON symbols(fqn);
         CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
         CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file_id);
+        CREATE INDEX IF NOT EXISTS idx_symbols_container ON symbols(container_id);
 
         CREATE TABLE IF NOT EXISTS refs (
             id INTEGER PRIMARY KEY,
@@ -67,32 +80,33 @@ internal static class Schema
         CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(dst, kind);
         """;
 
-    /// <summary>FTS5 trigram-tokenized index over symbols.name/fqn/signature, kept in sync via triggers.</summary>
+    /// <summary>FTS5 trigram-tokenized index over symbols.name/fqn/signature/xml_summary, kept in sync via triggers.</summary>
     public const string V2 = """
         CREATE VIRTUAL TABLE IF NOT EXISTS symbols_fts USING fts5(
             name,
             fqn,
             signature,
+            xml_summary,
             content='symbols',
             content_rowid='id',
             tokenize='trigram'
         );
 
         CREATE TRIGGER IF NOT EXISTS symbols_ai AFTER INSERT ON symbols BEGIN
-            INSERT INTO symbols_fts(rowid, name, fqn, signature)
-            VALUES (new.id, new.name, new.fqn, new.signature);
+            INSERT INTO symbols_fts(rowid, name, fqn, signature, xml_summary)
+            VALUES (new.id, new.name, new.fqn, new.signature, new.xml_summary);
         END;
 
         CREATE TRIGGER IF NOT EXISTS symbols_ad AFTER DELETE ON symbols BEGIN
-            INSERT INTO symbols_fts(symbols_fts, rowid, name, fqn, signature)
-            VALUES ('delete', old.id, old.name, old.fqn, old.signature);
+            INSERT INTO symbols_fts(symbols_fts, rowid, name, fqn, signature, xml_summary)
+            VALUES ('delete', old.id, old.name, old.fqn, old.signature, old.xml_summary);
         END;
 
         CREATE TRIGGER IF NOT EXISTS symbols_au AFTER UPDATE ON symbols BEGIN
-            INSERT INTO symbols_fts(symbols_fts, rowid, name, fqn, signature)
-            VALUES ('delete', old.id, old.name, old.fqn, old.signature);
-            INSERT INTO symbols_fts(rowid, name, fqn, signature)
-            VALUES (new.id, new.name, new.fqn, new.signature);
+            INSERT INTO symbols_fts(symbols_fts, rowid, name, fqn, signature, xml_summary)
+            VALUES ('delete', old.id, old.name, old.fqn, old.signature, old.xml_summary);
+            INSERT INTO symbols_fts(rowid, name, fqn, signature, xml_summary)
+            VALUES (new.id, new.name, new.fqn, new.signature, new.xml_summary);
         END;
         """;
 
