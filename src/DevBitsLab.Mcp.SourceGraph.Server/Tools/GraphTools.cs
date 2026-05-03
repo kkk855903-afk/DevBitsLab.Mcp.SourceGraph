@@ -73,13 +73,14 @@ public static class GraphTools
         });
 
     [McpServerTool]
-    [Description("Find every place that references a symbol. Resolves the symbol by name/FQN, then lists each call site or type-use as file:line. Use for 'who uses X?' or 'who calls X?'.")]
+    [Description("Find every place that references a symbol. Resolves the symbol by name/FQN, then lists each call site or type-use as file:line. Use for 'who uses X?' or 'who calls X?'. By default skips refs from source-generated files; pass includeGenerated=true to surface them.")]
     public static Task<string> FindReferencesAsync(
         IGraphStore store,
         [Description("Symbol name or FQN, same matching rules as find_definition")] string symbol,
         [Description("Maximum number of references to return (default 200)")] int limit = 200,
+        [Description("Include references from source-generated files (default false)")] bool includeGenerated = false,
         CancellationToken ct = default) =>
-        ToolMetrics.TrackAsync("find_references", new { symbol, limit }, async () =>
+        ToolMetrics.TrackAsync("find_references", new { symbol, limit, includeGenerated }, async () =>
         {
             var hits = await store.FindSymbolsAsync(symbol, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
             if (hits.Count == 0) return $"No symbol found for '{symbol}'.";
@@ -91,19 +92,21 @@ public static class GraphTools
                 sb.AppendLine();
             }
             var top = hits[0];
-            var refs = await store.FindReferencesAsync(top.Id, limit, ct).ConfigureAwait(false);
-            sb.AppendLine($"References to **{top.Fqn}** ({KindLabel(top.Kind)}):");
+            var refs = await store.FindReferencesAsync(top.Id, includeGenerated, limit, ct).ConfigureAwait(false);
+            sb.AppendLine($"References to **{top.Fqn}** ({KindLabel(top.Kind)}){GeneratedSuffix(top.IsGenerated)}:");
             sb.AppendLine($"- definition: {Format.Location(top.FilePath, top.StartLine, top.StartCol)}");
             if (refs.Count == 0)
             {
-                sb.AppendLine("- no other references in the graph");
+                sb.AppendLine(includeGenerated
+                    ? "- no other references in the graph"
+                    : "- no other references in the graph (pass includeGenerated=true to include source-generated files)");
                 return sb.ToString();
             }
             sb.AppendLine();
             sb.AppendLine($"{refs.Count} reference(s):");
             foreach (var r in refs)
             {
-                sb.AppendLine($"- {RefKindLabel(r.Kind)} at {Format.Location(r.FilePath, r.Line, r.Col)}");
+                sb.AppendLine($"- {RefKindLabel(r.Kind)} at {Format.Location(r.FilePath, r.Line, r.Col)}{GeneratedSuffix(r.IsGenerated)}");
             }
             return sb.ToString();
         });
@@ -453,6 +456,73 @@ public static class GraphTools
         });
 
     [McpServerTool]
+    [Description("Find Roslyn diagnostics (analyzer warnings, compiler errors, etc.) captured during indexing. Filter by severity (default 'warning' = severity >= 2), diagnostic code (e.g. 'CS0618'), and/or symbol. Use for 'what does this codebase warn about?' or 'is X being warned on?'.")]
+    public static Task<string> FindDiagnosticsAsync(
+        IGraphStore store,
+        [Description("Severity floor: hidden | info | warning (default) | error | all. Numeric values 0-3 also accepted.")] string? severity = "warning",
+        [Description("Optional diagnostic code filter, e.g. 'CS0618' for [Obsolete] usage")] string? code = null,
+        [Description("Optional symbol name/FQN to scope the lookup to a single symbol's diagnostics")] string? symbol = null,
+        [Description("Maximum rows to return (default 100)")] int limit = 100,
+        CancellationToken ct = default) =>
+        ToolMetrics.TrackAsync("find_diagnostics", new { severity, code, symbol, limit }, async () =>
+        {
+            var sev = ParseSeverity(severity);
+            if (sev == -1)
+            {
+                return $"Unknown severity '{severity}'. Expected one of: hidden | info | warning | error | all.";
+            }
+
+            long? symbolId = null;
+            string? symbolFqn = null;
+            if (!string.IsNullOrWhiteSpace(symbol))
+            {
+                var hits = await store.FindSymbolsAsync(symbol, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
+                if (hits.Count == 0) return $"No symbol found for '{symbol}'.";
+                symbolId = hits[0].Id;
+                symbolFqn = hits[0].Fqn;
+            }
+
+            var rows = await store.FindDiagnosticsAsync(sev, code, symbolId, limit, ct).ConfigureAwait(false);
+            var sb = new StringBuilder();
+            var sevLabel = sev is null ? "all" : $">= {SeverityLabel(sev.Value)}";
+            var codeClause = string.IsNullOrEmpty(code) ? "" : $", code={code}";
+            var symClause = symbolFqn is null ? "" : $", symbol={symbolFqn}";
+            sb.AppendLine($"Diagnostics (severity {sevLabel}{codeClause}{symClause}): {rows.Count}");
+            if (rows.Count == 0) return sb.ToString();
+            foreach (var d in rows)
+            {
+                sb.AppendLine($"- **{SeverityLabel(d.Severity)} {d.Code}** at {Format.Location(d.FilePath, d.Line, d.Col)} — {d.Message}");
+            }
+            return sb.ToString();
+        });
+
+    [McpServerTool]
+    [Description("List every source-generated file (Roslyn IIncrementalGenerator output: regex source-gen, MVVM Toolkit, ASP.NET routing, JSON source-gen, etc.) tracked by the index. Each row shows the path and the count of symbols emitted from that file.")]
+    public static Task<string> ListGeneratedFilesAsync(
+        IGraphStore store,
+        [Description("Maximum rows (default 100)")] int limit = 100,
+        CancellationToken ct = default) =>
+        ToolMetrics.TrackAsync("list_generated_files", new { limit }, async () =>
+        {
+            var rows = await store.ListGeneratedFilesAsync(limit, ct).ConfigureAwait(false);
+            var sb = new StringBuilder();
+            sb.AppendLine($"Generated files: {rows.Count}");
+            if (rows.Count == 0)
+            {
+                sb.AppendLine("_(no source-generated documents in this solution)_");
+                return sb.ToString();
+            }
+            sb.AppendLine();
+            sb.AppendLine("| Symbols | Path |");
+            sb.AppendLine("|--------:|------|");
+            foreach (var r in rows)
+            {
+                sb.AppendLine($"| {r.SymbolCount} | `{r.FilePath}` |");
+            }
+            return sb.ToString();
+        });
+
+    [McpServerTool]
     [Description("Show how often each MCP tool was called this server-process session: count, errors, avg/max latency, avg response size, last-called time. Use this to verify the agent is actually using the source-graph tools (vs grep+read fallback). Persistent log of every call is at usage.jsonl next to graph.db.")]
     public static string UsageStats() =>
         ToolMetrics.TrackSync("usage_stats", null, () =>
@@ -530,6 +600,39 @@ public static class GraphTools
         };
     }
 
+    /// <summary>Render " (generated)" when the symbol or reference came from a source-generated
+    /// file, "" otherwise. Use it to suffix file:line locations rendered with
+    /// <see cref="Format.Location"/>.</summary>
+    private static string GeneratedSuffix(bool isGenerated) => isGenerated ? " (generated)" : "";
+
+    /// <summary>
+    /// Map a textual severity token to the corresponding <c>Microsoft.CodeAnalysis.DiagnosticSeverity</c>
+    /// integer, with the convention of "warning" being the default. Returns the int value (Hidden=0,
+    /// Info=1, Warning=2, Error=3) or <c>null</c> when the input token is unknown.
+    /// </summary>
+    private static int? ParseSeverity(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw)) return 2; // default warning
+        return raw.Trim().ToLowerInvariant() switch
+        {
+            "hidden" or "0" => 0,
+            "info" or "information" or "1" => 1,
+            "warning" or "warn" or "2" => 2,
+            "error" or "err" or "3" => 3,
+            "all" or "any" => null,
+            _ => -1, // sentinel for "unknown"
+        };
+    }
+
+    private static string SeverityLabel(int severity) => severity switch
+    {
+        0 => "hidden",
+        1 => "info",
+        2 => "warning",
+        3 => "error",
+        _ => "?",
+    };
+
     internal static string KindLabelOf(SymbolKind kind) => KindLabel(kind);
 
     /// <summary>
@@ -561,7 +664,9 @@ internal static class Format
     public static string Location(string path, int line, int col) => $"{path}:{line}:{col}";
 
     /// <summary>Joins kind, accessibility, and modifiers into a compact parenthetical such as
-    /// "public class", "private readonly field", "method", "public async method".</summary>
+    /// "public class", "private readonly field", "method", "public async method". Appends
+    /// "(generated)" when the symbol's file is marked is_generated = 1, so agents can tell
+    /// hand-written code apart from source-generator output at a glance.</summary>
     public static string KindWithAttrs(SymbolHit h)
     {
         var sb = new StringBuilder();
@@ -574,6 +679,7 @@ internal static class Format
         }
         if (sb.Length > 0) sb.Append(' ');
         sb.Append(GraphTools.KindLabelOf(h.Kind));
+        if (h.IsGenerated) sb.Append(" (generated)");
         return sb.ToString();
     }
 

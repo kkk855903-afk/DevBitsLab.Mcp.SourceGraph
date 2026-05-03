@@ -57,3 +57,19 @@ public sealed record AttributeRecord(
 public sealed record AttributeArgs(
     IReadOnlyList<object?> Ctor,
     IReadOnlyDictionary<string, object?> Named);
+
+/// <summary>
+/// One Roslyn diagnostic record persisted to the graph. <see cref="Severity"/> mirrors
+/// <c>Microsoft.CodeAnalysis.DiagnosticSeverity</c> (Hidden=0, Info=1, Warning=2, Error=3);
+/// storing as int avoids a cross-package enum dependency in <c>Core</c>. <see cref="SymbolId"/>
+/// is <c>null</c> for file-scoped diagnostics whose source span doesn't fall within an
+/// indexed declaration.
+/// </summary>
+public sealed record DiagnosticRecord(
+    long? SymbolId,
+    long FileId,
+    int Severity,
+    string Code,
+    string Message,
+    int Line,
+    int Col);

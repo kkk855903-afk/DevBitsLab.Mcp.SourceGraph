@@ -6,7 +6,7 @@ public interface IGraphStore : IAsyncDisposable
 {
     Task EnsureSchemaAsync(CancellationToken ct = default);
 
-    Task<long> UpsertFileAsync(string path, byte[] contentSha256, DateTimeOffset indexedAt, CancellationToken ct = default);
+    Task<long> UpsertFileAsync(string path, byte[] contentSha256, DateTimeOffset indexedAt, bool isGenerated = false, CancellationToken ct = default);
     Task<byte[]?> GetFileContentHashAsync(string path, CancellationToken ct = default);
 
     /// <summary>Wipes refs and edges that originate IN this file (ref.file_id = id, edge.src in file's symbols).
@@ -88,6 +88,42 @@ public interface IGraphStore : IAsyncDisposable
 
     /// <summary>Return every attribute attached to <paramref name="symbolId"/>, in row-id (insert) order.</summary>
     Task<IReadOnlyList<AttributeRecord>> GetAttributesForSymbolAsync(long symbolId, CancellationToken ct = default);
+
+    /// <summary>
+    /// Replace the diagnostic set for <paramref name="fileId"/>: deletes every existing row with
+    /// <c>file_id = fileId</c> and inserts <paramref name="diagnostics"/> in a single transaction.
+    /// Run as the last step of per-file reindex, after symbols are upserted (so symbol_id values
+    /// are stable).
+    /// </summary>
+    Task UpsertDiagnosticsForFileAsync(long fileId, IEnumerable<DiagnosticRecord> diagnostics, CancellationToken ct = default);
+
+    /// <summary>
+    /// Filtered diagnostics query. <paramref name="severity"/> filters via <c>severity &gt;= ?</c>
+    /// (Roslyn's enum integer values: Hidden=0, Info=1, Warning=2, Error=3); <c>null</c> means
+    /// "every severity". <paramref name="code"/> matches the diagnostic id (e.g. <c>CS0618</c>);
+    /// <paramref name="symbolId"/> restricts to diagnostics attributed to that symbol.
+    /// Results are ordered by file then line.
+    /// </summary>
+    Task<IReadOnlyList<DiagnosticHit>> FindDiagnosticsAsync(int? severity, string? code, long? symbolId, int limit = 100, CancellationToken ct = default);
+
+    /// <summary>
+    /// Files marked <c>is_generated = 1</c>, with the count of symbols emitted from each file,
+    /// ordered by symbol count descending. Used by the <c>list_generated_files</c> MCP tool.
+    /// </summary>
+    Task<IReadOnlyList<GeneratedFileRow>> ListGeneratedFilesAsync(int limit = 100, CancellationToken ct = default);
+
+    /// <summary>
+    /// True if <paramref name="fileId"/>'s row has <c>is_generated = 1</c>. Used by tools that
+    /// annotate <c>(generated)</c> in their output.
+    /// </summary>
+    Task<bool> IsGeneratedFileAsync(long fileId, CancellationToken ct = default);
+
+    /// <summary>
+    /// Same as <see cref="FindReferencesAsync"/> but with an option to filter out references
+    /// whose source file is generated. Default behaviour for <c>find_references</c> excludes
+    /// generated refs; pass <c>includeGenerated = true</c> to include them.
+    /// </summary>
+    Task<IReadOnlyList<ReferenceHit>> FindReferencesAsync(long symbolId, bool includeGenerated, int limit = 200, CancellationToken ct = default);
 }
 
 public sealed record ModuleSymbol(SymbolHit Symbol, int InDegree);

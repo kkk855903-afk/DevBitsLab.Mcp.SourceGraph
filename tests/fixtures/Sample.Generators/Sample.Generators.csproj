@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Trivial IIncrementalGenerator that emits a class GeneratedHello with a Greet() method
+    into any project that references this analyser. Used by the diagnostics+source-gen
+    integration change to give the cold-index path an is_generated = 1 row to point at.
+
+    Source generators MUST target netstandard2.0 and reference Microsoft.CodeAnalysis
+    explicitly (not via the Sdk transitively) — Roslyn loads them into its own ALC and
+    needs the API surface they were compiled against.
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <IsRoslynComponent>true</IsRoslynComponent>
+    <EnforceExtendedAnalyzerRules>true</EnforceExtendedAnalyzerRules>
+    <IncludeBuildOutput>false</IncludeBuildOutput>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="5.3.0" PrivateAssets="all" />
+  </ItemGroup>
+
+</Project>
