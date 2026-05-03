@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="DevBitsLab.Mcp.SourceGraph.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- ONNX Runtime: embedding generator native dependency. Quantised models (~280 MB) run
+         on CPU on every developer laptop in single-digit ms per chunk. -->
+    <PackageReference Include="Microsoft.ML.OnnxRuntime" />
+
+    <!-- Microsoft.Extensions.AI provides the IEmbeddingGenerator&lt;TInput, TEmbedding&gt; surface
+         so callers depend on the interface, not the concrete ONNX implementation. -->
+    <PackageReference Include="Microsoft.Extensions.AI.Abstractions" />
+
+    <!-- BERT WordPiece tokenizer compatible with the Jina v2 tokenizer.json layout. -->
+    <PackageReference Include="FastBertTokenizer" />
+
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
+  </ItemGroup>
+
+</Project>

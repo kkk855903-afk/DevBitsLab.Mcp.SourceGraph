@@ -4,6 +4,11 @@
     <PackageReference Include="Microsoft.Data.Sqlite" />
     <PackageReference Include="Dapper" />
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
+
+    <!-- sqlite-vec native extension (vec0). Ships native vec0.{dylib,dll,so} for every supported
+         RID; we LoadExtension("vec0") at connection-open time. -->
+    <PackageReference Include="sqlite-vec" />
+
     <ProjectReference Include="..\DevBitsLab.Mcp.SourceGraph.Core\DevBitsLab.Mcp.SourceGraph.Core.csproj" />
   </ItemGroup>
 

@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Security.Cryptography;
 using DevBitsLab.Mcp.SourceGraph.Core;
+using DevBitsLab.Mcp.SourceGraph.Embeddings;
 using DevBitsLab.Mcp.SourceGraph.Storage;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
@@ -20,6 +21,7 @@ namespace DevBitsLab.Mcp.SourceGraph.Indexing;
 public sealed class RoslynIndexer : IAsyncDisposable
 {
     private readonly IGraphStore _store;
+    private readonly IEmbeddingsRequestSink _embeddingsSink;
     private readonly ILogger<RoslynIndexer> _logger;
     private readonly SemaphoreSlim _lock = new(1, 1);
 
@@ -30,10 +32,11 @@ public sealed class RoslynIndexer : IAsyncDisposable
     private readonly Dictionary<string, long> _fileIdByPath = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<long, List<string>> _keysByFileId = new();
 
-    public RoslynIndexer(IGraphStore store, ILogger<RoslynIndexer>? logger = null)
+    public RoslynIndexer(IGraphStore store, ILogger<RoslynIndexer>? logger = null, IEmbeddingsRequestSink? embeddingsSink = null)
     {
         _store = store;
         _logger = logger ?? NullLogger<RoslynIndexer>.Instance;
+        _embeddingsSink = embeddingsSink ?? new NoOpEmbeddingsRequestSink();
     }
 
     public string? SolutionPath => _solutionPath;
@@ -327,6 +330,14 @@ public sealed class RoslynIndexer : IAsyncDisposable
                     if (attrSeen.Add(key))
                     {
                         AttributeExtractor.AppendAttributes(symbol, id, pendingAttrs);
+
+                        // Enqueue an embedding request once per (file, symbol). The sink is
+                        // a no-op when --no-embeddings was passed or the model isn't available;
+                        // the indexer never blocks on it.
+                        if (_embeddingsSink.IsEnabled)
+                        {
+                            EnqueueEmbedRequest(id, document.FilePath, symbol, coreSymbol);
+                        }
                     }
                 }
             }
@@ -612,6 +623,36 @@ public sealed class RoslynIndexer : IAsyncDisposable
         return new IndexResult(filesIndexed, symbolsIndexed, refsIndexed, sw.Elapsed);
     }
 
+    /// <summary>
+    /// Build the synthesised text for a symbol and enqueue an embed request, applying the
+    /// generated-file/trivial-accessor skip rules first. Producer side never blocks.
+    /// </summary>
+    private void EnqueueEmbedRequest(long id, string? filePath, ISymbol roslynSymbol, Symbol coreSymbol)
+    {
+        if (string.IsNullOrEmpty(filePath)) return;
+
+        // Skip generated files and trivial-accessor-only symbols cheaply, before paying the
+        // cost of a syntax-tree round trip for the body excerpt.
+        if (SymbolTextBuilder.IsGeneratedFile(filePath)) return;
+
+        // Body excerpt is only meaningful for kinds that have one. Types/namespaces/fields
+        // get their text from the kind+fqn+xml_summary triple, which is enough for the
+        // skip rule to keep them when there's a doc summary, otherwise discard.
+        string? body = roslynSymbol switch
+        {
+            IMethodSymbol or IPropertySymbol or INamedTypeSymbol => SymbolMapping.BodyExcerpt(roslynSymbol, maxLines: 40),
+            _ => null,
+        };
+
+        var kindLabel = coreSymbol.Kind.ToString().ToLowerInvariant();
+        var text = SymbolTextBuilder.Build(kindLabel, coreSymbol.Fqn, coreSymbol.XmlSummary, coreSymbol.Signature, body);
+
+        if (SymbolTextBuilder.ShouldSkip(filePath, coreSymbol.XmlSummary, coreSymbol.Signature, body)) return;
+
+        var hash = SymbolTextBuilder.HashOf(text);
+        _embeddingsSink.Enqueue(new EmbedRequest(id, text, hash));
+    }
+
     private async Task HydrateMapsFromStoreAsync(CancellationToken ct)
     {
         var symbolRows = await _store.GetAllSymbolKeysAsync(ct).ConfigureAwait(false);
@@ -867,9 +908,10 @@ public sealed class RoslynIndexer : IAsyncDisposable
         string solutionPath,
         IGraphStore store,
         ILogger<RoslynIndexer>? logger = null,
+        IEmbeddingsRequestSink? embeddingsSink = null,
         CancellationToken ct = default)
     {
-        await using var indexer = new RoslynIndexer(store, logger);
+        await using var indexer = new RoslynIndexer(store, logger, embeddingsSink);
         await indexer.OpenAsync(solutionPath, ct).ConfigureAwait(false);
         return await indexer.IndexAllAsync(ct).ConfigureAwait(false);
     }
