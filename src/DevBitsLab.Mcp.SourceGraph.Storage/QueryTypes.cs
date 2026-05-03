@@ -16,7 +16,8 @@ public sealed record SymbolHit(
     string? Modifiers = null,
     int Accessibility = 0,
     string? XmlSummary = null,
-    bool IsGenerated = false);
+    bool IsGenerated = false,
+    string? TestFramework = null);
 
 public sealed record ReferenceHit(
     long Id,

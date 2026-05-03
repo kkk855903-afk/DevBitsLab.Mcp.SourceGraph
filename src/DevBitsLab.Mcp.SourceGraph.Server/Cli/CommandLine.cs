@@ -10,6 +10,8 @@ internal sealed class CommandLine
     public string? Model { get; private init; }
     /// <summary>Disable the embedding pipeline (no model download, no vec0 writes, semantic_search returns disabled-message).</summary>
     public bool NoEmbeddings { get; private init; }
+    /// <summary>True when <c>--no-history</c> was passed; disables the git-blame pipeline.</summary>
+    public bool NoHistory { get; private init; }
 
     public static CommandLine Parse(string[] args)
     {
@@ -21,6 +23,7 @@ internal sealed class CommandLine
         string? db = null;
         string? model = null;
         var noEmbeddings = false;
+        var noHistory = false;
 
         for (var i = 1; i < args.Length; i++)
         {
@@ -40,6 +43,9 @@ internal sealed class CommandLine
                     break;
                 case "--no-embeddings":
                     noEmbeddings = true;
+                    break;
+                case "--no-history":
+                    noHistory = true;
                     break;
                 default:
                     if (subcommand == "index" && solution is null && !a.StartsWith('-'))
@@ -64,6 +70,7 @@ internal sealed class CommandLine
             DatabasePath = db,
             Model = model,
             NoEmbeddings = noEmbeddings,
+            NoHistory = noHistory,
         };
     }
 
@@ -112,11 +119,11 @@ internal sealed class CommandLine
         sourcegraph-mcp — live code source graph MCP server for .NET
 
         Usage:
-          sourcegraph-mcp serve [--solution <path>] [--db <path>] [--model <id>] [--no-embeddings]
+          sourcegraph-mcp serve [--solution <path>] [--db <path>] [--model <id>] [--no-embeddings] [--no-history]
               Run the MCP stdio server. If --solution is given, opens that solution on startup
               and watches it for changes; otherwise indexes lazily on first query.
 
-          sourcegraph-mcp index <solution-path> [--db <path>] [--model <id>] [--no-embeddings]
+          sourcegraph-mcp index <solution-path> [--db <path>] [--model <id>] [--no-embeddings] [--no-history]
               Build/refresh the graph database from the given .sln file, then exit.
 
           sourcegraph-mcp stats [--db <path>]
@@ -130,6 +137,8 @@ internal sealed class CommandLine
                             jinaai/jina-embeddings-v2-base-code). Applies to serve/index.
           --no-embeddings   Skip the embedding pipeline entirely. semantic_search returns the
                             disabled-message; every other tool works as before.
+          --no-history      Disable the git-blame history pipeline. Use in environments without
+                            git on PATH or in CI runs where per-symbol history isn't needed.
 
         Defaults:
           --db   ./.sourcegraph/graph.db   (created if missing)
@@ -138,6 +147,7 @@ internal sealed class CommandLine
           sourcegraph-mcp index ./MySln.sln
           sourcegraph-mcp serve --solution ./MySln.sln
           sourcegraph-mcp serve --solution ./MySln.sln --no-embeddings
+          sourcegraph-mcp index ./MySln.sln --no-history
         """;
 
     /// <summary>

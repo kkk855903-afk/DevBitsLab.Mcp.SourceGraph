@@ -33,6 +33,13 @@ public sealed class RoslynIndexer : IAsyncDisposable
     private readonly Dictionary<string, long> _fileIdByPath = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<long, List<string>> _keysByFileId = new();
 
+    /// <summary>
+    /// Fires once per (re)indexed file with <c>(fileId, fullPath, contentSha256)</c>. The Server
+    /// project hooks this to enqueue work into the history pipeline; the indexer itself never
+    /// touches git. <c>null</c> by default — leaving the callback unset means no history feed.
+    /// </summary>
+    public Func<long, string, byte[], Task>? OnFileIndexed { get; set; }
+
     public RoslynIndexer(IGraphStore store, ILogger<RoslynIndexer>? logger = null, IEmbeddingsRequestSink? embeddingsSink = null)
     {
         _store = store;
@@ -270,6 +277,7 @@ public sealed class RoslynIndexer : IAsyncDisposable
         // linked-project iteration of the same path before reconciling.
         var changedFileIds = new HashSet<long>();
         var docsByChangedFile = new Dictionary<long, List<Document>>();
+        var changedFileMeta = new Dictionary<long, (string Path, byte[] Sha)>();
         var symbolsIndexed = 0;
 
         foreach (var document in documents)
@@ -326,6 +334,7 @@ public sealed class RoslynIndexer : IAsyncDisposable
             if (changedFileIds.Add(fileId))
             {
                 await _store.ClearFileOutgoingAsync(fileId, ct).ConfigureAwait(false);
+                changedFileMeta[fileId] = (path, sha);
             }
             if (!docsByChangedFile.TryGetValue(fileId, out var list))
             {
@@ -349,6 +358,11 @@ public sealed class RoslynIndexer : IAsyncDisposable
         var parentKeyByChildKey = new Dictionary<string, string>(StringComparer.Ordinal);
         var pendingAttrsByFile = new Dictionary<long, List<PendingAttribute>>();
         var seenSymbolForAttr = new Dictionary<long, HashSet<string>>();
+        // Test framework detection: keyed by symbol id, value = "xunit"/"nunit"/"mstest".
+        // Populated as we walk method symbols in pass 1; flushed in a single batch update once
+        // pass-1 completes. Doing it as a separate update lets us avoid clobbering the value
+        // on the symbol's ON-CONFLICT path during re-upserts.
+        var testFrameworkBySymbolId = new Dictionary<long, string>();
         foreach (var (fileId, docs) in docsByChangedFile)
         {
             var fileKeys = new HashSet<string>(StringComparer.Ordinal);
@@ -382,6 +396,9 @@ public sealed class RoslynIndexer : IAsyncDisposable
                         if (parentKey is not null) parentKeyByChildKey[key] = parentKey;
                     }
 
+                    // Test framework discrimination — only meaningful for methods.
+                    string? testFramework = symbol is IMethodSymbol ms ? TestDiscriminator.Detect(ms) : null;
+
                     var loc = node.GetLocation().GetLineSpan();
                     var coreSymbol = new Symbol(
                         Id: 0,
@@ -397,12 +414,18 @@ public sealed class RoslynIndexer : IAsyncDisposable
                         ContainerId: null,
                         Modifiers: SymbolMapping.Modifiers(symbol),
                         Accessibility: SymbolMapping.Accessibility(symbol),
-                        XmlSummary: SymbolMapping.XmlSummary(symbol));
+                        XmlSummary: SymbolMapping.XmlSummary(symbol),
+                        TestFramework: testFramework);
 
                     var id = await _store.UpsertSymbolAsync(key, coreSymbol, ct).ConfigureAwait(false);
                     var isNew = !_symbolIdByKey.ContainsKey(key);
                     _symbolIdByKey[key] = id;
                     if (isNew) symbolsIndexed++;
+
+                    if (testFramework is not null)
+                    {
+                        testFrameworkBySymbolId[id] = testFramework;
+                    }
 
                     // Attributes: only collect once per (file, symbol) tuple even if the symbol
                     // was discovered in multiple TFM iterations. If the same attribute is
@@ -474,6 +497,16 @@ public sealed class RoslynIndexer : IAsyncDisposable
             if (pendingAttrs.Count == 0) continue;
             var resolved = pendingAttrs.Select(p => AttributeExtractor.Resolve(p, _symbolIdByKey)).ToList();
             await _store.BulkInsertAttributesAsync(resolved, ct).ConfigureAwait(false);
+        }
+
+        // PASS 1 — phase E: flush detected test_framework values for the methods we walked.
+        // Done as a UPDATE since the value was set during initial UpsertSymbolAsync but the
+        // ON-CONFLICT path doesn't update test_framework, so an edit that changes a method's
+        // attached attributes still propagates here.
+        if (testFrameworkBySymbolId.Count > 0)
+        {
+            var rows = testFrameworkBySymbolId.Select(kv => (SymbolId: kv.Key, Framework: kv.Value)).ToList();
+            await _store.UpdateTestFrameworksAsync(rows, ct).ConfigureAwait(false);
         }
 
         // PASS 2: references — only for files we (re)indexed in pass 1.
@@ -670,7 +703,8 @@ public sealed class RoslynIndexer : IAsyncDisposable
                 EmitMemberImplements(typeSym, AddEdge);
             }
 
-            // Per-member emitters: UsesType from signatures, OverridesMember from Overridden*.
+            // Per-member emitters: UsesType from signatures, OverridesMember from Overridden*,
+            // Tests from test methods to first non-test production call.
             // We walk the same declaration set pass 1 does (via EnumerateDeclarations) so this
             // touches type/method/property/event/field nodes — the only ones that have signatures
             // worth scanning for type usage.
@@ -682,6 +716,13 @@ public sealed class RoslynIndexer : IAsyncDisposable
 
                 EmitUsesTypeForSignature(declSym, memberId, AddEdge);
                 EmitOverrides(declSym, memberId, AddEdge);
+
+                // Tests edge: the source is a test method (carries a recognised framework),
+                // the destination is the first non-trivial production call inside its body.
+                if (declSym is IMethodSymbol testMethod && TestDiscriminator.Detect(testMethod) is not null)
+                {
+                    EmitTestsEdge(node, model, memberId, AddEdge, ct);
+                }
             }
 
             if (refBatch.Count > 0)
@@ -808,6 +849,25 @@ public sealed class RoslynIndexer : IAsyncDisposable
         _logger.LogInformation(
             "Indexed {Files} (re)processed files, {Symbols} new symbols, {Refs} new references in {Elapsed} (store totals: {SF}/{SS}/{SR})",
             filesIndexed, symbolsIndexed, refsIndexed, sw.Elapsed, stats.FileCount, stats.SymbolCount, stats.ReferenceCount);
+
+        // Notify history pipeline (or any other downstream consumer) that these files just had
+        // their symbols re-upserted. Fired at the end so all symbol ids are stable in the store
+        // by the time the consumer queries by file_id. Best-effort: callback failures are
+        // swallowed (logged at debug) so a flaky consumer never breaks the index pass.
+        if (OnFileIndexed is not null && changedFileMeta.Count > 0)
+        {
+            foreach (var (fileId, meta) in changedFileMeta)
+            {
+                try
+                {
+                    await OnFileIndexed(fileId, meta.Path, meta.Sha).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex, "OnFileIndexed callback threw for {Path}; continuing", meta.Path);
+                }
+            }
+        }
 
         return new IndexResult(filesIndexed, symbolsIndexed, refsIndexed, sw.Elapsed);
     }
@@ -1009,6 +1069,53 @@ public sealed class RoslynIndexer : IAsyncDisposable
                 foreach (var t in Walk(arr.ElementType)) yield return t;
             }
         }
+    }
+
+    /// <summary>
+    /// Emits a single <see cref="EdgeKind.Tests"/> edge from a test method (id =
+    /// <paramref name="testMemberId"/>) to the first non-trivial production-code call inside
+    /// the method's body. "Non-trivial" excludes calls into other test methods, calls into a
+    /// type whose <c>[TestFixture]</c>/<c>[TestClass]</c> marker labels it as a test fixture,
+    /// and calls into files under a <c>/tests/</c> path segment. We pick only the first such
+    /// call to keep the edge focused and avoid noisy 1:N fanout per parametrised test.
+    /// </summary>
+    private void EmitTestsEdge(SyntaxNode methodNode, SemanticModel model, long testMemberId, Action<long, long, EdgeKind> addEdge, CancellationToken ct)
+    {
+        // Methods we walk include MethodDeclarationSyntax but EnumerateDeclarations also yields
+        // type/property/etc. nodes. Restrict ourselves to method bodies and expression-bodied
+        // members; nothing else has invocations worth interpreting as a test target.
+        foreach (var inv in methodNode.DescendantNodes().OfType<Microsoft.CodeAnalysis.CSharp.Syntax.InvocationExpressionSyntax>())
+        {
+            ct.ThrowIfCancellationRequested();
+            var calledSym = model.GetSymbolInfo(inv, ct).Symbol;
+            if (calledSym is not IMethodSymbol calledMethod) continue;
+            if (IsTestSymbol(calledMethod)) continue;
+            var key = SymbolMapping.CanonicalKey(calledMethod);
+            if (key is null) continue;
+            if (!_symbolIdByKey.TryGetValue(key, out var dstId)) continue;
+            if (dstId == testMemberId) continue;
+            addEdge(testMemberId, dstId, EdgeKind.Tests);
+            return; // first non-trivial production call wins
+        }
+    }
+
+    /// <summary>
+    /// Heuristic for "this symbol lives in test code": its containing assembly name ends in
+    /// <c>.Tests</c>, the symbol itself is a test method, or its containing type is a test
+    /// fixture (carries <c>[TestFixture]</c>/<c>[TestClass]</c>, or contains an xUnit
+    /// <c>[Fact]</c>/<c>[Theory]</c> method).
+    /// We intentionally DO NOT check whether the file path contains <c>/tests/</c>: in the
+    /// fixture solution under <c>tests/fixtures/Sample.Domain/</c>, the production code lives
+    /// under a path with that segment, and we still want it to be a Tests-edge target. The
+    /// assembly-name + container-fixture signals are sufficient for real-world code.
+    /// </summary>
+    private static bool IsTestSymbol(ISymbol symbol)
+    {
+        if (symbol is IMethodSymbol m && TestDiscriminator.Detect(m) is not null) return true;
+        if (TestDiscriminator.IsTestFixture(symbol.ContainingType)) return true;
+        var assembly = symbol.ContainingAssembly?.Name;
+        if (!string.IsNullOrEmpty(assembly) && assembly.EndsWith(".Tests", StringComparison.OrdinalIgnoreCase)) return true;
+        return false;
     }
 
     /// <summary>

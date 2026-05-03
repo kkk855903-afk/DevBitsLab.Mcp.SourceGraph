@@ -146,9 +146,13 @@ public sealed class SemanticIndexingFlowTests : IAsyncLifetime
         // synthesised text ("class Sample.Domain.Calculator", "method Calculator.Add", "Adds two
         // integers"). Under the deterministic-mock encoder this produces a clear winner that
         // joins to a Calculator-family symbol; we assert at least one Calculator symbol shows
-        // up in the top-k rather than exact rank to stay robust against fixture changes.
+        // up in the top-k rather than exact rank to stay robust against fixture changes. We
+        // ask for the top-25 because the fixture solution now includes Sample.Tests +
+        // Sample.Generators, which produce a lot of overlapping tokens (NUnit/MSTest attribute
+        // stubs, test method names, source-generated content) that compete with Calculator
+        // under the deterministic mock encoder.
         var queryVec = DeterministicMockEmbeddingGenerator.Embed("class Sample.Domain.Calculator integer arithmetic", Dim);
-        var hits = await embStore.SearchAsync(queryVec, k: 10);
+        var hits = await embStore.SearchAsync(queryVec, k: 25);
 
         hits.Should().NotBeEmpty();
         // Resolve the top-k symbol ids back to FQNs and assert at least one is from the

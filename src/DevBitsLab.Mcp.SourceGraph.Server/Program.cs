@@ -7,6 +7,7 @@ using DevBitsLab.Mcp.SourceGraph.Storage;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 CommandLine cli;
 try
@@ -106,10 +107,33 @@ static async Task<int> RunServeAsync(CommandLine cli)
         builder.Services.AddSingleton<IEmbeddingsRequestSink>(new NoOpEmbeddingsRequestSink());
     }
 
+    // History (git-blame) pipeline. Disabled when --no-history was passed, when no solution is
+    // loaded, or when the solution doesn't sit in a git working tree. The HistoryHostedService
+    // drains the queue regardless, so the indexer's OnFileIndexed callback never blocks producers
+    // even when the pipeline is disabled.
+    builder.Services.AddSingleton<HistoryQueue>();
+    builder.Services.AddSingleton(sp => new GitBlameRunner(sp.GetService<ILogger<GitBlameRunner>>()));
+
+    var solutionFull = string.IsNullOrEmpty(cli.SolutionPath) ? null : Path.GetFullPath(cli.SolutionPath);
+    var historyDisabled = await ResolveHistoryDisabledAsync(cli, solutionFull).ConfigureAwait(false);
+    builder.Services.AddSingleton(new HistoryOptions(historyDisabled));
+
     builder.Services.AddSingleton(sp =>
-        new RoslynIndexer(sp.GetRequiredService<IGraphStore>(), sp.GetRequiredService<ILogger<RoslynIndexer>>(), sp.GetRequiredService<IEmbeddingsRequestSink>()));
-    builder.Services.AddSingleton(new LiveIndexOptions(
-        SolutionPath: string.IsNullOrEmpty(cli.SolutionPath) ? null : Path.GetFullPath(cli.SolutionPath)));
+    {
+        var indexer = new RoslynIndexer(
+            sp.GetRequiredService<IGraphStore>(),
+            sp.GetRequiredService<ILogger<RoslynIndexer>>(),
+            sp.GetRequiredService<IEmbeddingsRequestSink>());
+        if (!historyDisabled)
+        {
+            var queue = sp.GetRequiredService<HistoryQueue>();
+            indexer.OnFileIndexed = (fileId, path, sha) =>
+                queue.Writer.WriteAsync(new HistoryRequest(fileId, path, sha)).AsTask();
+        }
+        return indexer;
+    });
+    builder.Services.AddSingleton(new LiveIndexOptions(SolutionPath: solutionFull));
+    builder.Services.AddHostedService<HistoryHostedService>();
     builder.Services.AddHostedService<LiveIndexService>();
 
     builder.Services
@@ -154,6 +178,7 @@ static async Task<int> RunIndexAsync(CommandLine cli)
     // rebuild.
     var modelInfo = new EmbeddingModelInfo(cli.Model ?? DefaultEmbeddingModel.ModelId, DefaultEmbeddingModel.Dimension);
     store.TryLoadVectorExtension(modelInfo.Dimension);
+    await store.EnsureSchemaAsync().ConfigureAwait(false);
 
     // For one-shot index runs we register the embedding pipeline only when the user opts in.
     // The hosted-service path (serve) does the same gating; here we follow the simpler shape
@@ -174,13 +199,33 @@ static async Task<int> RunIndexAsync(CommandLine cli)
             ms.FilePath(modelInfo.ModelId, "tokenizer.json"),
             modelInfo,
             logger: loggerFactory.CreateLogger<JinaCodeEmbeddingGenerator>());
-        await store.EnsureSchemaAsync().ConfigureAwait(false);
         var embStore = store.CreateEmbeddingsStore(modelInfo.Dimension, loggerFactory.CreateLogger<SqliteEmbeddingsStore>());
         embedService = new EmbeddingsHostedService(channelSink, generator, embStore, loggerFactory.CreateLogger<EmbeddingsHostedService>());
         embedDrain = embedService.StartAsync(CancellationToken.None);
     }
 
-    var result = await RoslynIndexer.IndexSolutionOnceAsync(solutionFull, store, loggerFactory.CreateLogger<RoslynIndexer>(), sink).ConfigureAwait(false);
+    // History pipeline (git blame) — disabled when --no-history is set, no solution to scope
+    // against, or git isn't available on PATH. The pipeline drains the channel either way; we
+    // just don't enqueue when it would do nothing useful.
+    var historyDisabled = await ResolveHistoryDisabledAsync(cli, solutionFull).ConfigureAwait(false);
+    var historyQueue = new HistoryQueue();
+    var blamer = new GitBlameRunner(loggerFactory.CreateLogger<GitBlameRunner>());
+    var historyTask = historyDisabled
+        ? Task.CompletedTask
+        : RunHistoryPipelineAsync(historyQueue, store, blamer, loggerFactory.CreateLogger<HistoryHostedService>());
+
+    await using var indexer = new RoslynIndexer(store, loggerFactory.CreateLogger<RoslynIndexer>(), sink);
+    if (!historyDisabled)
+    {
+        indexer.OnFileIndexed = (fileId, path, sha) =>
+            historyQueue.Writer.WriteAsync(new HistoryRequest(fileId, path, sha)).AsTask();
+    }
+    await indexer.OpenAsync(solutionFull).ConfigureAwait(false);
+    var result = await indexer.IndexAllAsync().ConfigureAwait(false);
+
+    // Drain the history channel so the pipeline finishes before we exit.
+    historyQueue.Writer.Complete();
+    await historyTask.ConfigureAwait(false);
 
     if (embedService is not null)
     {
@@ -194,7 +239,43 @@ static async Task<int> RunIndexAsync(CommandLine cli)
 
     Console.WriteLine($"indexed {result.FilesIndexed} files, {result.SymbolsIndexed} symbols, {result.ReferencesIndexed} refs in {result.Elapsed.TotalSeconds:F2}s");
     Console.WriteLine($"database: {cli.ResolvedDbPath()}");
+    if (historyDisabled) Console.WriteLine("history: disabled (--no-history or git unavailable)");
     return 0;
+}
+
+/// <summary>
+/// Run the history pipeline as a single async loop without the BackgroundService scaffolding.
+/// Used by the one-shot <c>index</c> command where we want the pipeline to drain naturally on
+/// channel close without StopAsync's stoppingToken cancellation racing the drain.
+/// </summary>
+static async Task RunHistoryPipelineAsync(
+    HistoryQueue queue,
+    DevBitsLab.Mcp.SourceGraph.Storage.IGraphStore store,
+    GitBlameRunner blamer,
+    ILogger<HistoryHostedService> logger)
+{
+    // Drive the same processing as the hosted service but via an explicit task we own. This
+    // avoids the BackgroundService.StopAsync race where the stopping token cancels the loop
+    // before it drains. The consumer exits naturally once queue.Writer.Complete() is called.
+    var svc = new HistoryHostedService(
+        queue, store, blamer, new HistoryOptions(false), logger);
+    var runner = svc.ExecuteAsyncForOneShot(CancellationToken.None);
+    await runner.ConfigureAwait(false);
+}
+
+/// <summary>
+/// Decide whether the git-blame pipeline should run. Disabled when <c>--no-history</c> is set,
+/// when no solution is loaded (we can't determine a working tree), or when the solution's
+/// directory isn't a git working tree (probed once via <c>git rev-parse --is-inside-work-tree</c>).
+/// </summary>
+static async Task<bool> ResolveHistoryDisabledAsync(CommandLine cli, string? solutionFull)
+{
+    if (cli.NoHistory) return true;
+    if (string.IsNullOrEmpty(solutionFull)) return true;
+    var solutionDir = Path.GetDirectoryName(solutionFull);
+    if (string.IsNullOrEmpty(solutionDir)) return true;
+    var probe = new GitBlameRunner();
+    return !await probe.IsGitWorkingTreeAsync(solutionDir).ConfigureAwait(false);
 }
 
 static async Task<int> RunStatsAsync(CommandLine cli)
