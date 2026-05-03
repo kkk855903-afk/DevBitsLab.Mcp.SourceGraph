@@ -15,4 +15,19 @@ public class Calculator
         }
         return result;
     }
+
+    /// <summary>Demonstrates Instantiates + UsesType edges to an indexed type.</summary>
+    public IGreeter MakeGreeter(string prefix) => new Greeter(prefix);
+
+    /// <summary>Demonstrates Throws to an indexed exception type.</summary>
+    public int Divide(int a, int b)
+    {
+        if (b == 0) throw new DivisionByZero();
+        return a / b;
+    }
+}
+
+public sealed class DivisionByZero : System.Exception
+{
+    public DivisionByZero() : base("cannot divide by zero") { }
 }

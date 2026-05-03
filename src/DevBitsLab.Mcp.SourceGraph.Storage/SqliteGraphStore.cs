@@ -369,16 +369,20 @@ public sealed class SqliteGraphStore : IGraphStore
         return rows.Select(r => new ModuleSymbol(r.ToHit(), (int)r.InDegree)).ToList();
     }
 
-    public async Task<IReadOnlyList<ImpactedSymbol>> ImpactOfChangeAsync(long symbolId, int maxDepth = 4, int limit = 100, CancellationToken ct = default)
+    public async Task<IReadOnlyList<ImpactedSymbol>> ImpactOfChangeAsync(long symbolId, int maxDepth = 4, int limit = 100, EdgeKind? edgeKind = EdgeKind.Calls, CancellationToken ct = default)
     {
-        const string sql = """
+        // The recursive CTE has to know whether to filter by edge kind. Inlining the @kind value
+        // is safer than two near-identical queries because dapper still parameterises @id/@maxDepth.
+        var kindClause = edgeKind is null ? "" : "AND kind = @kind";
+        var kindClauseRecursive = edgeKind is null ? "" : "AND e.kind = @kind";
+        var sql = $"""
             WITH RECURSIVE upstream(id, depth) AS (
-                SELECT src, 1 FROM edges WHERE dst = @id AND kind = 0
+                SELECT src, 1 FROM edges WHERE dst = @id {kindClause}
                 UNION
                 SELECT e.src, u.depth + 1
                 FROM edges e
                 JOIN upstream u ON e.dst = u.id
-                WHERE e.kind = 0 AND u.depth < @maxDepth
+                WHERE u.depth < @maxDepth {kindClauseRecursive}
             )
             SELECT s.id, s.name, s.fqn, s.kind, f.path AS FilePath, s.start_line AS StartLine, s.start_col AS StartCol,
                    s.end_line AS EndLine, s.end_col AS EndCol, s.signature, MIN(u.depth) AS Depth
@@ -390,7 +394,7 @@ public sealed class SqliteGraphStore : IGraphStore
             LIMIT @limit;
             """;
         var rows = await _connection.QueryAsync<RawImpactedSymbol>(new CommandDefinition(
-            sql, new { id = symbolId, maxDepth, limit }, cancellationToken: ct)).ConfigureAwait(false);
+            sql, new { id = symbolId, maxDepth, limit, kind = (int?)edgeKind }, cancellationToken: ct)).ConfigureAwait(false);
         return rows.Select(r => new ImpactedSymbol(r.ToHit(), (int)r.Depth)).ToList();
     }
 
@@ -408,39 +412,48 @@ public sealed class SqliteGraphStore : IGraphStore
             (int)StartLine, (int)StartCol, (int)EndLine, (int)EndCol, Signature);
     }
 
-    public async Task<IReadOnlyList<SymbolHit>> ListCallersAsync(long symbolId, int limit = 50, CancellationToken ct = default)
+    public async Task<IReadOnlyList<SymbolHit>> ListCallersAsync(long symbolId, int limit = 50, EdgeKind? edgeKind = EdgeKind.Calls, CancellationToken ct = default)
     {
-        const string sql = """
+        // edgeKind = null => walk every kind (used for kind = "all" in the MCP tool).
+        var kindClause = edgeKind is null ? "" : "AND e.kind = @kind";
+        var sql = $"""
             SELECT s.id, s.name, s.fqn, s.kind, f.path AS FilePath, s.start_line AS StartLine, s.start_col AS StartCol,
                    s.end_line AS EndLine, s.end_col AS EndCol, s.signature
             FROM edges e
             JOIN symbols s ON s.id = e.src
             JOIN files   f ON f.id = s.file_id
-            WHERE e.dst = @id AND e.kind = 0  -- EdgeKind.Calls
+            WHERE e.dst = @id {kindClause}
             ORDER BY f.path, s.start_line
             LIMIT @limit;
             """;
         var rows = await _connection.QueryAsync<RawSymbolHit>(new CommandDefinition(
-            sql, new { id = symbolId, limit }, cancellationToken: ct)).ConfigureAwait(false);
+            sql, new { id = symbolId, limit, kind = (int?)edgeKind }, cancellationToken: ct)).ConfigureAwait(false);
         return rows.Select(r => r.ToHit()).ToList();
     }
 
-    public async Task<IReadOnlyList<SymbolHit>> ListCalleesAsync(long symbolId, int limit = 50, CancellationToken ct = default)
+    public async Task<IReadOnlyList<SymbolHit>> ListCalleesAsync(long symbolId, int limit = 50, EdgeKind? edgeKind = EdgeKind.Calls, CancellationToken ct = default)
     {
-        const string sql = """
+        var kindClause = edgeKind is null ? "" : "AND e.kind = @kind";
+        var sql = $"""
             SELECT s.id, s.name, s.fqn, s.kind, f.path AS FilePath, s.start_line AS StartLine, s.start_col AS StartCol,
                    s.end_line AS EndLine, s.end_col AS EndCol, s.signature
             FROM edges e
             JOIN symbols s ON s.id = e.dst
             JOIN files   f ON f.id = s.file_id
-            WHERE e.src = @id AND e.kind = 0  -- EdgeKind.Calls
+            WHERE e.src = @id {kindClause}
             ORDER BY f.path, s.start_line
             LIMIT @limit;
             """;
         var rows = await _connection.QueryAsync<RawSymbolHit>(new CommandDefinition(
-            sql, new { id = symbolId, limit }, cancellationToken: ct)).ConfigureAwait(false);
+            sql, new { id = symbolId, limit, kind = (int?)edgeKind }, cancellationToken: ct)).ConfigureAwait(false);
         return rows.Select(r => r.ToHit()).ToList();
     }
+
+    public Task<IReadOnlyList<SymbolHit>> ListImplementationsAsync(long symbolId, int limit = 50, CancellationToken ct = default)
+        => ListCallersAsync(symbolId, limit, EdgeKind.ImplementsMember, ct);
+
+    public Task<IReadOnlyList<SymbolHit>> ListUsersOfTypeAsync(long symbolId, int limit = 50, CancellationToken ct = default)
+        => ListCallersAsync(symbolId, limit, EdgeKind.UsesType, ct);
 
     public async Task<SymbolHit?> GetSymbolByIdAsync(long symbolId, CancellationToken ct = default)
     {

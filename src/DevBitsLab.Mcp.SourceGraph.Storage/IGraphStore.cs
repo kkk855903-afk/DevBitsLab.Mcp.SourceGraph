@@ -35,11 +35,28 @@ public interface IGraphStore : IAsyncDisposable
     Task<IReadOnlyList<ReferenceHit>> FindReferencesAsync(long symbolId, int limit = 200, CancellationToken ct = default);
     Task<IReadOnlyList<SymbolHit>> ListSymbolsInFileAsync(string filePath, CancellationToken ct = default);
     Task<SymbolHit?> GetSymbolByIdAsync(long symbolId, CancellationToken ct = default);
-    Task<IReadOnlyList<SymbolHit>> ListCallersAsync(long symbolId, int limit = 50, CancellationToken ct = default);
-    Task<IReadOnlyList<SymbolHit>> ListCalleesAsync(long symbolId, int limit = 50, CancellationToken ct = default);
+    /// <summary>
+    /// Lists named callers of <paramref name="symbolId"/>. With the default <paramref name="edgeKind"/> = <see cref="EdgeKind.Calls"/>
+    /// this preserves the legacy behaviour. Pass a different kind to walk other edge types
+    /// (e.g. <see cref="EdgeKind.UsesType"/> to get type consumers); pass <c>null</c> to walk every edge kind.
+    /// </summary>
+    Task<IReadOnlyList<SymbolHit>> ListCallersAsync(long symbolId, int limit = 50, EdgeKind? edgeKind = EdgeKind.Calls, CancellationToken ct = default);
+    /// <summary>
+    /// Lists outgoing targets from <paramref name="symbolId"/>. With the default <paramref name="edgeKind"/> = <see cref="EdgeKind.Calls"/>
+    /// this preserves the legacy behaviour. Pass a different kind to walk other edge types; pass <c>null</c> to walk every edge kind.
+    /// </summary>
+    Task<IReadOnlyList<SymbolHit>> ListCalleesAsync(long symbolId, int limit = 50, EdgeKind? edgeKind = EdgeKind.Calls, CancellationToken ct = default);
+    /// <summary>Lists every member that satisfies the named interface member via <see cref="EdgeKind.ImplementsMember"/> edges.</summary>
+    Task<IReadOnlyList<SymbolHit>> ListImplementationsAsync(long symbolId, int limit = 50, CancellationToken ct = default);
+    /// <summary>Lists every member that consumes the given type via <see cref="EdgeKind.UsesType"/> edges.</summary>
+    Task<IReadOnlyList<SymbolHit>> ListUsersOfTypeAsync(long symbolId, int limit = 50, CancellationToken ct = default);
     Task<IReadOnlyList<SymbolHit>> SearchSymbolsAsync(string ftsQuery, Core.SymbolKind? kindFilter = null, int limit = 25, CancellationToken ct = default);
     Task<IReadOnlyList<ModuleSymbol>> ModuleSummaryAsync(string namespaceOrPathPrefix, int limit = 25, CancellationToken ct = default);
-    Task<IReadOnlyList<ImpactedSymbol>> ImpactOfChangeAsync(long symbolId, int maxDepth = 4, int limit = 100, CancellationToken ct = default);
+    /// <summary>
+    /// Walks the upstream graph of <paramref name="symbolId"/> via the given <paramref name="edgeKind"/> (default = <see cref="EdgeKind.Calls"/>)
+    /// up to <paramref name="maxDepth"/> hops. Pass <c>null</c> to walk every edge kind.
+    /// </summary>
+    Task<IReadOnlyList<ImpactedSymbol>> ImpactOfChangeAsync(long symbolId, int maxDepth = 4, int limit = 100, EdgeKind? edgeKind = EdgeKind.Calls, CancellationToken ct = default);
 }
 
 public sealed record ModuleSymbol(SymbolHit Symbol, int InDegree);

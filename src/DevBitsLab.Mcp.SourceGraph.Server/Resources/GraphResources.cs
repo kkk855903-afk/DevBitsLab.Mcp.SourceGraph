@@ -20,8 +20,8 @@ public static class GraphResources
         var hit = await store.GetSymbolByIdAsync(id, ct).ConfigureAwait(false);
         if (hit is null) return $"# Symbol id {id} not found";
 
-        var callers = await store.ListCallersAsync(id, 10, ct).ConfigureAwait(false);
-        var callees = await store.ListCalleesAsync(id, 10, ct).ConfigureAwait(false);
+        var callers = await store.ListCallersAsync(id, 10, ct: ct).ConfigureAwait(false);
+        var callees = await store.ListCalleesAsync(id, 10, ct: ct).ConfigureAwait(false);
 
         var sb = new StringBuilder();
         sb.AppendLine($"# {hit.Fqn}");
