@@ -489,3 +489,6 @@ $RECYCLE.BIN/
 
 # Claude Code session worktrees
 .claude/worktrees/
+
+# Per-user Claude Code permission settings
+.claude/settings.local.json
