@@ -6,6 +6,7 @@ using DevBitsLab.Mcp.SourceGraph.Storage;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 CommandLine cli;
 try
@@ -53,10 +54,26 @@ static async Task<int> RunServeAsync(CommandLine cli)
     ToolMetrics.Configure(Path.Combine(dbDir, "usage.jsonl"));
     builder.Services.AddSingleton<IGraphStore>(sp =>
         new SqliteGraphStore(dbPath, sp.GetRequiredService<ILogger<SqliteGraphStore>>()));
+    builder.Services.AddSingleton<HistoryQueue>();
+    builder.Services.AddSingleton(sp => new GitBlameRunner(sp.GetService<ILogger<GitBlameRunner>>()));
+
+    var solutionFull = string.IsNullOrEmpty(cli.SolutionPath) ? null : Path.GetFullPath(cli.SolutionPath);
+    var historyDisabled = await ResolveHistoryDisabledAsync(cli, solutionFull).ConfigureAwait(false);
+    builder.Services.AddSingleton(new HistoryOptions(historyDisabled));
+
     builder.Services.AddSingleton(sp =>
-        new RoslynIndexer(sp.GetRequiredService<IGraphStore>(), sp.GetRequiredService<ILogger<RoslynIndexer>>()));
-    builder.Services.AddSingleton(new LiveIndexOptions(
-        SolutionPath: string.IsNullOrEmpty(cli.SolutionPath) ? null : Path.GetFullPath(cli.SolutionPath)));
+    {
+        var indexer = new RoslynIndexer(sp.GetRequiredService<IGraphStore>(), sp.GetRequiredService<ILogger<RoslynIndexer>>());
+        if (!historyDisabled)
+        {
+            var queue = sp.GetRequiredService<HistoryQueue>();
+            indexer.OnFileIndexed = (fileId, path, sha) =>
+                queue.Writer.WriteAsync(new HistoryRequest(fileId, path, sha)).AsTask();
+        }
+        return indexer;
+    });
+    builder.Services.AddSingleton(new LiveIndexOptions(SolutionPath: solutionFull));
+    builder.Services.AddHostedService<HistoryHostedService>();
     builder.Services.AddHostedService<LiveIndexService>();
 
     builder.Services
@@ -94,11 +111,71 @@ static async Task<int> RunIndexAsync(CommandLine cli)
     });
 
     await using var store = new SqliteGraphStore(cli.ResolvedDbPath(), loggerFactory.CreateLogger<SqliteGraphStore>());
-    var result = await RoslynIndexer.IndexSolutionOnceAsync(solutionFull, store, loggerFactory.CreateLogger<RoslynIndexer>()).ConfigureAwait(false);
+    await store.EnsureSchemaAsync().ConfigureAwait(false);
+
+    var historyDisabled = await ResolveHistoryDisabledAsync(cli, solutionFull).ConfigureAwait(false);
+    var queue = new HistoryQueue();
+    var blamer = new GitBlameRunner(loggerFactory.CreateLogger<GitBlameRunner>());
+
+    // For one-shot index runs we don't bother with the BackgroundService scaffolding — drive the
+    // history pipeline as a single Task that we await for natural completion when the channel
+    // closes. StopAsync cancels the stoppingToken which would race-cancel mid-drain.
+    var historyTask = historyDisabled
+        ? Task.CompletedTask
+        : RunHistoryPipelineAsync(queue, store, blamer, loggerFactory.CreateLogger<HistoryHostedService>());
+
+    await using var indexer = new RoslynIndexer(store, loggerFactory.CreateLogger<RoslynIndexer>());
+    if (!historyDisabled)
+    {
+        indexer.OnFileIndexed = (fileId, path, sha) =>
+            queue.Writer.WriteAsync(new HistoryRequest(fileId, path, sha)).AsTask();
+    }
+    await indexer.OpenAsync(solutionFull).ConfigureAwait(false);
+    var result = await indexer.IndexAllAsync().ConfigureAwait(false);
+
+    // Drain the channel so the history pipeline finishes before we exit.
+    queue.Writer.Complete();
+    await historyTask.ConfigureAwait(false);
 
     Console.WriteLine($"indexed {result.FilesIndexed} files, {result.SymbolsIndexed} symbols, {result.ReferencesIndexed} refs in {result.Elapsed.TotalSeconds:F2}s");
     Console.WriteLine($"database: {cli.ResolvedDbPath()}");
+    if (historyDisabled) Console.WriteLine("history: disabled (--no-history or git unavailable)");
     return 0;
+}
+
+/// <summary>
+/// Run the history pipeline as a single async loop without the BackgroundService scaffolding.
+/// Used by the one-shot <c>index</c> command where we want the pipeline to drain naturally on
+/// channel close without StopAsync's stoppingToken cancellation racing the drain.
+/// </summary>
+static async Task RunHistoryPipelineAsync(
+    HistoryQueue queue,
+    DevBitsLab.Mcp.SourceGraph.Storage.IGraphStore store,
+    GitBlameRunner blamer,
+    ILogger<HistoryHostedService> logger)
+{
+    // Drive the same processing as the hosted service but via an explicit task we own. This
+    // avoids the BackgroundService.StopAsync race where the stopping token cancels the loop
+    // before it drains. The consumer exits naturally once queue.Writer.Complete() is called.
+    var svc = new HistoryHostedService(
+        queue, store, blamer, new HistoryOptions(false), logger);
+    var runner = svc.ExecuteAsyncForOneShot(CancellationToken.None);
+    await runner.ConfigureAwait(false);
+}
+
+/// <summary>
+/// Decide whether the git-blame pipeline should run. Disabled when <c>--no-history</c> is set,
+/// when no solution is loaded (we can't determine a working tree), or when the solution's
+/// directory isn't a git working tree (probed once via <c>git rev-parse --is-inside-work-tree</c>).
+/// </summary>
+static async Task<bool> ResolveHistoryDisabledAsync(CommandLine cli, string? solutionFull)
+{
+    if (cli.NoHistory) return true;
+    if (string.IsNullOrEmpty(solutionFull)) return true;
+    var solutionDir = Path.GetDirectoryName(solutionFull);
+    if (string.IsNullOrEmpty(solutionDir)) return true;
+    var probe = new GitBlameRunner();
+    return !await probe.IsGitWorkingTreeAsync(solutionDir).ConfigureAwait(false);
 }
 
 static async Task<int> RunStatsAsync(CommandLine cli)

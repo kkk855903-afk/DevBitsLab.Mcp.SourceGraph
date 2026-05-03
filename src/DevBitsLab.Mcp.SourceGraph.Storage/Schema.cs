@@ -7,7 +7,7 @@ internal static class Schema
     /// drops all data tables when the on-disk version is below this, since the index can always be
     /// rebuilt from source.
     /// </summary>
-    public const int Version = 6;
+    public const int Version = 7;
 
     /// <summary>
     /// V5 enriches the symbol row with metadata that Roslyn already exposes per symbol but which
@@ -29,6 +29,15 @@ internal static class Schema
     /// V6 adds the <c>attributes</c> table + <c>attributes_fts</c> trigram index on top of V5,
     /// so the indexer can record every <c>[Attribute]</c> attached to a symbol and answer
     /// <c>find_by_attribute</c> queries (with optional argument-substring filtering).
+    ///
+    /// V7 introduces test/history awareness on top of V6: a <c>test_framework</c> column on
+    /// <c>symbols</c> (values <c>xunit | nunit | mstest | NULL</c>) populated by the indexer
+    /// based on attribute discrimination, and a new <c>symbol_history</c> table that caches
+    /// the most recent commit / author / authored-time for each indexed symbol from
+    /// <c>git blame --line-porcelain</c>. The cache is keyed against the source file's
+    /// <c>content_sha256</c> so we don't re-blame on every reindex. A new
+    /// <see cref="Core.EdgeKind.Tests"/> edge kind links each test method to the first
+    /// non-trivial production call it exercises.
     /// </summary>
     public const string V1 = """
         CREATE TABLE IF NOT EXISTS schema_version (
@@ -57,7 +66,8 @@ internal static class Schema
             container_id INTEGER,
             modifiers TEXT,
             accessibility INTEGER NOT NULL DEFAULT 0,
-            xml_summary TEXT
+            xml_summary TEXT,
+            test_framework TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_symbols_fqn ON symbols(fqn);
         CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
@@ -94,6 +104,33 @@ internal static class Schema
         CREATE INDEX IF NOT EXISTS idx_attributes_symbol ON attributes(symbol_id);
         CREATE INDEX IF NOT EXISTS idx_attributes_name ON attributes(name);
         CREATE INDEX IF NOT EXISTS idx_attributes_attribute_symbol_id ON attributes(attribute_symbol_id);
+
+        CREATE TABLE IF NOT EXISTS symbol_history (
+            symbol_id INTEGER PRIMARY KEY,
+            last_commit_sha TEXT,
+            last_author TEXT,
+            last_authored_at INTEGER,
+            line_count INTEGER,
+            blamed_content_sha BLOB
+        );
+        CREATE INDEX IF NOT EXISTS idx_symbol_history_authored_at ON symbol_history(last_authored_at);
+
+        -- Convenience view of "recently changed" symbols. Window is parameterised at query time
+        -- via WHERE clauses; this view just keeps the joins ready so callers can stay declarative.
+        CREATE VIEW IF NOT EXISTS vw_recent_changes AS
+            SELECT s.id        AS symbol_id,
+                   s.fqn       AS fqn,
+                   s.name      AS name,
+                   s.kind      AS kind,
+                   f.path      AS file_path,
+                   s.start_line AS start_line,
+                   h.last_commit_sha AS last_commit_sha,
+                   h.last_author     AS last_author,
+                   h.last_authored_at AS last_authored_at,
+                   h.line_count       AS line_count
+            FROM symbol_history h
+            JOIN symbols s ON s.id = h.symbol_id
+            JOIN files   f ON f.id = s.file_id;
         """;
 
     /// <summary>FTS5 trigram-tokenized index over symbols.name/fqn/signature/xml_summary, kept in sync via triggers.</summary>
@@ -173,6 +210,8 @@ internal static class Schema
     /// <see cref="Version"/>. The index always rebuilds from source on next pass.
     /// </summary>
     public const string DropAll = """
+        DROP VIEW    IF EXISTS vw_recent_changes;
+        DROP TABLE   IF EXISTS symbol_history;
         DROP TRIGGER IF EXISTS attributes_ad;
         DROP TRIGGER IF EXISTS attributes_ai;
         DROP TABLE   IF EXISTS attributes_fts;

@@ -20,7 +20,22 @@ public sealed record Symbol(
     long? ContainerId,
     string? Modifiers = null,
     int Accessibility = 0,
-    string? XmlSummary = null);
+    string? XmlSummary = null,
+    string? TestFramework = null);
+
+/// <summary>
+/// Last-touch git history for a symbol, derived from <c>git blame --line-porcelain</c>
+/// over the symbol's <c>start_line..end_line</c> span. Cached against
+/// <see cref="BlamedContentSha"/> = the source file's <c>content_sha256</c>; if the file
+/// hash matches the previously blamed value, the row is reused as-is.
+/// </summary>
+public sealed record SymbolHistory(
+    long SymbolId,
+    string? LastCommitSha,
+    string? LastAuthor,
+    DateTimeOffset? LastAuthoredAt,
+    int LineCount,
+    byte[]? BlamedContentSha);
 
 public sealed record SymbolReference(
     long Id,

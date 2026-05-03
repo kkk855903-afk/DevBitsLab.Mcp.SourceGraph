@@ -22,6 +22,9 @@ public static class GraphTools
             var hits = await store.FindSymbolsAsync(symbol, fileHint, limit: 25, ct).ConfigureAwait(false);
             if (hits.Count == 0) return $"No definition found for '{symbol}'.";
 
+            // Pre-fetch history rows in one batch so we don't fire a query per hit.
+            var historyById = await store.GetSymbolHistoryBatchAsync(hits.Select(h => h.Id).ToList(), ct).ConfigureAwait(false);
+
             var sb = new StringBuilder();
             sb.AppendLine($"Found {hits.Count} match(es) for '{symbol}':");
             sb.AppendLine();
@@ -35,6 +38,11 @@ public static class GraphTools
                 var attrs = await store.GetAttributesForSymbolAsync(h.Id, ct).ConfigureAwait(false);
                 var attrLine = AttributeFormat.OneLine(attrs);
                 if (attrLine is not null) sb.AppendLine($"  - {attrLine}");
+                if (historyById.TryGetValue(h.Id, out var hist))
+                {
+                    var line = Format.HistoryLine(hist);
+                    if (line is not null) sb.AppendLine($"  - {line}");
+                }
             }
             return sb.ToString();
         });
@@ -118,6 +126,8 @@ public static class GraphTools
             var hits = await store.ListSymbolsInFileAsync(path, ct).ConfigureAwait(false);
             if (hits.Count == 0) return $"No indexed symbols found in '{path}'. The file may not be part of an indexed solution, or may not exist.";
 
+            var historyById = await store.GetSymbolHistoryBatchAsync(hits.Select(h => h.Id).ToList(), ct).ConfigureAwait(false);
+
             var sb = new StringBuilder();
             sb.AppendLine($"{hits.Count} symbol(s) in {hits[0].FilePath}:");
             foreach (var h in hits)
@@ -129,6 +139,11 @@ public static class GraphTools
                 var attrs = await store.GetAttributesForSymbolAsync(h.Id, ct).ConfigureAwait(false);
                 var line = AttributeFormat.OneLine(attrs);
                 if (line is not null) sb.AppendLine($"    {line}");
+                if (historyById.TryGetValue(h.Id, out var hist))
+                {
+                    var hline = Format.HistoryLine(hist);
+                    if (hline is not null) sb.AppendLine($"    {hline}");
+                }
             }
             return sb.ToString();
         });
@@ -546,6 +561,21 @@ internal static class Format
         1 => "private",
         _ => "",
     };
+
+    /// <summary>
+    /// Render a single-line history annotation: <c>last touched 2026-04-12 by jacques (a1b2c3d)</c>.
+    /// Returns <c>null</c> when <paramref name="history"/> is null or has no commit data so callers
+    /// can skip the line entirely.
+    /// </summary>
+    public static string? HistoryLine(SymbolHistory? history)
+    {
+        if (history is null) return null;
+        if (string.IsNullOrEmpty(history.LastCommitSha) && history.LastAuthor is null) return null;
+        var sha = history.LastCommitSha is { Length: > 0 } s ? s[..Math.Min(7, s.Length)] : "(none)";
+        var author = history.LastAuthor ?? "(unknown)";
+        var time = history.LastAuthoredAt is { } t ? t.ToString("yyyy-MM-dd") : "?";
+        return $"last touched {time} by {author} ({sha})";
+    }
 }
 
 internal static class AttributeFormat

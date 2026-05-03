@@ -6,6 +6,8 @@ internal sealed class CommandLine
     public string? SolutionPath { get; private init; }
     public string? DatabasePath { get; private init; }
     public bool ShowHelp { get; private init; }
+    /// <summary>True when <c>--no-history</c> was passed; disables the git-blame pipeline.</summary>
+    public bool NoHistory { get; private init; }
 
     public static CommandLine Parse(string[] args)
     {
@@ -15,6 +17,7 @@ internal sealed class CommandLine
         var subcommand = args[0];
         string? solution = null;
         string? db = null;
+        var noHistory = false;
 
         for (var i = 1; i < args.Length; i++)
         {
@@ -28,6 +31,9 @@ internal sealed class CommandLine
                     break;
                 case "--db":
                     db = ExpandTokens(RequireArg(args, ref i, a));
+                    break;
+                case "--no-history":
+                    noHistory = true;
                     break;
                 default:
                     if (subcommand == "index" && solution is null && !a.StartsWith('-'))
@@ -50,6 +56,7 @@ internal sealed class CommandLine
             Subcommand = subcommand,
             SolutionPath = solution,
             DatabasePath = db,
+            NoHistory = noHistory,
         };
     }
 
@@ -98,11 +105,11 @@ internal sealed class CommandLine
         sourcegraph-mcp — live code source graph MCP server for .NET
 
         Usage:
-          sourcegraph-mcp serve [--solution <path>] [--db <path>]
+          sourcegraph-mcp serve [--solution <path>] [--db <path>] [--no-history]
               Run the MCP stdio server. If --solution is given, opens that solution on startup
               and watches it for changes; otherwise indexes lazily on first query.
 
-          sourcegraph-mcp index <solution-path> [--db <path>]
+          sourcegraph-mcp index <solution-path> [--db <path>] [--no-history]
               Build/refresh the graph database from the given .sln file, then exit.
 
           sourcegraph-mcp stats [--db <path>]
@@ -111,12 +118,17 @@ internal sealed class CommandLine
           sourcegraph-mcp clear [--db <path>]
               Delete all rows from the graph database (schema preserved).
 
+        Flags:
+          --no-history   Disable the git-blame history pipeline. Use in environments without
+                         git on PATH or in CI runs where per-symbol history isn't needed.
+
         Defaults:
           --db   ./.sourcegraph/graph.db   (created if missing)
 
         Examples:
           sourcegraph-mcp index ./MySln.sln
           sourcegraph-mcp serve --solution ./MySln.sln
+          sourcegraph-mcp index ./MySln.sln --no-history
         """;
 
     /// <summary>

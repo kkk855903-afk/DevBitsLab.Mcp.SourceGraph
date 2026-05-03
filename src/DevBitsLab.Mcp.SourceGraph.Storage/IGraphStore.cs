@@ -36,6 +36,60 @@ public interface IGraphStore : IAsyncDisposable
     /// themselves are upserted, so <c>symbol_id</c> already resolves to a stable row.</summary>
     Task BulkInsertAttributesAsync(IEnumerable<AttributeRecord> attributes, CancellationToken ct = default);
 
+    /// <summary>
+    /// Set <c>symbols.test_framework</c> for the given symbol ids. Pairs whose <c>symbol_id</c>
+    /// is missing are silently skipped. Runs in a single transaction.
+    /// </summary>
+    Task UpdateTestFrameworksAsync(IReadOnlyList<(long SymbolId, string Framework)> rows, CancellationToken ct = default);
+
+    /// <summary>
+    /// Upsert one <see cref="SymbolHistory"/> row keyed by <c>symbol_id</c>.
+    /// </summary>
+    Task UpsertSymbolHistoryAsync(SymbolHistory history, CancellationToken ct = default);
+
+    /// <summary>
+    /// Get the cached blamed content sha for every indexed symbol whose <c>file_id</c> matches
+    /// <paramref name="fileId"/>. Used by the history pipeline to skip blame on unchanged files.
+    /// Returns the dictionary <c>symbol_id -&gt; blamed_content_sha</c> for rows that exist;
+    /// missing rows are absent from the result.
+    /// </summary>
+    Task<IReadOnlyDictionary<long, byte[]?>> GetBlamedShasForFileAsync(long fileId, CancellationToken ct = default);
+
+    /// <summary>
+    /// Look up the cached <see cref="SymbolHistory"/> row for <paramref name="symbolId"/>.
+    /// Returns <c>null</c> when no row exists (e.g., history disabled or never blamed).
+    /// </summary>
+    Task<SymbolHistory?> GetSymbolHistoryAsync(long symbolId, CancellationToken ct = default);
+
+    /// <summary>
+    /// Lookup history for a batch of symbols at once. Useful when annotating <c>find_definition</c>
+    /// or <c>list_symbols_in_file</c> output without firing one round-trip per row.
+    /// </summary>
+    Task<IReadOnlyDictionary<long, SymbolHistory>> GetSymbolHistoryBatchAsync(
+        IReadOnlyCollection<long> symbolIds, CancellationToken ct = default);
+
+    /// <summary>
+    /// List symbols whose <c>last_authored_at</c> falls in <c>[sinceUnixMs, +inf)</c>. Optionally
+    /// filtered by author (case-insensitive substring on <c>last_author</c>). Ordered by
+    /// recency descending. Joined to symbol metadata so callers can format full hits.
+    /// </summary>
+    Task<IReadOnlyList<RecentChangeHit>> ListRecentChangesAsync(
+        long sinceUnixMs, string? authorSubstring, int limit, CancellationToken ct = default);
+
+    /// <summary>
+    /// Walks the file_id maps to return every (symbol_id, file_path, start_line, end_line) tuple
+    /// whose file_id matches <paramref name="fileId"/>. Used by the history pipeline to discover
+    /// which symbols need a blame slice.
+    /// </summary>
+    Task<IReadOnlyList<SymbolSpan>> GetSymbolSpansForFileAsync(long fileId, CancellationToken ct = default);
+
+    /// <summary>
+    /// Inbound <c>Tests</c> edges for <paramref name="symbolId"/> — every test method that
+    /// targets this production symbol. Returns the SymbolHit + the framework recorded on
+    /// the test method's row.
+    /// </summary>
+    Task<IReadOnlyList<TestForHit>> ListTestsForAsync(long symbolId, int limit, CancellationToken ct = default);
+
     /// <summary>Used by the indexer to re-hydrate its in-memory maps after a process restart.</summary>
     Task<IReadOnlyList<SymbolKeyRow>> GetAllSymbolKeysAsync(CancellationToken ct = default);
     Task<IReadOnlyList<FileRow>> GetAllFilesAsync(CancellationToken ct = default);
@@ -97,3 +151,12 @@ public sealed record SymbolKeyRow(string CanonicalKey, long Id, long FileId);
 public sealed record FileRow(string Path, long Id);
 
 public sealed record GraphStats(int FileCount, int SymbolCount, int ReferenceCount, int EdgeCount);
+
+/// <summary>One row from <c>vw_recent_changes</c>: the symbol joined to its history entry.</summary>
+public sealed record RecentChangeHit(SymbolHit Symbol, SymbolHistory History);
+
+/// <summary>Result of <see cref="IGraphStore.ListTestsForAsync"/> — the test method + its framework.</summary>
+public sealed record TestForHit(SymbolHit Test, string? Framework);
+
+/// <summary>Lightweight projection of (symbol_id, file_path, start/end line) for the history pipeline.</summary>
+public sealed record SymbolSpan(long SymbolId, string FilePath, int StartLine, int EndLine);
