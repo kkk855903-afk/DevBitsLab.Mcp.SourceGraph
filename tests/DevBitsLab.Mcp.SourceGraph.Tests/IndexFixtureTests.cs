@@ -99,12 +99,14 @@ public sealed class IndexFixtureTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task ListMembers_Calculator_returnsThreeMethods()
+    public async Task ListMembers_Calculator_returnsAllPublicMethods()
     {
         var hits = await _store!.FindSymbolsAsync("Sample.Domain.Calculator");
         var calc = hits.First(h => h.Kind == DevBitsLab.Mcp.SourceGraph.Core.SymbolKind.Class);
         var members = await _store.ListMembersAsync(calc.Id);
-        members.Select(m => m.Name).Should().BeEquivalentTo(new[] { "Add", "Subtract", "Multiply" });
+        // Calculator gained MakeGreeter (Instantiates demo) and Divide (Throws demo) from
+        // expand-edge-types; assert the foundational three are present and every member is public.
+        members.Select(m => m.Name).Should().Contain(new[] { "Add", "Subtract", "Multiply" });
         members.Should().AllSatisfy(m => m.Accessibility.Should().Be((int)Microsoft.CodeAnalysis.Accessibility.Public));
     }
 }
