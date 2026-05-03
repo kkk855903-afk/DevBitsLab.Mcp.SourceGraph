@@ -1,6 +1,7 @@
 using System.Threading.Channels;
 using DevBitsLab.Mcp.SourceGraph.Core;
 using DevBitsLab.Mcp.SourceGraph.Indexing;
+using DevBitsLab.Mcp.SourceGraph.Server.Scoping;
 using DevBitsLab.Mcp.SourceGraph.Storage;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -12,7 +13,8 @@ namespace DevBitsLab.Mcp.SourceGraph.Server;
 /// every symbol whose span lives in it. The dispatcher (the indexer wrapper) drops these into
 /// <see cref="HistoryQueue.Writer"/> on every (re)indexed file.
 /// </summary>
-public readonly record struct HistoryRequest(long FileId, string Path, byte[] ContentSha256);
+/// <param name="ScopeId">Scope the file belongs to. Routed back to the matching per-scope store.</param>
+public readonly record struct HistoryRequest(long FileId, string Path, byte[] ContentSha256, string ScopeId = "");
 
 /// <summary>
 /// Singleton bag for the bounded async channel that ferries history work between the indexer
@@ -56,12 +58,35 @@ public sealed record HistoryOptions(bool Disabled);
 public sealed class HistoryHostedService : BackgroundService
 {
     private readonly HistoryQueue _queue;
-    private readonly IGraphStore _store;
+    private readonly IGraphStore? _legacyStore;
+    private readonly ScopeRouter? _router;
     private readonly GitBlameRunner _blamer;
     private readonly HistoryOptions _options;
     private readonly ILogger<HistoryHostedService> _logger;
     private bool _warnedDisabled;
 
+    /// <summary>
+    /// Multi-scope ctor used by the live host: routes each <see cref="HistoryRequest"/> back to
+    /// the per-scope <see cref="IGraphStore"/> using the request's <c>ScopeId</c> field.
+    /// </summary>
+    public HistoryHostedService(
+        HistoryQueue queue,
+        ScopeRouter router,
+        GitBlameRunner blamer,
+        HistoryOptions options,
+        ILogger<HistoryHostedService> logger)
+    {
+        _queue = queue;
+        _router = router;
+        _blamer = blamer;
+        _options = options;
+        _logger = logger;
+    }
+
+    /// <summary>
+    /// Single-store ctor used by the one-shot <c>index</c> CLI path. There's only one store, so
+    /// the scope id on the request is ignored.
+    /// </summary>
     public HistoryHostedService(
         HistoryQueue queue,
         IGraphStore store,
@@ -70,10 +95,17 @@ public sealed class HistoryHostedService : BackgroundService
         ILogger<HistoryHostedService> logger)
     {
         _queue = queue;
-        _store = store;
+        _legacyStore = store;
         _blamer = blamer;
         _options = options;
         _logger = logger;
+    }
+
+    private IGraphStore? StoreFor(string scopeId)
+    {
+        if (_legacyStore is not null) return _legacyStore;
+        if (_router is null) return null;
+        return _router.TryGet(scopeId, out var host) ? host.Store : null;
     }
 
     protected override Task ExecuteAsync(CancellationToken stoppingToken) => RunAsync(stoppingToken);
@@ -115,12 +147,18 @@ public sealed class HistoryHostedService : BackgroundService
 
     private async Task ProcessAsync(HistoryRequest req, CancellationToken ct)
     {
-        var spans = await _store.GetSymbolSpansForFileAsync(req.FileId, ct).ConfigureAwait(false);
+        var store = StoreFor(req.ScopeId);
+        if (store is null)
+        {
+            _logger.LogDebug("History request for unknown scope `{Scope}`; dropping", req.ScopeId);
+            return;
+        }
+        var spans = await store.GetSymbolSpansForFileAsync(req.FileId, ct).ConfigureAwait(false);
         if (spans.Count == 0) return;
 
         // Cache check: if every symbol in this file already has a blamed_content_sha matching the
         // file's current content_sha, there's nothing to do.
-        var cached = await _store.GetBlamedShasForFileAsync(req.FileId, ct).ConfigureAwait(false);
+        var cached = await store.GetBlamedShasForFileAsync(req.FileId, ct).ConfigureAwait(false);
         var allCached = spans.Count > 0 && spans.All(s =>
             cached.TryGetValue(s.SymbolId, out var sha) && sha is not null && sha.AsSpan().SequenceEqual(req.ContentSha256));
         if (allCached) return;
@@ -169,7 +207,7 @@ public sealed class HistoryHostedService : BackgroundService
                 LineCount: end - start + 1,
                 BlamedContentSha: req.ContentSha256);
 
-            await _store.UpsertSymbolHistoryAsync(history, ct).ConfigureAwait(false);
+            await store.UpsertSymbolHistoryAsync(history, ct).ConfigureAwait(false);
         }
     }
 }

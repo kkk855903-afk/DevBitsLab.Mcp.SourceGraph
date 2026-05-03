@@ -5,6 +5,7 @@ internal sealed class CommandLine
     public string Subcommand { get; private init; } = "serve";
     public string? SolutionPath { get; private init; }
     public string? DatabasePath { get; private init; }
+    public string? RepoRoot { get; private init; }
     public bool ShowHelp { get; private init; }
     /// <summary>Override the default embedding model identity (Hugging Face-style id).</summary>
     public string? Model { get; private init; }
@@ -12,6 +13,8 @@ internal sealed class CommandLine
     public bool NoEmbeddings { get; private init; }
     /// <summary>True when <c>--no-history</c> was passed; disables the git-blame pipeline.</summary>
     public bool NoHistory { get; private init; }
+    /// <summary>Positional rest args (used by `scopes add`, `scopes remove`, etc.).</summary>
+    public IReadOnlyList<string> Positional { get; private init; } = Array.Empty<string>();
 
     public static CommandLine Parse(string[] args)
     {
@@ -22,8 +25,10 @@ internal sealed class CommandLine
         string? solution = null;
         string? db = null;
         string? model = null;
+        string? root = null;
         var noEmbeddings = false;
         var noHistory = false;
+        var positional = new List<string>();
 
         for (var i = 1; i < args.Length; i++)
         {
@@ -41,6 +46,9 @@ internal sealed class CommandLine
                 case "--model":
                     model = RequireArg(args, ref i, a);
                     break;
+                case "--root":
+                    root = ExpandTokens(RequireArg(args, ref i, a));
+                    break;
                 case "--no-embeddings":
                     noEmbeddings = true;
                     break;
@@ -52,6 +60,10 @@ internal sealed class CommandLine
                     {
                         solution = ExpandTokens(a);
                     }
+                    else if (!a.StartsWith('-'))
+                    {
+                        positional.Add(a);
+                    }
                     else
                     {
                         throw new ArgumentException($"Unrecognised argument: {a}");
@@ -62,15 +74,18 @@ internal sealed class CommandLine
 
         if (solution is not null) AssertExpanded(solution, "--solution");
         if (db is not null) AssertExpanded(db, "--db");
+        if (root is not null) AssertExpanded(root, "--root");
 
         return new CommandLine
         {
             Subcommand = subcommand,
             SolutionPath = solution,
             DatabasePath = db,
+            RepoRoot = root,
             Model = model,
             NoEmbeddings = noEmbeddings,
             NoHistory = noHistory,
+            Positional = positional,
         };
     }
 
@@ -119,9 +134,10 @@ internal sealed class CommandLine
         sourcegraph-mcp — live code source graph MCP server for .NET
 
         Usage:
-          sourcegraph-mcp serve [--solution <path>] [--db <path>] [--model <id>] [--no-embeddings] [--no-history]
-              Run the MCP stdio server. If --solution is given, opens that solution on startup
-              and watches it for changes; otherwise indexes lazily on first query.
+          sourcegraph-mcp serve [--solution <path>] [--db <path>] [--root <repo>] [--model <id>] [--no-embeddings] [--no-history]
+              Run the MCP stdio server. With --solution given, registers an implicit single-scope
+              `default` mapped to that solution. Otherwise reads `.sourcegraph.json` from --root
+              (or CWD) for multi-scope configuration.
 
           sourcegraph-mcp index <solution-path> [--db <path>] [--model <id>] [--no-embeddings] [--no-history]
               Build/refresh the graph database from the given .sln file, then exit.
@@ -132,7 +148,23 @@ internal sealed class CommandLine
           sourcegraph-mcp clear [--db <path>]
               Delete all rows from the graph database (schema preserved).
 
+          sourcegraph-mcp init-scopes [--root <path>]
+              Discover .slnx (or .sln) files at <root> (default: cwd) and write a .sourcegraph.json
+              listing one scope per discovered solution.
+
+          sourcegraph-mcp scopes list [--root <path>]
+              List the scopes declared in the repo's .sourcegraph.json (or the synthesised default).
+
+          sourcegraph-mcp scopes add <name> --solution <path> [--root <path>] [--isolated]
+              Add a scope to .sourcegraph.json. <name> is the kebab-case id; --solution gives the
+              .slnx/.sln. The file is created on first use.
+
+          sourcegraph-mcp scopes remove <name> [--root <path>]
+              Remove a scope from .sourcegraph.json.
+
         Common flags:
+          --root <path>     Repository root used for `.sourcegraph.json` discovery and scope DBs.
+                            Defaults to the directory holding `--solution`, then CWD.
           --model <id>      Override the embedding model identity (default:
                             jinaai/jina-embeddings-v2-base-code). Applies to serve/index.
           --no-embeddings   Skip the embedding pipeline entirely. semantic_search returns the
@@ -141,20 +173,36 @@ internal sealed class CommandLine
                             git on PATH or in CI runs where per-symbol history isn't needed.
 
         Defaults:
-          --db   ./.sourcegraph/graph.db   (created if missing)
+          --db   ./.sourcegraph/scopes/default.db   (created if missing; legacy graph.db is migrated)
 
         Examples:
           sourcegraph-mcp index ./MySln.sln
           sourcegraph-mcp serve --solution ./MySln.sln
-          sourcegraph-mcp serve --solution ./MySln.sln --no-embeddings
-          sourcegraph-mcp index ./MySln.sln --no-history
+          sourcegraph-mcp serve --root ./repo
+          sourcegraph-mcp init-scopes
+          sourcegraph-mcp scopes add backend --solution ./backend.slnx
         """;
+
+    /// <summary>
+    /// Resolve the repository root for scope-based layout. Priority: explicit <c>--root</c>, then
+    /// the directory holding <c>--solution</c>, then the current working directory.
+    /// </summary>
+    public string ResolvedRepoRoot()
+    {
+        if (!string.IsNullOrEmpty(RepoRoot)) return Path.GetFullPath(RepoRoot);
+        if (!string.IsNullOrEmpty(SolutionPath))
+        {
+            var dir = Path.GetDirectoryName(Path.GetFullPath(SolutionPath));
+            if (!string.IsNullOrEmpty(dir)) return dir;
+        }
+        return Path.GetFullPath(Directory.GetCurrentDirectory());
+    }
 
     /// <summary>
     /// Resolves the SQLite database path with this priority:
     ///   1. --db &lt;path&gt; if provided.
-    ///   2. Beside --solution as &lt;solution-dir&gt;/.sourcegraph/graph.db. This is the common case
-    ///      and gives each registered solution its own graph file regardless of CWD.
+    ///   2. Beside --solution as &lt;solution-dir&gt;/.sourcegraph/scopes/default.db (post-scoping
+    ///      layout). The legacy graph.db is migrated to this location automatically.
     ///   3. A per-user cache directory: ~/.cache/sourcegraph-mcp/graph.db (Linux/macOS) or
     ///      %LOCALAPPDATA%/sourcegraph-mcp/graph.db (Windows). Used when no solution is given.
     ///   4. Last resort: $TMPDIR/sourcegraph-mcp/graph.db.
@@ -171,7 +219,8 @@ internal sealed class CommandLine
             var solutionDir = Path.GetDirectoryName(Path.GetFullPath(SolutionPath));
             if (!string.IsNullOrEmpty(solutionDir))
             {
-                return EnsureDir(Path.Combine(solutionDir, ".sourcegraph", "graph.db"));
+                // Post-scoping layout: scopes/default.db. The migrator handles the legacy graph.db.
+                return EnsureDir(Path.Combine(solutionDir, ".sourcegraph", "scopes", "default.db"));
             }
         }
 

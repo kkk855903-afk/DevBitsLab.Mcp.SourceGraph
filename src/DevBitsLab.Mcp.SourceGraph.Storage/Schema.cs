@@ -7,7 +7,7 @@ internal static class Schema
     /// drops all data tables when the on-disk version is below this, since the index can always be
     /// rebuilt from source.
     /// </summary>
-    public const int Version = 9;
+    public const int Version = 10;
 
     /// <summary>
     /// V5 enriches the symbol row with metadata that Roslyn already exposes per symbol but which
@@ -51,6 +51,14 @@ internal static class Schema
     /// <c>content_sha256</c> so we don't re-blame on every reindex. A new
     /// <see cref="Core.EdgeKind.Tests"/> edge kind links each test method to the first
     /// non-trivial production call it exercises.
+    ///
+    /// V10 is the storage-layout flip required by add-scoping: the on-disk DB itself didn't
+    /// gain new tables, but the host now owns one DB per scope under
+    /// <c>.sourcegraph/scopes/&lt;id&gt;.db</c> plus a separate <c>_meta.db</c> registry.
+    /// Bumping the schema version forces the rebuild path so legacy DBs in the old single-file
+    /// layout get re-applied cleanly when the migrator moves them to the new path. No new
+    /// per-row data — the registry's own version is tracked separately in
+    /// <see cref="SqliteScopeRegistry"/>.
     /// </summary>
     public const string V1 = """
         CREATE TABLE IF NOT EXISTS schema_version (

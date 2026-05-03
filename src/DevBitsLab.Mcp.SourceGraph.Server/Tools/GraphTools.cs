@@ -3,6 +3,7 @@ using System.Text;
 using DevBitsLab.Mcp.SourceGraph.Core;
 using DevBitsLab.Mcp.SourceGraph.Embeddings;
 using DevBitsLab.Mcp.SourceGraph.Server.Observability;
+using DevBitsLab.Mcp.SourceGraph.Server.Scoping;
 using DevBitsLab.Mcp.SourceGraph.Storage;
 using ModelContextProtocol.Server;
 
@@ -11,531 +12,566 @@ namespace DevBitsLab.Mcp.SourceGraph.Server.Tools;
 [McpServerToolType]
 public static class GraphTools
 {
+    private const string ScopeDescription =
+        "Optional scope id, the literal '*' for all non-isolated scopes, or a comma-separated list of ids " +
+        "(e.g. 'frontend,backend'). Omit to use `default_scope` from .sourcegraph.json. Call `list_scopes` to discover.";
+
     [McpServerTool]
     [Description("Find the definition of a symbol by name or fully-qualified name. Returns location, kind, signature, accessibility, modifiers, and one-line XML summary for each match. Use for 'where is X defined?'.")]
     public static Task<string> FindDefinitionAsync(
-        IGraphStore store,
+        ScopeRouter router,
         [Description("Symbol name (e.g. 'Calculator', 'Divide') or FQN suffix (e.g. 'Calculator.Add', 'Sample.Domain.Calculator')")] string symbol,
         [Description("Optional substring to narrow the search to specific file paths")] string? fileHint = null,
+        [Description(ScopeDescription)] string? scope = null,
         CancellationToken ct = default) =>
-        ToolMetrics.TrackAsync("find_definition", new { symbol, fileHint }, async () =>
-        {
-            var hits = await store.FindSymbolsAsync(symbol, fileHint, limit: 25, ct).ConfigureAwait(false);
-            if (hits.Count == 0) return $"No definition found for '{symbol}'.";
-
-            // Pre-fetch history rows in one batch so we don't fire a query per hit.
-            var historyById = await store.GetSymbolHistoryBatchAsync(hits.Select(h => h.Id).ToList(), ct).ConfigureAwait(false);
-
-            var sb = new StringBuilder();
-            sb.AppendLine($"Found {hits.Count} match(es) for '{symbol}':");
-            sb.AppendLine();
-            foreach (var h in hits)
+        ToolMetrics.TrackAsync("find_definition", new { symbol, fileHint, scope }, () =>
+            ScopedExecution.RunAsync(router, scope, async host =>
             {
-                sb.AppendLine($"- **{h.Fqn}** ({Format.KindWithAttrs(h)})");
-                sb.AppendLine($"  - {Format.Location(h.FilePath, h.StartLine, h.StartCol)}");
-                if (!string.IsNullOrEmpty(h.Signature)) sb.AppendLine($"  - `{h.Signature}`");
-                var oneLine = Format.OneLineSummary(h.XmlSummary);
-                if (!string.IsNullOrEmpty(oneLine)) sb.AppendLine($"  - _{oneLine}_");
-                var attrs = await store.GetAttributesForSymbolAsync(h.Id, ct).ConfigureAwait(false);
-                var attrLine = AttributeFormat.OneLine(attrs);
-                if (attrLine is not null) sb.AppendLine($"  - {attrLine}");
-                if (historyById.TryGetValue(h.Id, out var hist))
+                var hits = await host.Store.FindSymbolsAsync(symbol, fileHint, limit: 25, ct).ConfigureAwait(false);
+                if (hits.Count == 0) return $"No definition found for '{symbol}'.";
+
+                // Pre-fetch history rows in one batch so we don't fire a query per hit.
+                var historyById = await host.Store.GetSymbolHistoryBatchAsync(hits.Select(h => h.Id).ToList(), ct).ConfigureAwait(false);
+
+                var sb = new StringBuilder();
+                sb.AppendLine($"Found {hits.Count} match(es) for '{symbol}':");
+                sb.AppendLine();
+                foreach (var h in hits)
                 {
-                    var line = Format.HistoryLine(hist);
-                    if (line is not null) sb.AppendLine($"  - {line}");
+                    sb.AppendLine($"- **{h.Fqn}** ({Format.KindWithAttrs(h)})");
+                    sb.AppendLine($"  - {Format.Location(h.FilePath, h.StartLine, h.StartCol)}");
+                    if (!string.IsNullOrEmpty(h.Signature)) sb.AppendLine($"  - `{h.Signature}`");
+                    var oneLine = Format.OneLineSummary(h.XmlSummary);
+                    if (!string.IsNullOrEmpty(oneLine)) sb.AppendLine($"  - _{oneLine}_");
+                    var attrs = await host.Store.GetAttributesForSymbolAsync(h.Id, ct).ConfigureAwait(false);
+                    var attrLine = AttributeFormat.OneLine(attrs);
+                    if (attrLine is not null) sb.AppendLine($"  - {attrLine}");
+                    if (historyById.TryGetValue(h.Id, out var hist))
+                    {
+                        var line = Format.HistoryLine(hist);
+                        if (line is not null) sb.AppendLine($"  - {line}");
+                    }
                 }
-            }
-            return sb.ToString();
-        });
+                return sb.ToString();
+            }, ct));
 
     [McpServerTool]
     [Description("Find every symbol that carries an attribute by short name (e.g. 'HttpGet', 'Obsolete', 'Authorize'). Optional argValue does a trigram match against the attribute's serialised arguments (e.g. argValue='/api/v2' to find route attributes whose path contains that substring). Use for 'find every POST endpoint', 'what's been deprecated?', 'find all DI singletons'.")]
     public static Task<string> FindByAttributeAsync(
-        IGraphStore store,
+        ScopeRouter router,
         [Description("Attribute short name (e.g. 'HttpGet', 'Obsolete', 'Authorize'). Trailing 'Attribute' is implied; use the form you'd type in source.")] string name,
         [Description("Optional substring to match against the attribute's arguments via FTS5 trigram (>= 3 chars). E.g. '/api/users' or 'Use Foo'.")] string? argValue = null,
         [Description("Optional kind filter: class|method|property|field|...")] string? kind = null,
         [Description("Maximum results (default 50)")] int limit = 50,
+        [Description(ScopeDescription)] string? scope = null,
         CancellationToken ct = default) =>
-        ToolMetrics.TrackAsync("find_by_attribute", new { name, argValue, kind, limit }, async () =>
-        {
-            SymbolKind? kindFilter = string.IsNullOrEmpty(kind)
-                ? null
-                : Enum.TryParse<SymbolKind>(kind, ignoreCase: true, out var k) ? k : null;
-            var hits = await store.FindByAttributeAsync(name, argValue, kindFilter, limit, ct).ConfigureAwait(false);
-            if (hits.Count == 0)
+        ToolMetrics.TrackAsync("find_by_attribute", new { name, argValue, kind, limit, scope }, () =>
+            ScopedExecution.RunAsync(router, scope, async host =>
             {
-                var argsClause = string.IsNullOrEmpty(argValue) ? "" : $" with argValue ~ '{argValue}'";
-                return $"No symbols carry [{name}]{argsClause}.";
-            }
-            var sb = new StringBuilder();
-            sb.AppendLine($"{hits.Count} symbol(s) carry [{name}]:");
-            foreach (var h in hits)
-            {
-                sb.AppendLine($"- **{h.Fqn}** ({Format.KindWithAttrs(h)}) at {Format.Location(h.FilePath, h.StartLine, h.StartCol)}");
-                var attrs = await store.GetAttributesForSymbolAsync(h.Id, ct).ConfigureAwait(false);
-                var line = AttributeFormat.OneLine(attrs);
-                if (line is not null) sb.AppendLine($"  - {line}");
-            }
-            return sb.ToString();
-        });
+                SymbolKind? kindFilter = string.IsNullOrEmpty(kind)
+                    ? null
+                    : Enum.TryParse<SymbolKind>(kind, ignoreCase: true, out var k) ? k : null;
+                var hits = await host.Store.FindByAttributeAsync(name, argValue, kindFilter, limit, ct).ConfigureAwait(false);
+                if (hits.Count == 0)
+                {
+                    var argsClause = string.IsNullOrEmpty(argValue) ? "" : $" with argValue ~ '{argValue}'";
+                    return $"No symbols carry [{name}]{argsClause}.";
+                }
+                var sb = new StringBuilder();
+                sb.AppendLine($"{hits.Count} symbol(s) carry [{name}]:");
+                foreach (var h in hits)
+                {
+                    sb.AppendLine($"- **{h.Fqn}** ({Format.KindWithAttrs(h)}) at {Format.Location(h.FilePath, h.StartLine, h.StartCol)}");
+                    var attrs = await host.Store.GetAttributesForSymbolAsync(h.Id, ct).ConfigureAwait(false);
+                    var line = AttributeFormat.OneLine(attrs);
+                    if (line is not null) sb.AppendLine($"  - {line}");
+                }
+                return sb.ToString();
+            }, ct));
 
     [McpServerTool]
     [Description("Find every place that references a symbol. Resolves the symbol by name/FQN, then lists each call site or type-use as file:line. Use for 'who uses X?' or 'who calls X?'. By default skips refs from source-generated files; pass includeGenerated=true to surface them.")]
     public static Task<string> FindReferencesAsync(
-        IGraphStore store,
+        ScopeRouter router,
         [Description("Symbol name or FQN, same matching rules as find_definition")] string symbol,
         [Description("Maximum number of references to return (default 200)")] int limit = 200,
         [Description("Include references from source-generated files (default false)")] bool includeGenerated = false,
+        [Description(ScopeDescription)] string? scope = null,
         CancellationToken ct = default) =>
-        ToolMetrics.TrackAsync("find_references", new { symbol, limit, includeGenerated }, async () =>
-        {
-            var hits = await store.FindSymbolsAsync(symbol, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
-            if (hits.Count == 0) return $"No symbol found for '{symbol}'.";
+        ToolMetrics.TrackAsync("find_references", new { symbol, limit, includeGenerated, scope }, () =>
+            ScopedExecution.RunAsync(router, scope, async host =>
+            {
+                var hits = await host.Store.FindSymbolsAsync(symbol, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
+                if (hits.Count == 0) return $"No symbol found for '{symbol}'.";
 
-            var sb = new StringBuilder();
-            if (hits.Count > 1)
-            {
-                sb.AppendLine($"Multiple symbols match '{symbol}'; reporting references for the top match. Other matches: {string.Join(", ", hits.Skip(1).Select(h => h.Fqn))}");
+                var sb = new StringBuilder();
+                if (hits.Count > 1)
+                {
+                    sb.AppendLine($"Multiple symbols match '{symbol}'; reporting references for the top match. Other matches: {string.Join(", ", hits.Skip(1).Select(h => h.Fqn))}");
+                    sb.AppendLine();
+                }
+                var top = hits[0];
+                var refs = await host.Store.FindReferencesAsync(top.Id, includeGenerated, limit, ct).ConfigureAwait(false);
+                sb.AppendLine($"References to **{top.Fqn}** ({KindLabel(top.Kind)}){GeneratedSuffix(top.IsGenerated)}:");
+                sb.AppendLine($"- definition: {Format.Location(top.FilePath, top.StartLine, top.StartCol)}");
+                if (refs.Count == 0)
+                {
+                    sb.AppendLine(includeGenerated
+                        ? "- no other references in the graph"
+                        : "- no other references in the graph (pass includeGenerated=true to include source-generated files)");
+                    return sb.ToString();
+                }
                 sb.AppendLine();
-            }
-            var top = hits[0];
-            var refs = await store.FindReferencesAsync(top.Id, includeGenerated, limit, ct).ConfigureAwait(false);
-            sb.AppendLine($"References to **{top.Fqn}** ({KindLabel(top.Kind)}){GeneratedSuffix(top.IsGenerated)}:");
-            sb.AppendLine($"- definition: {Format.Location(top.FilePath, top.StartLine, top.StartCol)}");
-            if (refs.Count == 0)
-            {
-                sb.AppendLine(includeGenerated
-                    ? "- no other references in the graph"
-                    : "- no other references in the graph (pass includeGenerated=true to include source-generated files)");
+                sb.AppendLine($"{refs.Count} reference(s):");
+                foreach (var r in refs)
+                {
+                    sb.AppendLine($"- {RefKindLabel(r.Kind)} at {Format.Location(r.FilePath, r.Line, r.Col)}{GeneratedSuffix(r.IsGenerated)}");
+                }
                 return sb.ToString();
-            }
-            sb.AppendLine();
-            sb.AppendLine($"{refs.Count} reference(s):");
-            foreach (var r in refs)
-            {
-                sb.AppendLine($"- {RefKindLabel(r.Kind)} at {Format.Location(r.FilePath, r.Line, r.Col)}{GeneratedSuffix(r.IsGenerated)}");
-            }
-            return sb.ToString();
-        });
+            }, ct));
 
     [McpServerTool]
     [Description("List every symbol declared in a file (classes, methods, properties, etc.). Each row carries kind, accessibility, modifiers, and one-line XML summary. Use for 'what's in this file?' to skip a Read.")]
     public static Task<string> ListSymbolsInFileAsync(
-        IGraphStore store,
+        ScopeRouter router,
         [Description("Absolute path or path suffix that uniquely identifies the file")] string path,
+        [Description(ScopeDescription)] string? scope = null,
         CancellationToken ct = default) =>
-        ToolMetrics.TrackAsync("list_symbols_in_file", new { path }, async () =>
-        {
-            var hits = await store.ListSymbolsInFileAsync(path, ct).ConfigureAwait(false);
-            if (hits.Count == 0) return $"No indexed symbols found in '{path}'. The file may not be part of an indexed solution, or may not exist.";
-
-            var historyById = await store.GetSymbolHistoryBatchAsync(hits.Select(h => h.Id).ToList(), ct).ConfigureAwait(false);
-
-            var sb = new StringBuilder();
-            sb.AppendLine($"{hits.Count} symbol(s) in {hits[0].FilePath}:");
-            foreach (var h in hits)
+        ToolMetrics.TrackAsync("list_symbols_in_file", new { path, scope }, () =>
+            ScopedExecution.RunAsync(router, scope, async host =>
             {
-                sb.AppendLine($"- L{h.StartLine}: **{h.Name}** ({Format.KindWithAttrs(h)}) — {h.Fqn}");
-                if (!string.IsNullOrEmpty(h.Signature)) sb.AppendLine($"    `{h.Signature}`");
-                var oneLine = Format.OneLineSummary(h.XmlSummary);
-                if (!string.IsNullOrEmpty(oneLine)) sb.AppendLine($"    _{oneLine}_");
-                var attrs = await store.GetAttributesForSymbolAsync(h.Id, ct).ConfigureAwait(false);
-                var line = AttributeFormat.OneLine(attrs);
-                if (line is not null) sb.AppendLine($"    {line}");
-                if (historyById.TryGetValue(h.Id, out var hist))
+                var hits = await host.Store.ListSymbolsInFileAsync(path, ct).ConfigureAwait(false);
+                if (hits.Count == 0) return $"No indexed symbols found in '{path}'. The file may not be part of an indexed solution, or may not exist.";
+
+                var historyById = await host.Store.GetSymbolHistoryBatchAsync(hits.Select(h => h.Id).ToList(), ct).ConfigureAwait(false);
+
+                var sb = new StringBuilder();
+                sb.AppendLine($"{hits.Count} symbol(s) in {hits[0].FilePath}:");
+                foreach (var h in hits)
                 {
-                    var hline = Format.HistoryLine(hist);
-                    if (hline is not null) sb.AppendLine($"    {hline}");
+                    sb.AppendLine($"- L{h.StartLine}: **{h.Name}** ({Format.KindWithAttrs(h)}) — {h.Fqn}");
+                    if (!string.IsNullOrEmpty(h.Signature)) sb.AppendLine($"    `{h.Signature}`");
+                    var oneLine = Format.OneLineSummary(h.XmlSummary);
+                    if (!string.IsNullOrEmpty(oneLine)) sb.AppendLine($"    _{oneLine}_");
+                    var attrs = await host.Store.GetAttributesForSymbolAsync(h.Id, ct).ConfigureAwait(false);
+                    var line = AttributeFormat.OneLine(attrs);
+                    if (line is not null) sb.AppendLine($"    {line}");
+                    if (historyById.TryGetValue(h.Id, out var hist))
+                    {
+                        var hline = Format.HistoryLine(hist);
+                        if (hline is not null) sb.AppendLine($"    {hline}");
+                    }
                 }
-            }
-            return sb.ToString();
-        });
+                return sb.ToString();
+            }, ct));
 
     [McpServerTool]
     [Description("List inbound edges into a target symbol. Default kind=calls (i.e. callers). Use kind=uses_type to find consumers of a type, kind=overrides for derived implementations, kind=implements_member for members satisfying an interface, kind=instantiates for `new T()` sites, kind=throws for throw sites, or kind=all for every edge kind.")]
     public static Task<string> ListCallersAsync(
-        IGraphStore store,
+        ScopeRouter router,
         [Description("Target symbol name or FQN")] string symbol,
         [Description("Maximum number of results to return (default 50)")] int limit = 50,
         [Description("Edge kind to walk: calls (default) | uses_type | overrides | implements_member | instantiates | throws | all")] string? kind = null,
+        [Description(ScopeDescription)] string? scope = null,
         CancellationToken ct = default) =>
-        ToolMetrics.TrackAsync("list_callers", new { symbol, limit, kind }, async () =>
-        {
-            var (edgeKind, label, errorMsg) = ParseEdgeKind(kind);
-            if (errorMsg is not null) return errorMsg;
-
-            var hits = await store.FindSymbolsAsync(symbol, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
-            if (hits.Count == 0) return $"No symbol found for '{symbol}'.";
-            var top = hits[0];
-            var callers = await store.ListCallersAsync(top.Id, limit, edgeKind, ct).ConfigureAwait(false);
-            var sb = new StringBuilder();
-            sb.AppendLine($"Inbound `{label}` to **{top.Fqn}** ({KindLabel(top.Kind)}):");
-            if (callers.Count == 0) { sb.AppendLine("- (none)"); return sb.ToString(); }
-            foreach (var c in callers)
+        ToolMetrics.TrackAsync("list_callers", new { symbol, limit, kind, scope }, () =>
+            ScopedExecution.RunAsync(router, scope, async host =>
             {
-                sb.AppendLine($"- **{c.Fqn}** ({KindLabel(c.Kind)}) at {Format.Location(c.FilePath, c.StartLine, c.StartCol)}");
-            }
-            return sb.ToString();
-        });
+                var (edgeKind, label, errorMsg) = ParseEdgeKind(kind);
+                if (errorMsg is not null) return errorMsg;
+
+                var hits = await host.Store.FindSymbolsAsync(symbol, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
+                if (hits.Count == 0) return $"No symbol found for '{symbol}'.";
+                var top = hits[0];
+                var callers = await host.Store.ListCallersAsync(top.Id, limit, edgeKind, ct).ConfigureAwait(false);
+                var sb = new StringBuilder();
+                sb.AppendLine($"Inbound `{label}` to **{top.Fqn}** ({KindLabel(top.Kind)}):");
+                if (callers.Count == 0) { sb.AppendLine("- (none)"); return sb.ToString(); }
+                foreach (var c in callers)
+                {
+                    sb.AppendLine($"- **{c.Fqn}** ({KindLabel(c.Kind)}) at {Format.Location(c.FilePath, c.StartLine, c.StartCol)}");
+                }
+                return sb.ToString();
+            }, ct));
 
     [McpServerTool]
     [Description("List outbound edges from the target symbol. Default kind=calls (callees). Use kind=uses_type for types touched in this member's signature/body, kind=overrides for the base it overrides, kind=implements_member for the interface member it satisfies, kind=instantiates for types it constructs, kind=throws for exception types it throws, or kind=all.")]
     public static Task<string> ListCalleesAsync(
-        IGraphStore store,
+        ScopeRouter router,
         [Description("Source symbol name or FQN")] string symbol,
         [Description("Maximum number of results to return (default 50)")] int limit = 50,
         [Description("Edge kind to walk: calls (default) | uses_type | overrides | implements_member | instantiates | throws | all")] string? kind = null,
+        [Description(ScopeDescription)] string? scope = null,
         CancellationToken ct = default) =>
-        ToolMetrics.TrackAsync("list_callees", new { symbol, limit, kind }, async () =>
-        {
-            var (edgeKind, label, errorMsg) = ParseEdgeKind(kind);
-            if (errorMsg is not null) return errorMsg;
-
-            var hits = await store.FindSymbolsAsync(symbol, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
-            if (hits.Count == 0) return $"No symbol found for '{symbol}'.";
-            var top = hits[0];
-            var callees = await store.ListCalleesAsync(top.Id, limit, edgeKind, ct).ConfigureAwait(false);
-            var sb = new StringBuilder();
-            sb.AppendLine($"Outbound `{label}` from **{top.Fqn}** ({KindLabel(top.Kind)}):");
-            if (callees.Count == 0) { sb.AppendLine("- (none)"); return sb.ToString(); }
-            foreach (var c in callees)
+        ToolMetrics.TrackAsync("list_callees", new { symbol, limit, kind, scope }, () =>
+            ScopedExecution.RunAsync(router, scope, async host =>
             {
-                sb.AppendLine($"- **{c.Fqn}** ({KindLabel(c.Kind)}) at {Format.Location(c.FilePath, c.StartLine, c.StartCol)}");
-            }
-            return sb.ToString();
-        });
+                var (edgeKind, label, errorMsg) = ParseEdgeKind(kind);
+                if (errorMsg is not null) return errorMsg;
+
+                var hits = await host.Store.FindSymbolsAsync(symbol, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
+                if (hits.Count == 0) return $"No symbol found for '{symbol}'.";
+                var top = hits[0];
+                var callees = await host.Store.ListCalleesAsync(top.Id, limit, edgeKind, ct).ConfigureAwait(false);
+                var sb = new StringBuilder();
+                sb.AppendLine($"Outbound `{label}` from **{top.Fqn}** ({KindLabel(top.Kind)}):");
+                if (callees.Count == 0) { sb.AppendLine("- (none)"); return sb.ToString(); }
+                foreach (var c in callees)
+                {
+                    sb.AppendLine($"- **{c.Fqn}** ({KindLabel(c.Kind)}) at {Format.Location(c.FilePath, c.StartLine, c.StartCol)}");
+                }
+                return sb.ToString();
+            }, ct));
 
     [McpServerTool]
     [Description("Find every concrete member that implements an interface member (uses ImplementsMember edges). Use for 'who implements IGreeter.Greet?'.")]
     public static Task<string> FindImplementationsAsync(
-        IGraphStore store,
+        ScopeRouter router,
         [Description("Interface member name or FQN, e.g. 'IGreeter.Greet'")] string symbol,
         [Description("Include abstract base members in the result (default false)")] bool includeAbstract = false,
         [Description("Maximum results (default 50)")] int limit = 50,
+        [Description(ScopeDescription)] string? scope = null,
         CancellationToken ct = default) =>
-        ToolMetrics.TrackAsync("find_implementations", new { symbol, includeAbstract, limit }, async () =>
-        {
-            var hits = await store.FindSymbolsAsync(symbol, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
-            if (hits.Count == 0) return $"No symbol found for '{symbol}'.";
-            var top = hits[0];
-            var impls = await store.ListImplementationsAsync(top.Id, limit, ct).ConfigureAwait(false);
-            var filtered = includeAbstract
-                ? impls
-                : impls.Where(h => !(h.Signature?.Contains("abstract", StringComparison.Ordinal) ?? false)).ToList();
-            var sb = new StringBuilder();
-            sb.AppendLine($"Implementations of **{top.Fqn}** ({KindLabel(top.Kind)}):");
-            if (filtered.Count == 0) { sb.AppendLine("- (none)"); return sb.ToString(); }
-            foreach (var c in filtered)
+        ToolMetrics.TrackAsync("find_implementations", new { symbol, includeAbstract, limit, scope }, () =>
+            ScopedExecution.RunAsync(router, scope, async host =>
             {
-                sb.AppendLine($"- **{c.Fqn}** ({KindLabel(c.Kind)}) at {Format.Location(c.FilePath, c.StartLine, c.StartCol)}");
-            }
-            return sb.ToString();
-        });
+                var hits = await host.Store.FindSymbolsAsync(symbol, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
+                if (hits.Count == 0) return $"No symbol found for '{symbol}'.";
+                var top = hits[0];
+                var impls = await host.Store.ListImplementationsAsync(top.Id, limit, ct).ConfigureAwait(false);
+                var filtered = includeAbstract
+                    ? impls
+                    : impls.Where(h => !(h.Signature?.Contains("abstract", StringComparison.Ordinal) ?? false)).ToList();
+                var sb = new StringBuilder();
+                sb.AppendLine($"Implementations of **{top.Fqn}** ({KindLabel(top.Kind)}):");
+                if (filtered.Count == 0) { sb.AppendLine("- (none)"); return sb.ToString(); }
+                foreach (var c in filtered)
+                {
+                    sb.AppendLine($"- **{c.Fqn}** ({KindLabel(c.Kind)}) at {Format.Location(c.FilePath, c.StartLine, c.StartCol)}");
+                }
+                return sb.ToString();
+            }, ct));
 
     [McpServerTool]
     [Description("Free-text search for symbols by partial name, FQN, or signature using FTS5. Use this when you only have a fragment ('Calc', 'Greet', 'Async').")]
     public static Task<string> SearchSymbolsAsync(
-        IGraphStore store,
+        ScopeRouter router,
         [Description("Search query (a few characters, words, or substring of name/FQN/signature)")] string query,
         [Description("Optional kind filter: class|method|property|field|interface|namespace|...")] string? kind = null,
         [Description("Maximum results (default 25)")] int topK = 25,
+        [Description(ScopeDescription)] string? scope = null,
         CancellationToken ct = default) =>
-        ToolMetrics.TrackAsync("search_symbols", new { query, kind, topK }, async () =>
-        {
-            SymbolKind? kindFilter = string.IsNullOrEmpty(kind)
-                ? null
-                : Enum.TryParse<SymbolKind>(kind, ignoreCase: true, out var k) ? k : null;
-
-            var hits = await store.SearchSymbolsAsync(query, kindFilter, topK, ct).ConfigureAwait(false);
-            if (hits.Count == 0) return $"No symbols match '{query}'.";
-            var sb = new StringBuilder();
-            sb.AppendLine($"{hits.Count} match(es) for '{query}':");
-            foreach (var h in hits)
+        ToolMetrics.TrackAsync("search_symbols", new { query, kind, topK, scope }, () =>
+            ScopedExecution.RunAsync(router, scope, async host =>
             {
-                sb.AppendLine($"- **{h.Fqn}** ({KindLabel(h.Kind)}) at {Format.Location(h.FilePath, h.StartLine, h.StartCol)}");
-            }
-            return sb.ToString();
-        });
+                SymbolKind? kindFilter = string.IsNullOrEmpty(kind)
+                    ? null
+                    : Enum.TryParse<SymbolKind>(kind, ignoreCase: true, out var k) ? k : null;
+
+                var hits = await host.Store.SearchSymbolsAsync(query, kindFilter, topK, ct).ConfigureAwait(false);
+                if (hits.Count == 0) return $"No symbols match '{query}'.";
+                var sb = new StringBuilder();
+                sb.AppendLine($"{hits.Count} match(es) for '{query}':");
+                foreach (var h in hits)
+                {
+                    sb.AppendLine($"- **{h.Fqn}** ({KindLabel(h.Kind)}) at {Format.Location(h.FilePath, h.StartLine, h.StartCol)}");
+                }
+                return sb.ToString();
+            }, ct));
 
     [McpServerTool]
     [Description("Get the immediate graph neighborhood of a symbol: callers, callees, and inheritance/implements edges. Use to orient yourself around a symbol before diving in. Default kind=calls; pass kind=uses_type, overrides, implements_member, instantiates, throws, or all to inspect other edge layers.")]
     public static Task<string> NeighborhoodAsync(
-        IGraphStore store,
+        ScopeRouter router,
         [Description("Symbol name or FQN")] string symbol,
         [Description("Max items per category (default 20)")] int perCategory = 20,
         [Description("Edge kind to walk: calls (default) | uses_type | overrides | implements_member | instantiates | throws | all")] string? kind = null,
+        [Description(ScopeDescription)] string? scope = null,
         CancellationToken ct = default) =>
-        ToolMetrics.TrackAsync("neighborhood", new { symbol, perCategory, kind }, async () =>
-        {
-            var (edgeKind, label, errorMsg) = ParseEdgeKind(kind);
-            if (errorMsg is not null) return errorMsg;
-
-            var hits = await store.FindSymbolsAsync(symbol, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
-            if (hits.Count == 0) return $"No symbol found for '{symbol}'.";
-            var top = hits[0];
-            var callers = await store.ListCallersAsync(top.Id, perCategory, edgeKind, ct).ConfigureAwait(false);
-            var callees = await store.ListCalleesAsync(top.Id, perCategory, edgeKind, ct).ConfigureAwait(false);
-
-            var sb = new StringBuilder();
-            sb.AppendLine($"Neighborhood of **{top.Fqn}** ({Format.KindWithAttrs(top)}) [kind={label}]");
-            sb.AppendLine($"definition: {Format.Location(top.FilePath, top.StartLine, top.StartCol)}");
-            var topSummary = Format.OneLineSummary(top.XmlSummary);
-            if (!string.IsNullOrEmpty(topSummary)) sb.AppendLine($"_{topSummary}_");
-            var topAttrs = await store.GetAttributesForSymbolAsync(top.Id, ct).ConfigureAwait(false);
-            var topAttrLine = AttributeFormat.OneLine(topAttrs);
-            if (topAttrLine is not null) sb.AppendLine(topAttrLine);
-            sb.AppendLine();
-            sb.AppendLine($"### Inbound ({callers.Count})");
-            foreach (var c in callers)
+        ToolMetrics.TrackAsync("neighborhood", new { symbol, perCategory, kind, scope }, () =>
+            ScopedExecution.RunAsync(router, scope, async host =>
             {
-                sb.Append($"- {c.Fqn} ({Format.KindWithAttrs(c)}) — {Format.Location(c.FilePath, c.StartLine, c.StartCol)}");
-                var s = Format.OneLineSummary(c.XmlSummary);
-                if (!string.IsNullOrEmpty(s)) sb.Append(" — _" + s + "_");
+                var (edgeKind, label, errorMsg) = ParseEdgeKind(kind);
+                if (errorMsg is not null) return errorMsg;
+
+                var hits = await host.Store.FindSymbolsAsync(symbol, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
+                if (hits.Count == 0) return $"No symbol found for '{symbol}'.";
+                var top = hits[0];
+                var callers = await host.Store.ListCallersAsync(top.Id, perCategory, edgeKind, ct).ConfigureAwait(false);
+                var callees = await host.Store.ListCalleesAsync(top.Id, perCategory, edgeKind, ct).ConfigureAwait(false);
+
+                var sb = new StringBuilder();
+                sb.AppendLine($"Neighborhood of **{top.Fqn}** ({Format.KindWithAttrs(top)}) [kind={label}]");
+                sb.AppendLine($"definition: {Format.Location(top.FilePath, top.StartLine, top.StartCol)}");
+                var topSummary = Format.OneLineSummary(top.XmlSummary);
+                if (!string.IsNullOrEmpty(topSummary)) sb.AppendLine($"_{topSummary}_");
+                var topAttrs = await host.Store.GetAttributesForSymbolAsync(top.Id, ct).ConfigureAwait(false);
+                var topAttrLine = AttributeFormat.OneLine(topAttrs);
+                if (topAttrLine is not null) sb.AppendLine(topAttrLine);
                 sb.AppendLine();
-                var ca = await store.GetAttributesForSymbolAsync(c.Id, ct).ConfigureAwait(false);
-                var caLine = AttributeFormat.OneLine(ca);
-                if (caLine is not null) sb.AppendLine($"  {caLine}");
-            }
-            if (callers.Count == 0) sb.AppendLine("- (none)");
-            sb.AppendLine();
-            sb.AppendLine($"### Outbound ({callees.Count})");
-            foreach (var c in callees)
-            {
-                sb.Append($"- {c.Fqn} ({Format.KindWithAttrs(c)}) — {Format.Location(c.FilePath, c.StartLine, c.StartCol)}");
-                var s = Format.OneLineSummary(c.XmlSummary);
-                if (!string.IsNullOrEmpty(s)) sb.Append(" — _" + s + "_");
+                sb.AppendLine($"### Inbound ({callers.Count})");
+                foreach (var c in callers)
+                {
+                    sb.Append($"- {c.Fqn} ({Format.KindWithAttrs(c)}) — {Format.Location(c.FilePath, c.StartLine, c.StartCol)}");
+                    var s = Format.OneLineSummary(c.XmlSummary);
+                    if (!string.IsNullOrEmpty(s)) sb.Append(" — _" + s + "_");
+                    sb.AppendLine();
+                    var ca = await host.Store.GetAttributesForSymbolAsync(c.Id, ct).ConfigureAwait(false);
+                    var caLine = AttributeFormat.OneLine(ca);
+                    if (caLine is not null) sb.AppendLine($"  {caLine}");
+                }
+                if (callers.Count == 0) sb.AppendLine("- (none)");
                 sb.AppendLine();
-                var ca = await store.GetAttributesForSymbolAsync(c.Id, ct).ConfigureAwait(false);
-                var caLine = AttributeFormat.OneLine(ca);
-                if (caLine is not null) sb.AppendLine($"  {caLine}");
-            }
-            if (callees.Count == 0) sb.AppendLine("- (none)");
-            return sb.ToString();
-        });
+                sb.AppendLine($"### Outbound ({callees.Count})");
+                foreach (var c in callees)
+                {
+                    sb.Append($"- {c.Fqn} ({Format.KindWithAttrs(c)}) — {Format.Location(c.FilePath, c.StartLine, c.StartCol)}");
+                    var s = Format.OneLineSummary(c.XmlSummary);
+                    if (!string.IsNullOrEmpty(s)) sb.Append(" — _" + s + "_");
+                    sb.AppendLine();
+                    var ca = await host.Store.GetAttributesForSymbolAsync(c.Id, ct).ConfigureAwait(false);
+                    var caLine = AttributeFormat.OneLine(ca);
+                    if (caLine is not null) sb.AppendLine($"  {caLine}");
+                }
+                if (callees.Count == 0) sb.AppendLine("- (none)");
+                return sb.ToString();
+            }, ct));
 
     [McpServerTool]
     [Description("Summarize a namespace or directory: lists the most-referenced symbols (highest in-degree) so you know what to read first. Use 'Sample.Domain' or a path fragment.")]
     public static Task<string> ModuleSummaryAsync(
-        IGraphStore store,
+        ScopeRouter router,
         [Description("Namespace (e.g. 'Sample.Domain') or path-substring that identifies the module")] string namespaceOrPath,
         [Description("Top-K most-referenced symbols to return (default 25)")] int topK = 25,
+        [Description(ScopeDescription)] string? scope = null,
         CancellationToken ct = default) =>
-        ToolMetrics.TrackAsync("module_summary", new { namespaceOrPath, topK }, async () =>
-        {
-            var rows = await store.ModuleSummaryAsync(namespaceOrPath, topK, ct).ConfigureAwait(false);
-            if (rows.Count == 0) return $"No symbols matched module '{namespaceOrPath}'.";
-            var sb = new StringBuilder();
-            sb.AppendLine($"Top {rows.Count} symbol(s) in '{namespaceOrPath}' (by inbound calls):");
-            foreach (var row in rows)
+        ToolMetrics.TrackAsync("module_summary", new { namespaceOrPath, topK, scope }, () =>
+            ScopedExecution.RunAsync(router, scope, async host =>
             {
-                sb.Append($"- in-deg {row.InDegree,3} — **{row.Symbol.Fqn}** ({Format.KindWithAttrs(row.Symbol)}) at {Format.Location(row.Symbol.FilePath, row.Symbol.StartLine, row.Symbol.StartCol)}");
-                var s = Format.OneLineSummary(row.Symbol.XmlSummary);
-                if (!string.IsNullOrEmpty(s)) sb.Append(" — _" + s + "_");
-                sb.AppendLine();
-                var attrs = await store.GetAttributesForSymbolAsync(row.Symbol.Id, ct).ConfigureAwait(false);
-                var line = AttributeFormat.OneLine(attrs);
-                if (line is not null) sb.AppendLine($"  - {line}");
-            }
-            return sb.ToString();
-        });
+                var rows = await host.Store.ModuleSummaryAsync(namespaceOrPath, topK, ct).ConfigureAwait(false);
+                if (rows.Count == 0) return $"No symbols matched module '{namespaceOrPath}'.";
+                var sb = new StringBuilder();
+                sb.AppendLine($"Top {rows.Count} symbol(s) in '{namespaceOrPath}' (by inbound calls):");
+                foreach (var row in rows)
+                {
+                    sb.Append($"- in-deg {row.InDegree,3} — **{row.Symbol.Fqn}** ({Format.KindWithAttrs(row.Symbol)}) at {Format.Location(row.Symbol.FilePath, row.Symbol.StartLine, row.Symbol.StartCol)}");
+                    var s = Format.OneLineSummary(row.Symbol.XmlSummary);
+                    if (!string.IsNullOrEmpty(s)) sb.Append(" — _" + s + "_");
+                    sb.AppendLine();
+                    var attrs = await host.Store.GetAttributesForSymbolAsync(row.Symbol.Id, ct).ConfigureAwait(false);
+                    var line = AttributeFormat.OneLine(attrs);
+                    if (line is not null) sb.AppendLine($"  - {line}");
+                }
+                return sb.ToString();
+            }, ct));
 
     [McpServerTool]
     [Description("Compute the transitive set of upstream callers for a symbol (impact of changing it). Walks the call graph backward up to maxDepth. Default kind=calls; pass kind=uses_type, overrides, implements_member, instantiates, throws, or all to traverse other edge layers.")]
     public static Task<string> ImpactOfChangeAsync(
-        IGraphStore store,
+        ScopeRouter router,
         [Description("Symbol name or FQN")] string symbol,
         [Description("Maximum traversal depth (default 4)")] int maxDepth = 4,
         [Description("Maximum results (default 100)")] int limit = 100,
         [Description("Edge kind to walk: calls (default) | uses_type | overrides | implements_member | instantiates | throws | all")] string? kind = null,
+        [Description(ScopeDescription)] string? scope = null,
         CancellationToken ct = default) =>
-        ToolMetrics.TrackAsync("impact_of_change", new { symbol, maxDepth, limit, kind }, async () =>
-        {
-            var (edgeKind, label, errorMsg) = ParseEdgeKind(kind);
-            if (errorMsg is not null) return errorMsg;
-
-            var hits = await store.FindSymbolsAsync(symbol, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
-            if (hits.Count == 0) return $"No symbol found for '{symbol}'.";
-            var top = hits[0];
-            var rows = await store.ImpactOfChangeAsync(top.Id, maxDepth, limit, edgeKind, ct).ConfigureAwait(false);
-            var sb = new StringBuilder();
-            sb.AppendLine($"Upstream impact of **{top.Fqn}** ({KindLabel(top.Kind)}) [kind={label}] up to depth {maxDepth}:");
-            if (rows.Count == 0) { sb.AppendLine("- (no upstream callers found in graph)"); return sb.ToString(); }
-            foreach (var r in rows)
+        ToolMetrics.TrackAsync("impact_of_change", new { symbol, maxDepth, limit, kind, scope }, () =>
+            ScopedExecution.RunAsync(router, scope, async host =>
             {
-                sb.AppendLine($"- d{r.Depth}: **{r.Symbol.Fqn}** ({KindLabel(r.Symbol.Kind)}) at {Format.Location(r.Symbol.FilePath, r.Symbol.StartLine, r.Symbol.StartCol)}");
-            }
-            return sb.ToString();
-        });
+                var (edgeKind, label, errorMsg) = ParseEdgeKind(kind);
+                if (errorMsg is not null) return errorMsg;
+
+                var hits = await host.Store.FindSymbolsAsync(symbol, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
+                if (hits.Count == 0) return $"No symbol found for '{symbol}'.";
+                var top = hits[0];
+                var rows = await host.Store.ImpactOfChangeAsync(top.Id, maxDepth, limit, edgeKind, ct).ConfigureAwait(false);
+                var sb = new StringBuilder();
+                sb.AppendLine($"Upstream impact of **{top.Fqn}** ({KindLabel(top.Kind)}) [kind={label}] up to depth {maxDepth}:");
+                if (rows.Count == 0) { sb.AppendLine("- (no upstream callers found in graph)"); return sb.ToString(); }
+                foreach (var r in rows)
+                {
+                    sb.AppendLine($"- d{r.Depth}: **{r.Symbol.Fqn}** ({KindLabel(r.Symbol.Kind)}) at {Format.Location(r.Symbol.FilePath, r.Symbol.StartLine, r.Symbol.StartCol)}");
+                }
+                return sb.ToString();
+            }, ct));
 
     [McpServerTool]
     [Description("List the direct members of a container (class, struct, interface, namespace) by FQN, optionally filtered by accessibility. Walks the populated container_id chain — replaces 'list_symbols_in_file then filter'.")]
     public static Task<string> ListMembersAsync(
-        IGraphStore store,
+        ScopeRouter router,
         [Description("Container FQN (e.g. 'Sample.Domain.Calculator', 'Sample.Domain'). Resolved with the same matching rules as find_definition; the top match is used.")] string container,
         [Description("Reserved for a future change that follows inherits/implements edges; currently ignored.")] bool includeInherited = false,
         [Description("Optional accessibility filter: public|internal|private|protected|protected internal|private protected.")] string? accessibility = null,
         [Description("Maximum members to return (default 200)")] int limit = 200,
+        [Description(ScopeDescription)] string? scope = null,
         CancellationToken ct = default) =>
-        ToolMetrics.TrackAsync("list_members", new { container, includeInherited, accessibility, limit }, async () =>
-        {
-            var hits = await store.FindSymbolsAsync(container, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
-            if (hits.Count == 0) return $"No symbol found for container '{container}'.";
-            var top = hits[0];
+        ToolMetrics.TrackAsync("list_members", new { container, includeInherited, accessibility, limit, scope }, () =>
+            ScopedExecution.RunAsync(router, scope, async host =>
+            {
+                var hits = await host.Store.FindSymbolsAsync(container, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
+                if (hits.Count == 0) return $"No symbol found for container '{container}'.";
+                var top = hits[0];
 
-            int? accFilter = ParseAccessibility(accessibility);
-            if (!string.IsNullOrEmpty(accessibility) && accFilter is null)
-            {
-                return $"Unknown accessibility '{accessibility}'. Valid: public, internal, private, protected, protected internal, private protected.";
-            }
+                int? accFilter = ParseAccessibility(accessibility);
+                if (!string.IsNullOrEmpty(accessibility) && accFilter is null)
+                {
+                    return $"Unknown accessibility '{accessibility}'. Valid: public, internal, private, protected, protected internal, private protected.";
+                }
 
-            var members = await store.ListMembersAsync(top.Id, accFilter, limit, ct).ConfigureAwait(false);
-            var sb = new StringBuilder();
-            var filterNote = accFilter is null ? "" : $" (accessibility = {accessibility})";
-            sb.AppendLine($"{members.Count} member(s) of **{top.Fqn}** ({Format.KindWithAttrs(top)}){filterNote}:");
-            if (includeInherited)
-            {
-                sb.AppendLine("_(includeInherited is reserved for a future change; only direct members are returned.)_");
-            }
-            if (members.Count == 0) { sb.AppendLine("- (none)"); return sb.ToString(); }
-            foreach (var m in members)
-            {
-                sb.Append($"- L{m.StartLine}: **{m.Name}** ({Format.KindWithAttrs(m)}) — `{m.Signature ?? m.Fqn}`");
-                var s = Format.OneLineSummary(m.XmlSummary);
-                if (!string.IsNullOrEmpty(s)) sb.Append(" — _" + s + "_");
-                sb.AppendLine();
-            }
-            return sb.ToString();
-        });
+                var members = await host.Store.ListMembersAsync(top.Id, accFilter, limit, ct).ConfigureAwait(false);
+                var sb = new StringBuilder();
+                var filterNote = accFilter is null ? "" : $" (accessibility = {accessibility})";
+                sb.AppendLine($"{members.Count} member(s) of **{top.Fqn}** ({Format.KindWithAttrs(top)}){filterNote}:");
+                if (includeInherited)
+                {
+                    sb.AppendLine("_(includeInherited is reserved for a future change; only direct members are returned.)_");
+                }
+                if (members.Count == 0) { sb.AppendLine("- (none)"); return sb.ToString(); }
+                foreach (var m in members)
+                {
+                    sb.Append($"- L{m.StartLine}: **{m.Name}** ({Format.KindWithAttrs(m)}) — `{m.Signature ?? m.Fqn}`");
+                    var s = Format.OneLineSummary(m.XmlSummary);
+                    if (!string.IsNullOrEmpty(s)) sb.Append(" — _" + s + "_");
+                    sb.AppendLine();
+                }
+                return sb.ToString();
+            }, ct));
 
     [McpServerTool]
     [Description("Semantic / intent search: encode a natural-language query, find symbols whose code embeddings are nearest by cosine similarity. Use for 'find code that does retry logic', 'how does this codebase handle authentication', 'show me the rate-limiting code'. Complements (not replaces) search_symbols, which does name-fragment FTS5 trigram matching. Returns a top-k list with location, kind, and a similarity score in [-1, 1].")]
     public static Task<string> SemanticSearchAsync(
-        IGraphStore store,
-        IEmbeddingsStore embeddingsStore,
+        ScopeRouter router,
         ICodeEmbeddingGenerator generator,
         [Description("Free-text intent query, e.g. 'retry on transient errors', 'masks PII in logs'")] string query,
         [Description("Top-K results to return (default 20)")] int k = 20,
         [Description("Optional kind filter: class|method|property|field|interface|namespace|...")] string? kind = null,
+        [Description(ScopeDescription)] string? scope = null,
         CancellationToken ct = default) =>
-        ToolMetrics.TrackAsync("semantic_search", new { query, k, kind }, async () =>
-        {
-            // Graceful disable: any of these conditions means the embedding pipeline isn't live
-            // (no model, missing extension, --no-embeddings). Hand back a hint instead of an error.
-            if (!embeddingsStore.IsAvailable || !generator.IsAvailable)
+        ToolMetrics.TrackAsync("semantic_search", new { query, k, kind, scope }, () =>
+            ScopedExecution.RunAsync(router, scope, async host =>
             {
-                return "semantic_search disabled: install the embedding model (run with the network on for first start) or remove `--no-embeddings`. The graph itself is fully indexed; other tools (`find_definition`, `search_symbols`, `list_callers`, …) work as normal.";
-            }
-            if (string.IsNullOrWhiteSpace(query))
-            {
-                return "semantic_search: provide a non-empty query.";
-            }
+                if (!host.EmbeddingsStore.IsAvailable || !generator.IsAvailable)
+                {
+                    return "semantic_search disabled: install the embedding model (run with the network on for first start) or remove `--no-embeddings`. The graph itself is fully indexed; other tools (`find_definition`, `search_symbols`, `list_callers`, …) work as normal.";
+                }
+                if (string.IsNullOrWhiteSpace(query))
+                {
+                    return "semantic_search: provide a non-empty query.";
+                }
 
-            SymbolKind? kindFilter = string.IsNullOrEmpty(kind)
-                ? null
-                : Enum.TryParse<SymbolKind>(kind, ignoreCase: true, out var kk) ? kk : null;
+                SymbolKind? kindFilter = string.IsNullOrEmpty(kind)
+                    ? null
+                    : Enum.TryParse<SymbolKind>(kind, ignoreCase: true, out var kk) ? kk : null;
 
-            var queryEmbeddings = await generator.EmbedAsync(new[] { query }, ct).ConfigureAwait(false);
-            if (queryEmbeddings.Count == 0)
-            {
-                return "semantic_search: encoder produced no vector for the query.";
-            }
+                var queryEmbeddings = await generator.EmbedAsync(new[] { query }, ct).ConfigureAwait(false);
+                if (queryEmbeddings.Count == 0)
+                {
+                    return "semantic_search: encoder produced no vector for the query.";
+                }
 
-            var hits = await embeddingsStore.SearchAsync(queryEmbeddings[0], k, kindFilter, ct).ConfigureAwait(false);
-            if (hits.Count == 0)
-            {
-                return $"No semantic matches for '{query}'. The graph may not have any embeddings yet — let the indexer's embedding pass complete after a fresh `index` and try again.";
-            }
+                var hits = await host.EmbeddingsStore.SearchAsync(queryEmbeddings[0], k, kindFilter, ct).ConfigureAwait(false);
+                if (hits.Count == 0)
+                {
+                    return $"No semantic matches for '{query}'. The graph may not have any embeddings yet — let the indexer's embedding pass complete after a fresh `index` and try again.";
+                }
 
-            var sb = new StringBuilder();
-            sb.AppendLine($"{hits.Count} semantic match(es) for '{query}':");
-            foreach (var h in hits)
-            {
-                var sym = await store.GetSymbolByIdAsync(h.SymbolId, ct).ConfigureAwait(false);
-                if (sym is null) continue;
-                sb.Append($"- score {h.Score:F3} — **{sym.Fqn}** ({Format.KindWithAttrs(sym)}) at {Format.Location(sym.FilePath, sym.StartLine, sym.StartCol)}");
-                var s = Format.OneLineSummary(sym.XmlSummary);
-                if (!string.IsNullOrEmpty(s)) sb.Append(" — _" + s + "_");
-                sb.AppendLine();
-            }
-            return sb.ToString();
-        });
+                var sb = new StringBuilder();
+                sb.AppendLine($"{hits.Count} semantic match(es) for '{query}':");
+                foreach (var h in hits)
+                {
+                    var sym = await host.Store.GetSymbolByIdAsync(h.SymbolId, ct).ConfigureAwait(false);
+                    if (sym is null) continue;
+                    sb.Append($"- score {h.Score:F3} — **{sym.Fqn}** ({Format.KindWithAttrs(sym)}) at {Format.Location(sym.FilePath, sym.StartLine, sym.StartCol)}");
+                    var s = Format.OneLineSummary(sym.XmlSummary);
+                    if (!string.IsNullOrEmpty(s)) sb.Append(" — _" + s + "_");
+                    sb.AppendLine();
+                }
+                return sb.ToString();
+            }, ct));
 
     [McpServerTool]
     [Description("Print summary counts (files, symbols, references, edges) for the current graph database. Use to confirm the index is populated.")]
-    public static Task<string> GraphStatsAsync(IGraphStore store, CancellationToken ct = default) =>
-        ToolMetrics.TrackAsync("graph_stats", null, async () =>
-        {
-            var s = await store.GetStatsAsync(ct).ConfigureAwait(false);
-            return $"files={s.FileCount} symbols={s.SymbolCount} references={s.ReferenceCount} edges={s.EdgeCount}";
-        });
+    public static Task<string> GraphStatsAsync(
+        ScopeRouter router,
+        [Description(ScopeDescription)] string? scope = null,
+        CancellationToken ct = default) =>
+        ToolMetrics.TrackAsync("graph_stats", new { scope }, () =>
+            ScopedExecution.RunAsync(router, scope, async host =>
+            {
+                var s = await host.Store.GetStatsAsync(ct).ConfigureAwait(false);
+                return $"files={s.FileCount} symbols={s.SymbolCount} references={s.ReferenceCount} edges={s.EdgeCount}";
+            }, ct));
 
     [McpServerTool]
     [Description("Find Roslyn diagnostics (analyzer warnings, compiler errors, etc.) captured during indexing. Filter by severity (default 'warning' = severity >= 2), diagnostic code (e.g. 'CS0618'), and/or symbol. Use for 'what does this codebase warn about?' or 'is X being warned on?'.")]
     public static Task<string> FindDiagnosticsAsync(
-        IGraphStore store,
+        ScopeRouter router,
         [Description("Severity floor: hidden | info | warning (default) | error | all. Numeric values 0-3 also accepted.")] string? severity = "warning",
         [Description("Optional diagnostic code filter, e.g. 'CS0618' for [Obsolete] usage")] string? code = null,
         [Description("Optional symbol name/FQN to scope the lookup to a single symbol's diagnostics")] string? symbol = null,
         [Description("Maximum rows to return (default 100)")] int limit = 100,
+        [Description(ScopeDescription)] string? scope = null,
         CancellationToken ct = default) =>
-        ToolMetrics.TrackAsync("find_diagnostics", new { severity, code, symbol, limit }, async () =>
-        {
-            var sev = ParseSeverity(severity);
-            if (sev == -1)
+        ToolMetrics.TrackAsync("find_diagnostics", new { severity, code, symbol, limit, scope }, () =>
+            ScopedExecution.RunAsync(router, scope, async host =>
             {
-                return $"Unknown severity '{severity}'. Expected one of: hidden | info | warning | error | all.";
-            }
+                var sev = ParseSeverity(severity);
+                if (sev == -1)
+                {
+                    return $"Unknown severity '{severity}'. Expected one of: hidden | info | warning | error | all.";
+                }
 
-            long? symbolId = null;
-            string? symbolFqn = null;
-            if (!string.IsNullOrWhiteSpace(symbol))
-            {
-                var hits = await store.FindSymbolsAsync(symbol, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
-                if (hits.Count == 0) return $"No symbol found for '{symbol}'.";
-                symbolId = hits[0].Id;
-                symbolFqn = hits[0].Fqn;
-            }
+                long? symbolId = null;
+                string? symbolFqn = null;
+                if (!string.IsNullOrWhiteSpace(symbol))
+                {
+                    var hits = await host.Store.FindSymbolsAsync(symbol, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
+                    if (hits.Count == 0) return $"No symbol found for '{symbol}'.";
+                    symbolId = hits[0].Id;
+                    symbolFqn = hits[0].Fqn;
+                }
 
-            var rows = await store.FindDiagnosticsAsync(sev, code, symbolId, limit, ct).ConfigureAwait(false);
-            var sb = new StringBuilder();
-            var sevLabel = sev is null ? "all" : $">= {SeverityLabel(sev.Value)}";
-            var codeClause = string.IsNullOrEmpty(code) ? "" : $", code={code}";
-            var symClause = symbolFqn is null ? "" : $", symbol={symbolFqn}";
-            sb.AppendLine($"Diagnostics (severity {sevLabel}{codeClause}{symClause}): {rows.Count}");
-            if (rows.Count == 0) return sb.ToString();
-            foreach (var d in rows)
-            {
-                sb.AppendLine($"- **{SeverityLabel(d.Severity)} {d.Code}** at {Format.Location(d.FilePath, d.Line, d.Col)} — {d.Message}");
-            }
-            return sb.ToString();
-        });
+                var rows = await host.Store.FindDiagnosticsAsync(sev, code, symbolId, limit, ct).ConfigureAwait(false);
+                var sb = new StringBuilder();
+                var sevLabel = sev is null ? "all" : $">= {SeverityLabel(sev.Value)}";
+                var codeClause = string.IsNullOrEmpty(code) ? "" : $", code={code}";
+                var symClause = symbolFqn is null ? "" : $", symbol={symbolFqn}";
+                sb.AppendLine($"Diagnostics (severity {sevLabel}{codeClause}{symClause}): {rows.Count}");
+                if (rows.Count == 0) return sb.ToString();
+                foreach (var d in rows)
+                {
+                    sb.AppendLine($"- **{SeverityLabel(d.Severity)} {d.Code}** at {Format.Location(d.FilePath, d.Line, d.Col)} — {d.Message}");
+                }
+                return sb.ToString();
+            }, ct));
 
     [McpServerTool]
     [Description("List every source-generated file (Roslyn IIncrementalGenerator output: regex source-gen, MVVM Toolkit, ASP.NET routing, JSON source-gen, etc.) tracked by the index. Each row shows the path and the count of symbols emitted from that file.")]
     public static Task<string> ListGeneratedFilesAsync(
-        IGraphStore store,
+        ScopeRouter router,
         [Description("Maximum rows (default 100)")] int limit = 100,
+        [Description(ScopeDescription)] string? scope = null,
         CancellationToken ct = default) =>
-        ToolMetrics.TrackAsync("list_generated_files", new { limit }, async () =>
-        {
-            var rows = await store.ListGeneratedFilesAsync(limit, ct).ConfigureAwait(false);
-            var sb = new StringBuilder();
-            sb.AppendLine($"Generated files: {rows.Count}");
-            if (rows.Count == 0)
+        ToolMetrics.TrackAsync("list_generated_files", new { limit, scope }, () =>
+            ScopedExecution.RunAsync(router, scope, async host =>
             {
-                sb.AppendLine("_(no source-generated documents in this solution)_");
+                var rows = await host.Store.ListGeneratedFilesAsync(limit, ct).ConfigureAwait(false);
+                var sb = new StringBuilder();
+                sb.AppendLine($"Generated files: {rows.Count}");
+                if (rows.Count == 0)
+                {
+                    sb.AppendLine("_(no source-generated documents in this solution)_");
+                    return sb.ToString();
+                }
+                sb.AppendLine();
+                sb.AppendLine("| Symbols | Path |");
+                sb.AppendLine("|--------:|------|");
+                foreach (var r in rows)
+                {
+                    sb.AppendLine($"| {r.SymbolCount} | `{r.FilePath}` |");
+                }
                 return sb.ToString();
-            }
-            sb.AppendLine();
-            sb.AppendLine("| Symbols | Path |");
-            sb.AppendLine("|--------:|------|");
-            foreach (var r in rows)
-            {
-                sb.AppendLine($"| {r.SymbolCount} | `{r.FilePath}` |");
-            }
-            return sb.ToString();
-        });
+            }, ct));
 
     [McpServerTool]
     [Description("Show how often each MCP tool was called this server-process session: count, errors, avg/max latency, avg response size, last-called time. Use this to verify the agent is actually using the source-graph tools (vs grep+read fallback). Persistent log of every call is at usage.jsonl next to graph.db.")]
@@ -560,6 +596,21 @@ public static class GraphTools
                 var lastAgo = (DateTimeOffset.UtcNow - s.LastCalledAt).TotalSeconds;
                 sb.AppendLine($"| `{name}` | {s.Count} | {s.Errors} | {s.AvgMs:F1} | {s.MaxMs} | {(int)s.AvgResponseLen}B | {lastAgo:F0}s ago |");
             }
+
+            // Per-scope breakdown: surface which scopes account for the lion's share of tool calls
+            // so the agent can see where the index is actually being exercised.
+            var scopeSnap = ToolMetrics.ScopeSnapshot();
+            if (scopeSnap.Count > 0)
+            {
+                sb.AppendLine();
+                sb.AppendLine("| Scope | Calls |");
+                sb.AppendLine("|-------|------:|");
+                foreach (var (scopeName, count) in scopeSnap.OrderByDescending(kv => kv.Value))
+                {
+                    sb.AppendLine($"| `{scopeName}` | {count} |");
+                }
+            }
+
             if (!string.IsNullOrEmpty(ToolMetrics.LogPath))
             {
                 sb.AppendLine();
