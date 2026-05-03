@@ -1,13 +1,14 @@
+using DevBitsLab.Mcp.SourceGraph.Core;
 using DevBitsLab.Mcp.SourceGraph.Embeddings;
 using DevBitsLab.Mcp.SourceGraph.Indexing;
 using DevBitsLab.Mcp.SourceGraph.Server;
 using DevBitsLab.Mcp.SourceGraph.Server.Cli;
 using DevBitsLab.Mcp.SourceGraph.Server.Observability;
+using DevBitsLab.Mcp.SourceGraph.Server.Scoping;
 using DevBitsLab.Mcp.SourceGraph.Storage;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.Logging.Abstractions;
 
 CommandLine cli;
 try
@@ -34,6 +35,8 @@ return cli.Subcommand switch
     "index" => await RunIndexAsync(cli).ConfigureAwait(false),
     "stats" => await RunStatsAsync(cli).ConfigureAwait(false),
     "clear" => await RunClearAsync(cli).ConfigureAwait(false),
+    "init-scopes" => await ScopesCli.RunInitAsync(cli).ConfigureAwait(false),
+    "scopes" => await ScopesCli.RunSubcommandAsync(cli).ConfigureAwait(false),
     _ => Unknown(cli.Subcommand),
 };
 
@@ -50,8 +53,49 @@ static async Task<int> RunServeAsync(CommandLine cli)
     var builder = Host.CreateApplicationBuilder();
     builder.Logging.AddConsole(o => o.LogToStandardErrorThreshold = LogLevel.Trace);
 
-    var dbPath = cli.ResolvedDbPath();
-    var dbDir = Path.GetDirectoryName(dbPath) ?? Path.GetTempPath();
+    var repoRoot = cli.ResolvedRepoRoot();
+
+    // One-shot migration of the legacy `.sourcegraph/graph.db` to `.sourcegraph/scopes/default.db`.
+    // Runs before scope wiring so the synthesised default scope picks up the moved DB.
+    try
+    {
+        if (ScopeLayout.MigrateLegacyDb(repoRoot))
+        {
+            Console.Error.WriteLine($"[sourcegraph-mcp] migrated legacy {ScopeLayout.LegacyDbName} to scopes/default.db");
+        }
+    }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLineAsync($"[sourcegraph-mcp] legacy DB migration skipped: {ex.Message}").GetAwaiter().GetResult();
+    }
+
+    // Resolve the scope configuration. With --solution we synthesise a single scope so existing
+    // single-solution users keep working without a .sourcegraph.json. Without --solution we read
+    // .sourcegraph.json or fall back to a synthesised single-scope rooted at the repo.
+    ScopeConfig scopeConfig;
+    try
+    {
+        if (!string.IsNullOrEmpty(cli.SolutionPath))
+        {
+            // --solution overrides .sourcegraph.json: register an implicit single-scope `default`.
+            scopeConfig = ScopeConfigLoader.Synthesise(repoRoot, new[] { Path.GetFullPath(cli.SolutionPath) });
+        }
+        else
+        {
+            scopeConfig = ScopeConfigLoader.Load(repoRoot);
+            // When no .sourcegraph.json and no --solution, the synthesised default has no
+            // solutions list. That's fine — the indexer simply won't open a workspace and queries
+            // run against whatever's already in the DB.
+        }
+    }
+    catch (ScopeConfigException ex)
+    {
+        await Console.Error.WriteLineAsync($"[sourcegraph-mcp] {ex.Message}").ConfigureAwait(false);
+        return 2;
+    }
+
+    var dbDir = ScopeLayout.SourcegraphDir(repoRoot);
+    Directory.CreateDirectory(dbDir);
     ToolMetrics.Configure(Path.Combine(dbDir, "usage.jsonl"));
 
     var embeddingsEnabled = !cli.NoEmbeddings;
@@ -60,34 +104,11 @@ static async Task<int> RunServeAsync(CommandLine cli)
     // embeddings later will populate it without a schema rebuild.
     var modelInfo = new EmbeddingModelInfo(cli.Model ?? DefaultEmbeddingModel.ModelId, DefaultEmbeddingModel.Dimension);
 
-    builder.Services.AddSingleton<SqliteGraphStore>(sp =>
-    {
-        var store = new SqliteGraphStore(dbPath, sp.GetRequiredService<ILogger<SqliteGraphStore>>());
-        // Load the extension regardless of --no-embeddings so the schema can stand up the
-        // empty vec0 table — agents can ask semantic_search later without re-running migrate.
-        store.TryLoadVectorExtension(modelInfo.Dimension);
-        return store;
-    });
-    builder.Services.AddSingleton<IGraphStore>(sp => sp.GetRequiredService<SqliteGraphStore>());
-    builder.Services.AddSingleton<IEmbeddingsStore>(sp =>
-    {
-        var store = sp.GetRequiredService<SqliteGraphStore>();
-        return store.CreateEmbeddingsStore(modelInfo.Dimension, sp.GetRequiredService<ILogger<SqliteEmbeddingsStore>>());
-    });
-
-    // Always register the model identity so the semantic_search tool has a single source of
-    // truth for the active dimension. When --no-embeddings is set we skip the generator / sink /
-    // hosted-service wiring, but still register a disabled-only stand-in for ICodeEmbeddingGenerator
-    // so the tool DI resolution stays uniform.
     builder.Services.AddSingleton(modelInfo);
     builder.Services.AddSingleton<ModelStore>(sp => new ModelStore(sp.GetRequiredService<ILogger<ModelStore>>()));
 
     if (embeddingsEnabled)
     {
-        // Resolve model paths and build the generator. If the cache is empty we DO NOT block
-        // startup waiting for a download; the worker logs a warning and stays idle until the
-        // user runs the bootstrap (or downloads the files manually). Letting startup proceed
-        // is the right trade-off for the "model not yet downloaded" graceful-disable scenario.
         builder.Services.AddSingleton<ICodeEmbeddingGenerator>(sp =>
         {
             var ms = sp.GetRequiredService<ModelStore>();
@@ -107,33 +128,30 @@ static async Task<int> RunServeAsync(CommandLine cli)
         builder.Services.AddSingleton<IEmbeddingsRequestSink>(new NoOpEmbeddingsRequestSink());
     }
 
-    // History (git-blame) pipeline. Disabled when --no-history was passed, when no solution is
-    // loaded, or when the solution doesn't sit in a git working tree. The HistoryHostedService
-    // drains the queue regardless, so the indexer's OnFileIndexed callback never blocks producers
-    // even when the pipeline is disabled.
+    // Scope registry (lives in `_meta.db`). Wired up first so list_scopes can reflect the
+    // pre-scope-host status while initial indexing is still running.
+    builder.Services.AddSingleton<IScopeRegistry>(sp =>
+        new SqliteScopeRegistry(ScopeLayout.MetaDbPath(repoRoot),
+            sp.GetRequiredService<ILogger<SqliteScopeRegistry>>()));
+
+    var router = new ScopeRouter();
+    router.SetDefaultScope(scopeConfig.DefaultScope);
+    builder.Services.AddSingleton(router);
+
+    // History (git-blame) pipeline. Now multi-scope-aware via the router.
     builder.Services.AddSingleton<HistoryQueue>();
     builder.Services.AddSingleton(sp => new GitBlameRunner(sp.GetService<ILogger<GitBlameRunner>>()));
 
-    var solutionFull = string.IsNullOrEmpty(cli.SolutionPath) ? null : Path.GetFullPath(cli.SolutionPath);
-    var historyDisabled = await ResolveHistoryDisabledAsync(cli, solutionFull).ConfigureAwait(false);
+    var historyDisabled = await ResolveHistoryDisabledForScopesAsync(cli, scopeConfig).ConfigureAwait(false);
     builder.Services.AddSingleton(new HistoryOptions(historyDisabled));
 
-    builder.Services.AddSingleton(sp =>
-    {
-        var indexer = new RoslynIndexer(
-            sp.GetRequiredService<IGraphStore>(),
-            sp.GetRequiredService<ILogger<RoslynIndexer>>(),
-            sp.GetRequiredService<IEmbeddingsRequestSink>());
-        if (!historyDisabled)
-        {
-            var queue = sp.GetRequiredService<HistoryQueue>();
-            indexer.OnFileIndexed = (fileId, path, sha) =>
-                queue.Writer.WriteAsync(new HistoryRequest(fileId, path, sha)).AsTask();
-        }
-        return indexer;
-    });
-    builder.Services.AddSingleton(new LiveIndexOptions(SolutionPath: solutionFull));
-    builder.Services.AddHostedService<HistoryHostedService>();
+    builder.Services.AddSingleton(new LiveIndexConfig(scopeConfig.Scopes));
+    builder.Services.AddHostedService<HistoryHostedService>(sp => new HistoryHostedService(
+        sp.GetRequiredService<HistoryQueue>(),
+        sp.GetRequiredService<ScopeRouter>(),
+        sp.GetRequiredService<GitBlameRunner>(),
+        sp.GetRequiredService<HistoryOptions>(),
+        sp.GetRequiredService<ILogger<HistoryHostedService>>()));
     builder.Services.AddHostedService<LiveIndexService>();
 
     builder.Services
@@ -170,6 +188,14 @@ static async Task<int> RunIndexAsync(CommandLine cli)
         });
     });
 
+    // Migrate the legacy graph.db on the one-shot path too, so later `serve` runs see the moved
+    // file. Only when the user pointed at a solution (we know the repo root then).
+    var solutionDir = Path.GetDirectoryName(solutionFull) ?? "";
+    if (!string.IsNullOrEmpty(solutionDir))
+    {
+        try { ScopeLayout.MigrateLegacyDb(solutionDir); } catch { /* best-effort */ }
+    }
+
     await using var store = new SqliteGraphStore(cli.ResolvedDbPath(), loggerFactory.CreateLogger<SqliteGraphStore>());
 
     // Load the vec0 extension regardless of --no-embeddings so the schema can stand up an
@@ -181,8 +207,6 @@ static async Task<int> RunIndexAsync(CommandLine cli)
     await store.EnsureSchemaAsync().ConfigureAwait(false);
 
     // For one-shot index runs we register the embedding pipeline only when the user opts in.
-    // The hosted-service path (serve) does the same gating; here we follow the simpler shape
-    // because there's no host to manage.
     IEmbeddingsRequestSink sink = new NoOpEmbeddingsRequestSink();
     Task? embedDrain = null;
     ChannelEmbeddingsRequestSink? channelSink = null;
@@ -204,9 +228,6 @@ static async Task<int> RunIndexAsync(CommandLine cli)
         embedDrain = embedService.StartAsync(CancellationToken.None);
     }
 
-    // History pipeline (git blame) — disabled when --no-history is set, no solution to scope
-    // against, or git isn't available on PATH. The pipeline drains the channel either way; we
-    // just don't enqueue when it would do nothing useful.
     var historyDisabled = await ResolveHistoryDisabledAsync(cli, solutionFull).ConfigureAwait(false);
     var historyQueue = new HistoryQueue();
     var blamer = new GitBlameRunner(loggerFactory.CreateLogger<GitBlameRunner>());
@@ -218,18 +239,16 @@ static async Task<int> RunIndexAsync(CommandLine cli)
     if (!historyDisabled)
     {
         indexer.OnFileIndexed = (fileId, path, sha) =>
-            historyQueue.Writer.WriteAsync(new HistoryRequest(fileId, path, sha)).AsTask();
+            historyQueue.Writer.WriteAsync(new HistoryRequest(fileId, path, sha, "default")).AsTask();
     }
     await indexer.OpenAsync(solutionFull).ConfigureAwait(false);
     var result = await indexer.IndexAllAsync().ConfigureAwait(false);
 
-    // Drain the history channel so the pipeline finishes before we exit.
     historyQueue.Writer.Complete();
     await historyTask.ConfigureAwait(false);
 
     if (embedService is not null)
     {
-        // Give the worker a chance to drain the queue before exiting.
         channelSink!.Complete();
         using var stopCts = new CancellationTokenSource(TimeSpan.FromSeconds(60));
         try { await embedService.StopAsync(stopCts.Token).ConfigureAwait(false); } catch { /* best-effort drain */ }
@@ -245,8 +264,6 @@ static async Task<int> RunIndexAsync(CommandLine cli)
 
 /// <summary>
 /// Run the history pipeline as a single async loop without the BackgroundService scaffolding.
-/// Used by the one-shot <c>index</c> command where we want the pipeline to drain naturally on
-/// channel close without StopAsync's stoppingToken cancellation racing the drain.
 /// </summary>
 static async Task RunHistoryPipelineAsync(
     HistoryQueue queue,
@@ -254,9 +271,6 @@ static async Task RunHistoryPipelineAsync(
     GitBlameRunner blamer,
     ILogger<HistoryHostedService> logger)
 {
-    // Drive the same processing as the hosted service but via an explicit task we own. This
-    // avoids the BackgroundService.StopAsync race where the stopping token cancels the loop
-    // before it drains. The consumer exits naturally once queue.Writer.Complete() is called.
     var svc = new HistoryHostedService(
         queue, store, blamer, new HistoryOptions(false), logger);
     var runner = svc.ExecuteAsyncForOneShot(CancellationToken.None);
@@ -264,11 +278,32 @@ static async Task RunHistoryPipelineAsync(
 }
 
 /// <summary>
-/// Decide whether the git-blame pipeline should run. Disabled when <c>--no-history</c> is set,
-/// when no solution is loaded (we can't determine a working tree), or when the solution's
-/// directory isn't a git working tree (probed once via <c>git rev-parse --is-inside-work-tree</c>).
+/// Decide whether the git-blame pipeline should run for the multi-scope `serve` path. Disabled
+/// when <c>--no-history</c> is set, or when none of the configured scopes resolves to a git
+/// working tree.
 /// </summary>
-static async Task<bool> ResolveHistoryDisabledAsync(CommandLine cli, string? solutionFull)
+static async Task<bool> ResolveHistoryDisabledForScopesAsync(CommandLine cli, ScopeConfig config)
+{
+    if (cli.NoHistory) return true;
+    foreach (var scope in config.Scopes)
+    {
+        var solutionDir = scope.ProjectSet is ScopeProjectSet.Solutions s && s.Items.Count > 0
+            ? Path.GetDirectoryName(Path.IsPathRooted(s.Items[0]) ? s.Items[0] : Path.Combine(scope.Root, s.Items[0]))
+            : scope.Root;
+        if (string.IsNullOrEmpty(solutionDir)) continue;
+        var probe = new GitBlameRunner();
+        if (await probe.IsGitWorkingTreeAsync(solutionDir).ConfigureAwait(false))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// <summary>
+/// Single-solution overload used by the one-shot <c>index</c> command.
+/// </summary>
+static async Task<bool> ResolveHistoryDisabledAsync(CommandLine cli, string solutionFull)
 {
     if (cli.NoHistory) return true;
     if (string.IsNullOrEmpty(solutionFull)) return true;

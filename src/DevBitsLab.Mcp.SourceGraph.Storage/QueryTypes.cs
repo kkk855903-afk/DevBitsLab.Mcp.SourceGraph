@@ -17,7 +17,9 @@ public sealed record SymbolHit(
     int Accessibility = 0,
     string? XmlSummary = null,
     bool IsGenerated = false,
-    string? TestFramework = null);
+    string? TestFramework = null,
+    /// <summary>Roslyn DocumentationCommentId; identifies the same symbol across scope DBs.</summary>
+    string? CanonicalKey = null);
 
 public sealed record ReferenceHit(
     long Id,

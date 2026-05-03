@@ -421,7 +421,7 @@ public sealed class SqliteGraphStore : IGraphStore
         const string sql = """
             WITH ranked AS (
                 SELECT s.id, s.name, s.fqn, s.kind, f.path, s.start_line, s.start_col, s.end_line, s.end_col, s.signature,
-                    s.modifiers, s.accessibility, s.xml_summary, f.is_generated, s.test_framework,
+                    s.modifiers, s.accessibility, s.xml_summary, f.is_generated, s.test_framework, s.canonical_key,
                     CASE
                         WHEN s.name = @q THEN 1
                         WHEN s.fqn  = @q THEN 2
@@ -444,7 +444,8 @@ public sealed class SqliteGraphStore : IGraphStore
             SELECT id, name, fqn, kind, path AS FilePath, start_line AS StartLine, start_col AS StartCol,
                    end_line AS EndLine, end_col AS EndCol, signature,
                    modifiers AS Modifiers, accessibility AS Accessibility, xml_summary AS XmlSummary,
-                   is_generated AS IsGenerated, test_framework AS TestFramework
+                   is_generated AS IsGenerated, test_framework AS TestFramework,
+                   canonical_key AS CanonicalKey
             FROM ranked
             ORDER BY rank, length(fqn), fqn
             LIMIT @limit;
@@ -486,7 +487,8 @@ public sealed class SqliteGraphStore : IGraphStore
             SELECT s.id, s.name, s.fqn, s.kind, f.path AS FilePath, s.start_line AS StartLine, s.start_col AS StartCol,
                    s.end_line AS EndLine, s.end_col AS EndCol, s.signature,
                    s.modifiers AS Modifiers, s.accessibility AS Accessibility, s.xml_summary AS XmlSummary,
-                   f.is_generated AS IsGenerated, s.test_framework AS TestFramework
+                   f.is_generated AS IsGenerated, s.test_framework AS TestFramework,
+                   s.canonical_key AS CanonicalKey
             FROM symbols_fts t
             JOIN symbols s ON s.id = t.rowid
             JOIN files   f ON f.id = s.file_id
@@ -507,6 +509,7 @@ public sealed class SqliteGraphStore : IGraphStore
                    s.end_line AS EndLine, s.end_col AS EndCol, s.signature,
                    s.modifiers AS Modifiers, s.accessibility AS Accessibility, s.xml_summary AS XmlSummary,
                    f.is_generated AS IsGenerated, s.test_framework AS TestFramework,
+                   s.canonical_key AS CanonicalKey,
                    COALESCE((SELECT COUNT(*) FROM edges e WHERE e.dst = s.id AND e.kind = 0), 0) AS InDegree
             FROM symbols s
             JOIN files f ON f.id = s.file_id
@@ -540,6 +543,7 @@ public sealed class SqliteGraphStore : IGraphStore
                    s.end_line AS EndLine, s.end_col AS EndCol, s.signature,
                    s.modifiers AS Modifiers, s.accessibility AS Accessibility, s.xml_summary AS XmlSummary,
                    f.is_generated AS IsGenerated, s.test_framework AS TestFramework,
+                   s.canonical_key AS CanonicalKey,
                    MIN(u.depth) AS Depth
             FROM upstream u
             JOIN symbols s ON s.id = u.id
@@ -562,7 +566,8 @@ public sealed class SqliteGraphStore : IGraphStore
             SELECT s.id, s.name, s.fqn, s.kind, f.path AS FilePath, s.start_line AS StartLine, s.start_col AS StartCol,
                    s.end_line AS EndLine, s.end_col AS EndCol, s.signature,
                    s.modifiers AS Modifiers, s.accessibility AS Accessibility, s.xml_summary AS XmlSummary,
-                   f.is_generated AS IsGenerated, s.test_framework AS TestFramework
+                   f.is_generated AS IsGenerated, s.test_framework AS TestFramework,
+                   s.canonical_key AS CanonicalKey
             FROM symbols s
             JOIN files   f ON f.id = s.file_id
             WHERE s.container_id = @id
@@ -577,20 +582,22 @@ public sealed class SqliteGraphStore : IGraphStore
 
     private sealed record RawModuleSymbol(long Id, string Name, string Fqn, long Kind, string FilePath,
         long StartLine, long StartCol, long EndLine, long EndCol, string? Signature,
-        string? Modifiers, long Accessibility, string? XmlSummary, long IsGenerated, string? TestFramework, long InDegree)
+        string? Modifiers, long Accessibility, string? XmlSummary, long IsGenerated, string? TestFramework,
+        string? CanonicalKey, long InDegree)
     {
         public SymbolHit ToHit() => new(Id, Name, Fqn, (Core.SymbolKind)Kind, FilePath,
             (int)StartLine, (int)StartCol, (int)EndLine, (int)EndCol, Signature,
-            Modifiers, (int)Accessibility, XmlSummary, IsGenerated != 0, TestFramework);
+            Modifiers, (int)Accessibility, XmlSummary, IsGenerated != 0, TestFramework, CanonicalKey);
     }
 
     private sealed record RawImpactedSymbol(long Id, string Name, string Fqn, long Kind, string FilePath,
         long StartLine, long StartCol, long EndLine, long EndCol, string? Signature,
-        string? Modifiers, long Accessibility, string? XmlSummary, long IsGenerated, string? TestFramework, long Depth)
+        string? Modifiers, long Accessibility, string? XmlSummary, long IsGenerated, string? TestFramework,
+        string? CanonicalKey, long Depth)
     {
         public SymbolHit ToHit() => new(Id, Name, Fqn, (Core.SymbolKind)Kind, FilePath,
             (int)StartLine, (int)StartCol, (int)EndLine, (int)EndCol, Signature,
-            Modifiers, (int)Accessibility, XmlSummary, IsGenerated != 0, TestFramework);
+            Modifiers, (int)Accessibility, XmlSummary, IsGenerated != 0, TestFramework, CanonicalKey);
     }
 
     public async Task<IReadOnlyList<SymbolHit>> ListCallersAsync(long symbolId, int limit = 50, EdgeKind? edgeKind = EdgeKind.Calls, CancellationToken ct = default)
@@ -601,7 +608,8 @@ public sealed class SqliteGraphStore : IGraphStore
             SELECT s.id, s.name, s.fqn, s.kind, f.path AS FilePath, s.start_line AS StartLine, s.start_col AS StartCol,
                    s.end_line AS EndLine, s.end_col AS EndCol, s.signature,
                    s.modifiers AS Modifiers, s.accessibility AS Accessibility, s.xml_summary AS XmlSummary,
-                   f.is_generated AS IsGenerated, s.test_framework AS TestFramework
+                   f.is_generated AS IsGenerated, s.test_framework AS TestFramework,
+                   s.canonical_key AS CanonicalKey
             FROM edges e
             JOIN symbols s ON s.id = e.src
             JOIN files   f ON f.id = s.file_id
@@ -621,7 +629,8 @@ public sealed class SqliteGraphStore : IGraphStore
             SELECT s.id, s.name, s.fqn, s.kind, f.path AS FilePath, s.start_line AS StartLine, s.start_col AS StartCol,
                    s.end_line AS EndLine, s.end_col AS EndCol, s.signature,
                    s.modifiers AS Modifiers, s.accessibility AS Accessibility, s.xml_summary AS XmlSummary,
-                   f.is_generated AS IsGenerated, s.test_framework AS TestFramework
+                   f.is_generated AS IsGenerated, s.test_framework AS TestFramework,
+                   s.canonical_key AS CanonicalKey
             FROM edges e
             JOIN symbols s ON s.id = e.dst
             JOIN files   f ON f.id = s.file_id
@@ -646,7 +655,8 @@ public sealed class SqliteGraphStore : IGraphStore
             SELECT s.id, s.name, s.fqn, s.kind, f.path AS FilePath, s.start_line AS StartLine, s.start_col AS StartCol,
                    s.end_line AS EndLine, s.end_col AS EndCol, s.signature,
                    s.modifiers AS Modifiers, s.accessibility AS Accessibility, s.xml_summary AS XmlSummary,
-                   f.is_generated AS IsGenerated, s.test_framework AS TestFramework
+                   f.is_generated AS IsGenerated, s.test_framework AS TestFramework,
+                   s.canonical_key AS CanonicalKey
             FROM symbols s
             JOIN files   f ON f.id = s.file_id
             WHERE s.id = @id;
@@ -662,7 +672,8 @@ public sealed class SqliteGraphStore : IGraphStore
             SELECT s.id, s.name, s.fqn, s.kind, f.path AS FilePath, s.start_line AS StartLine, s.start_col AS StartCol,
                    s.end_line AS EndLine, s.end_col AS EndCol, s.signature,
                    s.modifiers AS Modifiers, s.accessibility AS Accessibility, s.xml_summary AS XmlSummary,
-                   f.is_generated AS IsGenerated, s.test_framework AS TestFramework
+                   f.is_generated AS IsGenerated, s.test_framework AS TestFramework,
+                   s.canonical_key AS CanonicalKey
             FROM symbols s
             JOIN files f ON f.id = s.file_id
             WHERE f.path = @path OR f.path LIKE '%' || @path
@@ -675,12 +686,13 @@ public sealed class SqliteGraphStore : IGraphStore
 
     private sealed record RawSymbolHit(long Id, string Name, string Fqn, long Kind, string FilePath,
         long StartLine, long StartCol, long EndLine, long EndCol, string? Signature,
-        string? Modifiers, long Accessibility, string? XmlSummary, long IsGenerated, string? TestFramework)
+        string? Modifiers, long Accessibility, string? XmlSummary, long IsGenerated, string? TestFramework,
+        string? CanonicalKey = null)
     {
         public SymbolHit ToHit() => new(
             Id, Name, Fqn, (Core.SymbolKind)Kind, FilePath,
             (int)StartLine, (int)StartCol, (int)EndLine, (int)EndCol, Signature,
-            Modifiers, (int)Accessibility, XmlSummary, IsGenerated != 0, TestFramework);
+            Modifiers, (int)Accessibility, XmlSummary, IsGenerated != 0, TestFramework, CanonicalKey);
     }
 
     private sealed record RawReferenceHit(long Id, long SymbolId, string FilePath, long Line, long Col, long Kind, long IsGenerated)
@@ -755,7 +767,8 @@ public sealed class SqliteGraphStore : IGraphStore
             SELECT s.id, s.name, s.fqn, s.kind, f.path AS FilePath, s.start_line AS StartLine, s.start_col AS StartCol,
                    s.end_line AS EndLine, s.end_col AS EndCol, s.signature,
                    s.modifiers AS Modifiers, s.accessibility AS Accessibility, s.xml_summary AS XmlSummary,
-                   f.is_generated AS IsGenerated, s.test_framework AS TestFramework
+                   f.is_generated AS IsGenerated, s.test_framework AS TestFramework,
+                   s.canonical_key AS CanonicalKey
             FROM attributes a
             JOIN symbols s ON s.id = a.symbol_id
             JOIN files   f ON f.id = s.file_id
@@ -979,6 +992,7 @@ public sealed class SqliteGraphStore : IGraphStore
                    s.end_line AS EndLine, s.end_col AS EndCol, s.signature,
                    s.modifiers AS Modifiers, s.accessibility AS Accessibility, s.xml_summary AS XmlSummary,
                    f.is_generated AS IsGenerated, s.test_framework AS TestFramework,
+                   s.canonical_key AS CanonicalKey,
                    h.last_commit_sha    AS LastCommitSha,
                    h.last_author        AS LastAuthor,
                    h.last_authored_at   AS LastAuthoredAtMs,
@@ -1019,7 +1033,8 @@ public sealed class SqliteGraphStore : IGraphStore
             SELECT s.id, s.name, s.fqn, s.kind, f.path AS FilePath, s.start_line AS StartLine, s.start_col AS StartCol,
                    s.end_line AS EndLine, s.end_col AS EndCol, s.signature,
                    s.modifiers AS Modifiers, s.accessibility AS Accessibility, s.xml_summary AS XmlSummary,
-                   f.is_generated AS IsGenerated, s.test_framework AS TestFramework
+                   f.is_generated AS IsGenerated, s.test_framework AS TestFramework,
+                   s.canonical_key AS CanonicalKey
             FROM edges e
             JOIN symbols s ON s.id = e.src
             JOIN files   f ON f.id = s.file_id
@@ -1051,11 +1066,12 @@ public sealed class SqliteGraphStore : IGraphStore
     private sealed record RawRecentChange(long Id, string Name, string Fqn, long Kind, string FilePath,
         long StartLine, long StartCol, long EndLine, long EndCol, string? Signature,
         string? Modifiers, long Accessibility, string? XmlSummary, long IsGenerated, string? TestFramework,
+        string? CanonicalKey,
         string? LastCommitSha, string? LastAuthor, long? LastAuthoredAtMs, long LineCount, byte[]? BlamedContentSha)
     {
         public SymbolHit ToHit() => new(Id, Name, Fqn, (Core.SymbolKind)Kind, FilePath,
             (int)StartLine, (int)StartCol, (int)EndLine, (int)EndCol, Signature,
-            Modifiers, (int)Accessibility, XmlSummary, IsGenerated != 0, TestFramework);
+            Modifiers, (int)Accessibility, XmlSummary, IsGenerated != 0, TestFramework, CanonicalKey);
         public SymbolHistory ToHistory() => new(
             Id, LastCommitSha, LastAuthor,
             LastAuthoredAtMs is null ? null : DateTimeOffset.FromUnixTimeMilliseconds(LastAuthoredAtMs.Value),

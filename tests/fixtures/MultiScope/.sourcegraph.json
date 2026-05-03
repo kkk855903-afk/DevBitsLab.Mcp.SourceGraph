@@ -1,0 +1,7 @@
+{
+  "scopes": [
+    { "name": "frontend", "solutions": ["frontend.sln"] },
+    { "name": "backend",  "solutions": ["backend.sln"] }
+  ],
+  "default_scope": "backend"
+}

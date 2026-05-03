@@ -35,6 +35,41 @@ or `search_symbols` next time.
 A persistent JSONL log of every tool call lives at
 `<solution>/.sourcegraph/usage.jsonl` for offline analysis.
 
+## Scopes (multi-solution monorepos)
+
+A `.sourcegraph.json` at the repo root opts a project into multi-scope mode:
+
+```json
+{
+  "scopes": [
+    { "name": "frontend", "solutions": ["src/frontend.slnx"] },
+    { "name": "backend",  "solutions": ["src/backend.slnx"], "exclude": ["**/Generated/**"] },
+    { "name": "vendor",   "paths": ["third_party/**/*.csproj"], "isolated": true }
+  ],
+  "default_scope": "backend"
+}
+```
+
+Each scope owns its own SQLite DB at `.sourcegraph/scopes/<id>.db`; a separate
+`_meta.db` registry tracks status (`ok | degraded | indexing`) and last-indexed
+time. An `isolated` scope is excluded from `scope = "*"` fan-out — useful for
+vendored / generated code that shouldn't pollute `find_references` on production.
+
+Every existing tool gains an optional `scope` parameter (string id, comma-separated
+list, or `"*"`). Call `list_scopes` to discover the configured scopes. Without a
+`.sourcegraph.json` and without `--solution`, a synthesised `default` scope keeps
+single-solution users working unchanged.
+
+CLI helpers:
+
+- `sourcegraph-mcp init-scopes` — scaffold a `.sourcegraph.json` from the .slnx
+  files at the repo root.
+- `sourcegraph-mcp scopes list` / `add <name> --solution <path>` / `remove <name>`.
+
+The legacy single-DB layout (`.sourcegraph/graph.db`) is migrated automatically
+on first start of the new server — the file is renamed into `scopes/default.db`
+and the synthesised default scope picks it up.
+
 ## Project-scoped MCP config
 
 `.mcp.json` at the repo root registers the `sourcegraph` server automatically when
@@ -96,11 +131,12 @@ the client is also resolved by the server against the process env, so paths like
 
 ## Project layout
 
-- `src/DevBitsLab.Mcp.SourceGraph.Core/` — domain types
-- `src/DevBitsLab.Mcp.SourceGraph.Storage/` — SQLite graph store + FTS5
+- `src/DevBitsLab.Mcp.SourceGraph.Core/` — domain types (Scope, ScopeProjectSet, ScopeIdValidator)
+- `src/DevBitsLab.Mcp.SourceGraph.Storage/` — SQLite graph store + FTS5; per-scope `IGraphStore` factory + `IScopeRegistry`; `ScopeConfigLoader`
 - `src/DevBitsLab.Mcp.SourceGraph.Indexing/` — Roslyn workspace + indexer
 - `src/DevBitsLab.Mcp.SourceGraph.Watcher/` — file + git HEAD watcher
-- `src/DevBitsLab.Mcp.SourceGraph.Server/` — stdio MCP host + CLI
-- `tests/fixtures/Sample.sln` — fixture solution for smoke tests
+- `src/DevBitsLab.Mcp.SourceGraph.Server/` — stdio MCP host + CLI; `Scoping/` (router + per-scope hosts)
+- `tests/fixtures/Sample.sln` — single-scope fixture for smoke tests
+- `tests/fixtures/MultiScope/` — multi-scope fixture (frontend.sln + backend.sln + .sourcegraph.json)
 
 Plan / milestones: `/Users/jacques/.claude/plans/create-a-plan-to-soft-pizza.md`

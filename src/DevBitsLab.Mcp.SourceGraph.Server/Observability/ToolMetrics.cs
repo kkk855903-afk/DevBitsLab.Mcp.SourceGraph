@@ -12,6 +12,7 @@ namespace DevBitsLab.Mcp.SourceGraph.Server.Observability;
 public static class ToolMetrics
 {
     private static readonly ConcurrentDictionary<string, ToolStats> _stats = new();
+    private static readonly ConcurrentDictionary<string, long> _scopeCounts = new();
     private static readonly Lock _writeLock = new();
     private static string? _logPath;
     private static readonly DateTimeOffset _processStart = DateTimeOffset.UtcNow;
@@ -72,10 +73,31 @@ public static class ToolMetrics
     {
         var stats = _stats.GetOrAdd(toolName, _ => new ToolStats());
         stats.Add(elapsed, responseLen, ok);
-        AppendJsonl(toolName, args, responseLen, elapsed, ok);
+        // Best-effort scope counter: pull `scope` off the args bag so usage_stats can show a
+        // per-scope breakdown. Reflection-light: only fires for anonymous arg objects that
+        // contain a `scope` property, which is the convention every scope-aware tool follows.
+        var scopeName = ExtractScope(args);
+        if (scopeName is not null)
+        {
+            _scopeCounts.AddOrUpdate(scopeName, 1, (_, c) => c + 1);
+        }
+        AppendJsonl(toolName, args, responseLen, elapsed, ok, scopeName);
     }
 
-    private static void AppendJsonl(string toolName, object? args, int responseLen, TimeSpan elapsed, bool ok)
+    private static string? ExtractScope(object? args)
+    {
+        if (args is null) return null;
+        var prop = args.GetType().GetProperty("scope");
+        if (prop is null) return null;
+        var value = prop.GetValue(args);
+        return value switch
+        {
+            string s when !string.IsNullOrEmpty(s) => s,
+            _ => null,
+        };
+    }
+
+    private static void AppendJsonl(string toolName, object? args, int responseLen, TimeSpan elapsed, bool ok, string? scope)
     {
         if (_logPath is null) return;
         var entry = new
@@ -85,6 +107,7 @@ public static class ToolMetrics
             ok,
             ms = elapsed.TotalMilliseconds,
             response_len = responseLen,
+            scope,
             args
         };
         try
@@ -104,6 +127,16 @@ public static class ToolMetrics
     public static IReadOnlyDictionary<string, ToolStatsSnapshot> Snapshot()
     {
         return _stats.ToDictionary(kv => kv.Key, kv => kv.Value.Snapshot());
+    }
+
+    /// <summary>
+    /// Per-scope call counts captured from the <c>scope</c> arg of every wrapped tool. Empty when
+    /// no tool has been called with an explicit <c>scope</c> argument yet. Surfaced by
+    /// <c>usage_stats</c> so users can see which scopes are getting exercised.
+    /// </summary>
+    public static IReadOnlyDictionary<string, long> ScopeSnapshot()
+    {
+        return _scopeCounts.ToDictionary(kv => kv.Key, kv => kv.Value);
     }
 
     public static DateTimeOffset ProcessStart => _processStart;
