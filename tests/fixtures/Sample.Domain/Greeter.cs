@@ -10,4 +10,8 @@ public class Greeter : IGreeter
     }
 
     public string Greet(string name) => $"{_prefix}, {name}!";
+
+    [Obsolete("legacy")]
+    [Legacy("use Greet instead", Severity = 2)]
+    public string LegacyGreet(string name) => Greet(name);
 }

@@ -30,6 +30,41 @@ public static class GraphTools
                 sb.AppendLine($"- **{h.Fqn}** ({KindLabel(h.Kind)})");
                 sb.AppendLine($"  - {Format.Location(h.FilePath, h.StartLine, h.StartCol)}");
                 if (!string.IsNullOrEmpty(h.Signature)) sb.AppendLine($"  - `{h.Signature}`");
+                var attrs = await store.GetAttributesForSymbolAsync(h.Id, ct).ConfigureAwait(false);
+                var line = AttributeFormat.OneLine(attrs);
+                if (line is not null) sb.AppendLine($"  - {line}");
+            }
+            return sb.ToString();
+        });
+
+    [McpServerTool]
+    [Description("Find every symbol that carries an attribute by short name (e.g. 'HttpGet', 'Obsolete', 'Authorize'). Optional argValue does a trigram match against the attribute's serialised arguments (e.g. argValue='/api/v2' to find route attributes whose path contains that substring). Use for 'find every POST endpoint', 'what's been deprecated?', 'find all DI singletons'.")]
+    public static Task<string> FindByAttributeAsync(
+        IGraphStore store,
+        [Description("Attribute short name (e.g. 'HttpGet', 'Obsolete', 'Authorize'). Trailing 'Attribute' is implied; use the form you'd type in source.")] string name,
+        [Description("Optional substring to match against the attribute's arguments via FTS5 trigram (>= 3 chars). E.g. '/api/users' or 'Use Foo'.")] string? argValue = null,
+        [Description("Optional kind filter: class|method|property|field|...")] string? kind = null,
+        [Description("Maximum results (default 50)")] int limit = 50,
+        CancellationToken ct = default) =>
+        ToolMetrics.TrackAsync("find_by_attribute", new { name, argValue, kind, limit }, async () =>
+        {
+            SymbolKind? kindFilter = string.IsNullOrEmpty(kind)
+                ? null
+                : Enum.TryParse<SymbolKind>(kind, ignoreCase: true, out var k) ? k : null;
+            var hits = await store.FindByAttributeAsync(name, argValue, kindFilter, limit, ct).ConfigureAwait(false);
+            if (hits.Count == 0)
+            {
+                var argsClause = string.IsNullOrEmpty(argValue) ? "" : $" with argValue ~ '{argValue}'";
+                return $"No symbols carry [{name}]{argsClause}.";
+            }
+            var sb = new StringBuilder();
+            sb.AppendLine($"{hits.Count} symbol(s) carry [{name}]:");
+            foreach (var h in hits)
+            {
+                sb.AppendLine($"- **{h.Fqn}** ({KindLabel(h.Kind)}) at {Format.Location(h.FilePath, h.StartLine, h.StartCol)}");
+                var attrs = await store.GetAttributesForSymbolAsync(h.Id, ct).ConfigureAwait(false);
+                var line = AttributeFormat.OneLine(attrs);
+                if (line is not null) sb.AppendLine($"  - {line}");
             }
             return sb.ToString();
         });
@@ -87,6 +122,9 @@ public static class GraphTools
             {
                 sb.AppendLine($"- L{h.StartLine}: **{h.Name}** ({KindLabel(h.Kind)}) — {h.Fqn}");
                 if (!string.IsNullOrEmpty(h.Signature)) sb.AppendLine($"    `{h.Signature}`");
+                var attrs = await store.GetAttributesForSymbolAsync(h.Id, ct).ConfigureAwait(false);
+                var line = AttributeFormat.OneLine(attrs);
+                if (line is not null) sb.AppendLine($"    {line}");
             }
             return sb.ToString();
         });
@@ -180,13 +218,28 @@ public static class GraphTools
             var sb = new StringBuilder();
             sb.AppendLine($"Neighborhood of **{top.Fqn}** ({KindLabel(top.Kind)})");
             sb.AppendLine($"definition: {Format.Location(top.FilePath, top.StartLine, top.StartCol)}");
+            var topAttrs = await store.GetAttributesForSymbolAsync(top.Id, ct).ConfigureAwait(false);
+            var topLine = AttributeFormat.OneLine(topAttrs);
+            if (topLine is not null) sb.AppendLine(topLine);
             sb.AppendLine();
             sb.AppendLine($"### Callers ({callers.Count})");
-            foreach (var c in callers) sb.AppendLine($"- {c.Fqn} — {Format.Location(c.FilePath, c.StartLine, c.StartCol)}");
+            foreach (var c in callers)
+            {
+                sb.AppendLine($"- {c.Fqn} — {Format.Location(c.FilePath, c.StartLine, c.StartCol)}");
+                var ca = await store.GetAttributesForSymbolAsync(c.Id, ct).ConfigureAwait(false);
+                var line = AttributeFormat.OneLine(ca);
+                if (line is not null) sb.AppendLine($"  {line}");
+            }
             if (callers.Count == 0) sb.AppendLine("- (none)");
             sb.AppendLine();
             sb.AppendLine($"### Callees ({callees.Count})");
-            foreach (var c in callees) sb.AppendLine($"- {c.Fqn} — {Format.Location(c.FilePath, c.StartLine, c.StartCol)}");
+            foreach (var c in callees)
+            {
+                sb.AppendLine($"- {c.Fqn} — {Format.Location(c.FilePath, c.StartLine, c.StartCol)}");
+                var ca = await store.GetAttributesForSymbolAsync(c.Id, ct).ConfigureAwait(false);
+                var line = AttributeFormat.OneLine(ca);
+                if (line is not null) sb.AppendLine($"  {line}");
+            }
             if (callees.Count == 0) sb.AppendLine("- (none)");
             return sb.ToString();
         });
@@ -207,6 +260,9 @@ public static class GraphTools
             foreach (var row in rows)
             {
                 sb.AppendLine($"- in-deg {row.InDegree,3} — **{row.Symbol.Fqn}** ({KindLabel(row.Symbol.Kind)}) at {Format.Location(row.Symbol.FilePath, row.Symbol.StartLine, row.Symbol.StartCol)}");
+                var attrs = await store.GetAttributesForSymbolAsync(row.Symbol.Id, ct).ConfigureAwait(false);
+                var line = AttributeFormat.OneLine(attrs);
+                if (line is not null) sb.AppendLine($"  - {line}");
             }
             return sb.ToString();
         });
@@ -309,4 +365,49 @@ public static class GraphTools
 internal static class Format
 {
     public static string Location(string path, int line, int col) => $"{path}:{line}:{col}";
+}
+
+internal static class AttributeFormat
+{
+    /// <summary>
+    /// Render the attribute set as a single annotation line, e.g.
+    /// <c>attributes: [HttpGet("/api/users"), Authorize, Obsolete]</c>. Returns
+    /// <c>null</c> when there are no attributes so callers can skip the line entirely.
+    /// </summary>
+    public static string? OneLine(IReadOnlyList<AttributeRecord> attrs)
+    {
+        if (attrs.Count == 0) return null;
+        var sb = new StringBuilder();
+        sb.Append("attributes: [");
+        for (var i = 0; i < attrs.Count; i++)
+        {
+            if (i > 0) sb.Append(", ");
+            sb.Append(attrs[i].Name);
+            var preview = ArgPreview(attrs[i].ArgsJson);
+            if (preview is not null) sb.Append(preview);
+        }
+        sb.Append(']');
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// Render an attribute card row for the <c>graph://symbol/{id}</c> resource.
+    /// Includes the full name and the raw args JSON so an agent can pick out the
+    /// values it needs.
+    /// </summary>
+    public static string Card(AttributeRecord attr)
+    {
+        var args = string.IsNullOrEmpty(attr.ArgsJson) ? "" : $" — `{attr.ArgsJson}`";
+        var link = attr.AttributeSymbolId is null ? "" : $" → symbol#{attr.AttributeSymbolId}";
+        return $"- `[{attr.Name}]` ({attr.FullName}){link}{args}";
+    }
+
+    private static string? ArgPreview(string? argsJson)
+    {
+        if (string.IsNullOrEmpty(argsJson)) return null;
+        // Truncate noisy payloads to keep the annotation single-line. The full payload is
+        // always available on the symbol resource.
+        const int maxLen = 64;
+        return argsJson.Length <= maxLen ? $"({argsJson})" : $"({argsJson[..maxLen]}…)";
+    }
 }

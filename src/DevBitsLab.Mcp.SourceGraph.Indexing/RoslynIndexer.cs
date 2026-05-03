@@ -253,11 +253,22 @@ public sealed class RoslynIndexer : IAsyncDisposable
         // PASS 1 — phase B: walk every iteration of each changed file (one path may have N
         // iterations across multi-target / linked / shared projects), upserting symbols and
         // accumulating the union of canonical keys per fileId before we reconcile.
+        // Attributes are gathered as PendingAttributes during this phase; their
+        // attribute_symbol_id is resolved after the whole pass completes, so a use site can
+        // link to a user-defined attribute class declared in another file we haven't walked
+        // yet (e.g. [Legacy] on Greeter.cs resolving to LegacyAttribute.cs even though
+        // Greeter.cs is processed first alphabetically).
         var newKeysForFile = new Dictionary<long, HashSet<string>>();
+        var pendingAttrsByFile = new Dictionary<long, List<PendingAttribute>>();
+        var seenSymbolForAttr = new Dictionary<long, HashSet<string>>();
         foreach (var (fileId, docs) in docsByChangedFile)
         {
             var fileKeys = new HashSet<string>(StringComparer.Ordinal);
             newKeysForFile[fileId] = fileKeys;
+            var pendingAttrs = new List<PendingAttribute>();
+            pendingAttrsByFile[fileId] = pendingAttrs;
+            var attrSeen = new HashSet<string>(StringComparer.Ordinal);
+            seenSymbolForAttr[fileId] = attrSeen;
 
             foreach (var document in docs)
             {
@@ -293,12 +304,23 @@ public sealed class RoslynIndexer : IAsyncDisposable
                     var isNew = !_symbolIdByKey.ContainsKey(key);
                     _symbolIdByKey[key] = id;
                     if (isNew) symbolsIndexed++;
+
+                    // Attributes: only collect once per (file, symbol) tuple even if the symbol
+                    // was discovered in multiple TFM iterations. If the same attribute is
+                    // visible across TFM iterations of the same source file we don't want to
+                    // double-store it.
+                    if (attrSeen.Add(key))
+                    {
+                        AttributeExtractor.AppendAttributes(symbol, id, pendingAttrs);
+                    }
                 }
             }
         }
 
         // Reconcile per changed fileId: delete any symbol attributed to this file in DB whose
         // canonical key is no longer declared anywhere in the file's tree (across all iterations).
+        // The reconcile call also wipes the file's attribute rows; we re-insert the freshly
+        // walked attribute set immediately after, in the same logical step.
         foreach (var (fileId, fileKeys) in newKeysForFile)
         {
             // Remove orphaned keys from in-memory map (best-effort; full correctness comes from
@@ -312,6 +334,17 @@ public sealed class RoslynIndexer : IAsyncDisposable
             }
             await _store.DeleteSymbolsForFileNotInAsync(fileId, fileKeys, ct).ConfigureAwait(false);
             _keysByFileId[fileId] = fileKeys.ToList();
+        }
+
+        // Resolve and bulk-insert attributes per file, now that every changed file has had
+        // its symbols upserted into _symbolIdByKey. Doing this in a separate sweep lets a
+        // use-site reference an attribute class that lives in a file we hadn't walked yet
+        // when we extracted the use site.
+        foreach (var (fileId, pendingAttrs) in pendingAttrsByFile)
+        {
+            if (pendingAttrs.Count == 0) continue;
+            var resolved = pendingAttrs.Select(p => AttributeExtractor.Resolve(p, _symbolIdByKey)).ToList();
+            await _store.BulkInsertAttributesAsync(resolved, ct).ConfigureAwait(false);
         }
 
         // PASS 2: references — only for files we (re)indexed in pass 1.

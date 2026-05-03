@@ -24,6 +24,10 @@ public interface IGraphStore : IAsyncDisposable
     Task BulkInsertReferencesAsync(IEnumerable<SymbolReference> references, CancellationToken ct = default);
     Task BulkInsertEdgesAsync(IEnumerable<Edge> edges, CancellationToken ct = default);
 
+    /// <summary>Bulk-insert the attributes attached to a set of symbols. Run after the symbols
+    /// themselves are upserted, so <c>symbol_id</c> already resolves to a stable row.</summary>
+    Task BulkInsertAttributesAsync(IEnumerable<AttributeRecord> attributes, CancellationToken ct = default);
+
     /// <summary>Used by the indexer to re-hydrate its in-memory maps after a process restart.</summary>
     Task<IReadOnlyList<SymbolKeyRow>> GetAllSymbolKeysAsync(CancellationToken ct = default);
     Task<IReadOnlyList<FileRow>> GetAllFilesAsync(CancellationToken ct = default);
@@ -40,6 +44,18 @@ public interface IGraphStore : IAsyncDisposable
     Task<IReadOnlyList<SymbolHit>> SearchSymbolsAsync(string ftsQuery, Core.SymbolKind? kindFilter = null, int limit = 25, CancellationToken ct = default);
     Task<IReadOnlyList<ModuleSymbol>> ModuleSummaryAsync(string namespaceOrPathPrefix, int limit = 25, CancellationToken ct = default);
     Task<IReadOnlyList<ImpactedSymbol>> ImpactOfChangeAsync(long symbolId, int maxDepth = 4, int limit = 100, CancellationToken ct = default);
+
+    /// <summary>
+    /// Find symbols that carry an attribute with the given short <paramref name="name"/>
+    /// (e.g. <c>"HttpGet"</c>). When <paramref name="argSubstring"/> is non-null, restrict
+    /// results to attributes whose serialised arguments match the substring via the FTS5
+    /// trigram index over <c>attributes_fts.args_text</c>. <paramref name="kindFilter"/>
+    /// narrows by symbol kind (e.g. only methods).
+    /// </summary>
+    Task<IReadOnlyList<SymbolHit>> FindByAttributeAsync(string name, string? argSubstring, Core.SymbolKind? kindFilter, int limit, CancellationToken ct = default);
+
+    /// <summary>Return every attribute attached to <paramref name="symbolId"/>, in row-id (insert) order.</summary>
+    Task<IReadOnlyList<AttributeRecord>> GetAttributesForSymbolAsync(long symbolId, CancellationToken ct = default);
 }
 
 public sealed record ModuleSymbol(SymbolHit Symbol, int InDegree);
