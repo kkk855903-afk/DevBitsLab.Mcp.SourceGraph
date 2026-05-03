@@ -7,7 +7,7 @@ internal static class Schema
     /// drops all data tables when the on-disk version is below this, since the index can always be
     /// rebuilt from source.
     /// </summary>
-    public const int Version = 6;
+    public const int Version = 7;
 
     /// <summary>
     /// V5 enriches the symbol row with metadata that Roslyn already exposes per symbol but which
@@ -29,6 +29,14 @@ internal static class Schema
     /// V6 adds the <c>attributes</c> table + <c>attributes_fts</c> trigram index on top of V5,
     /// so the indexer can record every <c>[Attribute]</c> attached to a symbol and answer
     /// <c>find_by_attribute</c> queries (with optional argument-substring filtering).
+    ///
+    /// V7 wires in <c>sqlite-vec</c>: an optional <c>symbol_embeddings</c> <c>vec0</c> virtual
+    /// table holds 768-dim float vectors keyed by <c>symbol_id</c>, and a sibling
+    /// <c>embedding_meta(symbol_id PK, content_hash BLOB, model_version TEXT)</c> tracks the
+    /// SHA-256 of the synthesised text and the active model identity so swapping models or
+    /// editing a symbol's body re-embeds correctly. The vec0 table is created only when the
+    /// extension is loadable; <c>embedding_meta</c> is unconditional so we can persist
+    /// (or re-stage) the metadata even on hosts where the extension is missing.
     /// </summary>
     public const string V1 = """
         CREATE TABLE IF NOT EXISTS schema_version (
@@ -94,6 +102,13 @@ internal static class Schema
         CREATE INDEX IF NOT EXISTS idx_attributes_symbol ON attributes(symbol_id);
         CREATE INDEX IF NOT EXISTS idx_attributes_name ON attributes(name);
         CREATE INDEX IF NOT EXISTS idx_attributes_attribute_symbol_id ON attributes(attribute_symbol_id);
+
+        CREATE TABLE IF NOT EXISTS embedding_meta (
+            symbol_id INTEGER PRIMARY KEY,
+            content_hash BLOB NOT NULL,
+            model_version TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_embedding_meta_model ON embedding_meta(model_version);
         """;
 
     /// <summary>FTS5 trigram-tokenized index over symbols.name/fqn/signature/xml_summary, kept in sync via triggers.</summary>
@@ -168,6 +183,19 @@ internal static class Schema
         """;
 
     /// <summary>
+    /// Vector index virtual table. Created only when the <c>sqlite-vec</c> extension loaded
+    /// successfully (see <see cref="SqliteGraphStore.TryLoadVectorExtension"/>). Embedding dim
+    /// is parameterised so a future <c>--model</c> override with a different dimension can
+    /// rebuild this part of the schema without dropping every other table.
+    /// </summary>
+    public static string V7Embeddings(int dim) => $$"""
+        CREATE VIRTUAL TABLE IF NOT EXISTS symbol_embeddings USING vec0(
+            symbol_id INTEGER PRIMARY KEY,
+            embedding FLOAT[{{dim}}]
+        );
+        """;
+
+    /// <summary>
     /// Drops every data table and trigger so a fresh schema can be applied.
     /// <c>EnsureSchemaAsync</c> calls this only when the on-disk version is below
     /// <see cref="Version"/>. The index always rebuilds from source on next pass.
@@ -181,6 +209,8 @@ internal static class Schema
         DROP TRIGGER IF EXISTS symbols_ad;
         DROP TRIGGER IF EXISTS symbols_ai;
         DROP TABLE   IF EXISTS symbols_fts;
+        DROP TABLE   IF EXISTS symbol_embeddings;
+        DROP TABLE   IF EXISTS embedding_meta;
         DROP TABLE   IF EXISTS edges;
         DROP TABLE   IF EXISTS refs;
         DROP TABLE   IF EXISTS symbols;

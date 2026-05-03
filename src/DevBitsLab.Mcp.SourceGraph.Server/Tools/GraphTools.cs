@@ -1,6 +1,7 @@
 using System.ComponentModel;
 using System.Text;
 using DevBitsLab.Mcp.SourceGraph.Core;
+using DevBitsLab.Mcp.SourceGraph.Embeddings;
 using DevBitsLab.Mcp.SourceGraph.Server.Observability;
 using DevBitsLab.Mcp.SourceGraph.Storage;
 using ModelContextProtocol.Server;
@@ -383,6 +384,59 @@ public static class GraphTools
             {
                 sb.Append($"- L{m.StartLine}: **{m.Name}** ({Format.KindWithAttrs(m)}) — `{m.Signature ?? m.Fqn}`");
                 var s = Format.OneLineSummary(m.XmlSummary);
+                if (!string.IsNullOrEmpty(s)) sb.Append(" — _" + s + "_");
+                sb.AppendLine();
+            }
+            return sb.ToString();
+        });
+
+    [McpServerTool]
+    [Description("Semantic / intent search: encode a natural-language query, find symbols whose code embeddings are nearest by cosine similarity. Use for 'find code that does retry logic', 'how does this codebase handle authentication', 'show me the rate-limiting code'. Complements (not replaces) search_symbols, which does name-fragment FTS5 trigram matching. Returns a top-k list with location, kind, and a similarity score in [-1, 1].")]
+    public static Task<string> SemanticSearchAsync(
+        IGraphStore store,
+        IEmbeddingsStore embeddingsStore,
+        ICodeEmbeddingGenerator generator,
+        [Description("Free-text intent query, e.g. 'retry on transient errors', 'masks PII in logs'")] string query,
+        [Description("Top-K results to return (default 20)")] int k = 20,
+        [Description("Optional kind filter: class|method|property|field|interface|namespace|...")] string? kind = null,
+        CancellationToken ct = default) =>
+        ToolMetrics.TrackAsync("semantic_search", new { query, k, kind }, async () =>
+        {
+            // Graceful disable: any of these conditions means the embedding pipeline isn't live
+            // (no model, missing extension, --no-embeddings). Hand back a hint instead of an error.
+            if (!embeddingsStore.IsAvailable || !generator.IsAvailable)
+            {
+                return "semantic_search disabled: install the embedding model (run with the network on for first start) or remove `--no-embeddings`. The graph itself is fully indexed; other tools (`find_definition`, `search_symbols`, `list_callers`, …) work as normal.";
+            }
+            if (string.IsNullOrWhiteSpace(query))
+            {
+                return "semantic_search: provide a non-empty query.";
+            }
+
+            SymbolKind? kindFilter = string.IsNullOrEmpty(kind)
+                ? null
+                : Enum.TryParse<SymbolKind>(kind, ignoreCase: true, out var kk) ? kk : null;
+
+            var queryEmbeddings = await generator.EmbedAsync(new[] { query }, ct).ConfigureAwait(false);
+            if (queryEmbeddings.Count == 0)
+            {
+                return "semantic_search: encoder produced no vector for the query.";
+            }
+
+            var hits = await embeddingsStore.SearchAsync(queryEmbeddings[0], k, kindFilter, ct).ConfigureAwait(false);
+            if (hits.Count == 0)
+            {
+                return $"No semantic matches for '{query}'. The graph may not have any embeddings yet — let the indexer's embedding pass complete after a fresh `index` and try again.";
+            }
+
+            var sb = new StringBuilder();
+            sb.AppendLine($"{hits.Count} semantic match(es) for '{query}':");
+            foreach (var h in hits)
+            {
+                var sym = await store.GetSymbolByIdAsync(h.SymbolId, ct).ConfigureAwait(false);
+                if (sym is null) continue;
+                sb.Append($"- score {h.Score:F3} — **{sym.Fqn}** ({Format.KindWithAttrs(sym)}) at {Format.Location(sym.FilePath, sym.StartLine, sym.StartCol)}");
+                var s = Format.OneLineSummary(sym.XmlSummary);
                 if (!string.IsNullOrEmpty(s)) sb.Append(" — _" + s + "_");
                 sb.AppendLine();
             }

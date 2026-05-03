@@ -140,6 +140,34 @@ internal static class SymbolMapping
     public static int Accessibility(ISymbol symbol) => (int)symbol.DeclaredAccessibility;
 
     /// <summary>
+    /// Returns the first <paramref name="maxLines"/> lines of the declaring syntax for symbols
+    /// that have a body (methods/properties/types). Returns <c>null</c> for symbols without
+    /// a syntactic body or when none of <paramref name="symbol"/>'s declarations have a tree.
+    /// Used to populate the synthesised text the embedding pipeline hashes and embeds.
+    /// </summary>
+    public static string? BodyExcerpt(ISymbol symbol, int maxLines = 40)
+    {
+        foreach (var sref in symbol.DeclaringSyntaxReferences)
+        {
+            var node = sref.GetSyntax();
+            if (node is null) continue;
+            var raw = node.ToString();
+            if (string.IsNullOrEmpty(raw)) continue;
+            // First N lines, joined with \n, no trailing whitespace.
+            var lines = raw.Split('\n');
+            var take = Math.Min(maxLines, lines.Length);
+            var sb = new StringBuilder();
+            for (var i = 0; i < take; i++)
+            {
+                sb.Append(lines[i].TrimEnd('\r'));
+                if (i + 1 < take) sb.Append('\n');
+            }
+            return sb.ToString();
+        }
+        return null;
+    }
+
+    /// <summary>
     /// Parses the symbol's <c>&lt;summary&gt;</c> XML doc text, preserving inline tags
     /// (<c>&lt;see&gt;</c>, <c>&lt;paramref&gt;</c>, …) as plain text. Resolves
     /// <c>&lt;inheritdoc/&gt;</c> by walking up the override chain (or the first declared

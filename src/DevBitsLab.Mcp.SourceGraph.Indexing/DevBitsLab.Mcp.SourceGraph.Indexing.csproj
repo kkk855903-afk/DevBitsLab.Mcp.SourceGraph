@@ -11,6 +11,7 @@
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
     <ProjectReference Include="..\DevBitsLab.Mcp.SourceGraph.Core\DevBitsLab.Mcp.SourceGraph.Core.csproj" />
     <ProjectReference Include="..\DevBitsLab.Mcp.SourceGraph.Storage\DevBitsLab.Mcp.SourceGraph.Storage.csproj" />
+    <ProjectReference Include="..\DevBitsLab.Mcp.SourceGraph.Embeddings\DevBitsLab.Mcp.SourceGraph.Embeddings.csproj" />
   </ItemGroup>
 
   <!-- MSBuildLocator requires that Microsoft.Build.* assemblies are not loaded from the project's

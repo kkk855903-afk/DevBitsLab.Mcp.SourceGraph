@@ -6,6 +6,10 @@ internal sealed class CommandLine
     public string? SolutionPath { get; private init; }
     public string? DatabasePath { get; private init; }
     public bool ShowHelp { get; private init; }
+    /// <summary>Override the default embedding model identity (Hugging Face-style id).</summary>
+    public string? Model { get; private init; }
+    /// <summary>Disable the embedding pipeline (no model download, no vec0 writes, semantic_search returns disabled-message).</summary>
+    public bool NoEmbeddings { get; private init; }
 
     public static CommandLine Parse(string[] args)
     {
@@ -15,6 +19,8 @@ internal sealed class CommandLine
         var subcommand = args[0];
         string? solution = null;
         string? db = null;
+        string? model = null;
+        var noEmbeddings = false;
 
         for (var i = 1; i < args.Length; i++)
         {
@@ -28,6 +34,12 @@ internal sealed class CommandLine
                     break;
                 case "--db":
                     db = ExpandTokens(RequireArg(args, ref i, a));
+                    break;
+                case "--model":
+                    model = RequireArg(args, ref i, a);
+                    break;
+                case "--no-embeddings":
+                    noEmbeddings = true;
                     break;
                 default:
                     if (subcommand == "index" && solution is null && !a.StartsWith('-'))
@@ -50,6 +62,8 @@ internal sealed class CommandLine
             Subcommand = subcommand,
             SolutionPath = solution,
             DatabasePath = db,
+            Model = model,
+            NoEmbeddings = noEmbeddings,
         };
     }
 
@@ -98,11 +112,11 @@ internal sealed class CommandLine
         sourcegraph-mcp — live code source graph MCP server for .NET
 
         Usage:
-          sourcegraph-mcp serve [--solution <path>] [--db <path>]
+          sourcegraph-mcp serve [--solution <path>] [--db <path>] [--model <id>] [--no-embeddings]
               Run the MCP stdio server. If --solution is given, opens that solution on startup
               and watches it for changes; otherwise indexes lazily on first query.
 
-          sourcegraph-mcp index <solution-path> [--db <path>]
+          sourcegraph-mcp index <solution-path> [--db <path>] [--model <id>] [--no-embeddings]
               Build/refresh the graph database from the given .sln file, then exit.
 
           sourcegraph-mcp stats [--db <path>]
@@ -111,12 +125,19 @@ internal sealed class CommandLine
           sourcegraph-mcp clear [--db <path>]
               Delete all rows from the graph database (schema preserved).
 
+        Common flags:
+          --model <id>      Override the embedding model identity (default:
+                            jinaai/jina-embeddings-v2-base-code). Applies to serve/index.
+          --no-embeddings   Skip the embedding pipeline entirely. semantic_search returns the
+                            disabled-message; every other tool works as before.
+
         Defaults:
           --db   ./.sourcegraph/graph.db   (created if missing)
 
         Examples:
           sourcegraph-mcp index ./MySln.sln
           sourcegraph-mcp serve --solution ./MySln.sln
+          sourcegraph-mcp serve --solution ./MySln.sln --no-embeddings
         """;
 
     /// <summary>

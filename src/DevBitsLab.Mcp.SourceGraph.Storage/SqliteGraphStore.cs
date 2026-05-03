@@ -11,6 +11,8 @@ public sealed class SqliteGraphStore : IGraphStore
     private readonly SqliteConnection _connection;
     private readonly ILogger<SqliteGraphStore> _logger;
     private readonly SemaphoreSlim _writeLock = new(1, 1);
+    private bool _vectorExtensionLoaded;
+    private int _embeddingDimension;
 
     public SqliteGraphStore(string databasePath, ILogger<SqliteGraphStore>? logger = null)
     {
@@ -26,6 +28,62 @@ public sealed class SqliteGraphStore : IGraphStore
         _connection.Open();
         _connection.Execute("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA temp_store=MEMORY;");
         _logger = logger ?? NullLogger<SqliteGraphStore>.Instance;
+    }
+
+    /// <summary>True once <see cref="TryLoadVectorExtension"/> has succeeded for this connection.</summary>
+    public bool VectorExtensionLoaded => _vectorExtensionLoaded;
+
+    /// <summary>
+    /// Active embedding dimension on this DB. Returns 0 until <see cref="TryLoadVectorExtension"/>
+    /// runs. Used by callers to size the vec0 virtual table consistently.
+    /// </summary>
+    public int EmbeddingDimension => _embeddingDimension;
+
+    /// <summary>
+    /// Attempt to load the <c>sqlite-vec</c> (<c>vec0</c>) extension into this connection.
+    /// Returns <c>true</c> on success, <c>false</c> if the native binary isn't on the load path
+    /// (graceful disable). Safe to call multiple times — second and subsequent calls are no-ops.
+    /// Must be called BEFORE <see cref="EnsureSchemaAsync"/> so the <c>symbol_embeddings</c>
+    /// virtual table can be created.
+    /// </summary>
+    public bool TryLoadVectorExtension(int dimension)
+    {
+        if (_vectorExtensionLoaded) return true;
+        try
+        {
+            _connection.EnableExtensions(true);
+            // Microsoft.Data.Sqlite's LoadVector helper from the sqlite-vec NuGet ships an
+            // extension method on SqliteConnection; we call it via reflection-free invocation.
+            _connection.LoadExtension("vec0");
+            _vectorExtensionLoaded = true;
+            _embeddingDimension = dimension;
+            _logger.LogInformation("Loaded sqlite-vec (vec0) extension; semantic search enabled (dim={Dim})", dimension);
+            return true;
+        }
+        catch (SqliteException ex)
+        {
+            _logger.LogWarning(ex, "Could not load sqlite-vec extension; semantic search disabled");
+            return false;
+        }
+        catch (Exception ex) when (ex is DllNotFoundException or BadImageFormatException or NotSupportedException or InvalidOperationException)
+        {
+            _logger.LogWarning(ex, "Could not load sqlite-vec extension; semantic search disabled");
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Build an <see cref="IEmbeddingsStore"/> sharing this graph store's connection. Returns
+    /// a working <see cref="SqliteEmbeddingsStore"/> when the vec0 extension was loaded;
+    /// otherwise returns <see cref="DisabledEmbeddingsStore"/> so callers don't need to branch.
+    /// </summary>
+    public IEmbeddingsStore CreateEmbeddingsStore(int dimension, ILogger? logger = null)
+    {
+        if (_vectorExtensionLoaded && _embeddingDimension == dimension)
+        {
+            return new SqliteEmbeddingsStore(_connection, dimension, _writeLock, logger);
+        }
+        return new DisabledEmbeddingsStore(dimension);
     }
 
     public async Task EnsureSchemaAsync(CancellationToken ct = default)
@@ -51,6 +109,14 @@ public sealed class SqliteGraphStore : IGraphStore
             using var tx = _connection.BeginTransaction();
             await _connection.ExecuteAsync(new CommandDefinition(Schema.V1, transaction: tx, cancellationToken: ct)).ConfigureAwait(false);
             await _connection.ExecuteAsync(new CommandDefinition(Schema.V2, transaction: tx, cancellationToken: ct)).ConfigureAwait(false);
+            // Vec0 virtual table only when the extension actually loaded. We can still persist
+            // schema_version=7 without it; the embedding pipeline degrades gracefully and the
+            // semantic_search tool reports the disabled state.
+            if (_vectorExtensionLoaded && _embeddingDimension > 0)
+            {
+                await _connection.ExecuteAsync(new CommandDefinition(
+                    Schema.V7Embeddings(_embeddingDimension), transaction: tx, cancellationToken: ct)).ConfigureAwait(false);
+            }
             await _connection.ExecuteAsync(
                 new CommandDefinition("INSERT OR REPLACE INTO schema_version(version) VALUES (@v);", new { v = Schema.Version }, transaction: tx, cancellationToken: ct)).ConfigureAwait(false);
             tx.Commit();
