@@ -61,14 +61,15 @@ public sealed class SqliteGraphStore : IGraphStore
         }
     }
 
-    public async Task<long> UpsertFileAsync(string path, byte[] contentSha256, DateTimeOffset indexedAt, CancellationToken ct = default)
+    public async Task<long> UpsertFileAsync(string path, byte[] contentSha256, DateTimeOffset indexedAt, bool isGenerated = false, CancellationToken ct = default)
     {
         const string sql = """
-            INSERT INTO files(path, content_sha256, last_indexed_at)
-            VALUES (@path, @sha, @at)
+            INSERT INTO files(path, content_sha256, last_indexed_at, is_generated)
+            VALUES (@path, @sha, @at, @gen)
             ON CONFLICT(path) DO UPDATE SET
                 content_sha256 = excluded.content_sha256,
-                last_indexed_at = excluded.last_indexed_at
+                last_indexed_at = excluded.last_indexed_at,
+                is_generated   = excluded.is_generated
             RETURNING id;
             """;
         await _writeLock.WaitAsync(ct).ConfigureAwait(false);
@@ -76,7 +77,7 @@ public sealed class SqliteGraphStore : IGraphStore
         {
             return await _connection.ExecuteScalarAsync<long>(new CommandDefinition(
                 sql,
-                new { path, sha = contentSha256, at = indexedAt.ToUnixTimeMilliseconds() },
+                new { path, sha = contentSha256, at = indexedAt.ToUnixTimeMilliseconds(), gen = isGenerated ? 1 : 0 },
                 cancellationToken: ct)).ConfigureAwait(false);
         }
         finally
@@ -163,6 +164,11 @@ public sealed class SqliteGraphStore : IGraphStore
                 DELETE FROM attributes
                 WHERE symbol_id IN (SELECT id FROM symbols WHERE file_id = @id);
                 """;
+            // v7: diagnostics are file-scoped (and optionally symbol-scoped). They get rebuilt by
+            // UpsertDiagnosticsForFileAsync after pass 2; clearing them here keeps the deletion
+            // path (file removed from solution) clean too — the indexer drops symbols but never
+            // re-runs diagnostics for a vanished file, so without this wipe the rows would orphan.
+            const string deleteDiagnosticsSql = "DELETE FROM diagnostics WHERE file_id = @id;";
             const string deleteSymbolsSql = """
                 DELETE FROM symbols
                 WHERE file_id = @id AND canonical_key NOT IN (SELECT key FROM keep_keys);
@@ -170,6 +176,7 @@ public sealed class SqliteGraphStore : IGraphStore
             await _connection.ExecuteAsync(new CommandDefinition(deleteRefsSql, new { id = fileId }, transaction: tx, cancellationToken: ct)).ConfigureAwait(false);
             await _connection.ExecuteAsync(new CommandDefinition(deleteEdgesSql, new { id = fileId }, transaction: tx, cancellationToken: ct)).ConfigureAwait(false);
             await _connection.ExecuteAsync(new CommandDefinition(deleteAttributesSql, new { id = fileId }, transaction: tx, cancellationToken: ct)).ConfigureAwait(false);
+            await _connection.ExecuteAsync(new CommandDefinition(deleteDiagnosticsSql, new { id = fileId }, transaction: tx, cancellationToken: ct)).ConfigureAwait(false);
             await _connection.ExecuteAsync(new CommandDefinition(deleteSymbolsSql, new { id = fileId }, transaction: tx, cancellationToken: ct)).ConfigureAwait(false);
             await _connection.ExecuteAsync(new CommandDefinition("DELETE FROM keep_keys;", transaction: tx, cancellationToken: ct)).ConfigureAwait(false);
 
@@ -322,7 +329,7 @@ public sealed class SqliteGraphStore : IGraphStore
         const string sql = """
             WITH ranked AS (
                 SELECT s.id, s.name, s.fqn, s.kind, f.path, s.start_line, s.start_col, s.end_line, s.end_col, s.signature,
-                    s.modifiers, s.accessibility, s.xml_summary,
+                    s.modifiers, s.accessibility, s.xml_summary, f.is_generated,
                     CASE
                         WHEN s.name = @q THEN 1
                         WHEN s.fqn  = @q THEN 2
@@ -344,7 +351,8 @@ public sealed class SqliteGraphStore : IGraphStore
             )
             SELECT id, name, fqn, kind, path AS FilePath, start_line AS StartLine, start_col AS StartCol,
                    end_line AS EndLine, end_col AS EndCol, signature,
-                   modifiers AS Modifiers, accessibility AS Accessibility, xml_summary AS XmlSummary
+                   modifiers AS Modifiers, accessibility AS Accessibility, xml_summary AS XmlSummary,
+                   is_generated AS IsGenerated
             FROM ranked
             ORDER BY rank, length(fqn), fqn
             LIMIT @limit;
@@ -354,13 +362,21 @@ public sealed class SqliteGraphStore : IGraphStore
         return rows.Select(r => r.ToHit()).ToList();
     }
 
-    public async Task<IReadOnlyList<ReferenceHit>> FindReferencesAsync(long symbolId, int limit = 200, CancellationToken ct = default)
+    public Task<IReadOnlyList<ReferenceHit>> FindReferencesAsync(long symbolId, int limit = 200, CancellationToken ct = default)
+        => FindReferencesAsync(symbolId, includeGenerated: true, limit, ct);
+
+    public async Task<IReadOnlyList<ReferenceHit>> FindReferencesAsync(long symbolId, bool includeGenerated, int limit = 200, CancellationToken ct = default)
     {
-        const string sql = """
-            SELECT r.id, r.symbol_id AS SymbolId, f.path AS FilePath, r.line, r.col, r.kind
+        // includeGenerated = false filters out refs whose source file is marked is_generated = 1.
+        // The legacy 3-argument overload above defaults to true so existing callers (resources,
+        // tests) keep their pre-v7 behaviour.
+        var sql = $"""
+            SELECT r.id, r.symbol_id AS SymbolId, f.path AS FilePath, r.line, r.col, r.kind,
+                   f.is_generated AS IsGenerated
             FROM refs r
             JOIN files f ON f.id = r.file_id
             WHERE r.symbol_id = @id
+              {(includeGenerated ? "" : "AND f.is_generated = 0")}
             ORDER BY f.path, r.line, r.col
             LIMIT @limit;
             """;
@@ -377,7 +393,8 @@ public sealed class SqliteGraphStore : IGraphStore
         var sql = $"""
             SELECT s.id, s.name, s.fqn, s.kind, f.path AS FilePath, s.start_line AS StartLine, s.start_col AS StartCol,
                    s.end_line AS EndLine, s.end_col AS EndCol, s.signature,
-                   s.modifiers AS Modifiers, s.accessibility AS Accessibility, s.xml_summary AS XmlSummary
+                   s.modifiers AS Modifiers, s.accessibility AS Accessibility, s.xml_summary AS XmlSummary,
+                   f.is_generated AS IsGenerated
             FROM symbols_fts t
             JOIN symbols s ON s.id = t.rowid
             JOIN files   f ON f.id = s.file_id
@@ -397,6 +414,7 @@ public sealed class SqliteGraphStore : IGraphStore
             SELECT s.id, s.name, s.fqn, s.kind, f.path AS FilePath, s.start_line AS StartLine, s.start_col AS StartCol,
                    s.end_line AS EndLine, s.end_col AS EndCol, s.signature,
                    s.modifiers AS Modifiers, s.accessibility AS Accessibility, s.xml_summary AS XmlSummary,
+                   f.is_generated AS IsGenerated,
                    COALESCE((SELECT COUNT(*) FROM edges e WHERE e.dst = s.id AND e.kind = 0), 0) AS InDegree
             FROM symbols s
             JOIN files f ON f.id = s.file_id
@@ -429,6 +447,7 @@ public sealed class SqliteGraphStore : IGraphStore
             SELECT s.id, s.name, s.fqn, s.kind, f.path AS FilePath, s.start_line AS StartLine, s.start_col AS StartCol,
                    s.end_line AS EndLine, s.end_col AS EndCol, s.signature,
                    s.modifiers AS Modifiers, s.accessibility AS Accessibility, s.xml_summary AS XmlSummary,
+                   f.is_generated AS IsGenerated,
                    MIN(u.depth) AS Depth
             FROM upstream u
             JOIN symbols s ON s.id = u.id
@@ -450,7 +469,8 @@ public sealed class SqliteGraphStore : IGraphStore
         var sql = $"""
             SELECT s.id, s.name, s.fqn, s.kind, f.path AS FilePath, s.start_line AS StartLine, s.start_col AS StartCol,
                    s.end_line AS EndLine, s.end_col AS EndCol, s.signature,
-                   s.modifiers AS Modifiers, s.accessibility AS Accessibility, s.xml_summary AS XmlSummary
+                   s.modifiers AS Modifiers, s.accessibility AS Accessibility, s.xml_summary AS XmlSummary,
+                   f.is_generated AS IsGenerated
             FROM symbols s
             JOIN files   f ON f.id = s.file_id
             WHERE s.container_id = @id
@@ -465,20 +485,20 @@ public sealed class SqliteGraphStore : IGraphStore
 
     private sealed record RawModuleSymbol(long Id, string Name, string Fqn, long Kind, string FilePath,
         long StartLine, long StartCol, long EndLine, long EndCol, string? Signature,
-        string? Modifiers, long Accessibility, string? XmlSummary, long InDegree)
+        string? Modifiers, long Accessibility, string? XmlSummary, long IsGenerated, long InDegree)
     {
         public SymbolHit ToHit() => new(Id, Name, Fqn, (Core.SymbolKind)Kind, FilePath,
             (int)StartLine, (int)StartCol, (int)EndLine, (int)EndCol, Signature,
-            Modifiers, (int)Accessibility, XmlSummary);
+            Modifiers, (int)Accessibility, XmlSummary, IsGenerated != 0);
     }
 
     private sealed record RawImpactedSymbol(long Id, string Name, string Fqn, long Kind, string FilePath,
         long StartLine, long StartCol, long EndLine, long EndCol, string? Signature,
-        string? Modifiers, long Accessibility, string? XmlSummary, long Depth)
+        string? Modifiers, long Accessibility, string? XmlSummary, long IsGenerated, long Depth)
     {
         public SymbolHit ToHit() => new(Id, Name, Fqn, (Core.SymbolKind)Kind, FilePath,
             (int)StartLine, (int)StartCol, (int)EndLine, (int)EndCol, Signature,
-            Modifiers, (int)Accessibility, XmlSummary);
+            Modifiers, (int)Accessibility, XmlSummary, IsGenerated != 0);
     }
 
     public async Task<IReadOnlyList<SymbolHit>> ListCallersAsync(long symbolId, int limit = 50, EdgeKind? edgeKind = EdgeKind.Calls, CancellationToken ct = default)
@@ -488,7 +508,8 @@ public sealed class SqliteGraphStore : IGraphStore
         var sql = $"""
             SELECT s.id, s.name, s.fqn, s.kind, f.path AS FilePath, s.start_line AS StartLine, s.start_col AS StartCol,
                    s.end_line AS EndLine, s.end_col AS EndCol, s.signature,
-                   s.modifiers AS Modifiers, s.accessibility AS Accessibility, s.xml_summary AS XmlSummary
+                   s.modifiers AS Modifiers, s.accessibility AS Accessibility, s.xml_summary AS XmlSummary,
+                   f.is_generated AS IsGenerated
             FROM edges e
             JOIN symbols s ON s.id = e.src
             JOIN files   f ON f.id = s.file_id
@@ -507,7 +528,8 @@ public sealed class SqliteGraphStore : IGraphStore
         var sql = $"""
             SELECT s.id, s.name, s.fqn, s.kind, f.path AS FilePath, s.start_line AS StartLine, s.start_col AS StartCol,
                    s.end_line AS EndLine, s.end_col AS EndCol, s.signature,
-                   s.modifiers AS Modifiers, s.accessibility AS Accessibility, s.xml_summary AS XmlSummary
+                   s.modifiers AS Modifiers, s.accessibility AS Accessibility, s.xml_summary AS XmlSummary,
+                   f.is_generated AS IsGenerated
             FROM edges e
             JOIN symbols s ON s.id = e.dst
             JOIN files   f ON f.id = s.file_id
@@ -531,7 +553,8 @@ public sealed class SqliteGraphStore : IGraphStore
         const string sql = """
             SELECT s.id, s.name, s.fqn, s.kind, f.path AS FilePath, s.start_line AS StartLine, s.start_col AS StartCol,
                    s.end_line AS EndLine, s.end_col AS EndCol, s.signature,
-                   s.modifiers AS Modifiers, s.accessibility AS Accessibility, s.xml_summary AS XmlSummary
+                   s.modifiers AS Modifiers, s.accessibility AS Accessibility, s.xml_summary AS XmlSummary,
+                   f.is_generated AS IsGenerated
             FROM symbols s
             JOIN files   f ON f.id = s.file_id
             WHERE s.id = @id;
@@ -546,7 +569,8 @@ public sealed class SqliteGraphStore : IGraphStore
         const string sql = """
             SELECT s.id, s.name, s.fqn, s.kind, f.path AS FilePath, s.start_line AS StartLine, s.start_col AS StartCol,
                    s.end_line AS EndLine, s.end_col AS EndCol, s.signature,
-                   s.modifiers AS Modifiers, s.accessibility AS Accessibility, s.xml_summary AS XmlSummary
+                   s.modifiers AS Modifiers, s.accessibility AS Accessibility, s.xml_summary AS XmlSummary,
+                   f.is_generated AS IsGenerated
             FROM symbols s
             JOIN files f ON f.id = s.file_id
             WHERE f.path = @path OR f.path LIKE '%' || @path
@@ -559,17 +583,17 @@ public sealed class SqliteGraphStore : IGraphStore
 
     private sealed record RawSymbolHit(long Id, string Name, string Fqn, long Kind, string FilePath,
         long StartLine, long StartCol, long EndLine, long EndCol, string? Signature,
-        string? Modifiers, long Accessibility, string? XmlSummary)
+        string? Modifiers, long Accessibility, string? XmlSummary, long IsGenerated)
     {
         public SymbolHit ToHit() => new(
             Id, Name, Fqn, (Core.SymbolKind)Kind, FilePath,
             (int)StartLine, (int)StartCol, (int)EndLine, (int)EndCol, Signature,
-            Modifiers, (int)Accessibility, XmlSummary);
+            Modifiers, (int)Accessibility, XmlSummary, IsGenerated != 0);
     }
 
-    private sealed record RawReferenceHit(long Id, long SymbolId, string FilePath, long Line, long Col, long Kind)
+    private sealed record RawReferenceHit(long Id, long SymbolId, string FilePath, long Line, long Col, long Kind, long IsGenerated)
     {
-        public ReferenceHit ToHit() => new(Id, SymbolId, FilePath, (int)Line, (int)Col, (Core.ReferenceKind)Kind);
+        public ReferenceHit ToHit() => new(Id, SymbolId, FilePath, (int)Line, (int)Col, (Core.ReferenceKind)Kind, IsGenerated != 0);
     }
 
     public async Task<IReadOnlyList<SymbolKeyRow>> GetAllSymbolKeysAsync(CancellationToken ct = default)
@@ -638,7 +662,8 @@ public sealed class SqliteGraphStore : IGraphStore
         var sql = $"""
             SELECT s.id, s.name, s.fqn, s.kind, f.path AS FilePath, s.start_line AS StartLine, s.start_col AS StartCol,
                    s.end_line AS EndLine, s.end_col AS EndCol, s.signature,
-                   s.modifiers AS Modifiers, s.accessibility AS Accessibility, s.xml_summary AS XmlSummary
+                   s.modifiers AS Modifiers, s.accessibility AS Accessibility, s.xml_summary AS XmlSummary,
+                   f.is_generated AS IsGenerated
             FROM attributes a
             JOIN symbols s ON s.id = a.symbol_id
             JOIN files   f ON f.id = s.file_id
@@ -673,6 +698,98 @@ public sealed class SqliteGraphStore : IGraphStore
             sql, new { id = symbolId }, cancellationToken: ct)).ConfigureAwait(false);
         return rows.AsList();
     }
+
+    public async Task UpsertDiagnosticsForFileAsync(long fileId, IEnumerable<DiagnosticRecord> diagnostics, CancellationToken ct = default)
+    {
+        const string deleteSql = "DELETE FROM diagnostics WHERE file_id = @id;";
+        const string insertSql = """
+            INSERT INTO diagnostics(symbol_id, file_id, severity, code, message, line, col)
+            VALUES (@SymbolId, @FileId, @Severity, @Code, @Message, @Line, @Col);
+            """;
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            using var tx = _connection.BeginTransaction();
+            await _connection.ExecuteAsync(new CommandDefinition(
+                deleteSql, new { id = fileId }, transaction: tx, cancellationToken: ct)).ConfigureAwait(false);
+            foreach (var d in diagnostics)
+            {
+                await _connection.ExecuteAsync(new CommandDefinition(insertSql, new
+                {
+                    d.SymbolId,
+                    d.FileId,
+                    d.Severity,
+                    d.Code,
+                    d.Message,
+                    d.Line,
+                    d.Col,
+                }, transaction: tx, cancellationToken: ct)).ConfigureAwait(false);
+            }
+            tx.Commit();
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public async Task<IReadOnlyList<DiagnosticHit>> FindDiagnosticsAsync(int? severity, string? code, long? symbolId, int limit = 100, CancellationToken ct = default)
+    {
+        // severity is treated as a >= filter so callers can ask "show me warnings and above" with
+        // severity = 2 (Warning). Code matches the diagnostic id (e.g. CS0618). symbolId restricts
+        // to diagnostics whose source span fell inside the named symbol.
+        var clauses = new List<string>();
+        if (severity is not null) clauses.Add("d.severity >= @sev");
+        if (!string.IsNullOrEmpty(code)) clauses.Add("d.code = @code");
+        if (symbolId is not null) clauses.Add("d.symbol_id = @sid");
+        var where = clauses.Count == 0 ? "" : "WHERE " + string.Join(" AND ", clauses);
+
+        var sql = $"""
+            SELECT d.id, d.symbol_id AS SymbolId, d.file_id AS FileId, f.path AS FilePath,
+                   d.severity, d.code, d.message, d.line, d.col
+            FROM diagnostics d
+            JOIN files f ON f.id = d.file_id
+            {where}
+            ORDER BY f.path, d.line, d.col
+            LIMIT @limit;
+            """;
+        var rows = await _connection.QueryAsync<RawDiagnosticHit>(new CommandDefinition(
+            sql, new { sev = severity, code, sid = symbolId, limit }, cancellationToken: ct)).ConfigureAwait(false);
+        return rows.Select(r => r.ToHit()).ToList();
+    }
+
+    public async Task<IReadOnlyList<GeneratedFileRow>> ListGeneratedFilesAsync(int limit = 100, CancellationToken ct = default)
+    {
+        const string sql = """
+            SELECT f.id        AS FileId,
+                   f.path      AS FilePath,
+                   COALESCE((SELECT COUNT(*) FROM symbols s WHERE s.file_id = f.id), 0) AS SymbolCount
+            FROM files f
+            WHERE f.is_generated = 1
+            ORDER BY SymbolCount DESC, f.path
+            LIMIT @limit;
+            """;
+        var rows = await _connection.QueryAsync<RawGeneratedFileRow>(new CommandDefinition(
+            sql, new { limit }, cancellationToken: ct)).ConfigureAwait(false);
+        return rows.Select(r => new GeneratedFileRow(r.FileId, r.FilePath, (int)r.SymbolCount)).ToList();
+    }
+
+    public async Task<bool> IsGeneratedFileAsync(long fileId, CancellationToken ct = default)
+    {
+        var v = await _connection.ExecuteScalarAsync<long?>(new CommandDefinition(
+            "SELECT is_generated FROM files WHERE id = @id;",
+            new { id = fileId }, cancellationToken: ct)).ConfigureAwait(false);
+        return v is not null && v.Value != 0;
+    }
+
+    private sealed record RawDiagnosticHit(long Id, long? SymbolId, long FileId, string FilePath,
+        long Severity, string Code, string Message, long Line, long Col)
+    {
+        public DiagnosticHit ToHit() => new(Id, SymbolId, FileId, FilePath,
+            (int)Severity, Code, Message, (int)Line, (int)Col);
+    }
+
+    private sealed record RawGeneratedFileRow(long FileId, string FilePath, long SymbolCount);
 
     public async ValueTask DisposeAsync()
     {

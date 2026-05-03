@@ -1,3 +1,4 @@
+using System.Collections.Immutable;
 using System.Diagnostics;
 using System.Security.Cryptography;
 using DevBitsLab.Mcp.SourceGraph.Core;
@@ -65,7 +66,7 @@ public sealed class RoslynIndexer : IAsyncDisposable
         await _lock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
-            var docs = AllCSharpDocuments().ToList();
+            var docs = (await AllCSharpDocumentsAsync(ct).ConfigureAwait(false)).ToList();
             return await IndexCoreAsync(docs, fullReset: false, ct).ConfigureAwait(false);
         }
         finally
@@ -124,6 +125,7 @@ public sealed class RoslynIndexer : IAsyncDisposable
             }
 
             // Resolve documents from the LOCAL updated solution (not _workspace.CurrentSolution).
+            var touchedProjects = new HashSet<ProjectId>();
             foreach (var p in pathSet)
             {
                 if (deleted.Contains(p, StringComparer.OrdinalIgnoreCase)) continue;
@@ -131,7 +133,35 @@ public sealed class RoslynIndexer : IAsyncDisposable
                 foreach (var did in docIds)
                 {
                     var d = solution.GetDocument(did);
-                    if (d is not null && d.SourceCodeKind == SourceCodeKind.Regular) docs.Add(d);
+                    if (d is not null && d.SourceCodeKind == SourceCodeKind.Regular)
+                    {
+                        docs.Add(d);
+                        touchedProjects.Add(d.Project.Id);
+                    }
+                }
+            }
+
+            // For every project whose input files changed, also walk its source-generated docs.
+            // The SHA gate inside IndexCoreAsync will skip generated docs whose synthesised text
+            // hasn't changed (per design.md "SHA gate on generated content").
+            foreach (var pid in touchedProjects)
+            {
+                var project = solution.GetProject(pid);
+                if (project is null || project.Language != LanguageNames.CSharp) continue;
+                IEnumerable<SourceGeneratedDocument> sourceGenDocs;
+                try
+                {
+                    sourceGenDocs = await project.GetSourceGeneratedDocumentsAsync(ct).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Source generator failure for project {Project} during incremental reindex", project.Name);
+                    continue;
+                }
+                foreach (var d in sourceGenDocs)
+                {
+                    if (string.IsNullOrEmpty(d.FilePath)) continue;
+                    docs.Add(d);
                 }
             }
 
@@ -177,12 +207,42 @@ public sealed class RoslynIndexer : IAsyncDisposable
         if (_workspace is null) throw new InvalidOperationException("Call OpenAsync before indexing.");
     }
 
-    private IEnumerable<Document> AllCSharpDocuments()
+    private async Task<IEnumerable<Document>> AllCSharpDocumentsAsync(CancellationToken ct)
     {
-        return _workspace!.CurrentSolution.Projects
+        // Regular documents: same set we always walked.
+        var regular = _workspace!.CurrentSolution.Projects
             .Where(p => p.Language == LanguageNames.CSharp)
             .SelectMany(p => p.Documents)
             .Where(d => d.SourceCodeKind == SourceCodeKind.Regular && !string.IsNullOrEmpty(d.FilePath));
+
+        // Source-generated documents: per-project Project.GetSourceGeneratedDocumentsAsync drives
+        // the source generators that ship with the project (regex source-gen, MVVM Toolkit, ASP.NET
+        // routing, etc.) and surfaces synthesised C# files. They have a stable Document.FilePath
+        // string from Roslyn that we can use as the unique key. Marking those rows is_generated = 1
+        // is what makes the find_references default-filter and the (generated) annotations work.
+        var generatedList = new List<Document>();
+        foreach (var project in _workspace.CurrentSolution.Projects.Where(p => p.Language == LanguageNames.CSharp))
+        {
+            ct.ThrowIfCancellationRequested();
+            IEnumerable<SourceGeneratedDocument> sourceGenDocs;
+            try
+            {
+                sourceGenDocs = await project.GetSourceGeneratedDocumentsAsync(ct).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                // A misbehaving generator can throw during synthesis. Log and skip this project's
+                // generated set rather than failing the whole index.
+                _logger.LogWarning(ex, "Source generator failure for project {Project}; skipping generated docs", project.Name);
+                continue;
+            }
+            foreach (var d in sourceGenDocs)
+            {
+                if (string.IsNullOrEmpty(d.FilePath)) continue;
+                generatedList.Add(d);
+            }
+        }
+        return regular.Concat(generatedList);
     }
 
     private async Task<IndexResult> IndexCoreAsync(IReadOnlyList<Document> documents, bool fullReset, CancellationToken ct)
@@ -213,24 +273,45 @@ public sealed class RoslynIndexer : IAsyncDisposable
         {
             ct.ThrowIfCancellationRequested();
             var path = document.FilePath;
-            if (path is null || !File.Exists(path)) continue;
+            if (path is null) continue;
 
+            // Source-generated documents don't exist on disk; their bytes come from the document's
+            // SourceText. Same SHA gate either way — same hash on identical generator output means
+            // we skip the file entirely (per design.md "SHA gate on generated content").
+            var isGenerated = document is SourceGeneratedDocument;
             byte[] bytes;
-            try
+            if (isGenerated)
             {
-                bytes = await File.ReadAllBytesAsync(path, ct).ConfigureAwait(false);
+                try
+                {
+                    var text = await document.GetTextAsync(ct).ConfigureAwait(false);
+                    bytes = System.Text.Encoding.UTF8.GetBytes(text.ToString());
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex, "Skipping generated doc {Path} (text fetch failed)", path);
+                    continue;
+                }
             }
-            catch (IOException ex)
+            else
             {
-                // Editor save in progress, antivirus, etc. Skip; the watcher will fire again.
-                _logger.LogDebug(ex, "Skipping {Path} (read failed; will retry on next event)", path);
-                continue;
+                if (!File.Exists(path)) continue;
+                try
+                {
+                    bytes = await File.ReadAllBytesAsync(path, ct).ConfigureAwait(false);
+                }
+                catch (IOException ex)
+                {
+                    // Editor save in progress, antivirus, etc. Skip; the watcher will fire again.
+                    _logger.LogDebug(ex, "Skipping {Path} (read failed; will retry on next event)", path);
+                    continue;
+                }
             }
             var sha = SHA256.HashData(bytes);
             var stored = await _store.GetFileContentHashAsync(path, ct).ConfigureAwait(false);
             var unchanged = stored is not null && stored.AsSpan().SequenceEqual(sha);
 
-            var fileId = await _store.UpsertFileAsync(path, sha, DateTimeOffset.UtcNow, ct).ConfigureAwait(false);
+            var fileId = await _store.UpsertFileAsync(path, sha, DateTimeOffset.UtcNow, isGenerated, ct).ConfigureAwait(false);
             _fileIdByPath[path] = fileId;
 
             if (unchanged && !fullReset && _keysByFileId.ContainsKey(fileId))
@@ -601,6 +682,114 @@ public sealed class RoslynIndexer : IAsyncDisposable
             {
                 await _store.BulkInsertEdgesAsync(edgeBatch, ct).ConfigureAwait(false);
             }
+        }
+
+        // PASS 3 — diagnostics. compilation.GetDiagnostics(ct) returns every diagnostic the workspace
+        // would surface in IDE squiggles: analyzer warnings, compiler warnings/errors, etc. We persist
+        // every one whose Location.SourceSpan is non-empty, attributing it to the smallest enclosing
+        // indexed declaration when its position falls inside one. The reconcile step inside
+        // UpsertDiagnosticsForFileAsync deletes existing rows for the file before inserting, so a
+        // re-index naturally drops stale diagnostics for files whose warnings were silenced.
+        //
+        // We gather diagnostics per project (one compilation per project), then bucket them by
+        // fileId so each file gets a single Upsert call with its full set in one transaction.
+        var projectsTouched = new HashSet<ProjectId>();
+        foreach (var docs in docsByChangedFile.Values)
+        {
+            foreach (var d in docs) projectsTouched.Add(d.Project.Id);
+        }
+        var diagnosticsByFile = new Dictionary<long, List<DiagnosticRecord>>();
+        // Pre-create empty buckets for every changed file so files with zero diagnostics still get
+        // an Upsert call to clear out stale rows from a prior index.
+        foreach (var fid in changedFileIds) diagnosticsByFile[fid] = new List<DiagnosticRecord>();
+
+        foreach (var pid in projectsTouched)
+        {
+            ct.ThrowIfCancellationRequested();
+            var project = _workspace!.CurrentSolution.GetProject(pid);
+            if (project is null) continue;
+            Compilation? compilation;
+            try
+            {
+                compilation = await project.GetCompilationAsync(ct).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to get compilation for {Project}; skipping diagnostics", project.Name);
+                continue;
+            }
+            if (compilation is null) continue;
+
+            ImmutableArray<Diagnostic> diags;
+            try
+            {
+                diags = compilation.GetDiagnostics(ct);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to read diagnostics for {Project}", project.Name);
+                continue;
+            }
+
+            foreach (var diag in diags)
+            {
+                ct.ThrowIfCancellationRequested();
+                var loc = diag.Location;
+                if (loc.SourceSpan.IsEmpty) continue;
+                var tree = loc.SourceTree;
+                if (tree is null) continue;
+                var path = tree.FilePath;
+                if (string.IsNullOrEmpty(path)) continue;
+                if (!_fileIdByPath.TryGetValue(path, out var fileId)) continue;
+                if (!changedFileIds.Contains(fileId)) continue; // only touch files we re-indexed
+
+                long? symbolId = null;
+                try
+                {
+                    var model = compilation.GetSemanticModel(tree);
+                    var enclosing = model.GetEnclosingSymbol(loc.SourceSpan.Start, ct);
+                    while (enclosing is not null && !SymbolMapping.IsIndexable(enclosing))
+                    {
+                        enclosing = enclosing.ContainingSymbol;
+                    }
+                    if (enclosing is not null)
+                    {
+                        var key = SymbolMapping.CanonicalKey(enclosing);
+                        if (key is not null && _symbolIdByKey.TryGetValue(key, out var sid))
+                        {
+                            symbolId = sid;
+                        }
+                    }
+                }
+                catch
+                {
+                    // Best-effort symbol attribution. If lookup fails, leave the diagnostic
+                    // file-scoped (symbolId = NULL) and persist anyway.
+                }
+
+                var lineSpan = loc.GetLineSpan();
+                var rec = new DiagnosticRecord(
+                    SymbolId: symbolId,
+                    FileId: fileId,
+                    Severity: (int)diag.Severity,
+                    Code: diag.Id,
+                    Message: diag.GetMessage(),
+                    Line: lineSpan.StartLinePosition.Line + 1,
+                    Col: lineSpan.StartLinePosition.Character + 1);
+                if (!diagnosticsByFile.TryGetValue(fileId, out var bucket))
+                {
+                    bucket = new List<DiagnosticRecord>();
+                    diagnosticsByFile[fileId] = bucket;
+                }
+                bucket.Add(rec);
+            }
+        }
+
+        // Reconcile diagnostics: even files with zero diagnostics get an Upsert call so that
+        // freshly-fixed warnings disappear from the table on the next index.
+        foreach (var (fid, bucket) in diagnosticsByFile)
+        {
+            await _store.UpsertDiagnosticsForFileAsync(fid, bucket, ct).ConfigureAwait(false);
         }
 
         sw.Stop();

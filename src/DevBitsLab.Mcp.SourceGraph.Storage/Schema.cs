@@ -7,7 +7,7 @@ internal static class Schema
     /// drops all data tables when the on-disk version is below this, since the index can always be
     /// rebuilt from source.
     /// </summary>
-    public const int Version = 6;
+    public const int Version = 7;
 
     /// <summary>
     /// V5 enriches the symbol row with metadata that Roslyn already exposes per symbol but which
@@ -29,6 +29,11 @@ internal static class Schema
     /// V6 adds the <c>attributes</c> table + <c>attributes_fts</c> trigram index on top of V5,
     /// so the indexer can record every <c>[Attribute]</c> attached to a symbol and answer
     /// <c>find_by_attribute</c> queries (with optional argument-substring filtering).
+    ///
+    /// V7 adds <c>files.is_generated</c> (1 for documents obtained from
+    /// <c>Project.GetSourceGeneratedDocumentsAsync()</c>) and the <c>diagnostics</c> table
+    /// keyed by file/symbol so <c>find_diagnostics</c> can answer "show me every CS0618"
+    /// or "what's wrong in this file?" without re-running a build.
     /// </summary>
     public const string V1 = """
         CREATE TABLE IF NOT EXISTS schema_version (
@@ -39,7 +44,8 @@ internal static class Schema
             id INTEGER PRIMARY KEY,
             path TEXT UNIQUE NOT NULL,
             content_sha256 BLOB NOT NULL,
-            last_indexed_at INTEGER NOT NULL
+            last_indexed_at INTEGER NOT NULL,
+            is_generated INTEGER NOT NULL DEFAULT 0
         );
 
         CREATE TABLE IF NOT EXISTS symbols (
@@ -94,6 +100,25 @@ internal static class Schema
         CREATE INDEX IF NOT EXISTS idx_attributes_symbol ON attributes(symbol_id);
         CREATE INDEX IF NOT EXISTS idx_attributes_name ON attributes(name);
         CREATE INDEX IF NOT EXISTS idx_attributes_attribute_symbol_id ON attributes(attribute_symbol_id);
+
+        -- v7: Roslyn diagnostics. severity matches Microsoft.CodeAnalysis.DiagnosticSeverity
+        -- (Hidden=0, Info=1, Warning=2, Error=3) so callers can filter "WHERE severity >= 2"
+        -- to get warnings and errors. symbol_id is NULL when the diagnostic's source span
+        -- doesn't fall inside any indexed declaration (e.g. unused-using on a using directive).
+        CREATE TABLE IF NOT EXISTS diagnostics (
+            id INTEGER PRIMARY KEY,
+            symbol_id INTEGER,
+            file_id INTEGER NOT NULL,
+            severity INTEGER NOT NULL,
+            code TEXT NOT NULL,
+            message TEXT NOT NULL,
+            line INTEGER NOT NULL,
+            col INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_diagnostics_severity ON diagnostics(severity);
+        CREATE INDEX IF NOT EXISTS idx_diagnostics_code ON diagnostics(code);
+        CREATE INDEX IF NOT EXISTS idx_diagnostics_file ON diagnostics(file_id);
+        CREATE INDEX IF NOT EXISTS idx_diagnostics_symbol ON diagnostics(symbol_id);
         """;
 
     /// <summary>FTS5 trigram-tokenized index over symbols.name/fqn/signature/xml_summary, kept in sync via triggers.</summary>
@@ -173,6 +198,7 @@ internal static class Schema
     /// <see cref="Version"/>. The index always rebuilds from source on next pass.
     /// </summary>
     public const string DropAll = """
+        DROP TABLE   IF EXISTS diagnostics;
         DROP TRIGGER IF EXISTS attributes_ad;
         DROP TRIGGER IF EXISTS attributes_ai;
         DROP TABLE   IF EXISTS attributes_fts;
