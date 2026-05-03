@@ -12,7 +12,10 @@ public sealed record SymbolHit(
     int StartCol,
     int EndLine,
     int EndCol,
-    string? Signature);
+    string? Signature,
+    string? Modifiers = null,
+    int Accessibility = 0,
+    string? XmlSummary = null);
 
 public sealed record ReferenceHit(
     long Id,

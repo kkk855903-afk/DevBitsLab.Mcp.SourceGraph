@@ -17,7 +17,10 @@ public sealed record Symbol(
     int EndLine,
     int EndCol,
     string? Signature,
-    long? ContainerId);
+    long? ContainerId,
+    string? Modifiers = null,
+    int Accessibility = 0,
+    string? XmlSummary = null);
 
 public sealed record SymbolReference(
     long Id,

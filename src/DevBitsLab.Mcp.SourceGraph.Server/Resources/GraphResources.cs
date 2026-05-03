@@ -9,6 +9,17 @@ namespace DevBitsLab.Mcp.SourceGraph.Server.Resources;
 [McpServerResourceType]
 public static class GraphResources
 {
+    private static string AccessibilityLabel(int accessibility) => accessibility switch
+    {
+        6 => "public",
+        5 => "protected internal",
+        4 => "internal",
+        3 => "protected",
+        2 => "private protected",
+        1 => "private",
+        _ => "",
+    };
+
     [McpServerResource(UriTemplate = "graph://symbol/{symbolId}", Name = "graph-symbol", MimeType = "text/markdown")]
     [Description("Markdown card for a graph symbol: signature, definition location, top callers and callees.")]
     public static async Task<string> GetSymbolAsync(
@@ -27,8 +38,22 @@ public static class GraphResources
         sb.AppendLine($"# {hit.Fqn}");
         sb.AppendLine();
         sb.AppendLine($"- **Kind:** {hit.Kind}");
+        var accLabel = AccessibilityLabel(hit.Accessibility);
+        if (!string.IsNullOrEmpty(accLabel)) sb.AppendLine($"- **Accessibility:** {accLabel}");
+        if (!string.IsNullOrEmpty(hit.Modifiers)) sb.AppendLine($"- **Modifiers:** {hit.Modifiers.Replace(',', ' ')}");
         sb.AppendLine($"- **Defined in:** `{hit.FilePath}:{hit.StartLine}:{hit.StartCol}`");
         if (!string.IsNullOrEmpty(hit.Signature)) sb.AppendLine($"- **Signature:** `{hit.Signature}`");
+        if (!string.IsNullOrEmpty(hit.XmlSummary))
+        {
+            sb.AppendLine();
+            sb.AppendLine("## Summary");
+            sb.AppendLine();
+            foreach (var line in hit.XmlSummary.Split('\n'))
+            {
+                sb.Append("> ");
+                sb.AppendLine(line.TrimEnd());
+            }
+        }
         sb.AppendLine();
         sb.AppendLine($"## Callers ({callers.Count})");
         if (callers.Count == 0) sb.AppendLine("_(none)_");

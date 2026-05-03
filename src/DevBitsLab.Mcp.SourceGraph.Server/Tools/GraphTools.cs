@@ -11,7 +11,7 @@ namespace DevBitsLab.Mcp.SourceGraph.Server.Tools;
 public static class GraphTools
 {
     [McpServerTool]
-    [Description("Find the definition of a symbol by name or fully-qualified name. Returns location, kind, and signature for each match. Use for 'where is X defined?'.")]
+    [Description("Find the definition of a symbol by name or fully-qualified name. Returns location, kind, signature, accessibility, modifiers, and one-line XML summary for each match. Use for 'where is X defined?'.")]
     public static Task<string> FindDefinitionAsync(
         IGraphStore store,
         [Description("Symbol name (e.g. 'Calculator', 'Divide') or FQN suffix (e.g. 'Calculator.Add', 'Sample.Domain.Calculator')")] string symbol,
@@ -27,9 +27,11 @@ public static class GraphTools
             sb.AppendLine();
             foreach (var h in hits)
             {
-                sb.AppendLine($"- **{h.Fqn}** ({KindLabel(h.Kind)})");
+                sb.AppendLine($"- **{h.Fqn}** ({Format.KindWithAttrs(h)})");
                 sb.AppendLine($"  - {Format.Location(h.FilePath, h.StartLine, h.StartCol)}");
                 if (!string.IsNullOrEmpty(h.Signature)) sb.AppendLine($"  - `{h.Signature}`");
+                var oneLine = Format.OneLineSummary(h.XmlSummary);
+                if (!string.IsNullOrEmpty(oneLine)) sb.AppendLine($"  - _{oneLine}_");
             }
             return sb.ToString();
         });
@@ -71,7 +73,7 @@ public static class GraphTools
         });
 
     [McpServerTool]
-    [Description("List every symbol declared in a file (classes, methods, properties, etc.). Use for 'what's in this file?' to skip a Read.")]
+    [Description("List every symbol declared in a file (classes, methods, properties, etc.). Each row carries kind, accessibility, modifiers, and one-line XML summary. Use for 'what's in this file?' to skip a Read.")]
     public static Task<string> ListSymbolsInFileAsync(
         IGraphStore store,
         [Description("Absolute path or path suffix that uniquely identifies the file")] string path,
@@ -85,8 +87,10 @@ public static class GraphTools
             sb.AppendLine($"{hits.Count} symbol(s) in {hits[0].FilePath}:");
             foreach (var h in hits)
             {
-                sb.AppendLine($"- L{h.StartLine}: **{h.Name}** ({KindLabel(h.Kind)}) — {h.Fqn}");
+                sb.AppendLine($"- L{h.StartLine}: **{h.Name}** ({Format.KindWithAttrs(h)}) — {h.Fqn}");
                 if (!string.IsNullOrEmpty(h.Signature)) sb.AppendLine($"    `{h.Signature}`");
+                var oneLine = Format.OneLineSummary(h.XmlSummary);
+                if (!string.IsNullOrEmpty(oneLine)) sb.AppendLine($"    _{oneLine}_");
             }
             return sb.ToString();
         });
@@ -178,15 +182,29 @@ public static class GraphTools
             var callees = await store.ListCalleesAsync(top.Id, perCategory, ct).ConfigureAwait(false);
 
             var sb = new StringBuilder();
-            sb.AppendLine($"Neighborhood of **{top.Fqn}** ({KindLabel(top.Kind)})");
+            sb.AppendLine($"Neighborhood of **{top.Fqn}** ({Format.KindWithAttrs(top)})");
             sb.AppendLine($"definition: {Format.Location(top.FilePath, top.StartLine, top.StartCol)}");
+            var topSummary = Format.OneLineSummary(top.XmlSummary);
+            if (!string.IsNullOrEmpty(topSummary)) sb.AppendLine($"_{topSummary}_");
             sb.AppendLine();
             sb.AppendLine($"### Callers ({callers.Count})");
-            foreach (var c in callers) sb.AppendLine($"- {c.Fqn} — {Format.Location(c.FilePath, c.StartLine, c.StartCol)}");
+            foreach (var c in callers)
+            {
+                sb.Append($"- {c.Fqn} ({Format.KindWithAttrs(c)}) — {Format.Location(c.FilePath, c.StartLine, c.StartCol)}");
+                var s = Format.OneLineSummary(c.XmlSummary);
+                if (!string.IsNullOrEmpty(s)) sb.Append(" — _" + s + "_");
+                sb.AppendLine();
+            }
             if (callers.Count == 0) sb.AppendLine("- (none)");
             sb.AppendLine();
             sb.AppendLine($"### Callees ({callees.Count})");
-            foreach (var c in callees) sb.AppendLine($"- {c.Fqn} — {Format.Location(c.FilePath, c.StartLine, c.StartCol)}");
+            foreach (var c in callees)
+            {
+                sb.Append($"- {c.Fqn} ({Format.KindWithAttrs(c)}) — {Format.Location(c.FilePath, c.StartLine, c.StartCol)}");
+                var s = Format.OneLineSummary(c.XmlSummary);
+                if (!string.IsNullOrEmpty(s)) sb.Append(" — _" + s + "_");
+                sb.AppendLine();
+            }
             if (callees.Count == 0) sb.AppendLine("- (none)");
             return sb.ToString();
         });
@@ -206,7 +224,10 @@ public static class GraphTools
             sb.AppendLine($"Top {rows.Count} symbol(s) in '{namespaceOrPath}' (by inbound calls):");
             foreach (var row in rows)
             {
-                sb.AppendLine($"- in-deg {row.InDegree,3} — **{row.Symbol.Fqn}** ({KindLabel(row.Symbol.Kind)}) at {Format.Location(row.Symbol.FilePath, row.Symbol.StartLine, row.Symbol.StartCol)}");
+                sb.Append($"- in-deg {row.InDegree,3} — **{row.Symbol.Fqn}** ({Format.KindWithAttrs(row.Symbol)}) at {Format.Location(row.Symbol.FilePath, row.Symbol.StartLine, row.Symbol.StartCol)}");
+                var s = Format.OneLineSummary(row.Symbol.XmlSummary);
+                if (!string.IsNullOrEmpty(s)) sb.Append(" — _" + s + "_");
+                sb.AppendLine();
             }
             return sb.ToString();
         });
@@ -231,6 +252,46 @@ public static class GraphTools
             foreach (var r in rows)
             {
                 sb.AppendLine($"- d{r.Depth}: **{r.Symbol.Fqn}** ({KindLabel(r.Symbol.Kind)}) at {Format.Location(r.Symbol.FilePath, r.Symbol.StartLine, r.Symbol.StartCol)}");
+            }
+            return sb.ToString();
+        });
+
+    [McpServerTool]
+    [Description("List the direct members of a container (class, struct, interface, namespace) by FQN, optionally filtered by accessibility. Walks the populated container_id chain — replaces 'list_symbols_in_file then filter'.")]
+    public static Task<string> ListMembersAsync(
+        IGraphStore store,
+        [Description("Container FQN (e.g. 'Sample.Domain.Calculator', 'Sample.Domain'). Resolved with the same matching rules as find_definition; the top match is used.")] string container,
+        [Description("Reserved for a future change that follows inherits/implements edges; currently ignored.")] bool includeInherited = false,
+        [Description("Optional accessibility filter: public|internal|private|protected|protected internal|private protected.")] string? accessibility = null,
+        [Description("Maximum members to return (default 200)")] int limit = 200,
+        CancellationToken ct = default) =>
+        ToolMetrics.TrackAsync("list_members", new { container, includeInherited, accessibility, limit }, async () =>
+        {
+            var hits = await store.FindSymbolsAsync(container, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
+            if (hits.Count == 0) return $"No symbol found for container '{container}'.";
+            var top = hits[0];
+
+            int? accFilter = ParseAccessibility(accessibility);
+            if (!string.IsNullOrEmpty(accessibility) && accFilter is null)
+            {
+                return $"Unknown accessibility '{accessibility}'. Valid: public, internal, private, protected, protected internal, private protected.";
+            }
+
+            var members = await store.ListMembersAsync(top.Id, accFilter, limit, ct).ConfigureAwait(false);
+            var sb = new StringBuilder();
+            var filterNote = accFilter is null ? "" : $" (accessibility = {accessibility})";
+            sb.AppendLine($"{members.Count} member(s) of **{top.Fqn}** ({Format.KindWithAttrs(top)}){filterNote}:");
+            if (includeInherited)
+            {
+                sb.AppendLine("_(includeInherited is reserved for a future change; only direct members are returned.)_");
+            }
+            if (members.Count == 0) { sb.AppendLine("- (none)"); return sb.ToString(); }
+            foreach (var m in members)
+            {
+                sb.Append($"- L{m.StartLine}: **{m.Name}** ({Format.KindWithAttrs(m)}) — `{m.Signature ?? m.Fqn}`");
+                var s = Format.OneLineSummary(m.XmlSummary);
+                if (!string.IsNullOrEmpty(s)) sb.Append(" — _" + s + "_");
+                sb.AppendLine();
             }
             return sb.ToString();
         });
@@ -304,9 +365,67 @@ public static class GraphTools
         ReferenceKind.Inherits => "inherit",
         _ => "?",
     };
+
+    private static int? ParseAccessibility(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw)) return null;
+        return raw.Trim().ToLowerInvariant() switch
+        {
+            "public" => 6,
+            "protected internal" or "protected_or_internal" => 5,
+            "internal" => 4,
+            "protected" => 3,
+            "private protected" or "protected_and_internal" => 2,
+            "private" => 1,
+            _ => null,
+        };
+    }
+
+    internal static string KindLabelOf(SymbolKind kind) => KindLabel(kind);
 }
 
 internal static class Format
 {
     public static string Location(string path, int line, int col) => $"{path}:{line}:{col}";
+
+    /// <summary>Joins kind, accessibility, and modifiers into a compact parenthetical such as
+    /// "public class", "private readonly field", "method", "public async method".</summary>
+    public static string KindWithAttrs(SymbolHit h)
+    {
+        var sb = new StringBuilder();
+        var acc = AccessibilityLabel(h.Accessibility);
+        if (!string.IsNullOrEmpty(acc)) sb.Append(acc);
+        if (!string.IsNullOrEmpty(h.Modifiers))
+        {
+            if (sb.Length > 0) sb.Append(' ');
+            sb.Append(h.Modifiers.Replace(',', ' '));
+        }
+        if (sb.Length > 0) sb.Append(' ');
+        sb.Append(GraphTools.KindLabelOf(h.Kind));
+        return sb.ToString();
+    }
+
+    /// <summary>First sentence of an XML doc summary, capped to ~120 chars. Single-line; trailing
+    /// whitespace and the period are preserved up to the first '. ' or newline boundary.</summary>
+    public static string? OneLineSummary(string? xmlSummary)
+    {
+        if (string.IsNullOrWhiteSpace(xmlSummary)) return null;
+        var s = xmlSummary.Replace('\r', ' ').Replace('\n', ' ').Trim();
+        var endIdx = s.IndexOf(". ", StringComparison.Ordinal);
+        if (endIdx >= 0) s = s[..(endIdx + 1)];
+        const int maxLen = 120;
+        if (s.Length > maxLen) s = s[..maxLen].TrimEnd() + "…";
+        return s;
+    }
+
+    public static string AccessibilityLabel(int accessibility) => accessibility switch
+    {
+        6 => "public",
+        5 => "protected internal",
+        4 => "internal",
+        3 => "protected",
+        2 => "private protected",
+        1 => "private",
+        _ => "",
+    };
 }

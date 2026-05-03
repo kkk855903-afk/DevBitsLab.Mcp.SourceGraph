@@ -176,21 +176,25 @@ public sealed class SqliteGraphStore : IGraphStore
     {
         // Stable id by canonical_key. On conflict we update the location/signature/etc but the
         // integer id is preserved, so refs/edges from other files that point to this symbol stay
-        // correct across edits.
+        // correct across edits. NOTE: container_id is intentionally NOT included in the conflict
+        // update path — it's set separately by BatchUpdateContainerIdsAsync after pass-1 inserts
+        // every symbol, so the parent row exists by the time the lookup happens.
         const string sql = """
-            INSERT INTO symbols(canonical_key, name, fqn, kind, file_id, start_line, start_col, end_line, end_col, signature, container_id)
-            VALUES (@Key, @Name, @Fqn, @Kind, @FileId, @StartLine, @StartCol, @EndLine, @EndCol, @Signature, @ContainerId)
+            INSERT INTO symbols(canonical_key, name, fqn, kind, file_id, start_line, start_col, end_line, end_col, signature, container_id, modifiers, accessibility, xml_summary)
+            VALUES (@Key, @Name, @Fqn, @Kind, @FileId, @StartLine, @StartCol, @EndLine, @EndCol, @Signature, @ContainerId, @Modifiers, @Accessibility, @XmlSummary)
             ON CONFLICT(canonical_key) DO UPDATE SET
-                name        = excluded.name,
-                fqn         = excluded.fqn,
-                kind        = excluded.kind,
-                file_id     = excluded.file_id,
-                start_line  = excluded.start_line,
-                start_col   = excluded.start_col,
-                end_line    = excluded.end_line,
-                end_col     = excluded.end_col,
-                signature   = excluded.signature,
-                container_id = excluded.container_id
+                name          = excluded.name,
+                fqn           = excluded.fqn,
+                kind          = excluded.kind,
+                file_id       = excluded.file_id,
+                start_line    = excluded.start_line,
+                start_col     = excluded.start_col,
+                end_line      = excluded.end_line,
+                end_col       = excluded.end_col,
+                signature     = excluded.signature,
+                modifiers     = excluded.modifiers,
+                accessibility = excluded.accessibility,
+                xml_summary   = excluded.xml_summary
             RETURNING id;
             """;
         await _writeLock.WaitAsync(ct).ConfigureAwait(false);
@@ -209,7 +213,32 @@ public sealed class SqliteGraphStore : IGraphStore
                 symbol.EndCol,
                 symbol.Signature,
                 symbol.ContainerId,
+                symbol.Modifiers,
+                symbol.Accessibility,
+                symbol.XmlSummary,
             }, cancellationToken: ct)).ConfigureAwait(false);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public async Task BatchUpdateContainerIdsAsync(IReadOnlyList<(long ChildId, long ParentId)> pairs, CancellationToken ct = default)
+    {
+        if (pairs.Count == 0) return;
+        const string sql = "UPDATE symbols SET container_id = @ParentId WHERE id = @ChildId;";
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            using var tx = _connection.BeginTransaction();
+            foreach (var (childId, parentId) in pairs)
+            {
+                await _connection.ExecuteAsync(new CommandDefinition(
+                    sql, new { ChildId = childId, ParentId = parentId }, transaction: tx, cancellationToken: ct))
+                    .ConfigureAwait(false);
+            }
+            tx.Commit();
         }
         finally
         {
@@ -284,6 +313,7 @@ public sealed class SqliteGraphStore : IGraphStore
         const string sql = """
             WITH ranked AS (
                 SELECT s.id, s.name, s.fqn, s.kind, f.path, s.start_line, s.start_col, s.end_line, s.end_col, s.signature,
+                    s.modifiers, s.accessibility, s.xml_summary,
                     CASE
                         WHEN s.name = @q THEN 1
                         WHEN s.fqn  = @q THEN 2
@@ -304,7 +334,8 @@ public sealed class SqliteGraphStore : IGraphStore
                   )
             )
             SELECT id, name, fqn, kind, path AS FilePath, start_line AS StartLine, start_col AS StartCol,
-                   end_line AS EndLine, end_col AS EndCol, signature
+                   end_line AS EndLine, end_col AS EndCol, signature,
+                   modifiers AS Modifiers, accessibility AS Accessibility, xml_summary AS XmlSummary
             FROM ranked
             ORDER BY rank, length(fqn), fqn
             LIMIT @limit;
@@ -336,7 +367,8 @@ public sealed class SqliteGraphStore : IGraphStore
         var fts = "\"" + ftsQuery.Replace("\"", "\"\"") + "\"";
         var sql = $"""
             SELECT s.id, s.name, s.fqn, s.kind, f.path AS FilePath, s.start_line AS StartLine, s.start_col AS StartCol,
-                   s.end_line AS EndLine, s.end_col AS EndCol, s.signature
+                   s.end_line AS EndLine, s.end_col AS EndCol, s.signature,
+                   s.modifiers AS Modifiers, s.accessibility AS Accessibility, s.xml_summary AS XmlSummary
             FROM symbols_fts t
             JOIN symbols s ON s.id = t.rowid
             JOIN files   f ON f.id = s.file_id
@@ -355,6 +387,7 @@ public sealed class SqliteGraphStore : IGraphStore
         const string sql = """
             SELECT s.id, s.name, s.fqn, s.kind, f.path AS FilePath, s.start_line AS StartLine, s.start_col AS StartCol,
                    s.end_line AS EndLine, s.end_col AS EndCol, s.signature,
+                   s.modifiers AS Modifiers, s.accessibility AS Accessibility, s.xml_summary AS XmlSummary,
                    COALESCE((SELECT COUNT(*) FROM edges e WHERE e.dst = s.id AND e.kind = 0), 0) AS InDegree
             FROM symbols s
             JOIN files f ON f.id = s.file_id
@@ -381,7 +414,9 @@ public sealed class SqliteGraphStore : IGraphStore
                 WHERE e.kind = 0 AND u.depth < @maxDepth
             )
             SELECT s.id, s.name, s.fqn, s.kind, f.path AS FilePath, s.start_line AS StartLine, s.start_col AS StartCol,
-                   s.end_line AS EndLine, s.end_col AS EndCol, s.signature, MIN(u.depth) AS Depth
+                   s.end_line AS EndLine, s.end_col AS EndCol, s.signature,
+                   s.modifiers AS Modifiers, s.accessibility AS Accessibility, s.xml_summary AS XmlSummary,
+                   MIN(u.depth) AS Depth
             FROM upstream u
             JOIN symbols s ON s.id = u.id
             JOIN files   f ON f.id = s.file_id
@@ -394,25 +429,51 @@ public sealed class SqliteGraphStore : IGraphStore
         return rows.Select(r => new ImpactedSymbol(r.ToHit(), (int)r.Depth)).ToList();
     }
 
+    public async Task<IReadOnlyList<SymbolHit>> ListMembersAsync(long containerId, int? accessibilityFilter = null, int limit = 200, CancellationToken ct = default)
+    {
+        // Direct children of the named container, ordered by start_line. Inherited members are
+        // resolved at the tool layer (would require walking inherits/implements edges to map a
+        // base type's children onto this container).
+        var sql = $"""
+            SELECT s.id, s.name, s.fqn, s.kind, f.path AS FilePath, s.start_line AS StartLine, s.start_col AS StartCol,
+                   s.end_line AS EndLine, s.end_col AS EndCol, s.signature,
+                   s.modifiers AS Modifiers, s.accessibility AS Accessibility, s.xml_summary AS XmlSummary
+            FROM symbols s
+            JOIN files   f ON f.id = s.file_id
+            WHERE s.container_id = @id
+              {(accessibilityFilter is null ? "" : "AND s.accessibility = @acc")}
+            ORDER BY f.path, s.start_line, s.start_col
+            LIMIT @limit;
+            """;
+        var rows = await _connection.QueryAsync<RawSymbolHit>(new CommandDefinition(
+            sql, new { id = containerId, acc = accessibilityFilter, limit }, cancellationToken: ct)).ConfigureAwait(false);
+        return rows.Select(r => r.ToHit()).ToList();
+    }
+
     private sealed record RawModuleSymbol(long Id, string Name, string Fqn, long Kind, string FilePath,
-        long StartLine, long StartCol, long EndLine, long EndCol, string? Signature, long InDegree)
+        long StartLine, long StartCol, long EndLine, long EndCol, string? Signature,
+        string? Modifiers, long Accessibility, string? XmlSummary, long InDegree)
     {
         public SymbolHit ToHit() => new(Id, Name, Fqn, (Core.SymbolKind)Kind, FilePath,
-            (int)StartLine, (int)StartCol, (int)EndLine, (int)EndCol, Signature);
+            (int)StartLine, (int)StartCol, (int)EndLine, (int)EndCol, Signature,
+            Modifiers, (int)Accessibility, XmlSummary);
     }
 
     private sealed record RawImpactedSymbol(long Id, string Name, string Fqn, long Kind, string FilePath,
-        long StartLine, long StartCol, long EndLine, long EndCol, string? Signature, long Depth)
+        long StartLine, long StartCol, long EndLine, long EndCol, string? Signature,
+        string? Modifiers, long Accessibility, string? XmlSummary, long Depth)
     {
         public SymbolHit ToHit() => new(Id, Name, Fqn, (Core.SymbolKind)Kind, FilePath,
-            (int)StartLine, (int)StartCol, (int)EndLine, (int)EndCol, Signature);
+            (int)StartLine, (int)StartCol, (int)EndLine, (int)EndCol, Signature,
+            Modifiers, (int)Accessibility, XmlSummary);
     }
 
     public async Task<IReadOnlyList<SymbolHit>> ListCallersAsync(long symbolId, int limit = 50, CancellationToken ct = default)
     {
         const string sql = """
             SELECT s.id, s.name, s.fqn, s.kind, f.path AS FilePath, s.start_line AS StartLine, s.start_col AS StartCol,
-                   s.end_line AS EndLine, s.end_col AS EndCol, s.signature
+                   s.end_line AS EndLine, s.end_col AS EndCol, s.signature,
+                   s.modifiers AS Modifiers, s.accessibility AS Accessibility, s.xml_summary AS XmlSummary
             FROM edges e
             JOIN symbols s ON s.id = e.src
             JOIN files   f ON f.id = s.file_id
@@ -429,7 +490,8 @@ public sealed class SqliteGraphStore : IGraphStore
     {
         const string sql = """
             SELECT s.id, s.name, s.fqn, s.kind, f.path AS FilePath, s.start_line AS StartLine, s.start_col AS StartCol,
-                   s.end_line AS EndLine, s.end_col AS EndCol, s.signature
+                   s.end_line AS EndLine, s.end_col AS EndCol, s.signature,
+                   s.modifiers AS Modifiers, s.accessibility AS Accessibility, s.xml_summary AS XmlSummary
             FROM edges e
             JOIN symbols s ON s.id = e.dst
             JOIN files   f ON f.id = s.file_id
@@ -446,7 +508,8 @@ public sealed class SqliteGraphStore : IGraphStore
     {
         const string sql = """
             SELECT s.id, s.name, s.fqn, s.kind, f.path AS FilePath, s.start_line AS StartLine, s.start_col AS StartCol,
-                   s.end_line AS EndLine, s.end_col AS EndCol, s.signature
+                   s.end_line AS EndLine, s.end_col AS EndCol, s.signature,
+                   s.modifiers AS Modifiers, s.accessibility AS Accessibility, s.xml_summary AS XmlSummary
             FROM symbols s
             JOIN files   f ON f.id = s.file_id
             WHERE s.id = @id;
@@ -460,7 +523,8 @@ public sealed class SqliteGraphStore : IGraphStore
     {
         const string sql = """
             SELECT s.id, s.name, s.fqn, s.kind, f.path AS FilePath, s.start_line AS StartLine, s.start_col AS StartCol,
-                   s.end_line AS EndLine, s.end_col AS EndCol, s.signature
+                   s.end_line AS EndLine, s.end_col AS EndCol, s.signature,
+                   s.modifiers AS Modifiers, s.accessibility AS Accessibility, s.xml_summary AS XmlSummary
             FROM symbols s
             JOIN files f ON f.id = s.file_id
             WHERE f.path = @path OR f.path LIKE '%' || @path
@@ -472,11 +536,13 @@ public sealed class SqliteGraphStore : IGraphStore
     }
 
     private sealed record RawSymbolHit(long Id, string Name, string Fqn, long Kind, string FilePath,
-        long StartLine, long StartCol, long EndLine, long EndCol, string? Signature)
+        long StartLine, long StartCol, long EndLine, long EndCol, string? Signature,
+        string? Modifiers, long Accessibility, string? XmlSummary)
     {
         public SymbolHit ToHit() => new(
             Id, Name, Fqn, (Core.SymbolKind)Kind, FilePath,
-            (int)StartLine, (int)StartCol, (int)EndLine, (int)EndCol, Signature);
+            (int)StartLine, (int)StartCol, (int)EndLine, (int)EndCol, Signature,
+            Modifiers, (int)Accessibility, XmlSummary);
     }
 
     private sealed record RawReferenceHit(long Id, long SymbolId, string FilePath, long Line, long Col, long Kind)
