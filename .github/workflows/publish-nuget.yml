@@ -17,6 +17,7 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
+    environment: Release   # NUGET_API_KEY lives as an environment secret
     steps:
       - uses: actions/checkout@v4
         with:
