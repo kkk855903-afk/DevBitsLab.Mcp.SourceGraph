@@ -1,6 +1,8 @@
 using DevBitsLab.Mcp.SourceGraph.Core;
 using DevBitsLab.Mcp.SourceGraph.Embeddings;
 using DevBitsLab.Mcp.SourceGraph.Indexing;
+using DevBitsLab.Mcp.SourceGraph.Sdk;
+using DevBitsLab.Mcp.SourceGraph.Server.Plugins;
 using DevBitsLab.Mcp.SourceGraph.Server.Scoping;
 using DevBitsLab.Mcp.SourceGraph.Storage;
 using DevBitsLab.Mcp.SourceGraph.Watcher;
@@ -28,6 +30,7 @@ public sealed class LiveIndexService : BackgroundService
     private readonly HistoryOptions _historyOptions;
     private readonly IEmbeddingsRequestSink _embeddingsSink;
     private readonly EmbeddingModelInfo _modelInfo;
+    private readonly AnalyzerPipeline _analyzerPipeline;
     private readonly ILogger<LiveIndexService> _logger;
     private readonly ILoggerFactory _loggerFactory;
 
@@ -39,6 +42,7 @@ public sealed class LiveIndexService : BackgroundService
         HistoryOptions historyOptions,
         IEmbeddingsRequestSink embeddingsSink,
         EmbeddingModelInfo modelInfo,
+        AnalyzerPipeline analyzerPipeline,
         ILogger<LiveIndexService> logger,
         ILoggerFactory loggerFactory)
     {
@@ -49,6 +53,7 @@ public sealed class LiveIndexService : BackgroundService
         _historyOptions = historyOptions;
         _embeddingsSink = embeddingsSink;
         _modelInfo = modelInfo;
+        _analyzerPipeline = analyzerPipeline;
         _logger = logger;
         _loggerFactory = loggerFactory;
     }
@@ -134,6 +139,16 @@ public sealed class LiveIndexService : BackgroundService
                 var initial = await indexer.IndexAllAsync(ct).ConfigureAwait(false);
                 _logger.LogInformation("Scope `{Id}` initial index complete in {Elapsed}: {Files} files re-processed",
                     scope.Id, initial.Elapsed, initial.FilesIndexed);
+
+                // Plugin analyzers: walk every indexed file and dispatch the registered analyzers.
+                // Done after the cold index so the per-scope graph already has the symbols /
+                // attributes the analyzers want to consume. Skipped silently when the plugin host
+                // has no analyzers, which is the v0.5.0 zero-config path.
+                if (_analyzerPipeline.HasAnalyzers)
+                {
+                    await DispatchAnalyzersForScopeAsync(host, ct).ConfigureAwait(false);
+                }
+
                 host.Status = "ok";
                 host.LastIndexedAt = DateTimeOffset.UtcNow;
                 await _registry.UpsertAsync(ToRow(scope, host.Status, null), ct).ConfigureAwait(false);
@@ -221,6 +236,115 @@ public sealed class LiveIndexService : BackgroundService
             catch (Exception ex) { _logger.LogWarning(ex, "Disposing scope `{Id}` raised", host.Scope.Id); }
         }
     }
+
+    /// <summary>
+    /// Walk every file the indexer just touched and dispatch every loaded analyzer against it.
+    /// Events are synthesised from the per-scope store's current rows: <c>SymbolDeclared</c> per
+    /// indexed symbol in the file plus <c>AttributeAttached</c> per attribute on those symbols.
+    /// This is the simplest way to bridge the workspace-aware bulk indexer to the per-document
+    /// SDK contract without requiring the indexer itself to capture the live event stream — the
+    /// store is the source of truth either way.
+    /// </summary>
+    private async Task DispatchAnalyzersForScopeAsync(ScopeHost host, CancellationToken ct)
+    {
+        var files = await host.Store.GetAllFilesAsync(ct).ConfigureAwait(false);
+        var symbolKeys = await host.Store.GetAllSymbolKeysAsync(ct).ConfigureAwait(false);
+
+        // Build canonical-key -> id map for the emitter; analyzers can target any indexed symbol
+        // by canonical key, including ones in files other than the one currently being analysed.
+        var symbolIdByKey = new Dictionary<string, long>(StringComparer.Ordinal);
+        var keysByFileId = new Dictionary<long, List<string>>();
+        foreach (var k in symbolKeys)
+        {
+            symbolIdByKey[k.CanonicalKey] = k.Id;
+            if (!keysByFileId.TryGetValue(k.FileId, out var list))
+            {
+                list = new List<string>();
+                keysByFileId[k.FileId] = list;
+            }
+            list.Add(k.CanonicalKey);
+        }
+
+        foreach (var file in files)
+        {
+            ct.ThrowIfCancellationRequested();
+            byte[] contents;
+            try
+            {
+                if (!File.Exists(file.Path)) continue;
+                contents = await File.ReadAllBytesAsync(file.Path, ct).ConfigureAwait(false);
+            }
+            catch (IOException ex)
+            {
+                _logger.LogDebug(ex, "Skipping {Path} for analyzer dispatch (read failed)", file.Path);
+                continue;
+            }
+
+            // Synthesise the IndexEvent stream: every symbol declared in this file plus every
+            // attribute attached to those symbols.
+            var events = new List<Sdk.IndexEvent>();
+            if (keysByFileId.TryGetValue(file.Id, out var keys))
+            {
+                foreach (var key in keys)
+                {
+                    var sym = await host.Store.GetSymbolByIdAsync(symbolIdByKey[key], ct).ConfigureAwait(false);
+                    if (sym is null) continue;
+                    events.Add(new Sdk.IndexEvent.SymbolDeclared(
+                        CanonicalKey: key,
+                        Name: sym.Name,
+                        Fqn: sym.Fqn,
+                        Kind: MapToPluginKind(sym.Kind),
+                        StartLine: sym.StartLine,
+                        StartColumn: sym.StartCol,
+                        EndLine: sym.EndLine,
+                        EndColumn: sym.EndCol,
+                        Signature: sym.Signature,
+                        Modifiers: sym.Modifiers,
+                        Accessibility: sym.Accessibility,
+                        XmlSummary: sym.XmlSummary));
+
+                    var attrs = await host.Store.GetAttributesForSymbolAsync(sym.Id, ct).ConfigureAwait(false);
+                    foreach (var a in attrs)
+                    {
+                        events.Add(new Sdk.IndexEvent.AttributeAttached(
+                            SymbolCanonicalKey: key,
+                            AttributeName: a.Name,
+                            AttributeFullName: a.FullName,
+                            ArgsJson: a.ArgsJson));
+                    }
+                }
+            }
+
+            await _analyzerPipeline.RunAsync(
+                host.Store,
+                file.Id,
+                file.Path,
+                contents,
+                host.Scope.Id,
+                host.Scope.Root,
+                events,
+                symbolIdByKey,
+                ct).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>Storage-side <see cref="Core.SymbolKind"/> -&gt; SDK <see cref="Sdk.PluginSymbolKind"/>.</summary>
+    private static Sdk.PluginSymbolKind MapToPluginKind(Core.SymbolKind k) => k switch
+    {
+        Core.SymbolKind.Namespace => Sdk.PluginSymbolKind.Namespace,
+        Core.SymbolKind.Class => Sdk.PluginSymbolKind.Class,
+        Core.SymbolKind.Struct => Sdk.PluginSymbolKind.Struct,
+        Core.SymbolKind.Interface => Sdk.PluginSymbolKind.Interface,
+        Core.SymbolKind.Enum => Sdk.PluginSymbolKind.Enum,
+        Core.SymbolKind.EnumMember => Sdk.PluginSymbolKind.EnumMember,
+        Core.SymbolKind.Delegate => Sdk.PluginSymbolKind.Delegate,
+        Core.SymbolKind.Method => Sdk.PluginSymbolKind.Method,
+        Core.SymbolKind.Constructor => Sdk.PluginSymbolKind.Constructor,
+        Core.SymbolKind.Property => Sdk.PluginSymbolKind.Property,
+        Core.SymbolKind.Field => Sdk.PluginSymbolKind.Field,
+        Core.SymbolKind.Event => Sdk.PluginSymbolKind.Event,
+        _ => Sdk.PluginSymbolKind.Other,
+    };
 
     private static string? ResolvePrimarySolution(Scope scope)
     {

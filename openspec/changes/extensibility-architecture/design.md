@@ -46,6 +46,9 @@ Per-plugin `try/catch` in the host. A throwing analyzer is marked `failed` for t
 **6. Tool name prefixing.**
 Plugin tool names are mandatory-prefixed by the plugin's `Prefix`. The built-in tools (no plugin) keep their bare names. This keeps the agent surface predictable and prevents accidental shadowing.
 
+**7. Programmatic tool registration via MCP SDK.**
+The current `ModelContextProtocol` SDK favours static `[McpServerToolType]`/`[McpServerTool]`-attributed methods discovered via `WithToolsFromAssembly()`. A plugin loaded at runtime can't expose static-attributed methods on a type the host scanned at startup, so we use the SDK's `McpServerTool.Create(handler, options)` API per registered delegate and pass the resulting list to `IMcpServerBuilder.WithTools(IEnumerable<McpServerTool>)`. The plugin's `IMcpToolPlugin.RegisterAsync` calls `IToolRegistry.AddTool(name, description, Delegate)`; the host's `ToolRegistry` does the SDK call internally. End-state: built-in tools still come from `WithToolsFromAssembly`, plugin tools come from `WithTools(...)`, both end up in the same MCP catalog.
+
 ## Risks / Trade-offs
 
 - **API stability burden.** A public SDK is a contract; we'll have to be conservative about breaking changes. Versioning rule: SDK gets its own semver, plugins declare a min version. Server refuses to load plugins targeting a higher SDK version than it ships.

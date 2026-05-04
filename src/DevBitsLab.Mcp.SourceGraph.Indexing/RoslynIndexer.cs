@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.Security.Cryptography;
 using DevBitsLab.Mcp.SourceGraph.Core;
 using DevBitsLab.Mcp.SourceGraph.Embeddings;
+using DevBitsLab.Mcp.SourceGraph.Sdk;
 using DevBitsLab.Mcp.SourceGraph.Storage;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
@@ -18,9 +19,25 @@ namespace DevBitsLab.Mcp.SourceGraph.Indexing;
 /// Long-lived indexer that owns an MSBuildWorkspace and a symbol-key map.
 /// One-shot use: <see cref="IndexSolutionOnceAsync"/>. Live use: open then call
 /// <see cref="IndexAllAsync"/> once, then <see cref="IndexChangedFilesAsync"/> as files change.
+///
+/// <para>
+/// Also implements <see cref="ILanguageIndexer"/> so the v0.6 plugin host can register the
+/// built-in C# pathway alongside third-party language indexers. For <c>.cs</c> files the host
+/// continues to drive the workspace-aware bulk path (<see cref="IndexAllAsync"/>); the contract's
+/// per-document <see cref="ILanguageIndexer.IndexAsync"/> is implemented for completeness so a
+/// chained dispatcher (e.g. tests) can still extract events from a single file without opening a
+/// workspace. Routing the workspace-aware bulk path through the dispatcher would have meant
+/// re-architecting <see cref="LiveIndexService"/>; the brief explicitly preserves single-solution
+/// back-compat, so the dispatcher special-cases <c>.cs</c> and keeps the existing solution walk.
+/// </para>
 /// </summary>
-public sealed class RoslynIndexer : IAsyncDisposable
+public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
 {
+    /// <summary>The single .cs extension this indexer claims.</summary>
+    private static readonly IReadOnlyCollection<string> _fileExtensions = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { ".cs" };
+    /// <inheritdoc />
+    IReadOnlyCollection<string> ILanguageIndexer.FileExtensions => _fileExtensions;
+
     private readonly IGraphStore _store;
     private readonly IEmbeddingsRequestSink _embeddingsSink;
     private readonly ILogger<RoslynIndexer> _logger;
@@ -1217,6 +1234,107 @@ public sealed class RoslynIndexer : IAsyncDisposable
         _workspace?.Dispose();
         _lock.Dispose();
         return ValueTask.CompletedTask;
+    }
+
+    /// <summary>
+    /// <see cref="ILanguageIndexer"/> contract entry point. The plugin-aware dispatcher in the
+    /// server special-cases <c>.cs</c> and keeps the existing workspace-aware bulk path, so this
+    /// method is rarely invoked at runtime. It exists so the contract is satisfied (the type
+    /// really IS the seam) and so a downstream tool that wants per-file events without opening
+    /// an MSBuildWorkspace can still get them via syntax-tree-only parsing.
+    /// </summary>
+    Task<IReadOnlyList<Sdk.IndexEvent>> ILanguageIndexer.IndexAsync(IndexContext ctx, CancellationToken ct)
+    {
+        IReadOnlyList<Sdk.IndexEvent> events = ExtractEventsFromSyntaxTree(ctx);
+        return Task.FromResult(events);
+    }
+
+    /// <summary>
+    /// Parse <paramref name="ctx"/>'s contents as a C# syntax tree (no workspace, no semantics)
+    /// and emit <see cref="Sdk.IndexEvent.SymbolDeclared"/> + <see cref="Sdk.IndexEvent.FileScanned"/>
+    /// records for each top-level declaration. Used by the per-document <see cref="ILanguageIndexer.IndexAsync"/>
+    /// path; intentionally does NOT call into the workspace-aware bulk path so this method is
+    /// safe to invoke from a thread that doesn't own the indexer's <see cref="_lock"/>.
+    /// </summary>
+    private static IReadOnlyList<Sdk.IndexEvent> ExtractEventsFromSyntaxTree(IndexContext ctx)
+    {
+        var events = new List<Sdk.IndexEvent>();
+        var sha = SHA256.HashData(ctx.Contents);
+        var tree = CSharpSyntaxTree.ParseText(SourceText.From(ctx.Contents, ctx.Contents.Length, System.Text.Encoding.UTF8));
+        var root = tree.GetRoot();
+        foreach (var node in EnumerateDeclarations(root))
+        {
+            string? name = null;
+            string? fqn = null;
+            Sdk.PluginSymbolKind kind = Sdk.PluginSymbolKind.Other;
+            switch (node)
+            {
+                case ClassDeclarationSyntax c:
+                    name = c.Identifier.ValueText;
+                    fqn = QualifyTypeName(c, name);
+                    kind = Sdk.PluginSymbolKind.Class;
+                    break;
+                case StructDeclarationSyntax s:
+                    name = s.Identifier.ValueText;
+                    fqn = QualifyTypeName(s, name);
+                    kind = Sdk.PluginSymbolKind.Struct;
+                    break;
+                case InterfaceDeclarationSyntax iface:
+                    name = iface.Identifier.ValueText;
+                    fqn = QualifyTypeName(iface, name);
+                    kind = Sdk.PluginSymbolKind.Interface;
+                    break;
+                case RecordDeclarationSyntax r:
+                    name = r.Identifier.ValueText;
+                    fqn = QualifyTypeName(r, name);
+                    kind = Sdk.PluginSymbolKind.Record;
+                    break;
+                case EnumDeclarationSyntax en:
+                    name = en.Identifier.ValueText;
+                    fqn = QualifyTypeName(en, name);
+                    kind = Sdk.PluginSymbolKind.Enum;
+                    break;
+                case MethodDeclarationSyntax m:
+                    name = m.Identifier.ValueText;
+                    fqn = QualifyMemberName(m, name);
+                    kind = Sdk.PluginSymbolKind.Method;
+                    break;
+                case PropertyDeclarationSyntax p:
+                    name = p.Identifier.ValueText;
+                    fqn = QualifyMemberName(p, name);
+                    kind = Sdk.PluginSymbolKind.Property;
+                    break;
+            }
+            if (name is null || fqn is null) continue;
+            var span = node.GetLocation().GetLineSpan();
+            events.Add(new Sdk.IndexEvent.SymbolDeclared(
+                CanonicalKey: $"R:{ctx.FilePath}#{span.StartLinePosition.Line}:{name}",
+                Name: name,
+                Fqn: fqn,
+                Kind: kind,
+                StartLine: span.StartLinePosition.Line + 1,
+                StartColumn: span.StartLinePosition.Character + 1,
+                EndLine: span.EndLinePosition.Line + 1,
+                EndColumn: span.EndLinePosition.Character + 1));
+        }
+        events.Add(new Sdk.IndexEvent.FileScanned(ctx.FilePath, sha, IsGenerated: false));
+        return events;
+    }
+
+    private static string QualifyTypeName(SyntaxNode node, string name)
+    {
+        var ns = node.Ancestors().OfType<BaseNamespaceDeclarationSyntax>().FirstOrDefault();
+        var nsName = ns?.Name.ToString();
+        return string.IsNullOrEmpty(nsName) ? name : $"{nsName}.{name}";
+    }
+
+    private static string QualifyMemberName(SyntaxNode node, string name)
+    {
+        var typeDecl = node.Ancestors().OfType<BaseTypeDeclarationSyntax>().FirstOrDefault();
+        if (typeDecl is null) return name;
+        var typeName = typeDecl.Identifier.ValueText;
+        var nsName = typeDecl.Ancestors().OfType<BaseNamespaceDeclarationSyntax>().FirstOrDefault()?.Name.ToString();
+        return string.IsNullOrEmpty(nsName) ? $"{typeName}.{name}" : $"{nsName}.{typeName}.{name}";
     }
 }
 

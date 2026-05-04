@@ -8,11 +8,35 @@ namespace DevBitsLab.Mcp.SourceGraph.Storage;
 /// In-memory shape of <c>.sourcegraph.json</c>. Loaded by <see cref="ScopeConfigLoader"/>; consumed
 /// by the indexer wiring and the scope CLI subcommands. Non-defaulted fields come straight from
 /// the JSON; <see cref="DefaultScope"/> is optional and falls back to "single registered scope" at
-/// resolution time.
+/// resolution time. <see cref="Plugins"/> is empty by default so single-solution callers stay
+/// zero-config.
 /// </summary>
 public sealed record ScopeConfig(
     IReadOnlyList<Scope> Scopes,
-    string? DefaultScope);
+    string? DefaultScope,
+    IReadOnlyList<PluginRef>? Plugins = null)
+{
+    /// <summary>The plugin list, normalised to empty when not explicitly supplied.</summary>
+    public IReadOnlyList<PluginRef> Plugins { get; init; } = Plugins ?? Array.Empty<PluginRef>();
+}
+
+/// <summary>
+/// One entry in <c>.sourcegraph.json</c>'s top-level <c>plugins[]</c> array. The field set is
+/// disjunctive: either <see cref="Package"/>+<see cref="Version"/> for a NuGet plugin, or
+/// <see cref="Path"/> for a DLL drop. Validated at load time so a malformed entry can never reach
+/// the plugin host.
+/// </summary>
+public sealed record PluginRef(string? Package, string? Version, string? Path)
+{
+    /// <summary>True when this entry references a NuGet package.</summary>
+    public bool IsNuGet => !string.IsNullOrEmpty(Package);
+
+    /// <summary>True when this entry references a DLL on disk.</summary>
+    public bool IsPath => !string.IsNullOrEmpty(Path);
+
+    /// <summary>Stable identity surfaced via <c>plugins list</c>. Falls back to the path's filename when no package id is set.</summary>
+    public string Identity => Package ?? (Path is not null ? System.IO.Path.GetFileNameWithoutExtension(Path) : "?");
+}
 
 /// <summary>
 /// Reads, validates, and synthesises <c>.sourcegraph.json</c>. The single-solution path stays
@@ -130,7 +154,37 @@ public static class ScopeConfigLoader
                 $"{FileName}: `default_scope` is `{dto.DefaultScope}` but no scope by that name is declared.");
         }
 
-        return new ScopeConfig(scopes, dto.DefaultScope);
+        var plugins = ParsePlugins(dto.Plugins);
+        return new ScopeConfig(scopes, dto.DefaultScope, plugins);
+    }
+
+    /// <summary>
+    /// Translate the JSON <c>plugins[]</c> array into <see cref="PluginRef"/> records. Each entry
+    /// must declare exactly one of <c>package</c>+<c>version</c> or <c>path</c>; mixing or omitting
+    /// throws <see cref="ScopeConfigException"/> with a precise message.
+    /// </summary>
+    private static IReadOnlyList<PluginRef> ParsePlugins(IReadOnlyList<PluginRefJson>? entries)
+    {
+        if (entries is null || entries.Count == 0) return Array.Empty<PluginRef>();
+        var result = new List<PluginRef>(entries.Count);
+        for (var i = 0; i < entries.Count; i++)
+        {
+            var e = entries[i];
+            var hasPackage = !string.IsNullOrEmpty(e.Package);
+            var hasPath = !string.IsNullOrEmpty(e.Path);
+            if (hasPackage == hasPath)
+            {
+                throw new ScopeConfigException(
+                    $"{FileName} plugin #{i}: declare exactly one of `package`+`version` or `path`.");
+            }
+            if (hasPackage && string.IsNullOrEmpty(e.Version))
+            {
+                throw new ScopeConfigException(
+                    $"{FileName} plugin #{i} (`{e.Package}`): NuGet entries require a `version` field.");
+            }
+            result.Add(new PluginRef(e.Package, e.Version, e.Path));
+        }
+        return result;
     }
 
     /// <summary>
@@ -149,7 +203,7 @@ public static class ScopeConfigLoader
             ProjectSet: new ScopeProjectSet.Solutions(solutions, Array.Empty<string>()),
             Isolated: false,
             LastIndexedAt: DateTimeOffset.MinValue);
-        return new ScopeConfig(new[] { scope }, "default");
+        return new ScopeConfig(new[] { scope }, "default", Array.Empty<PluginRef>());
     }
 
     /// <summary>Discovers .slnx and .sln files at the repo root for the <c>init-scopes</c> scaffolder.</summary>
@@ -182,6 +236,14 @@ public static class ScopeConfigLoader
                 Isolated = s.Isolated ? true : null,
             }).ToList(),
             DefaultScope = config.DefaultScope,
+            Plugins = config.Plugins.Count > 0
+                ? config.Plugins.Select(p => new PluginRefJson
+                {
+                    Package = p.Package,
+                    Version = p.Version,
+                    Path = p.Path,
+                }).ToList()
+                : null,
         };
         return JsonSerializer.Serialize(dto, _writeOptions);
     }
@@ -216,6 +278,19 @@ internal sealed record ScopeConfigJson
 {
     [JsonPropertyName("scopes")] public IReadOnlyList<ScopeEntryJson>? Scopes { get; init; }
     [JsonPropertyName("default_scope")] public string? DefaultScope { get; init; }
+    [JsonPropertyName("plugins")] public IReadOnlyList<PluginRefJson>? Plugins { get; init; }
+}
+
+/// <summary>
+/// Wire-shape of a single entry in the top-level <c>plugins[]</c> array. Either <c>package</c> +
+/// <c>version</c> or <c>path</c> must be present; mixing both, or omitting both, is rejected by
+/// the loader.
+/// </summary>
+internal sealed record PluginRefJson
+{
+    [JsonPropertyName("package")] public string? Package { get; init; }
+    [JsonPropertyName("version")] public string? Version { get; init; }
+    [JsonPropertyName("path")] public string? Path { get; init; }
 }
 
 internal sealed record ScopeEntryJson

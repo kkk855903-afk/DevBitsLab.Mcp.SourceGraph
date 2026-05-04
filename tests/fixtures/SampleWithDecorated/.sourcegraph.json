@@ -1,0 +1,12 @@
+{
+  "scopes": [
+    {
+      "name": "default",
+      "solutions": ["Sample.Decorated.slnx"]
+    }
+  ],
+  "default_scope": "default",
+  "plugins": [
+    { "path": "../SamplePlugin/bin/Debug/netstandard2.0/SamplePlugin.dll" }
+  ]
+}
