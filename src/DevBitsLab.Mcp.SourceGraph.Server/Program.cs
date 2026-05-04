@@ -1,9 +1,11 @@
 using DevBitsLab.Mcp.SourceGraph.Core;
 using DevBitsLab.Mcp.SourceGraph.Embeddings;
 using DevBitsLab.Mcp.SourceGraph.Indexing;
+using DevBitsLab.Mcp.SourceGraph.Sdk;
 using DevBitsLab.Mcp.SourceGraph.Server;
 using DevBitsLab.Mcp.SourceGraph.Server.Cli;
 using DevBitsLab.Mcp.SourceGraph.Server.Observability;
+using DevBitsLab.Mcp.SourceGraph.Server.Plugins;
 using DevBitsLab.Mcp.SourceGraph.Server.Scoping;
 using DevBitsLab.Mcp.SourceGraph.Storage;
 using Microsoft.Extensions.DependencyInjection;
@@ -37,6 +39,7 @@ return cli.Subcommand switch
     "clear" => await RunClearAsync(cli).ConfigureAwait(false),
     "init-scopes" => await ScopesCli.RunInitAsync(cli).ConfigureAwait(false),
     "scopes" => await ScopesCli.RunSubcommandAsync(cli).ConfigureAwait(false),
+    "plugins" => await PluginsCli.RunSubcommandAsync(cli).ConfigureAwait(false),
     _ => Unknown(cli.Subcommand),
 };
 
@@ -154,11 +157,82 @@ static async Task<int> RunServeAsync(CommandLine cli)
         sp.GetRequiredService<ILogger<HistoryHostedService>>()));
     builder.Services.AddHostedService<LiveIndexService>();
 
-    builder.Services
+    // Plugin host: discover plugins via .sourcegraph.json's plugins[] array. With NO entry the
+    // host is a no-op and single-solution v0.5.0 behaviour is preserved exactly. The built-in
+    // RoslynLanguageIndexer is registered into LanguageIndexerRegistry below — no plugin entry
+    // required.
+    var pluginHost = new PluginHost(repoRoot, scopeConfig.Plugins, StartupLogging.CreateLogger<PluginHost>());
+    try
+    {
+        await pluginHost.LoadAllAsync().ConfigureAwait(false);
+    }
+    catch (Exception ex)
+    {
+        await Console.Error.WriteLineAsync($"[sourcegraph-mcp] plugin host startup failed: {ex.Message}").ConfigureAwait(false);
+    }
+    builder.Services.AddSingleton(pluginHost);
+
+    // The language-indexer registry is shared across scopes. The built-in C# pathway is not
+    // routed through here for actual indexing — `LiveIndexService` keeps the workspace-aware
+    // bulk path for back-compat — but registering it here makes the seam visible to `plugins
+    // list` and to the analyzer pipeline.
+    var langRegistry = new LanguageIndexerRegistry();
+    var rejectedExt = langRegistry.Register(new BuiltInRoslynLanguageIndexerStub());
+    if (rejectedExt.Count > 0)
+    {
+        await Console.Error.WriteLineAsync($"[sourcegraph-mcp] built-in indexer extension(s) rejected: {string.Join(", ", rejectedExt)}").ConfigureAwait(false);
+    }
+    foreach (var record in pluginHost.Plugins.Where(p => p.Status == PluginStatus.Loaded))
+    {
+        foreach (var li in record.LanguageIndexers)
+        {
+            var rejected = langRegistry.Register(li, record);
+            if (rejected.Count > 0)
+            {
+                record.Status = PluginStatus.Failed;
+                record.StatusMessage = $"Refused to claim already-registered file extensions: {string.Join(", ", rejected)}.";
+            }
+        }
+    }
+    builder.Services.AddSingleton(langRegistry);
+    builder.Services.AddSingleton<AnalyzerPipeline>();
+
+    var mcpBuilder = builder.Services
         .AddMcpServer()
         .WithStdioServerTransport()
         .WithToolsFromAssembly()
         .WithResourcesFromAssembly();
+
+    // Tool plugins: register every tool the loaded plugins want to expose, prefixed by their
+    // declared `Prefix`. Collisions (same final name from two plugins, or shadowing a built-in)
+    // mark the plugin failed but the host stays up.
+    var claimedNames = new HashSet<string>(StringComparer.Ordinal);
+    foreach (var record in pluginHost.Plugins.Where(p => p.Status == PluginStatus.Loaded))
+    {
+        foreach (var tp in record.ToolPlugins)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(tp.Prefix))
+                {
+                    record.Status = PluginStatus.Failed;
+                    record.StatusMessage = "IMcpToolPlugin.Prefix is empty; non-empty prefix is required.";
+                    continue;
+                }
+                var registry = new ToolRegistry(tp.Prefix, claimedNames, record);
+                await tp.RegisterAsync(registry).ConfigureAwait(false);
+                if (registry.RegisteredTools.Count > 0)
+                {
+                    mcpBuilder.WithTools(registry.RegisteredTools);
+                }
+            }
+            catch (Exception ex)
+            {
+                record.Status = PluginStatus.Failed;
+                record.StatusMessage = $"IMcpToolPlugin.RegisterAsync threw: {ex.Message}";
+            }
+        }
+    }
 
     await builder.Build().RunAsync().ConfigureAwait(false);
     return 0;
@@ -247,6 +321,42 @@ static async Task<int> RunIndexAsync(CommandLine cli)
     historyQueue.Writer.Complete();
     await historyTask.ConfigureAwait(false);
 
+    // Plugin host + analyzer pipeline. The one-shot `index` path mirrors `serve`'s behaviour
+    // here so a CI / smoke-test invocation produces the same per-scope graph the live server
+    // would. Skipped silently when no plugins are declared in `.sourcegraph.json`, preserving
+    // the v0.5.0 zero-config single-solution path.
+    var repoRootForIndex = Path.GetDirectoryName(solutionFull) ?? cli.ResolvedRepoRoot();
+    DevBitsLab.Mcp.SourceGraph.Storage.ScopeConfig? indexScopeConfig = null;
+    try
+    {
+        indexScopeConfig = DevBitsLab.Mcp.SourceGraph.Storage.ScopeConfigLoader.Load(repoRootForIndex);
+    }
+    catch (DevBitsLab.Mcp.SourceGraph.Storage.ScopeConfigException ex)
+    {
+        await Console.Error.WriteLineAsync($"[sourcegraph-mcp] {ex.Message}").ConfigureAwait(false);
+    }
+    if (indexScopeConfig is { Plugins.Count: > 0 })
+    {
+        var pluginHost = new PluginHost(repoRootForIndex, indexScopeConfig.Plugins, loggerFactory.CreateLogger<PluginHost>());
+        try
+        {
+            await pluginHost.LoadAllAsync().ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            await Console.Error.WriteLineAsync($"[sourcegraph-mcp] plugin host startup failed: {ex.Message}").ConfigureAwait(false);
+        }
+
+        var analyzerPipeline = new AnalyzerPipeline(pluginHost, loggerFactory.CreateLogger<AnalyzerPipeline>());
+        if (analyzerPipeline.HasAnalyzers)
+        {
+            await DispatchAnalyzersForOneShotAsync(store, "default", repoRootForIndex, analyzerPipeline, loggerFactory.CreateLogger<Program>()).ConfigureAwait(false);
+        }
+        var loadedCount = pluginHost.Plugins.Count(p => p.Status == PluginStatus.Loaded);
+        var failedCount = pluginHost.Plugins.Count(p => p.Status == PluginStatus.Failed);
+        Console.WriteLine($"plugins: {loadedCount} loaded, {failedCount} failed");
+    }
+
     if (embedService is not null)
     {
         channelSink!.Complete();
@@ -261,6 +371,106 @@ static async Task<int> RunIndexAsync(CommandLine cli)
     if (historyDisabled) Console.WriteLine("history: disabled (--no-history or git unavailable)");
     return 0;
 }
+
+/// <summary>
+/// One-shot analyzer-dispatch helper for the `index` CLI path. Mirrors what
+/// <see cref="LiveIndexService"/> does per scope: reads every indexed file's symbol+attribute
+/// rows out of the store, packages them as <see cref="Sdk.IndexEvent"/>s, and runs every loaded
+/// analyzer against each file. Failures are isolated by the pipeline; the function returns
+/// normally even if some analyzers fail.
+/// </summary>
+static async Task DispatchAnalyzersForOneShotAsync(
+    DevBitsLab.Mcp.SourceGraph.Storage.IGraphStore store,
+    string scopeId,
+    string repoRoot,
+    AnalyzerPipeline analyzerPipeline,
+    ILogger<Program> logger)
+{
+    var files = await store.GetAllFilesAsync().ConfigureAwait(false);
+    var symbolKeys = await store.GetAllSymbolKeysAsync().ConfigureAwait(false);
+
+    var symbolIdByKey = new Dictionary<string, long>(StringComparer.Ordinal);
+    var keysByFileId = new Dictionary<long, List<string>>();
+    foreach (var k in symbolKeys)
+    {
+        symbolIdByKey[k.CanonicalKey] = k.Id;
+        if (!keysByFileId.TryGetValue(k.FileId, out var list))
+        {
+            list = new List<string>();
+            keysByFileId[k.FileId] = list;
+        }
+        list.Add(k.CanonicalKey);
+    }
+
+    foreach (var file in files)
+    {
+        byte[] contents;
+        try
+        {
+            if (!File.Exists(file.Path)) continue;
+            contents = await File.ReadAllBytesAsync(file.Path).ConfigureAwait(false);
+        }
+        catch (IOException ex)
+        {
+            logger.LogDebug(ex, "Skipping {Path} for analyzer dispatch (read failed)", file.Path);
+            continue;
+        }
+
+        var events = new List<IndexEvent>();
+        if (keysByFileId.TryGetValue(file.Id, out var keys))
+        {
+            foreach (var key in keys)
+            {
+                var sym = await store.GetSymbolByIdAsync(symbolIdByKey[key]).ConfigureAwait(false);
+                if (sym is null) continue;
+                events.Add(new IndexEvent.SymbolDeclared(
+                    CanonicalKey: key,
+                    Name: sym.Name,
+                    Fqn: sym.Fqn,
+                    Kind: MapStorageKindToPluginKind(sym.Kind),
+                    StartLine: sym.StartLine,
+                    StartColumn: sym.StartCol,
+                    EndLine: sym.EndLine,
+                    EndColumn: sym.EndCol,
+                    Signature: sym.Signature,
+                    Modifiers: sym.Modifiers,
+                    Accessibility: sym.Accessibility,
+                    XmlSummary: sym.XmlSummary));
+
+                var attrs = await store.GetAttributesForSymbolAsync(sym.Id).ConfigureAwait(false);
+                foreach (var a in attrs)
+                {
+                    events.Add(new IndexEvent.AttributeAttached(
+                        SymbolCanonicalKey: key,
+                        AttributeName: a.Name,
+                        AttributeFullName: a.FullName,
+                        ArgsJson: a.ArgsJson));
+                }
+            }
+        }
+
+        await analyzerPipeline.RunAsync(
+            store, file.Id, file.Path, contents, scopeId, repoRoot,
+            events, symbolIdByKey).ConfigureAwait(false);
+    }
+}
+
+static PluginSymbolKind MapStorageKindToPluginKind(DevBitsLab.Mcp.SourceGraph.Core.SymbolKind k) => k switch
+{
+    DevBitsLab.Mcp.SourceGraph.Core.SymbolKind.Namespace => PluginSymbolKind.Namespace,
+    DevBitsLab.Mcp.SourceGraph.Core.SymbolKind.Class => PluginSymbolKind.Class,
+    DevBitsLab.Mcp.SourceGraph.Core.SymbolKind.Struct => PluginSymbolKind.Struct,
+    DevBitsLab.Mcp.SourceGraph.Core.SymbolKind.Interface => PluginSymbolKind.Interface,
+    DevBitsLab.Mcp.SourceGraph.Core.SymbolKind.Enum => PluginSymbolKind.Enum,
+    DevBitsLab.Mcp.SourceGraph.Core.SymbolKind.EnumMember => PluginSymbolKind.EnumMember,
+    DevBitsLab.Mcp.SourceGraph.Core.SymbolKind.Delegate => PluginSymbolKind.Delegate,
+    DevBitsLab.Mcp.SourceGraph.Core.SymbolKind.Method => PluginSymbolKind.Method,
+    DevBitsLab.Mcp.SourceGraph.Core.SymbolKind.Constructor => PluginSymbolKind.Constructor,
+    DevBitsLab.Mcp.SourceGraph.Core.SymbolKind.Property => PluginSymbolKind.Property,
+    DevBitsLab.Mcp.SourceGraph.Core.SymbolKind.Field => PluginSymbolKind.Field,
+    DevBitsLab.Mcp.SourceGraph.Core.SymbolKind.Event => PluginSymbolKind.Event,
+    _ => PluginSymbolKind.Other,
+};
 
 /// <summary>
 /// Run the history pipeline as a single async loop without the BackgroundService scaffolding.

@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!--
+      Targets netstandard2.0 to match a real third-party plugin: the SDK is netstandard2.0, so
+      end-users authoring a plugin can ship a single DLL that loads into the .NET 10 host. The
+      plugin DLL itself is loaded into a per-plugin AssemblyLoadContext at runtime; the SDK
+      contracts load from the host context (shared list).
+    -->
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>SamplePlugin</RootNamespace>
+    <AssemblyName>SamplePlugin</AssemblyName>
+    <!-- Keep this fixture standalone so it doesn't get picked up by the main solution's test discovery. -->
+    <IsPackable>false</IsPackable>
+    <ManagePackageVersionsCentrally>false</ManagePackageVersionsCentrally>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <EnforceCodeStyleInBuild>false</EnforceCodeStyleInBuild>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Reference the SDK as a project ref so the fixture rebuilds whenever the SDK changes. -->
+    <ProjectReference Include="..\..\..\src\DevBitsLab.Mcp.SourceGraph.Sdk\DevBitsLab.Mcp.SourceGraph.Sdk.csproj" />
+  </ItemGroup>
+
+</Project>
