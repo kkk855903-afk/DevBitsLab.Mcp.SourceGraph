@@ -35,4 +35,4 @@
 
 ## 6. Update specs
 
-- [ ] 6.1 Sync delta specs into `openspec/specs/{indexing, storage, mcp-tools}/spec.md` on archive.
+- [x] 6.1 Sync delta specs into `openspec/specs/{indexing, storage, mcp-tools}/spec.md` on archive.

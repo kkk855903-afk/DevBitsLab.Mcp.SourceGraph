@@ -82,3 +82,28 @@ priority: `--db` if given, then `<solution-dir>/.sourcegraph/graph.db` if
 - **WHEN** the CLI is invoked from CWD `/` (e.g. by an MCP host) without
   `--solution` or `--db`
 - **THEN** the DB lands at the per-user cache path; CWD is never used
+
+### Requirement: Embedding-related CLI flags
+The CLI SHALL accept `--model <id>` to override the embedding model and `--no-embeddings` to disable the embedding pipeline entirely; both apply to `serve` and `index`.
+
+#### Scenario: Disable embeddings
+- **WHEN** `sourcegraph-mcp serve --solution <sln> --no-embeddings` is invoked
+- **THEN** `EmbeddingsHostedService` is not registered, the model is not downloaded, and `semantic_search` returns the disabled-message
+
+#### Scenario: Override model
+- **WHEN** the user passes `--model nomic-ai/CodeRankEmbed`
+- **THEN** the server resolves and (if needed) downloads that model, ignores any cached embeddings whose `model_version` is different, and re-embeds on next index
+
+### Requirement: Scope-management subcommands
+The CLI SHALL accept `sourcegraph-mcp scopes list`, `sourcegraph-mcp scopes add <name> ...`, and `sourcegraph-mcp scopes remove <name>` to inspect and edit `.sourcegraph.json`.
+
+#### Scenario: List scopes
+- **WHEN** the user runs `sourcegraph-mcp scopes list` in a repo with three configured scopes
+- **THEN** the command prints each scope's id, name, kind (solutions/projects/paths), isolation flag, and last-indexed timestamp
+
+### Requirement: init-scopes scaffolder
+The CLI SHALL accept `sourcegraph-mcp init-scopes` that discovers .slnx files at the repo root and writes a `.sourcegraph.json` listing one scope per discovered solution.
+
+#### Scenario: Bootstrap from siblings
+- **WHEN** the user runs `init-scopes` in a repo containing `frontend.slnx` and `backend.slnx` at the root
+- **THEN** `.sourcegraph.json` is written with two scopes (`frontend`, `backend`), each pointing at its solution, and no `default_scope` is set
