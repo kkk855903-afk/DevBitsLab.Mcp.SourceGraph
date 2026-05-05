@@ -26,6 +26,25 @@
     <ProjectReference Include="..\..\src\DevBitsLab.Mcp.SourceGraph.Server\DevBitsLab.Mcp.SourceGraph.Server.csproj" />
   </ItemGroup>
 
+  <!-- Fixture build dependency. DiagnosticsAndGeneratorTests opens tests/fixtures/Sample.sln via
+       MSBuildWorkspace and expects the Sample.Generators IIncrementalGenerator to run; Roslyn
+       only loads the analyzer if Sample.Generators.dll is on disk. Sample.App references the
+       generator via <ProjectReference OutputItemType="Analyzer"/>, so building Sample.App
+       transitively builds Sample.Domain + Sample.Generators. ReferenceOutputAssembly=false keeps
+       the fixture's Exe/analyzer outputs out of the test project's link/asset graph.
+       SetConfiguration=Debug pins the fixture build to Debug regardless of the test project's
+       own configuration: RoslynIndexer opens Sample.sln via MSBuildWorkspace.Create() with no
+       global properties, which defaults the workspace to Debug, so the analyzer DLL must always
+       end up under bin/Debug/... or `dotnet test -c Release` would still leave Roslyn looking
+       in the wrong place. -->
+  <ItemGroup>
+    <ProjectReference Include="..\fixtures\Sample.App\Sample.App.csproj"
+                      ReferenceOutputAssembly="false"
+                      Private="false"
+                      PrivateAssets="all"
+                      SetConfiguration="Configuration=Debug" />
+  </ItemGroup>
+
   <!-- MSBuildLocator requires that Microsoft.Build.* assemblies are not loaded from the project's
        output dir; instead they're resolved at runtime from the SDK install. Mirror the dance the
        Indexing/Server projects do so test runs of RoslynIndexer.IndexSolutionOnceAsync work. -->

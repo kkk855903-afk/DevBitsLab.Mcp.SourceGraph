@@ -504,6 +504,15 @@ public sealed class SqliteGraphStore : IGraphStore
 
     public async Task<IReadOnlyList<ModuleSymbol>> ModuleSummaryAsync(string namespaceOrPathPrefix, int limit = 25, CancellationToken ct = default)
     {
+        // QueryAsync<dynamic> instead of QueryAsync<RawModuleSymbol>: InDegree is an undeclared
+        // aggregate (COALESCE(COUNT(*), 0)), so Microsoft.Data.Sqlite reports its column type as
+        // BLOB whenever the prefix matches no symbols and the result set is empty. Dapper's typed
+        // deserializer is built upfront from that schema and rejects byte[]→long, throwing the
+        // misleading "(... System.Byte[] InDegree) is required for ... materialization" error.
+        // The dynamic path uses a name-keyed DapperRow that reads each value lazily, so it never
+        // touches the column type metadata until a row is actually present (when the value's real
+        // type is Int64 as expected). CAST AS INTEGER does NOT help here — sqlite3_column_decltype
+        // doesn't propagate CAST.
         const string sql = """
             SELECT s.id, s.name, s.fqn, s.kind, f.path AS FilePath, s.start_line AS StartLine, s.start_col AS StartCol,
                    s.end_line AS EndLine, s.end_col AS EndCol, s.signature,
@@ -519,9 +528,27 @@ public sealed class SqliteGraphStore : IGraphStore
             ORDER BY InDegree DESC, length(s.fqn), s.fqn
             LIMIT @limit;
             """;
-        var rows = await _connection.QueryAsync<RawModuleSymbol>(new CommandDefinition(
+        var rows = await _connection.QueryAsync(new CommandDefinition(
             sql, new { prefix = namespaceOrPathPrefix, limit }, cancellationToken: ct)).ConfigureAwait(false);
-        return rows.Select(r => new ModuleSymbol(r.ToHit(), (int)r.InDegree)).ToList();
+        return rows.Select(r => new ModuleSymbol(
+            new SymbolHit(
+                Id: (long)r.id,
+                Name: (string)r.name,
+                Fqn: (string)r.fqn,
+                Kind: (Core.SymbolKind)(long)r.kind,
+                FilePath: (string)r.FilePath,
+                StartLine: Convert.ToInt32(r.StartLine),
+                StartCol: Convert.ToInt32(r.StartCol),
+                EndLine: Convert.ToInt32(r.EndLine),
+                EndCol: Convert.ToInt32(r.EndCol),
+                Signature: (string?)r.signature,
+                Modifiers: (string?)r.Modifiers,
+                Accessibility: Convert.ToInt32(r.Accessibility),
+                XmlSummary: (string?)r.XmlSummary,
+                IsGenerated: ((long)r.IsGenerated) != 0,
+                TestFramework: (string?)r.TestFramework,
+                CanonicalKey: (string?)r.CanonicalKey),
+            InDegree: Convert.ToInt32(r.InDegree))).ToList();
     }
 
     public async Task<IReadOnlyList<ImpactedSymbol>> ImpactOfChangeAsync(long symbolId, int maxDepth = 4, int limit = 100, EdgeKind? edgeKind = EdgeKind.Calls, CancellationToken ct = default)
@@ -578,16 +605,6 @@ public sealed class SqliteGraphStore : IGraphStore
         var rows = await _connection.QueryAsync<RawSymbolHit>(new CommandDefinition(
             sql, new { id = containerId, acc = accessibilityFilter, limit }, cancellationToken: ct)).ConfigureAwait(false);
         return rows.Select(r => r.ToHit()).ToList();
-    }
-
-    private sealed record RawModuleSymbol(long Id, string Name, string Fqn, long Kind, string FilePath,
-        long StartLine, long StartCol, long EndLine, long EndCol, string? Signature,
-        string? Modifiers, long Accessibility, string? XmlSummary, long IsGenerated, string? TestFramework,
-        string? CanonicalKey, long InDegree)
-    {
-        public SymbolHit ToHit() => new(Id, Name, Fqn, (Core.SymbolKind)Kind, FilePath,
-            (int)StartLine, (int)StartCol, (int)EndLine, (int)EndCol, Signature,
-            Modifiers, (int)Accessibility, XmlSummary, IsGenerated != 0, TestFramework, CanonicalKey);
     }
 
     private sealed record RawImpactedSymbol(long Id, string Name, string Fqn, long Kind, string FilePath,
@@ -896,18 +913,30 @@ public sealed class SqliteGraphStore : IGraphStore
 
     public async Task<IReadOnlyList<GeneratedFileRow>> ListGeneratedFilesAsync(int limit = 100, CancellationToken ct = default)
     {
+        // Manual reader instead of Dapper's QueryAsync<T> because the SymbolCount column is an
+        // undeclared aggregate expression. Dapper builds its deserializer upfront from the
+        // reader's column metadata, and Microsoft.Data.Sqlite reports the field type as BLOB
+        // (byte[]) whenever an undeclared expression's result set is empty — even with an
+        // explicit CAST(... AS INTEGER), since sqlite3_column_decltype doesn't propagate CAST.
+        // That makes Dapper reject the (long, string, long) record signature for any solution
+        // with no source-generated files (test fixtures and prod alike). Reading row-by-row with
+        // GetInt64 sidesteps the schema check: by the time we touch a value we have a real row.
         const string sql = """
-            SELECT f.id        AS FileId,
-                   f.path      AS FilePath,
-                   COALESCE((SELECT COUNT(*) FROM symbols s WHERE s.file_id = f.id), 0) AS SymbolCount
+            SELECT f.id, f.path,
+                   COALESCE((SELECT COUNT(*) FROM symbols s WHERE s.file_id = f.id), 0)
             FROM files f
             WHERE f.is_generated = 1
-            ORDER BY SymbolCount DESC, f.path
+            ORDER BY 3 DESC, f.path
             LIMIT @limit;
             """;
-        var rows = await _connection.QueryAsync<RawGeneratedFileRow>(new CommandDefinition(
+        var rows = new List<GeneratedFileRow>();
+        await using var reader = await _connection.ExecuteReaderAsync(new CommandDefinition(
             sql, new { limit }, cancellationToken: ct)).ConfigureAwait(false);
-        return rows.Select(r => new GeneratedFileRow(r.FileId, r.FilePath, (int)r.SymbolCount)).ToList();
+        while (await reader.ReadAsync(ct).ConfigureAwait(false))
+        {
+            rows.Add(new GeneratedFileRow(reader.GetInt64(0), reader.GetString(1), (int)reader.GetInt64(2)));
+        }
+        return rows;
     }
 
     public async Task<bool> IsGeneratedFileAsync(long fileId, CancellationToken ct = default)
@@ -924,8 +953,6 @@ public sealed class SqliteGraphStore : IGraphStore
         public DiagnosticHit ToHit() => new(Id, SymbolId, FileId, FilePath,
             (int)Severity, Code, Message, (int)Line, (int)Col);
     }
-
-    private sealed record RawGeneratedFileRow(long FileId, string FilePath, long SymbolCount);
 
     public async Task<IReadOnlyDictionary<long, byte[]?>> GetBlamedShasForFileAsync(long fileId, CancellationToken ct = default)
     {
