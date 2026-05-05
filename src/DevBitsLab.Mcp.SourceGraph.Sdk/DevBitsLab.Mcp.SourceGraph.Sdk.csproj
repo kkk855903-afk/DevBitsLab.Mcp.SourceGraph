@@ -15,7 +15,7 @@
     <ImplicitUsings>disable</ImplicitUsings>
     <RootNamespace>DevBitsLab.Mcp.SourceGraph.Sdk</RootNamespace>
 
-    <!-- Dual-versioned: server csproj is on 0.6.0, the SDK ships its own 1.0.0 timeline so a
+    <!-- Dual-versioned: server csproj is on 0.6.1, the SDK ships its own 1.0.0 timeline so a
          plugin pinned at <Version>1.0.0</Version> stays buildable across server minor bumps. -->
     <PackageId>DevBitsLab.Mcp.SourceGraph.Sdk</PackageId>
     <Version>1.0.0</Version>
