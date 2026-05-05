@@ -39,6 +39,10 @@ public sealed class JinaCodeEmbeddingGenerator : ICodeEmbeddingGenerator
     private bool _initialised;
     private bool _available;
     private readonly object _initLock = new();
+    // Serialises EmbedAsync calls. The interface contract only guarantees single-worker access,
+    // but the host now wires one drain per scope (all sharing this singleton generator), so we
+    // serialise inside the implementation rather than push the concern out to every caller.
+    private readonly SemaphoreSlim _embedGate = new(initialCount: 1, maxCount: 1);
 
     public JinaCodeEmbeddingGenerator(
         string modelOnnxPath,
@@ -75,9 +79,18 @@ public sealed class JinaCodeEmbeddingGenerator : ICodeEmbeddingGenerator
         }
 
         // Run the synchronous ONNX session call on a worker so we don't block the indexer's
-        // task pump. ORT's Run() is reentrant-safe per session but we're called from a single
-        // background worker so we don't need to gate it explicitly.
-        return await Task.Run(() => EncodeBatch(inputs, ct), ct).ConfigureAwait(false);
+        // task pump. ORT's Run() is reentrant-safe per session, but we serialise here because
+        // the host now shares this singleton across one drain task per scope — the interface
+        // only guarantees safety from a single background worker.
+        await _embedGate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            return await Task.Run(() => EncodeBatch(inputs, ct), ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _embedGate.Release();
+        }
     }
 
     private float[][] EncodeBatch(IReadOnlyList<string> inputs, CancellationToken ct)
@@ -216,5 +229,6 @@ public sealed class JinaCodeEmbeddingGenerator : ICodeEmbeddingGenerator
         _session?.Dispose();
         _session = null;
         _tokenizer = null;
+        _embedGate.Dispose();
     }
 }

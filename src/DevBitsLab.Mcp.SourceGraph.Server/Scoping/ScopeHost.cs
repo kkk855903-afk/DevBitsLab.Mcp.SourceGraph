@@ -45,9 +45,33 @@ public sealed class ScopeHost : IAsyncDisposable
     /// updated alongside the registry every time the scope settles into a new state.
     /// </summary>
     public DateTimeOffset LastIndexedAt { get; set; }
+    /// <summary>
+    /// Per-scope embed-request channel the indexer writes to. Null when embeddings are disabled
+    /// for this scope (no model, no vec extension, or <c>--no-embeddings</c>).
+    /// </summary>
+    public ChannelEmbeddingsRequestSink? EmbeddingsSink { get; set; }
+    /// <summary>
+    /// Background drain task for <see cref="EmbeddingsSink"/>. Null when embeddings are disabled.
+    /// Started by <c>LiveIndexService.OpenScopeAsync</c> and stopped by <see cref="DisposeAsync"/>.
+    /// </summary>
+    public EmbeddingsHostedService? EmbeddingsService { get; set; }
 
     public async ValueTask DisposeAsync()
     {
+        // Stop the embeddings drain first so any in-flight upserts complete before the underlying
+        // SQLite store is disposed. Best-effort with a short bound — losing a few queued requests
+        // on shutdown is preferable to hanging the process. BackgroundService implements
+        // IDisposable (it owns a stop CancellationTokenSource) so dispose it after stop.
+        if (EmbeddingsService is not null)
+        {
+            EmbeddingsSink?.Complete();
+            using var stopCts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+            try { await EmbeddingsService.StopAsync(stopCts.Token).ConfigureAwait(false); }
+            catch { /* best-effort drain */ }
+            EmbeddingsService.Dispose();
+            EmbeddingsService = null;
+            EmbeddingsSink = null;
+        }
         if (Watcher is not null) await Watcher.DisposeAsync().ConfigureAwait(false);
         await Indexer.DisposeAsync().ConfigureAwait(false);
         await Store.DisposeAsync().ConfigureAwait(false);

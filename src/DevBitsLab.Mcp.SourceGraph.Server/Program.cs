@@ -110,6 +110,10 @@ static async Task<int> RunServeAsync(CommandLine cli)
     builder.Services.AddSingleton(modelInfo);
     builder.Services.AddSingleton<ModelStore>(sp => new ModelStore(sp.GetRequiredService<ILogger<ModelStore>>()));
 
+    // The embedding generator is a process-wide singleton (the ONNX session is expensive to
+    // construct and is thread-safe). The per-scope sink and drain task are owned by each
+    // ScopeHost in LiveIndexService, so the symbol-id <-> per-scope-store routing stays
+    // unambiguous. See ScopeHost.EmbeddingsService for the per-scope ownership.
     if (embeddingsEnabled)
     {
         builder.Services.AddSingleton<ICodeEmbeddingGenerator>(sp =>
@@ -120,15 +124,10 @@ static async Task<int> RunServeAsync(CommandLine cli)
             var tok = ms.FilePath(info.ModelId, "tokenizer.json");
             return new JinaCodeEmbeddingGenerator(onnx, tok, info, logger: sp.GetRequiredService<ILogger<JinaCodeEmbeddingGenerator>>());
         });
-        var sink = new ChannelEmbeddingsRequestSink();
-        builder.Services.AddSingleton(sink);
-        builder.Services.AddSingleton<IEmbeddingsRequestSink>(sink);
-        builder.Services.AddHostedService<EmbeddingsHostedService>();
     }
     else
     {
         builder.Services.AddSingleton<ICodeEmbeddingGenerator>(_ => new DisabledEmbeddingGenerator(modelInfo));
-        builder.Services.AddSingleton<IEmbeddingsRequestSink>(new NoOpEmbeddingsRequestSink());
     }
 
     // Scope registry (lives in `_meta.db`). Wired up first so list_scopes can reflect the

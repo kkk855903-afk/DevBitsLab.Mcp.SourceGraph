@@ -88,7 +88,7 @@ The CLI SHALL accept `--model <id>` to override the embedding model and `--no-em
 
 #### Scenario: Disable embeddings
 - **WHEN** `sourcegraph-mcp serve --solution <sln> --no-embeddings` is invoked
-- **THEN** `EmbeddingsHostedService` is not registered, the model is not downloaded, and `semantic_search` returns the disabled-message
+- **THEN** no per-scope embeddings drain is started, the model is not downloaded, and `semantic_search` returns the disabled-message
 
 #### Scenario: Override model
 - **WHEN** the user passes `--model nomic-ai/CodeRankEmbed`
