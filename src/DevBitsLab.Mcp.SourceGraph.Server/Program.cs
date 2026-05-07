@@ -7,10 +7,12 @@ using DevBitsLab.Mcp.SourceGraph.Server.Cli;
 using DevBitsLab.Mcp.SourceGraph.Server.Observability;
 using DevBitsLab.Mcp.SourceGraph.Server.Plugins;
 using DevBitsLab.Mcp.SourceGraph.Server.Scoping;
+using DevBitsLab.Mcp.SourceGraph.Server.Tools;
 using DevBitsLab.Mcp.SourceGraph.Storage;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using ModelContextProtocol.Server;
 
 CommandLine cli;
 try
@@ -196,6 +198,18 @@ static async Task<int> RunServeAsync(CommandLine cli)
     builder.Services.AddSingleton(langRegistry);
     builder.Services.AddSingleton<AnalyzerPipeline>();
 
+    // Server-published usage instructions: tells the connected model to prefer source-graph
+    // tools over Grep+Read for symbol-level questions, and to call usage_stats at end of turn
+    // to verify the graph was actually queried. Suppressed by --no-instructions or
+    // SOURCEGRAPH_NO_INSTRUCTIONS=1 — clients that don't honour the field already ignore it.
+    var noInstructions = ServerInstructions.ShouldSuppress(
+        cli.NoInstructions,
+        Environment.GetEnvironmentVariable(ServerInstructions.EnvVarName));
+    if (!noInstructions)
+    {
+        builder.Services.Configure<McpServerOptions>(o => o.ServerInstructions = ServerInstructions.Template);
+    }
+
     var mcpBuilder = builder.Services
         .AddMcpServer()
         .WithStdioServerTransport()
@@ -233,7 +247,14 @@ static async Task<int> RunServeAsync(CommandLine cli)
         }
     }
 
-    await builder.Build().RunAsync().ConfigureAwait(false);
+    var host = builder.Build();
+
+    // Walk the registered McpServerTool collection and rewrite ProtocolTool.Description to append
+    // `Use when: <trigger>` for every method carrying [ToolTrigger]. Done after Build() so we see
+    // both built-in tools (registered via WithToolsFromAssembly) and any tools added by plugins.
+    ToolDescriptionFormatter.ApplyTriggersFromAttributes(host.Services.GetServices<McpServerTool>());
+
+    await host.RunAsync().ConfigureAwait(false);
     return 0;
 }
 

@@ -13,6 +13,9 @@ internal sealed class CommandLine
     public bool NoEmbeddings { get; private init; }
     /// <summary>True when <c>--no-history</c> was passed; disables the git-blame pipeline.</summary>
     public bool NoHistory { get; private init; }
+    /// <summary>True when <c>--no-instructions</c> was passed; suppresses the server-published
+    /// usage guidance string in the MCP <c>initialize</c> response.</summary>
+    public bool NoInstructions { get; private init; }
     /// <summary>Positional rest args (used by `scopes add`, `scopes remove`, etc.).</summary>
     public IReadOnlyList<string> Positional { get; private init; } = Array.Empty<string>();
 
@@ -28,6 +31,7 @@ internal sealed class CommandLine
         string? root = null;
         var noEmbeddings = false;
         var noHistory = false;
+        var noInstructions = false;
         var positional = new List<string>();
 
         for (var i = 1; i < args.Length; i++)
@@ -54,6 +58,9 @@ internal sealed class CommandLine
                     break;
                 case "--no-history":
                     noHistory = true;
+                    break;
+                case "--no-instructions":
+                    noInstructions = true;
                     break;
                 default:
                     if (subcommand == "index" && solution is null && !a.StartsWith('-'))
@@ -85,6 +92,7 @@ internal sealed class CommandLine
             Model = model,
             NoEmbeddings = noEmbeddings,
             NoHistory = noHistory,
+            NoInstructions = noInstructions,
             Positional = positional,
         };
     }
@@ -171,6 +179,8 @@ internal sealed class CommandLine
                             disabled-message; every other tool works as before.
           --no-history      Disable the git-blame history pipeline. Use in environments without
                             git on PATH or in CI runs where per-symbol history isn't needed.
+          --no-instructions Don't publish server-side usage guidance in the MCP `initialize`
+                            response. Equivalent to setting SOURCEGRAPH_NO_INSTRUCTIONS=1.
 
         Defaults:
           --db   ./.sourcegraph/scopes/default.db   (created if missing; legacy graph.db is migrated)

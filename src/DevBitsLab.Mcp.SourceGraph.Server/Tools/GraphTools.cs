@@ -17,7 +17,8 @@ public static class GraphTools
         "(e.g. 'frontend,backend'). Omit to use `default_scope` from .sourcegraph.json. Call `list_scopes` to discover.";
 
     [McpServerTool]
-    [Description("Find the definition of a symbol by name or fully-qualified name. Returns location, kind, signature, accessibility, modifiers, and one-line XML summary for each match. Use for 'where is X defined?'.")]
+    [ToolTrigger("\"where is X defined?\"")]
+    [Description("Find the definition of a symbol by name or fully-qualified name. Returns location, kind, signature, accessibility, modifiers, and one-line XML summary for each match.")]
     public static Task<string> FindDefinitionAsync(
         ScopeRouter router,
         [Description("Symbol name (e.g. 'Calculator', 'Divide') or FQN suffix (e.g. 'Calculator.Add', 'Sample.Domain.Calculator')")] string symbol,
@@ -56,7 +57,8 @@ public static class GraphTools
             }, ct));
 
     [McpServerTool]
-    [Description("Find every symbol that carries an attribute by short name (e.g. 'HttpGet', 'Obsolete', 'Authorize'). Optional argValue does a trigram match against the attribute's serialised arguments (e.g. argValue='/api/v2' to find route attributes whose path contains that substring). Use for 'find every POST endpoint', 'what's been deprecated?', 'find all DI singletons'.")]
+    [ToolTrigger("\"find every POST endpoint\", \"what's been deprecated?\", \"find all DI singletons\"")]
+    [Description("Find every symbol that carries an attribute by short name (e.g. 'HttpGet', 'Obsolete', 'Authorize'). Optional argValue does a trigram match against the attribute's serialised arguments (e.g. argValue='/api/v2' to find route attributes whose path contains that substring).")]
     public static Task<string> FindByAttributeAsync(
         ScopeRouter router,
         [Description("Attribute short name (e.g. 'HttpGet', 'Obsolete', 'Authorize'). Trailing 'Attribute' is implied; use the form you'd type in source.")] string name,
@@ -90,7 +92,8 @@ public static class GraphTools
             }, ct));
 
     [McpServerTool]
-    [Description("Find every place that references a symbol. Resolves the symbol by name/FQN, then lists each call site or type-use as file:line. Use for 'who uses X?' or 'who calls X?'. By default skips refs from source-generated files; pass includeGenerated=true to surface them.")]
+    [ToolTrigger("\"who uses X?\" or \"who calls X?\"")]
+    [Description("Find every place that references a symbol. Resolves the symbol by name/FQN, then lists each call site or type-use as file:line. By default skips refs from source-generated files; pass includeGenerated=true to surface them.")]
     public static Task<string> FindReferencesAsync(
         ScopeRouter router,
         [Description("Symbol name or FQN, same matching rules as find_definition")] string symbol,
@@ -131,7 +134,8 @@ public static class GraphTools
             }, ct));
 
     [McpServerTool]
-    [Description("List every symbol declared in a file (classes, methods, properties, etc.). Each row carries kind, accessibility, modifiers, and one-line XML summary. Use for 'what's in this file?' to skip a Read.")]
+    [ToolTrigger("\"what's in this file?\" — faster than reading the whole file")]
+    [Description("List every symbol declared in a file (classes, methods, properties, etc.). Each row carries kind, accessibility, modifiers, and one-line XML summary.")]
     public static Task<string> ListSymbolsInFileAsync(
         ScopeRouter router,
         [Description("Absolute path or path suffix that uniquely identifies the file")] string path,
@@ -166,6 +170,7 @@ public static class GraphTools
             }, ct));
 
     [McpServerTool]
+    [ToolTrigger("\"who calls X?\" or \"who consumes type X?\"")]
     [Description("List inbound edges into a target symbol. Default kind=calls (i.e. callers). Use kind=uses_type to find consumers of a type, kind=overrides for derived implementations, kind=implements_member for members satisfying an interface, kind=instantiates for `new T()` sites, kind=throws for throw sites, or kind=all for every edge kind.")]
     public static Task<string> ListCallersAsync(
         ScopeRouter router,
@@ -195,6 +200,7 @@ public static class GraphTools
             }, ct));
 
     [McpServerTool]
+    [ToolTrigger("\"what does X call?\" or \"what types does X use?\"")]
     [Description("List outbound edges from the target symbol. Default kind=calls (callees). Use kind=uses_type for types touched in this member's signature/body, kind=overrides for the base it overrides, kind=implements_member for the interface member it satisfies, kind=instantiates for types it constructs, kind=throws for exception types it throws, or kind=all.")]
     public static Task<string> ListCalleesAsync(
         ScopeRouter router,
@@ -224,7 +230,8 @@ public static class GraphTools
             }, ct));
 
     [McpServerTool]
-    [Description("Find every concrete member that implements an interface member (uses ImplementsMember edges). Use for 'who implements IGreeter.Greet?'.")]
+    [ToolTrigger("\"who implements IGreeter.Greet?\"")]
+    [Description("Find every concrete member that implements an interface member (uses ImplementsMember edges).")]
     public static Task<string> FindImplementationsAsync(
         ScopeRouter router,
         [Description("Interface member name or FQN, e.g. 'IGreeter.Greet'")] string symbol,
@@ -253,7 +260,8 @@ public static class GraphTools
             }, ct));
 
     [McpServerTool]
-    [Description("Free-text search for symbols by partial name, FQN, or signature using FTS5. Use this when you only have a fragment ('Calc', 'Greet', 'Async').")]
+    [ToolTrigger("\"I only have a fragment of the name (e.g. 'Calc', 'Greet', 'Async')\"")]
+    [Description("Free-text search for symbols by partial name, FQN, or signature using FTS5.")]
     public static Task<string> SearchSymbolsAsync(
         ScopeRouter router,
         [Description("Search query (a few characters, words, or substring of name/FQN/signature)")] string query,
@@ -280,7 +288,8 @@ public static class GraphTools
             }, ct));
 
     [McpServerTool]
-    [Description("Get the immediate graph neighborhood of a symbol: callers, callees, and inheritance/implements edges. Use to orient yourself around a symbol before diving in. Default kind=calls; pass kind=uses_type, overrides, implements_member, instantiates, throws, or all to inspect other edge layers.")]
+    [ToolTrigger("\"give me a quick overview around X\" — orient before diving in")]
+    [Description("Get the immediate graph neighborhood of a symbol: callers, callees, and inheritance/implements edges. Default kind=calls; pass kind=uses_type, overrides, implements_member, instantiates, throws, or all to inspect other edge layers.")]
     public static Task<string> NeighborhoodAsync(
         ScopeRouter router,
         [Description("Symbol name or FQN")] string symbol,
@@ -338,7 +347,8 @@ public static class GraphTools
             }, ct));
 
     [McpServerTool]
-    [Description("Summarize a namespace or directory: lists the most-referenced symbols (highest in-degree) so you know what to read first. Use 'Sample.Domain' or a path fragment.")]
+    [ToolTrigger("\"what's important in this namespace?\" or \"what's the entrypoint to module Y?\"")]
+    [Description("Summarize a namespace or directory: lists the most-referenced symbols (highest in-degree) so you know what to read first. Pass 'Sample.Domain' or a path fragment.")]
     public static Task<string> ModuleSummaryAsync(
         ScopeRouter router,
         [Description("Namespace (e.g. 'Sample.Domain') or path-substring that identifies the module")] string namespaceOrPath,
@@ -366,6 +376,7 @@ public static class GraphTools
             }, ct));
 
     [McpServerTool]
+    [ToolTrigger("\"what would change if I edit X?\" — transitive callers")]
     [Description("Compute the transitive set of upstream callers for a symbol (impact of changing it). Walks the call graph backward up to maxDepth. Default kind=calls; pass kind=uses_type, overrides, implements_member, instantiates, throws, or all to traverse other edge layers.")]
     public static Task<string> ImpactOfChangeAsync(
         ScopeRouter router,
@@ -396,6 +407,7 @@ public static class GraphTools
             }, ct));
 
     [McpServerTool]
+    [ToolTrigger("\"what members does X have?\" or \"list members of namespace Y\"")]
     [Description("List the direct members of a container (class, struct, interface, namespace) by FQN, optionally filtered by accessibility. Walks the populated container_id chain — replaces 'list_symbols_in_file then filter'.")]
     public static Task<string> ListMembersAsync(
         ScopeRouter router,
@@ -438,7 +450,8 @@ public static class GraphTools
             }, ct));
 
     [McpServerTool]
-    [Description("Semantic / intent search: encode a natural-language query, find symbols whose code embeddings are nearest by cosine similarity. Use for 'find code that does retry logic', 'how does this codebase handle authentication', 'show me the rate-limiting code'. Complements (not replaces) search_symbols, which does name-fragment FTS5 trigram matching. Returns a top-k list with location, kind, and a similarity score in [-1, 1].")]
+    [ToolTrigger("\"find code that does retry logic\", \"how does this codebase handle authentication\", \"show me the rate-limiting code\"")]
+    [Description("Semantic / intent search: encode a natural-language query, find symbols whose code embeddings are nearest by cosine similarity. Complements (not replaces) search_symbols, which does name-fragment FTS5 trigram matching. Returns a top-k list with location, kind, and a similarity score in [-1, 1].")]
     public static Task<string> SemanticSearchAsync(
         ScopeRouter router,
         ICodeEmbeddingGenerator generator,
@@ -503,7 +516,8 @@ public static class GraphTools
             }, ct));
 
     [McpServerTool]
-    [Description("Find Roslyn diagnostics (analyzer warnings, compiler errors, etc.) captured during indexing. Filter by severity (default 'warning' = severity >= 2), diagnostic code (e.g. 'CS0618'), and/or symbol. Use for 'what does this codebase warn about?' or 'is X being warned on?'.")]
+    [ToolTrigger("\"what does this codebase warn about?\" or \"is X being warned on?\"")]
+    [Description("Find Roslyn diagnostics (analyzer warnings, compiler errors, etc.) captured during indexing. Filter by severity (default 'warning' = severity >= 2), diagnostic code (e.g. 'CS0618'), and/or symbol.")]
     public static Task<string> FindDiagnosticsAsync(
         ScopeRouter router,
         [Description("Severity floor: hidden | info | warning (default) | error | all. Numeric values 0-3 also accepted.")] string? severity = "warning",
@@ -546,6 +560,7 @@ public static class GraphTools
             }, ct));
 
     [McpServerTool]
+    [ToolTrigger("\"what's source-generated in this codebase?\"")]
     [Description("List every source-generated file (Roslyn IIncrementalGenerator output: regex source-gen, MVVM Toolkit, ASP.NET routing, JSON source-gen, etc.) tracked by the index. Each row shows the path and the count of symbols emitted from that file.")]
     public static Task<string> ListGeneratedFilesAsync(
         ScopeRouter router,

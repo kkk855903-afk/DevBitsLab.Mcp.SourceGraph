@@ -1,4 +1,5 @@
 using DevBitsLab.Mcp.SourceGraph.Sdk;
+using DevBitsLab.Mcp.SourceGraph.Server.Tools;
 using Microsoft.Extensions.DependencyInjection;
 using ModelContextProtocol.Server;
 
@@ -33,6 +34,19 @@ public sealed class ToolRegistry : IToolRegistry
 
     /// <inheritdoc />
     public void AddTool(string toolName, string description, Delegate handler)
+        => AddToolCore(toolName, description, handler, trigger: null);
+
+    /// <inheritdoc />
+    public void AddTool(string toolName, string description, Delegate handler, string trigger)
+    {
+        if (string.IsNullOrWhiteSpace(trigger))
+        {
+            throw new ArgumentException("Trigger must be non-empty when calling the trigger-bearing overload.", nameof(trigger));
+        }
+        AddToolCore(toolName, description, handler, trigger);
+    }
+
+    private void AddToolCore(string toolName, string description, Delegate handler, string? trigger)
     {
         if (string.IsNullOrEmpty(toolName))
         {
@@ -53,7 +67,7 @@ public sealed class ToolRegistry : IToolRegistry
         var tool = McpServerTool.Create(handler, new McpServerToolCreateOptions
         {
             Name = fullName,
-            Description = description,
+            Description = ToolDescriptionFormatter.AppendTrigger(description, trigger),
         });
         _registered.Add(tool);
         _ownerRecord.RegisteredToolNames.Add(fullName);

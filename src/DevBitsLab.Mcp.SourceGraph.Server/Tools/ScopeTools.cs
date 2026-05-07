@@ -14,7 +14,8 @@ namespace DevBitsLab.Mcp.SourceGraph.Server.Tools;
 public static class ScopeTools
 {
     [McpServerTool]
-    [Description("List every registered scope: id, name, root directory, project count, last-indexed timestamp, status (ok | degraded | indexing), and isolation flag. Use this when an existing tool errors with 'no default_scope', or to discover what `scope = '*'` would cover. Pair with the optional `scope` parameter on every other tool.")]
+    [ToolTrigger("\"what scopes are configured?\" — call before passing the `scope` parameter to other tools, or after a 'no default_scope' error")]
+    [Description("List every registered scope: id, name, root directory, project count, last-indexed timestamp, status (ok | degraded | indexing), and isolation flag. Pair with the optional `scope` parameter on every other tool.")]
     public static string ListScopes(ScopeRouter router) =>
         ToolMetrics.TrackSync("list_scopes", null, () =>
         {

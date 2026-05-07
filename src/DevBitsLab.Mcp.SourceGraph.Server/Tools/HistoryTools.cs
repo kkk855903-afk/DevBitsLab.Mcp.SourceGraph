@@ -20,7 +20,8 @@ public static class HistoryTools
         "(e.g. 'frontend,backend'). Omit to use `default_scope` from .sourcegraph.json. Call `list_scopes` to discover.";
 
     [McpServerTool]
-    [Description("List the test methods that exercise a production symbol. Walks inbound `Tests` edges and returns each test's location, framework, and class. Use for 'what tests cover X?' before refactoring.")]
+    [ToolTrigger("\"what tests cover X?\" — call before refactoring")]
+    [Description("List the test methods that exercise a production symbol. Walks inbound `Tests` edges and returns each test's location, framework, and class.")]
     public static Task<string> ListTestsForAsync(
         ScopeRouter router,
         [Description("Production symbol name or FQN (e.g. 'Calculator.Add', 'Sample.Domain.Calculator.Multiply').")] string symbol,
@@ -56,7 +57,8 @@ public static class HistoryTools
             }, ct));
 
     [McpServerTool]
-    [Description("Return the cached git-blame summary for a symbol: last commit sha (7-char), author, ISO-8601 authored time, and lines blamed. Use for 'who last touched X?' or 'when did X change?'.")]
+    [ToolTrigger("\"who last touched X?\" or \"when did X change?\"")]
+    [Description("Return the cached git-blame summary for a symbol: last commit sha (7-char), author, ISO-8601 authored time, and lines blamed.")]
     public static Task<string> WhoAuthoredAsync(
         ScopeRouter router,
         HistoryOptions options,
@@ -82,7 +84,8 @@ public static class HistoryTools
             }, ct));
 
     [McpServerTool]
-    [Description("List symbols whose last git-blame authored time falls within the last N days, optionally filtered by author substring. Use for 'what changed last week?' or 'what has Alice been working on?'.")]
+    [ToolTrigger("\"what changed last week?\" or \"what has Alice been working on?\"")]
+    [Description("List symbols whose last git-blame authored time falls within the last N days, optionally filtered by author substring.")]
     public static Task<string> RecentChangesAsync(
         ScopeRouter router,
         HistoryOptions options,

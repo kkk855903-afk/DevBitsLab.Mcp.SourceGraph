@@ -43,6 +43,28 @@ public interface IToolRegistry
     /// <param name="description">Human-readable description used by the MCP client to render the tool.</param>
     /// <param name="handler">Delegate implementing the tool body. Standard MCP SDK rules apply for parameter binding.</param>
     void AddTool(string toolName, string description, Delegate handler);
+
+    /// <summary>
+    /// Add a new tool that advertises a natural-language trigger phrase. The host appends a
+    /// <c>Use when: &lt;trigger&gt;</c> line to the tool's effective description before
+    /// registering it with the underlying MCP server, so the connected model sees the trigger
+    /// alongside the tool's signature in the catalog. Use this overload when the tool answers
+    /// a recognisable question shape (e.g. <c>"\"who handles MediatR request X?\""</c>); use the
+    /// 3-arg <see cref="AddTool(string, string, Delegate)"/> for diagnostic / utility tools.
+    /// </summary>
+    /// <remarks>
+    /// This method was added in SDK 1.1.0. The 3-arg <see cref="AddTool(string, string, Delegate)"/>
+    /// remains on the interface unchanged, so plugins compiled against SDK 1.0.0 keep working
+    /// without recompilation.
+    /// </remarks>
+    /// <param name="toolName">Short tool name (without the prefix).</param>
+    /// <param name="description">Human-readable description used by the MCP client to render the tool.</param>
+    /// <param name="handler">Delegate implementing the tool body.</param>
+    /// <param name="trigger">
+    ///     Natural-language question phrase the tool answers (typically wrapped in quotes,
+    ///     e.g. <c>"\"who handles MediatR request X?\""</c>). Required, non-empty.
+    /// </param>
+    void AddTool(string toolName, string description, Delegate handler, string trigger);
 }
 
 /// <summary>
