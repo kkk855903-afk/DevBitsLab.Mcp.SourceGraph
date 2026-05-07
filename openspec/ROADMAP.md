@@ -1,8 +1,22 @@
 # Roadmap
 
-Eight active OpenSpec change proposals organized into four phases. Each is
-self-contained and validates strict (`openspec validate --all --strict`); they
-can land in any order respecting the dependencies noted below.
+All proposed changes have shipped and archived. New proposals can be drafted
+under `openspec/changes/<slug>/` and validated with
+`openspec validate --all --strict`.
+
+## Shipped (archived)
+
+The original phase-1-to-4 proposals plus two post-1.0 maturity changes
+(`add-otel-signals`, `harden-release-pipeline`) all landed and were archived;
+their delta specs are folded into the live `openspec/specs/` baselines.
+Listed here so maintainers can trace history:
+
+## Post-1.0 maturity (2026-05-07)
+
+| Change | Adds | Capability |
+|---|---|---|
+| **`add-otel-signals`** | `ActivitySource("DevBitsLab.Mcp.SourceGraph")` + `Meter` with four named instruments emitted from every wrapped MCP tool call; coexists with the existing JSONL log + `usage_stats` tool. | `observability` |
+| **`harden-release-pipeline`** | `dotnet test` gate before NuGet publish; cross-platform CI (Linux/macOS/Windows); CodeQL; Dependabot; deterministic builds + SourceLink; SDK packed alongside the Tool. | `distribution` |
 
 ## Phase 1 — Code-meaning enrichment
 

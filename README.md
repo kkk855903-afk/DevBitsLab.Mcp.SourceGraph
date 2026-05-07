@@ -29,7 +29,10 @@ calls with a single structured tool call:
 - [Command-line interface](#command-line-interface)
 - [How the index stays live](#how-the-index-stays-live)
 - [Observability](#observability)
+- [Resource limits and tunables](#resource-limits-and-tunables)
+- [Platform support](#platform-support)
 - [Building from source](#building-from-source)
+- [Contributing & security](#contributing--security)
 - [License](#license)
 
 ## Features
@@ -316,11 +319,62 @@ sourcegraph-mcp stats --db ./.sourcegraph/scopes/default.db
 
 ## Observability
 
-- Every tool call appends to `<solution>/.sourcegraph/usage.jsonl` (or the
-  per-scope equivalent), so you can audit how agents are using the graph.
-- The `usage_stats` tool returns in-process counts and latencies on demand —
-  use it at the end of a turn to confirm the agent reached for the graph
-  instead of falling back to `Grep` + `Read`.
+The server emits three signals you can hook into:
+
+1. **JSONL audit log** — every tool call appends one line to
+   `<root>/.sourcegraph/usage.jsonl`, capturing timestamp, tool name, args,
+   scope, latency, response size, and error state. Suitable for offline
+   analysis or compliance archival.
+2. **`usage_stats` MCP tool** — returns in-process counters (call count, error
+   count, average / max latency, average response size, last-called time) for
+   the current process. Use it at end-of-turn to verify the agent reached for
+   the graph instead of falling back to `Grep` + `Read`.
+3. **OpenTelemetry signals** — the server emits spans on
+   `ActivitySource("DevBitsLab.Mcp.SourceGraph")` and metrics on
+   `Meter("DevBitsLab.Mcp.SourceGraph")`. Counters: `sourcegraph.tool.calls`,
+   `sourcegraph.tool.errors`. Histograms: `sourcegraph.tool.duration` (ms),
+   `sourcegraph.tool.response_size` (bytes). Tags: `mcp.tool`, `mcp.tool.ok`,
+   `mcp.tool.scope`. Both signals are zero-cost when no listener is attached;
+   pick them up with the OpenTelemetry SDK or `dotnet-counters monitor --name
+   sourcegraph-mcp DevBitsLab.Mcp.SourceGraph`.
+
+## Resource limits and tunables
+
+The server is designed to stay inside a single process and a single SQLite
+database per scope. The current limits are:
+
+| Limit | Default | How to change |
+|---|---|---|
+| Roslyn analyzer timeout per document | 30 s | Hard-coded in `AnalyzerPipeline`; override via fork. |
+| File-watcher debounce window | 200 ms | Hard-coded in `SolutionWatcher`. |
+| Default `SearchSymbols` / `find_references` result limit | 25 / 200 rows | Pass `limit` on the MCP tool call. |
+| `impact_of_change` max depth | 4 hops | Pass `maxDepth` on the tool call. |
+| `semantic_search` top-k default | 10 | Pass `k` on the tool call. |
+| Embedding model download | ~480 MB | Disable with `--no-embeddings`. |
+| Per-symbol `git blame` shellout | enabled | Disable with `--no-history`. |
+| MCP `initialize` instructions payload | enabled | Disable with `--no-instructions` or `SOURCEGRAPH_NO_INSTRUCTIONS=1`. |
+| SQLite database size per scope | unbounded | Use `clear` to wipe; databases live under `<root>/.sourcegraph/scopes/<id>.db`. |
+
+There is no built-in query timeout. If you need one, layer a `CancellationToken`
+on the MCP client side — the server honours cancellation through every async
+graph operation.
+
+## Platform support
+
+| Platform | Build / test in CI | Distribution |
+|---|---|---|
+| Linux x64 / arm64 | Ubuntu (latest) on every push and PR | `dotnet tool install -g` |
+| macOS arm64 / x64 | macOS (latest) on every push and PR | `dotnet tool install -g` |
+| Windows x64       | Windows (latest) on every push and PR | `dotnet tool install -g` |
+
+The published tool targets **`net10.0`**. Earlier .NET runtimes (8, 9) are not
+currently supported — see [GOVERNANCE.md](GOVERNANCE.md#roadmap-items-currently-parked)
+for the LTS-multi-TFM roadmap.
+
+The configuration schema for `.sourcegraph.json` is published as JSON Schema
+at [`schema/sourcegraph.schema.json`](schema/sourcegraph.schema.json) — most
+editors will validate your config if you add a top-level
+`"$schema": "./schema/sourcegraph.schema.json"`.
 
 ## Building from source
 
@@ -347,6 +401,18 @@ published tool, swap `command` / `args` for:
 ```
 
 Re-run `dotnet build` after each change so the next launch picks it up.
+
+## Contributing & security
+
+- Contribution workflow, coding conventions, and the MCP-tool authoring
+  checklist live in [CONTRIBUTING.md](CONTRIBUTING.md).
+- The architecture overview and module layout live in
+  [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+- Vulnerability disclosure is documented in [SECURITY.md](SECURITY.md) — please
+  do **not** open public issues for security problems.
+- Project governance, decision-making, and the deprecation policy live in
+  [GOVERNANCE.md](GOVERNANCE.md).
+- A running history of changes is in [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 

@@ -89,10 +89,28 @@ jobs:
         run: dotnet restore
 
       - name: Build
-        run: dotnet build -c Release --no-restore
+        run: dotnet build -c Release --no-restore /p:ContinuousIntegrationBuild=true
 
-      - name: Pack
+      - name: Test (gate)
+        # A failing test blocks the publish — never push a broken release to NuGet.
+        run: >
+          dotnet test -c Release --no-build
+          --logger "trx;LogFileName=test-results.trx"
+          --logger "console;verbosity=normal"
+          --results-directory ./TestResults
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-test-results
+          path: ./TestResults/**/*.trx
+
+      - name: Pack tool
         run: dotnet pack src/DevBitsLab.Mcp.SourceGraph.Server -c Release --no-build -o ./out
+
+      - name: Pack SDK
+        run: dotnet pack src/DevBitsLab.Mcp.SourceGraph.Sdk -c Release --no-build -o ./out
 
       - name: Push to NuGet
         env:
