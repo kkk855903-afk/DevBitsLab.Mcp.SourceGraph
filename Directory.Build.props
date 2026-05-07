@@ -12,4 +12,10 @@
     <Company>DevBitsLab</Company>
     <Product>DevBitsLab.Mcp.SourceGraph</Product>
   </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Pack the repo-root LICENSE as ordinary content alongside <PackageLicenseExpression>;
+         do NOT also set <PackageLicenseFile>, that would conflict and fail the pack. -->
+    <None Include="$(MSBuildThisFileDirectory)LICENSE" Pack="true" PackagePath="\" Visible="false" />
+  </ItemGroup>
 </Project>

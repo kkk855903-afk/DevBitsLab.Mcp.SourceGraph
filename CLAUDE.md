@@ -119,5 +119,3 @@ the client is also resolved by the server against the process env, so paths like
 - `src/DevBitsLab.Mcp.SourceGraph.Server/` — stdio MCP host + CLI; `Scoping/` (router + per-scope hosts)
 - `tests/fixtures/Sample.sln` — single-scope fixture for smoke tests
 - `tests/fixtures/MultiScope/` — multi-scope fixture (frontend.sln + backend.sln + .sourcegraph.json)
-
-Plan / milestones: `/Users/jacques/.claude/plans/create-a-plan-to-soft-pizza.md`

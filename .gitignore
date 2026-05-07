@@ -492,3 +492,6 @@ $RECYCLE.BIN/
 
 # Per-user Claude Code permission settings
 .claude/settings.local.json
+
+# Per-session scheduled-tasks lock (Claude Code runtime)
+.claude/scheduled_tasks.lock
