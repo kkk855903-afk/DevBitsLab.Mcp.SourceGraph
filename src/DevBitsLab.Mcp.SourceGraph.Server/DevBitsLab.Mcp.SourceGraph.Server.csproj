@@ -36,6 +36,7 @@
     <ProjectReference Include="..\DevBitsLab.Mcp.SourceGraph.Core\DevBitsLab.Mcp.SourceGraph.Core.csproj" />
     <ProjectReference Include="..\DevBitsLab.Mcp.SourceGraph.Storage\DevBitsLab.Mcp.SourceGraph.Storage.csproj" />
     <ProjectReference Include="..\DevBitsLab.Mcp.SourceGraph.Indexing\DevBitsLab.Mcp.SourceGraph.Indexing.csproj" />
+    <ProjectReference Include="..\DevBitsLab.Mcp.SourceGraph.Indexing.Xaml\DevBitsLab.Mcp.SourceGraph.Indexing.Xaml.csproj" />
     <ProjectReference Include="..\DevBitsLab.Mcp.SourceGraph.Watcher\DevBitsLab.Mcp.SourceGraph.Watcher.csproj" />
     <ProjectReference Include="..\DevBitsLab.Mcp.SourceGraph.Embeddings\DevBitsLab.Mcp.SourceGraph.Embeddings.csproj" />
     <ProjectReference Include="..\DevBitsLab.Mcp.SourceGraph.Sdk\DevBitsLab.Mcp.SourceGraph.Sdk.csproj" />

@@ -66,6 +66,14 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
 
     public string? SolutionPath => _solutionPath;
 
+    /// <summary>
+    /// The underlying <see cref="MSBuildWorkspace"/> after <see cref="OpenAsync"/> completes.
+    /// Exposed so the server can construct a <see cref="MSBuildLanguageProjectFactory"/> that
+    /// surfaces every loaded project's file paths to the per-scope project lookup map without
+    /// re-opening the solution.
+    /// </summary>
+    public MSBuildWorkspace? Workspace => _workspace;
+
     public async Task OpenAsync(string solutionPath, CancellationToken ct = default)
     {
         MSBuildHost.EnsureRegistered();
@@ -924,14 +932,20 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
     private async Task HydrateMapsFromStoreAsync(CancellationToken ct)
     {
         var symbolRows = await _store.GetAllSymbolKeysAsync(ct).ConfigureAwait(false);
+        var hydrated = 0;
         foreach (var row in symbolRows)
         {
-            // Schema v11 dropped the legacy unprefixed key format; every row written by this
-            // indexer carries the "csharp:" scheme. Assert in DEBUG so a regression in any
-            // emission site fails loudly during tests rather than corrupting the in-memory map.
-            Debug.Assert(
-                row.CanonicalKey.StartsWith(SymbolMapping.CanonicalKeyScheme, StringComparison.Ordinal),
-                $"Expected csharp:-prefixed canonical key from store, got '{row.CanonicalKey}'");
+            // Multiple language indexers share the same per-scope store now that
+            // `xaml-language-indexer` shipped: rows here may carry `csharp:`, `xaml:`, or any
+            // future scheme. The C# pathway only owns its own scheme — silently skip rows from
+            // other languages so the in-memory `_symbolIdByKey` map (which is consulted only by
+            // C# emission sites) stays scheme-pure. The XAML indexer maintains its own per-pass
+            // map via the dispatcher's `GraphStoreEmitter`, so non-csharp rows aren't lost,
+            // they're just not the C# pathway's concern.
+            if (!row.CanonicalKey.StartsWith(SymbolMapping.CanonicalKeyScheme, StringComparison.Ordinal))
+            {
+                continue;
+            }
             _symbolIdByKey[row.CanonicalKey] = row.Id;
             if (!_keysByFileId.TryGetValue(row.FileId, out var keys))
             {
@@ -939,15 +953,16 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                 _keysByFileId[row.FileId] = keys;
             }
             keys.Add(row.CanonicalKey);
+            hydrated++;
         }
         var fileRows = await _store.GetAllFilesAsync(ct).ConfigureAwait(false);
         foreach (var fr in fileRows)
         {
             _fileIdByPath[fr.Path] = fr.Id;
         }
-        if (symbolRows.Count > 0)
+        if (hydrated > 0)
         {
-            _logger.LogInformation("Hydrated {Symbols} symbol(s) and {Files} file(s) from graph store", symbolRows.Count, fileRows.Count);
+            _logger.LogInformation("Hydrated {Symbols} csharp symbol(s) and {Files} file(s) from graph store", hydrated, fileRows.Count);
         }
     }
 

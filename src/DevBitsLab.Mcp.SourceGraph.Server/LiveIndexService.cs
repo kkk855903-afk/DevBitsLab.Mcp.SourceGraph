@@ -32,6 +32,8 @@ public sealed class LiveIndexService : BackgroundService
     private readonly ICodeEmbeddingGenerator _embeddingGenerator;
     private readonly EmbeddingModelInfo _modelInfo;
     private readonly AnalyzerPipeline _analyzerPipeline;
+    private readonly LanguageIndexerDispatcher _languageDispatcher;
+    private readonly LanguageProjectFactoryRegistry _projectFactories;
     private readonly ILogger<LiveIndexService> _logger;
     private readonly ILoggerFactory _loggerFactory;
     // Hosts prepared during StartAsync — registered with the router with status="indexing" before
@@ -48,6 +50,8 @@ public sealed class LiveIndexService : BackgroundService
         ICodeEmbeddingGenerator embeddingGenerator,
         EmbeddingModelInfo modelInfo,
         AnalyzerPipeline analyzerPipeline,
+        LanguageIndexerDispatcher languageDispatcher,
+        LanguageProjectFactoryRegistry projectFactories,
         ILogger<LiveIndexService> logger,
         ILoggerFactory loggerFactory)
     {
@@ -59,6 +63,8 @@ public sealed class LiveIndexService : BackgroundService
         _embeddingGenerator = embeddingGenerator;
         _modelInfo = modelInfo;
         _analyzerPipeline = analyzerPipeline;
+        _languageDispatcher = languageDispatcher;
+        _projectFactories = projectFactories;
         _logger = logger;
         _loggerFactory = loggerFactory;
     }
@@ -268,6 +274,41 @@ public sealed class LiveIndexService : BackgroundService
             var initial = await host.Indexer.IndexAllAsync(ct).ConfigureAwait(false);
             _logger.LogInformation("Scope `{Id}` initial index complete in {Elapsed}: {Files} files re-processed",
                 scope.Id, initial.Elapsed, initial.FilesIndexed);
+
+            // Carryover from open-language-contract task 5.3 / 6.1 / 6.2: build the per-scope
+            // file → project lookup so IndexContext.Project is populated for every dispatched
+            // document. The MSBuild factory needs the live workspace; build a per-scope dispatcher
+            // here that includes it alongside the global factory pool (which already has the
+            // built-in XAML factory). Then dispatch every non-`.cs` file the registry knows about
+            // — XAML and any plugin-supplied indexer (.py, .ts, …) — so their events land in the
+            // store before the analyzer pipeline runs over them.
+            if (host.Indexer.Workspace is { } workspace)
+            {
+                var perScopeFactories = new LanguageProjectFactoryRegistry();
+                foreach (var f in _projectFactories.All()) perScopeFactories.Register(f);
+                perScopeFactories.Register(new MSBuildLanguageProjectFactory(workspace));
+                var perScopeDispatcher = new LanguageIndexerDispatcher(
+                    _languageDispatcher.Indexers,
+                    perScopeFactories,
+                    _loggerFactory.CreateLogger<LanguageIndexerDispatcher>());
+                await perScopeDispatcher.BuildProjectMapAsync(host, ct).ConfigureAwait(false);
+                var nonCsCount = await perScopeDispatcher.DispatchAllAsync(host, ct).ConfigureAwait(false);
+                if (nonCsCount > 0)
+                {
+                    _logger.LogInformation("Scope `{Id}` non-C# dispatch indexed {Count} files",
+                        scope.Id, nonCsCount);
+                }
+            }
+            else
+            {
+                await _languageDispatcher.BuildProjectMapAsync(host, ct).ConfigureAwait(false);
+                var nonCsCount = await _languageDispatcher.DispatchAllAsync(host, ct).ConfigureAwait(false);
+                if (nonCsCount > 0)
+                {
+                    _logger.LogInformation("Scope `{Id}` non-C# dispatch indexed {Count} files (no MSBuild workspace)",
+                        scope.Id, nonCsCount);
+                }
+            }
 
             // Plugin analyzers: walk every indexed file and dispatch the registered analyzers.
             // Done after the cold index so the per-scope graph already has the symbols /

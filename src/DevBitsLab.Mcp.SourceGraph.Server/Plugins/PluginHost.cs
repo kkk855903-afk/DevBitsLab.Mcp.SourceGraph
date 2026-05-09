@@ -125,6 +125,13 @@ public sealed class PluginHost
                         }
                     }
                 }
+                if (typeof(ILanguageProjectFactory).IsAssignableFrom(type))
+                {
+                    if (TryActivate<ILanguageProjectFactory>(type, record, "ILanguageProjectFactory") is { } lpf)
+                    {
+                        record.LanguageProjectFactories.Add(lpf);
+                    }
+                }
                 if (typeof(ICodeAnalyzer).IsAssignableFrom(type))
                 {
                     if (TryActivate<ICodeAnalyzer>(type, record, "ICodeAnalyzer") is { } ca)
@@ -145,18 +152,22 @@ public sealed class PluginHost
                 }
             }
 
-            if (record.LanguageIndexers.Count == 0 && record.Analyzers.Count == 0 && record.ToolPlugins.Count == 0)
+            if (record.LanguageIndexers.Count == 0
+                && record.LanguageProjectFactories.Count == 0
+                && record.Analyzers.Count == 0
+                && record.ToolPlugins.Count == 0)
             {
                 record.Status = PluginStatus.Failed;
-                record.StatusMessage = "Plugin assembly contained no ILanguageIndexer / ICodeAnalyzer / IMcpToolPlugin implementations.";
+                record.StatusMessage = "Plugin assembly contained no ILanguageIndexer / ILanguageProjectFactory / ICodeAnalyzer / IMcpToolPlugin implementations.";
                 _logger.LogWarning("Plugin `{Identity}` loaded but exposed no contract implementations", pref.Identity);
                 return;
             }
 
             _logger.LogInformation(
-                "Plugin `{Identity}` loaded: {Indexers} indexer(s), {Analyzers} analyzer(s), {ToolPlugins} tool plugin(s)",
+                "Plugin `{Identity}` loaded: {Indexers} indexer(s), {Factories} project factory(ies), {Analyzers} analyzer(s), {ToolPlugins} tool plugin(s)",
                 pref.Identity,
                 record.LanguageIndexers.Count,
+                record.LanguageProjectFactories.Count,
                 record.Analyzers.Count,
                 record.ToolPlugins.Count);
         }

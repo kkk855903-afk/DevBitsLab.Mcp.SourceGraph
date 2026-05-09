@@ -40,6 +40,14 @@ calls with a single structured tool call:
 - **Roslyn-backed C# indexing.** Symbols, references, call/uses-type/overrides/
   implements/instantiates/throws edges, XML doc summaries, accessibility, and
   modifiers — all queryable in one round-trip.
+- **Cross-language XAML indexing.** Built-in `.xaml` indexer covering WPF /
+  WinUI 3 / UWP / Avalonia / Uno from a single per-file profile detection
+  step. Cross-language joins (`code-behind`, `handles-event`,
+  `instantiates-type`) point at C# canonical keys via string equality, so
+  `find_references` on the C# class returns the XAML view that binds it.
+  Five XAML symbol kinds, eight cross-language edge kinds, plus
+  `xaml-attached-property` annotations for `Grid.Row` / `DockPanel.Dock` /
+  etc.
 - **FTS5 name search.** Trigram fragment matching for cases where you only
   remember "`…Greet…Async`".
 - **Optional code-aware semantic search.** ONNX embeddings (default model:
@@ -221,6 +229,27 @@ to the client at handshake time.
 // Fan a query out across every non-isolated scope in a monorepo
 { "tool": "find_references",
   "args": { "symbol": "ILogger.LogError", "scope": "*" } }
+
+// Cross-language XAML join — find me the codebehind for this view.
+// Returns the C# `csharp:T:SampleWpf.Views.MainWindow` partial-class symbol
+// because the XAML indexer wired `<Window x:Class="SampleWpf.Views.MainWindow">`
+// to a `code-behind` edge.
+{ "tool": "list_callees",
+  "args": { "symbol": "Views/MainWindow.xaml", "kind": "code-behind" } }
+
+// Cross-language reverse lookup: every XAML view that points at this codebehind type.
+{ "tool": "list_callers",
+  "args": { "symbol": "SampleWpf.Views.MainWindow", "kind": "code-behind" } }
+
+// Every element that bound to a viewmodel property (XAML binds-path edge).
+// The `payload` sub-line in the response shows the binding's `path`, `mode`,
+// `converter`, and friends (see `harden-sdk-pre-xaml`).
+{ "tool": "list_callers",
+  "args": { "symbol": "MainViewModel.UserName", "kind": "binds-path" } }
+
+// Every element with `Grid.Row` set (XAML attached-property annotation).
+{ "tool": "find_by_annotation",
+  "args": { "name": "Grid.Row", "flavor": "xaml-attached-property" } }
 ```
 
 ## Resource templates

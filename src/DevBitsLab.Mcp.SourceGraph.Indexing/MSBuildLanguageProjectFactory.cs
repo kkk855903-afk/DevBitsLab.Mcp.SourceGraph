@@ -12,7 +12,7 @@ namespace DevBitsLab.Mcp.SourceGraph.Indexing;
 /// reloads the workspace between calls, the next discovery picks up the change without the factory
 /// needing its own invalidation hook.</para>
 /// </summary>
-internal sealed class MSBuildLanguageProjectFactory : ILanguageProjectFactory
+public sealed class MSBuildLanguageProjectFactory : ILanguageProjectFactory
 {
     private readonly MSBuildWorkspace _workspace;
 

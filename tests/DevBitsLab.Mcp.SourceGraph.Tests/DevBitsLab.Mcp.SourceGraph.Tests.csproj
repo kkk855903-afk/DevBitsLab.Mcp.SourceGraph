@@ -25,6 +25,7 @@
     <ProjectReference Include="..\..\src\DevBitsLab.Mcp.SourceGraph.Core\DevBitsLab.Mcp.SourceGraph.Core.csproj" />
     <ProjectReference Include="..\..\src\DevBitsLab.Mcp.SourceGraph.Storage\DevBitsLab.Mcp.SourceGraph.Storage.csproj" />
     <ProjectReference Include="..\..\src\DevBitsLab.Mcp.SourceGraph.Indexing\DevBitsLab.Mcp.SourceGraph.Indexing.csproj" />
+    <ProjectReference Include="..\..\src\DevBitsLab.Mcp.SourceGraph.Indexing.Xaml\DevBitsLab.Mcp.SourceGraph.Indexing.Xaml.csproj" />
     <ProjectReference Include="..\..\src\DevBitsLab.Mcp.SourceGraph.Embeddings\DevBitsLab.Mcp.SourceGraph.Embeddings.csproj" />
     <ProjectReference Include="..\..\src\DevBitsLab.Mcp.SourceGraph.Sdk\DevBitsLab.Mcp.SourceGraph.Sdk.csproj" />
     <ProjectReference Include="..\..\src\DevBitsLab.Mcp.SourceGraph.Server\DevBitsLab.Mcp.SourceGraph.Server.csproj" />
@@ -43,6 +44,18 @@
        in the wrong place. -->
   <ItemGroup>
     <ProjectReference Include="..\fixtures\Sample.App\Sample.App.csproj"
+                      ReferenceOutputAssembly="false"
+                      Private="false"
+                      PrivateAssets="all"
+                      SetConfiguration="Configuration=Debug" />
+    <!-- XAML fixtures: built so RoslynIndexer can open the .sln via MSBuildWorkspace. Same shape
+         as the Sample.App reference above (build dependency only — no asset / link / runtime). -->
+    <ProjectReference Include="..\fixtures\SampleWpf\SampleWpf.csproj"
+                      ReferenceOutputAssembly="false"
+                      Private="false"
+                      PrivateAssets="all"
+                      SetConfiguration="Configuration=Debug" />
+    <ProjectReference Include="..\fixtures\SampleAvalonia\SampleAvalonia.csproj"
                       ReferenceOutputAssembly="false"
                       Private="false"
                       PrivateAssets="all"

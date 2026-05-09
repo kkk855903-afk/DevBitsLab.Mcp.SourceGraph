@@ -194,6 +194,15 @@ static async Task<int> RunServeAsync(CommandLine cli)
     {
         await Console.Error.WriteLineAsync($"[sourcegraph-mcp] built-in indexer extension(s) rejected: {string.Join(", ", rejectedExt)}").ConfigureAwait(false);
     }
+    // Built-in XAML indexer ships with the server (in-tree). Registered here alongside the C#
+    // stub so `LanguageIndexerRegistry` reports the .xaml claim and so the dispatcher routes
+    // .xaml files to the indexer at scope startup. The matching XamlLanguageProjectFactory is
+    // registered in the project-factory registry below.
+    var xamlRejected = langRegistry.Register(new DevBitsLab.Mcp.SourceGraph.Indexing.Xaml.XamlLanguageIndexer());
+    if (xamlRejected.Count > 0)
+    {
+        await Console.Error.WriteLineAsync($"[sourcegraph-mcp] XAML indexer extension(s) rejected: {string.Join(", ", xamlRejected)}").ConfigureAwait(false);
+    }
     foreach (var record in pluginHost.Plugins.Where(p => p.Status == PluginStatus.Loaded))
     {
         foreach (var li in record.LanguageIndexers)
@@ -207,7 +216,24 @@ static async Task<int> RunServeAsync(CommandLine cli)
         }
     }
     builder.Services.AddSingleton(langRegistry);
+
+    // Per-scope ILanguageProjectFactory registry. The XAML factory ships in-tree; plugin-supplied
+    // factories are added below from the loaded plugin records. The MSBuild factory is wired
+    // per-scope inside LiveIndexService once the Roslyn workspace is open (it requires the live
+    // workspace handle, which doesn't exist yet at this point in the startup flow).
+    var projectFactoryRegistry = new LanguageProjectFactoryRegistry();
+    projectFactoryRegistry.Register(new DevBitsLab.Mcp.SourceGraph.Indexing.Xaml.XamlLanguageProjectFactory());
+    foreach (var record in pluginHost.Plugins.Where(p => p.Status == PluginStatus.Loaded))
+    {
+        foreach (var lpf in record.LanguageProjectFactories)
+        {
+            projectFactoryRegistry.Register(lpf, record);
+        }
+    }
+    builder.Services.AddSingleton(projectFactoryRegistry);
+
     builder.Services.AddSingleton<AnalyzerPipeline>();
+    builder.Services.AddSingleton<LanguageIndexerDispatcher>();
 
     // Server-published usage instructions: tells the connected model to prefer source-graph
     // tools over Grep+Read for symbol-level questions, and to call usage_stats at end of turn
@@ -423,9 +449,12 @@ static async Task<int> RunIndexAsync(CommandLine cli)
     {
         await Console.Error.WriteLineAsync($"[sourcegraph-mcp] {ex.Message}").ConfigureAwait(false);
     }
-    if (indexScopeConfig is { Plugins.Count: > 0 })
+    // Plugin host always runs on the one-shot CLI path so the in-tree XAML indexer dispatches
+    // .xaml files alongside the C# bulk index. Skipping the plugin host loop is fine when no
+    // plugins are declared (LoadAllAsync is a no-op then) — but the langRegistry below still
+    // gets the built-in C# stub + XAML indexer so the dispatcher pass actually runs.
     {
-        var pluginHost = new PluginHost(repoRootForIndex, indexScopeConfig.Plugins, loggerFactory.CreateLogger<PluginHost>());
+        var pluginHost = new PluginHost(repoRootForIndex, indexScopeConfig?.Plugins ?? Array.Empty<PluginRef>(), loggerFactory.CreateLogger<PluginHost>());
         try
         {
             await pluginHost.LoadAllAsync().ConfigureAwait(false);
@@ -435,14 +464,72 @@ static async Task<int> RunIndexAsync(CommandLine cli)
             await Console.Error.WriteLineAsync($"[sourcegraph-mcp] plugin host startup failed: {ex.Message}").ConfigureAwait(false);
         }
 
-        var analyzerPipeline = new AnalyzerPipeline(pluginHost, loggerFactory.CreateLogger<AnalyzerPipeline>());
-        if (analyzerPipeline.HasAnalyzers)
+        // Build the language indexer registry — same shape as the serve path.
+        var langRegistry = new LanguageIndexerRegistry();
+        langRegistry.Register(new BuiltInRoslynLanguageIndexerStub());
+        langRegistry.Register(new DevBitsLab.Mcp.SourceGraph.Indexing.Xaml.XamlLanguageIndexer());
+        foreach (var record in pluginHost.Plugins.Where(p => p.Status == PluginStatus.Loaded))
         {
-            await DispatchAnalyzersForOneShotAsync(store, "default", repoRootForIndex, analyzerPipeline, loggerFactory.CreateLogger<Program>()).ConfigureAwait(false);
+            foreach (var li in record.LanguageIndexers)
+            {
+                langRegistry.Register(li, record);
+            }
         }
-        var loadedCount = pluginHost.Plugins.Count(p => p.Status == PluginStatus.Loaded);
-        var failedCount = pluginHost.Plugins.Count(p => p.Status == PluginStatus.Failed);
-        Console.WriteLine($"plugins: {loadedCount} loaded, {failedCount} failed");
+
+        var projectFactoryRegistry = new LanguageProjectFactoryRegistry();
+        projectFactoryRegistry.Register(new DevBitsLab.Mcp.SourceGraph.Indexing.Xaml.XamlLanguageProjectFactory());
+        foreach (var record in pluginHost.Plugins.Where(p => p.Status == PluginStatus.Loaded))
+        {
+            foreach (var lpf in record.LanguageProjectFactories) projectFactoryRegistry.Register(lpf, record);
+        }
+        if (indexer.Workspace is { } ws)
+        {
+            projectFactoryRegistry.Register(new MSBuildLanguageProjectFactory(ws));
+        }
+
+        // Dispatch non-C# files (XAML + plugin-supplied) for the one-shot path. The C# bulk index
+        // above already covered .cs. We use the dispatcher's test-friendly overload here rather
+        // than constructing a ScopeHost: ScopeHost owns indexer/embeddings/store lifetimes via
+        // its DisposeAsync, but the one-shot CLI path keeps `await using var indexer = new ...`
+        // and `await using var store = new ...` for those — wrapping the host would either
+        // double-dispose them or leak when the dispatcher throws. Building the project map
+        // inline against the existing store sidesteps both problems.
+        var dispatcher = new LanguageIndexerDispatcher(langRegistry, projectFactoryRegistry, loggerFactory.CreateLogger<LanguageIndexerDispatcher>());
+        var oneShotProjectMap = new Dictionary<string, ILanguageProject>(StringComparer.OrdinalIgnoreCase);
+        foreach (var factory in projectFactoryRegistry.All())
+        {
+            IReadOnlyList<ILanguageProject> projects;
+            try { projects = await factory.DiscoverAsync(repoRootForIndex, default).ConfigureAwait(false); }
+            catch (Exception ex)
+            {
+                await Console.Error.WriteLineAsync($"[sourcegraph-mcp] factory `{factory.GetType().FullName}` failed DiscoverAsync: {ex.Message}").ConfigureAwait(false);
+                continue;
+            }
+            foreach (var p in projects)
+            {
+                foreach (var path in p.FilePaths)
+                {
+                    if (!oneShotProjectMap.ContainsKey(path)) oneShotProjectMap[path] = p;
+                }
+            }
+        }
+        var dispatched = await dispatcher.DispatchAllForTestAsync(store, "default", repoRootForIndex, oneShotProjectMap).ConfigureAwait(false);
+        if (dispatched > 0)
+        {
+            Console.WriteLine($"non-C# dispatch: indexed {dispatched} files");
+        }
+
+        if (indexScopeConfig is { Plugins.Count: > 0 })
+        {
+            var analyzerPipeline = new AnalyzerPipeline(pluginHost, loggerFactory.CreateLogger<AnalyzerPipeline>());
+            if (analyzerPipeline.HasAnalyzers)
+            {
+                await DispatchAnalyzersForOneShotAsync(store, "default", repoRootForIndex, analyzerPipeline, loggerFactory.CreateLogger<Program>()).ConfigureAwait(false);
+            }
+            var loadedCount = pluginHost.Plugins.Count(p => p.Status == PluginStatus.Loaded);
+            var failedCount = pluginHost.Plugins.Count(p => p.Status == PluginStatus.Failed);
+            Console.WriteLine($"plugins: {loadedCount} loaded, {failedCount} failed");
+        }
     }
 
     if (embedService is not null)

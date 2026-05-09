@@ -33,11 +33,21 @@ namespace DevBitsLab.Mcp.SourceGraph.IntegrationTests;
 internal sealed class ServerHarness : IAsyncDisposable
 {
     /// <summary>
-    /// Hard cap on how long we wait for the spawned dotnet host to exit on dispose. A stuck
-    /// child shouldn't hang the test run; if the graceful close-stdin path doesn't release
-    /// the process within this window the harness escalates to <c>Kill(entireProcessTree=true)</c>.
+    /// Hard cap on how long we wait for the spawned dotnet host to exit on dispose, and the
+    /// matching cap on the MCP <c>initialize</c> handshake. A stuck child shouldn't hang the test
+    /// run; if the graceful close-stdin path doesn't release the process within this window the
+    /// harness escalates to <c>Kill(entireProcessTree=true)</c>.
+    /// <para>
+    /// Sized for the slowest supported runner: Windows agents pay a higher fixed cost on
+    /// <c>dotnet run --no-build</c> startup plus per-scope SQLite open + vocabulary computation
+    /// (the multi-scope fixture in particular dances close to the original 10s budget — the
+    /// preceding test in the same class routinely reports ~10s on Windows). 30s gives Windows
+    /// breathing room without making genuinely deadlocked tests slow to fail; macOS / Linux
+    /// success-path runs are unaffected because they complete in 3–10s and yield well before
+    /// the cap.
+    /// </para>
     /// </summary>
-    public static readonly TimeSpan ProcessExitTimeout = TimeSpan.FromSeconds(10);
+    public static readonly TimeSpan ProcessExitTimeout = TimeSpan.FromSeconds(30);
 
     /// <summary>
     /// Hard cap on how long we wait for the spawned <c>dotnet run --no-build … serve</c> child

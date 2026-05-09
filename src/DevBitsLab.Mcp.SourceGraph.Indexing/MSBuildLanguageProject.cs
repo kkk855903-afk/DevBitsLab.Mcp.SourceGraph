@@ -13,7 +13,7 @@ namespace DevBitsLab.Mcp.SourceGraph.Indexing;
 /// after this wrapper is built, callers should construct a new <see cref="MSBuildLanguageProject"/>
 /// rather than mutating the snapshot.</para>
 /// </summary>
-internal sealed class MSBuildLanguageProject : ILanguageProject
+public sealed class MSBuildLanguageProject : ILanguageProject
 {
     private readonly Microsoft.CodeAnalysis.Project _project;
 

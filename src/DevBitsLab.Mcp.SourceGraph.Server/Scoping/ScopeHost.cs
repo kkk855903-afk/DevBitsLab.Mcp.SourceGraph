@@ -1,6 +1,7 @@
 using DevBitsLab.Mcp.SourceGraph.Core;
 using DevBitsLab.Mcp.SourceGraph.Embeddings;
 using DevBitsLab.Mcp.SourceGraph.Indexing;
+using DevBitsLab.Mcp.SourceGraph.Sdk;
 using DevBitsLab.Mcp.SourceGraph.Storage;
 using DevBitsLab.Mcp.SourceGraph.Watcher;
 using Microsoft.Extensions.Logging;
@@ -74,6 +75,18 @@ public sealed class ScopeHost : IAsyncDisposable
     /// Started by <c>LiveIndexService.OpenScopeAsync</c> and stopped by <see cref="DisposeAsync"/>.
     /// </summary>
     public EmbeddingsHostedService? EmbeddingsService { get; set; }
+
+    /// <summary>
+    /// Per-scope file-path → <see cref="ILanguageProject"/> map populated at scope startup by
+    /// running every registered <see cref="ILanguageProjectFactory"/>'s <c>DiscoverAsync</c>. The
+    /// dispatcher reads from this map to populate <see cref="IndexContext.Project"/> for every
+    /// dispatched document; a file outside any project receives <c>Project = null</c>. Keys are
+    /// absolute paths compared case-insensitively
+    /// (<see cref="StringComparer.OrdinalIgnoreCase"/>) regardless of OS — a deliberate v1
+    /// simplification that costs the rare two-files-with-same-name-different-case pair on
+    /// case-sensitive filesystems but spares every other path the cross-platform comparer dance.
+    /// </summary>
+    public Dictionary<string, ILanguageProject> ProjectByFilePath { get; } = new(StringComparer.OrdinalIgnoreCase);
 
     public async ValueTask DisposeAsync()
     {

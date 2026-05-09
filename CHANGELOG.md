@@ -11,6 +11,30 @@ below note which package the change applies to.
 ## [Unreleased]
 
 ### Added
+- **Built-in XAML indexer.** New in-tree
+  `DevBitsLab.Mcp.SourceGraph.Indexing.Xaml` assembly registered for `.xaml`
+  files. Indexes WPF / WinUI 3 / UWP / Avalonia / Uno from a single indexer
+  with framework-profile auto-detection. Emits five symbol kinds
+  (`xaml-view`, `xaml-element`, `xaml-resource`, `xaml-style`,
+  `xaml-template`), eight cross-language edge kinds (`code-behind`,
+  `binds-path`, `binds-element`, `handles-event`, `uses-resource`,
+  `instantiates-type`, `merges`, `applies-style`), and one annotation
+  flavor (`xaml-attached-property`). Cross-language joins to the C#
+  Roslyn graph go through string equality on `symbols.canonical_key`
+  via the `CanonicalKeys` helpers (e.g. `x:Class="MyApp.Views.Main"` →
+  `csharp:T:MyApp.Views.Main`). Per-project resource cascade cache built
+  once at scope startup from `App.xaml`'s `Application.Resources`,
+  `MergedDictionaries`, and `Themes/Generic.xaml`.
+  (`xaml-language-indexer`)
+- **Per-scope `ILanguageProjectFactory` discovery.** `PluginHost` now
+  activates `ILanguageProjectFactory` instances from registered plugins
+  alongside `ILanguageIndexer` ones; new `LanguageProjectFactoryRegistry`
+  feeds a per-scope `ScopeHost.ProjectByFilePath` map populated at scope
+  startup. The new `LanguageIndexerDispatcher` walks every non-`.cs` file
+  whose extension has a registered indexer and routes it through that
+  indexer with `IndexContext.Project` populated. The existing C# bulk
+  pathway is unchanged; the deferred 5.3 / 6.1 / 6.2 plumbing from
+  `open-language-contract` lands here as the carryover. (`xaml-language-indexer`)
 - 🌿 Green-leaf brand mark on every built-in MCP tool response so the agent
   (and reading human) can tell at a glance the answer came from sourcegraph
   vs. `Grep` + `Read`. Suppress with `--no-leaf` or `SOURCEGRAPH_NO_LEAF=1`.

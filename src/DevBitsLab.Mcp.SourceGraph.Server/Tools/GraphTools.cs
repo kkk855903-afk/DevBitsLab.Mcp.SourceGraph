@@ -157,9 +157,9 @@ public static class GraphTools
     public static Task<string> FindByAnnotationAsync(
         ScopeRouter router,
         [Description("Annotation short name (e.g. 'HttpGet', 'Obsolete', 'Authorize'). Trailing 'Attribute' is implied; use the form you'd type in source.")] string name,
-        [Description("Optional flavor filter (kebab-case, e.g. 'csharp-attribute', 'ts-decorator'). Null matches across all flavors. Call `list_scopes` and inspect `annotation_flavors` from the initialize response to discover what's available.")] string? flavor = null,
+        [Description("Optional flavor filter (kebab-case, e.g. 'csharp-attribute', 'xaml-attached-property', 'ts-decorator'). Null matches across all flavors. Call `list_scopes` and inspect `annotation_flavors` from the initialize response to discover what's available on the active scope.")] string? flavor = null,
         [Description("Optional substring to match against the annotation's arguments via FTS5 trigram (>= 3 chars). E.g. '/api/users' or 'Use Foo'.")] string? argValue = null,
-        [Description("Optional kebab-case symbol kind filter: class|method|property|field|...")] string? kind = null,
+        [Description("Optional kebab-case symbol kind filter: class|method|property|field|interface|namespace|enum|enum-member|operator|record|delegate|struct|event|xaml-view|xaml-element|xaml-resource|xaml-style|xaml-template|... (any plugin-defined kebab-case kind also accepted).")] string? kind = null,
         [Description("Maximum results (default 50)")] int limit = 50,
         [Description(ScopeDescription)] string? scope = null,
         CancellationToken ct = default) =>
@@ -309,12 +309,12 @@ public static class GraphTools
 
     [McpServerTool]
     [ToolTrigger("\"who calls X?\" or \"who consumes type X?\"")]
-    [Description("List inbound edges into a target symbol. Default kind=calls (i.e. callers). Use kind=uses-type to find consumers of a type, kind=overrides-member for derived implementations, kind=implements-member for members satisfying an interface, kind=instantiates for `new T()` sites, kind=throws for throw sites, kind=tests for inbound test edges, or kind=all for every edge kind. Plugin-defined kinds (any kebab-case identifier) are accepted as-is.")]
+    [Description("List inbound edges into a target symbol. Default kind=calls (i.e. callers). Use kind=uses-type to find consumers of a type, kind=overrides-member for derived implementations, kind=implements-member for members satisfying an interface, kind=instantiates for `new T()` sites, kind=throws for throw sites, kind=tests for inbound test edges, or any XAML kind (code-behind, binds-path, binds-element, handles-event, uses-resource, instantiates-type, merges, applies-style) on a scope that loaded the XAML indexer; kind=all walks every edge kind. Plugin-defined kinds (any kebab-case identifier) are accepted as-is.")]
     public static Task<string> ListCallersAsync(
         ScopeRouter router,
         [Description("Target symbol name or FQN")] string symbol,
         [Description("Maximum number of results to return (default 50)")] int limit = 50,
-        [Description("Edge kind to walk (kebab-case): calls (default) | uses-type | overrides-member | implements-member | instantiates | throws | tests | all. Plugin-defined kinds are accepted.")] string? kind = null,
+        [Description("Edge kind to walk (kebab-case): calls (default) | uses-type | overrides-member | implements-member | instantiates | throws | tests | code-behind | binds-path | binds-element | handles-event | uses-resource | instantiates-type | merges | applies-style | all. Plugin-defined kinds are accepted.")] string? kind = null,
         [Description(ScopeDescription)] string? scope = null,
         CancellationToken ct = default) =>
         ToolMetrics.TrackAsync("list_callers", new { symbol, limit, kind, scope }, () =>
@@ -373,12 +373,12 @@ public static class GraphTools
 
     [McpServerTool]
     [ToolTrigger("\"what does X call?\" or \"what types does X use?\"")]
-    [Description("List outbound edges from the target symbol. Default kind=calls (callees). Use kind=uses-type for types touched in this member's signature/body, kind=overrides-member for the base it overrides, kind=implements-member for the interface member it satisfies, kind=instantiates for types it constructs, kind=throws for exception types it throws, kind=tests for outbound test edges, or kind=all. Plugin-defined kinds (any kebab-case identifier) are accepted as-is.")]
+    [Description("List outbound edges from the target symbol. Default kind=calls (callees). Use kind=uses-type for types touched in this member's signature/body, kind=overrides-member for the base it overrides, kind=implements-member for the interface member it satisfies, kind=instantiates for types it constructs, kind=throws for exception types it throws, kind=tests for outbound test edges, or any XAML kind (code-behind, binds-path, binds-element, handles-event, uses-resource, instantiates-type, merges, applies-style) on a scope that loaded the XAML indexer; kind=all walks every edge kind. Plugin-defined kinds (any kebab-case identifier) are accepted as-is.")]
     public static Task<string> ListCalleesAsync(
         ScopeRouter router,
         [Description("Source symbol name or FQN")] string symbol,
         [Description("Maximum number of results to return (default 50)")] int limit = 50,
-        [Description("Edge kind to walk (kebab-case): calls (default) | uses-type | overrides-member | implements-member | instantiates | throws | tests | all. Plugin-defined kinds are accepted.")] string? kind = null,
+        [Description("Edge kind to walk (kebab-case): calls (default) | uses-type | overrides-member | implements-member | instantiates | throws | tests | code-behind | binds-path | binds-element | handles-event | uses-resource | instantiates-type | merges | applies-style | all. Plugin-defined kinds are accepted.")] string? kind = null,
         [Description(ScopeDescription)] string? scope = null,
         CancellationToken ct = default) =>
         ToolMetrics.TrackAsync("list_callees", new { symbol, limit, kind, scope }, () =>
@@ -484,7 +484,7 @@ public static class GraphTools
     public static Task<string> SearchSymbolsAsync(
         ScopeRouter router,
         [Description("Search query (a few characters, words, or substring of name/FQN/signature)")] string query,
-        [Description("Optional kebab-case symbol kind filter: class|method|property|field|interface|namespace|...")] string? kind = null,
+        [Description("Optional kebab-case symbol kind filter: class|method|property|field|interface|namespace|enum|enum-member|operator|record|delegate|struct|event|xaml-view|xaml-element|xaml-resource|xaml-style|xaml-template|... (any plugin-defined kebab-case kind also accepted).")] string? kind = null,
         [Description("Maximum results (default 25)")] int topK = 25,
         [Description(ScopeDescription)] string? scope = null,
         CancellationToken ct = default) =>
@@ -523,12 +523,12 @@ public static class GraphTools
 
     [McpServerTool]
     [ToolTrigger("\"give me a quick overview around X\" — orient before diving in")]
-    [Description("Get the immediate graph neighborhood of a symbol: callers, callees, and inheritance/implements edges. Default kind=calls; pass kind=uses-type, overrides-member, implements-member, instantiates, throws, tests, all, or any plugin-defined kebab-case kind to inspect other edge layers.")]
+    [Description("Get the immediate graph neighborhood of a symbol: callers, callees, and inheritance/implements edges. Default kind=calls; pass kind=uses-type, overrides-member, implements-member, instantiates, throws, tests, all, any XAML edge kind (code-behind, binds-path, binds-element, handles-event, uses-resource, instantiates-type, merges, applies-style) on a scope that loaded the XAML indexer, or any plugin-defined kebab-case kind to inspect other edge layers.")]
     public static Task<string> NeighborhoodAsync(
         ScopeRouter router,
         [Description("Symbol name or FQN")] string symbol,
         [Description("Max items per category (default 20)")] int perCategory = 20,
-        [Description("Edge kind to walk (kebab-case): calls (default) | uses-type | overrides-member | implements-member | instantiates | throws | tests | all. Plugin-defined kinds are accepted.")] string? kind = null,
+        [Description("Edge kind to walk (kebab-case): calls (default) | uses-type | overrides-member | implements-member | instantiates | throws | tests | code-behind | binds-path | binds-element | handles-event | uses-resource | instantiates-type | merges | applies-style | all. Plugin-defined kinds are accepted.")] string? kind = null,
         [Description(ScopeDescription)] string? scope = null,
         CancellationToken ct = default) =>
         ToolMetrics.TrackAsync("neighborhood", new { symbol, perCategory, kind, scope }, () =>
@@ -711,7 +711,7 @@ public static class GraphTools
         [Description("Symbol name or FQN")] string symbol,
         [Description("Maximum traversal depth (default 4)")] int maxDepth = 4,
         [Description("Maximum results (default 100)")] int limit = 100,
-        [Description("Edge kind to walk (kebab-case): calls (default) | uses-type | overrides-member | implements-member | instantiates | throws | tests | all. Plugin-defined kinds are accepted.")] string? kind = null,
+        [Description("Edge kind to walk (kebab-case): calls (default) | uses-type | overrides-member | implements-member | instantiates | throws | tests | code-behind | binds-path | binds-element | handles-event | uses-resource | instantiates-type | merges | applies-style | all. Plugin-defined kinds are accepted.")] string? kind = null,
         [Description(ScopeDescription)] string? scope = null,
         IProgress<ProgressNotificationValue>? progress = null,
         CancellationToken ct = default) =>
@@ -830,7 +830,7 @@ public static class GraphTools
         ICodeEmbeddingGenerator generator,
         [Description("Free-text intent query, e.g. 'retry on transient errors', 'masks PII in logs'")] string query,
         [Description("Top-K results to return (default 20)")] int k = 20,
-        [Description("Optional kebab-case symbol kind filter: class|method|property|field|interface|namespace|...")] string? kind = null,
+        [Description("Optional kebab-case symbol kind filter: class|method|property|field|interface|namespace|enum|enum-member|operator|record|delegate|struct|event|xaml-view|xaml-element|xaml-resource|xaml-style|xaml-template|... (any plugin-defined kebab-case kind also accepted).")] string? kind = null,
         [Description(ScopeDescription)] string? scope = null,
         IProgress<ProgressNotificationValue>? progress = null,
         CancellationToken ct = default) =>

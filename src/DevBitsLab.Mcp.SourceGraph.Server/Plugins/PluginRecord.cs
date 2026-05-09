@@ -47,6 +47,13 @@ public sealed class PluginRecord
     /// <summary>The language indexer instances the plugin supplied.</summary>
     public IList<ILanguageIndexer> LanguageIndexers { get; } = new List<ILanguageIndexer>();
 
+    /// <summary>
+    /// The language-project factories the plugin supplied. Discovered alongside indexers; the
+    /// host invokes each factory's <c>DiscoverAsync</c> once per scope at startup so
+    /// <c>IndexContext.Project</c> can be populated for every dispatched document.
+    /// </summary>
+    public IList<ILanguageProjectFactory> LanguageProjectFactories { get; } = new List<ILanguageProjectFactory>();
+
     /// <summary>The analyzers the plugin supplied.</summary>
     public IList<ICodeAnalyzer> Analyzers { get; } = new List<ICodeAnalyzer>();
 

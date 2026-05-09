@@ -1,0 +1,18 @@
+<Window x:Class="SampleAvalonia.Views.MainWindow"
+        xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="clr-namespace:SampleAvalonia.ViewModels"
+        Title="Avalonia Main">
+    <Window.DataContext>
+        <vm:MainViewModel />
+    </Window.DataContext>
+    <Grid>
+        <TextBox x:Name="UserNameBox"
+                 Grid.Row="0"
+                 Text="{Binding User.Name, Mode=TwoWay}" />
+        <Button x:Name="SaveButton"
+                Grid.Row="1"
+                Theme="{StaticResource DangerButton}"
+                Click="OnSave" />
+    </Grid>
+</Window>

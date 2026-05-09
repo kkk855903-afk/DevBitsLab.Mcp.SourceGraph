@@ -33,7 +33,7 @@ The server SHALL expose a `list_symbols_in_file` tool that lists every symbol de
 - **THEN** the response includes every symbol whose `file_id` joins to a files row whose path matches the suffix, ordered by `start_line`, each annotated with kind, accessibility, modifiers, and (if any) XML summary first sentence
 
 ### Requirement: Caller and callee enumeration
-The server SHALL expose `list_callers` and `list_callees` tools that walk `calls` edges by default, with an optional `kind` parameter that accepts a kebab-case edge kind name (`calls | uses-type | overrides-member | implements-member | instantiates | throws | tests | all`) or any future kind exposed by the active scope's plugins, to filter the edge kind walked. When an edge row carries a non-null `payload` JSON value, the rendered markdown SHALL include an indented `payload:` sub-line under the edge row, displaying up to the first five key/value pairs from the payload object; if more than five pairs are present, an `(N more)` suffix SHALL indicate the elision count.
+The server SHALL expose `list_callers` and `list_callees` tools that walk `calls` edges by default, with an optional `kind` parameter that accepts a kebab-case edge kind name (`calls | uses-type | overrides-member | implements-member | instantiates | throws | tests | code-behind | binds-path | binds-element | handles-event | uses-resource | instantiates-type | merges | applies-style | all`) or any future kind exposed by the active scope's plugins, to filter the edge kind walked. The XAML edge kinds (`code-behind`, `binds-path`, `binds-element`, `handles-event`, `uses-resource`, `instantiates-type`, `merges`, `applies-style`) are part of the enumerable vocabulary on every scope that loads the XAML indexer. When an edge row carries a non-null `payload` JSON value, the rendered markdown SHALL include an indented `payload:` sub-line under the edge row, displaying up to the first five key/value pairs from the payload object; if more than five pairs are present, an `(N more)` suffix SHALL indicate the elision count.
 
 #### Scenario: List callers (default = calls)
 - **WHEN** the agent invokes `list_callers(symbol = "Calculator.Add")`
@@ -50,6 +50,14 @@ The server SHALL expose `list_callers` and `list_callees` tools that walk `calls
 #### Scenario: Unknown kind reported back
 - **WHEN** the agent invokes `list_callers(symbol = "X", kind = "not-a-real-kind")` against a scope where no indexer emits `not-a-real-kind`
 - **THEN** the response is an empty result set with a brief note that the kind was not present in the active scope's published `edge_kinds` vocabulary (which unions the SDK constants with the scope's stored kinds, so a built-in kind like `"calls"` is never reported as unknown even on a never-indexed scope)
+
+#### Scenario: Find the codebehind of a XAML view
+- **WHEN** the agent invokes `list_callees(symbol = "xaml:view:Views/MainWindow.xaml", kind = "code-behind")` against a scope that loaded the XAML indexer and indexed a WPF solution
+- **THEN** the response lists the C# partial class symbol (`csharp:T:SampleWpf.Views.MainWindow`) as the resolved target
+
+#### Scenario: List every binding to a viewmodel property (cross-language)
+- **WHEN** the agent invokes `list_callers(symbol = "csharp:P:SampleWpf.ViewModels.MainViewModel.UserName", kind = "binds-path")`
+- **THEN** the response lists every XAML element with a `binds-path` edge whose payload `path` resolves to `UserName` on the same target type, with each row's payload sub-line (per `harden-sdk-pre-xaml`) showing the `path`, `mode`, and `converter` values
 
 #### Scenario: Edge with no payload renders unchanged
 - **WHEN** `list_callers` returns an edge whose `payload` column is `NULL` (e.g. a built-in C# `calls` edge today)
@@ -147,7 +155,7 @@ The server SHALL expose a `list_members` tool that returns the symbols whose `co
 - **THEN** only public members are returned
 
 ### Requirement: find_by_annotation tool
-The server SHALL expose a `find_by_annotation` tool that returns symbols matching an annotation name and optional flavor, argument substring, and symbol kind filter. The legacy `find_by_attribute` tool SHALL NOT exist after this change; agents call `find_by_annotation(name = "...", flavor = "csharp-attribute", ...)` for the equivalent query.
+The server SHALL expose a `find_by_annotation` tool that returns symbols matching an annotation name and optional flavor, argument substring, and symbol kind filter. The legacy `find_by_attribute` tool SHALL NOT exist after this change; agents call `find_by_annotation(name = "...", flavor = "csharp-attribute", ...)` for the equivalent query. The flavor enumeration accepted by the `flavor` parameter SHALL include `xaml-attached-property` (in addition to `csharp-attribute`) on every scope that loads the XAML indexer.
 
 #### Scenario: Find every POST endpoint
 - **WHEN** the agent invokes `find_by_annotation(name = "HttpPost", flavor = "csharp-attribute")`
@@ -160,6 +168,25 @@ The server SHALL expose a `find_by_annotation` tool that returns symbols matchin
 #### Scenario: Cross-flavor query
 - **WHEN** the agent invokes `find_by_annotation(name = "Component")` (no flavor specified) against a polyglot scope
 - **THEN** the response returns symbols whose annotations match `name = "Component"` across every flavor present in the scope, with each row tagged with the flavor that produced it
+
+#### Scenario: Find every element with Grid.Row set
+- **WHEN** the agent invokes `find_by_annotation(name = "Grid.Row", flavor = "xaml-attached-property")` against a scope that loaded the XAML indexer
+- **THEN** the response lists every XAML element symbol carrying a `Grid.Row` attached property, with the value visible in the args column
+
+#### Scenario: Cross-flavor query returns mixed results
+- **WHEN** the agent invokes `find_by_annotation(name = "Background")` with no flavor specified, against a scope where the C# indexer emits `csharp-attribute` annotations and the XAML indexer emits `xaml-attached-property` annotations
+- **THEN** any annotation with `name == "Background"` from either flavor appears in the response, each row tagged with its flavor
+
+### Requirement: Symbol kind enumeration in tool parameters
+The kind parameter on `list_symbols_in_file`, `find_definition`, and `module_summary` SHALL accept (in addition to the C# kinds documented by `open-language-contract`) the new XAML symbol kinds: `xaml-view`, `xaml-element`, `xaml-resource`, `xaml-style`, `xaml-template`. The expanded enumeration appears in the parameter doc on every scope that loads the XAML indexer.
+
+#### Scenario: List every XAML view in a project
+- **WHEN** the agent invokes `list_symbols_in_file(file = "Views/MainWindow.xaml")` against a scope that loaded the XAML indexer
+- **THEN** the response includes the `xaml-view` symbol for the file root plus any `xaml-element`, `xaml-resource`, `xaml-style`, or `xaml-template` symbols declared inside
+
+#### Scenario: Find definition of a XAML resource
+- **WHEN** the agent invokes `find_definition(symbol = "xaml:resource:App.xaml#AccentBrush")`
+- **THEN** the response includes the resource's declaration site (file path, line, column) plus every `uses-resource` edge that targets it (via the existing reference-listing behaviour)
 
 ### Requirement: Annotations surfaced in existing tool output
 `find_definition`, `list_symbols_in_file`, `neighborhood`, and `module_summary` SHALL include an `annotations:` line per result that lists each attached annotation's name (with truncated arg preview when present and a flavor tag when the scope has more than one flavor present), so an agent reads `[HttpGet("/api/users"), Authorize]` without a second call.
