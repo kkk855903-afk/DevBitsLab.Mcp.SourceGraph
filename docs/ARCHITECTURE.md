@@ -1,6 +1,6 @@
 # Architecture
 
-This document describes how `DevBitsLab.Mcp.SourceGraph` is organised, how an
+This document describes how 🌿 `DevBitsLab.Mcp.SourceGraph` is organised, how an
 indexing run flows from disk to SQLite, and how MCP tool calls are dispatched
 across scopes. It complements [README.md](../README.md) (user-facing) and
 [CONTRIBUTING.md](../CONTRIBUTING.md) (workflow).

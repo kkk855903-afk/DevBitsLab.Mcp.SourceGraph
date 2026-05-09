@@ -1,7 +1,7 @@
 {
   "mcpServers": {
     "SourceGraph": {
-      "name": "SourceGraph",
+      "name": "🌿 SourceGraph",
       "command": "dotnet",
       "args": [
         "run",

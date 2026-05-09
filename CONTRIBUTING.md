@@ -1,4 +1,4 @@
-# Contributing to DevBitsLab.Mcp.SourceGraph
+# Contributing to 🌿 DevBitsLab.Mcp.SourceGraph
 
 Thanks for your interest in contributing! This document covers everything you
 need to get a change reviewed and merged.

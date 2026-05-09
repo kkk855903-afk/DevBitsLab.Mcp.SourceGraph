@@ -1,4 +1,4 @@
-# DevBitsLab.Mcp.SourceGraph
+# 🌿 DevBitsLab.Mcp.SourceGraph
 
 Live code source graph MCP server for .NET solutions. Indexes C# via Roslyn into
 SQLite + FTS5 and exposes graph queries to MCP clients (Claude Code, Cursor) over
