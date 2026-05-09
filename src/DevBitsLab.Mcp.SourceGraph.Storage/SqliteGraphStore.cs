@@ -637,13 +637,16 @@ public sealed class SqliteGraphStore : IGraphStore
     public async Task<IReadOnlyList<SymbolHit>> ListCallersAsync(long symbolId, int limit = 50, string? edgeKind = "calls", CancellationToken ct = default)
     {
         // edgeKind = null => walk every kind (used for kind = "all" in the MCP tool).
+        // payload column is projected through to SymbolHit.PayloadJson so the markdown renderer
+        // can surface per-edge metadata as an indented sub-line when non-null.
         var kindClause = edgeKind is null ? "" : "AND e.kind_name = @kind";
         var sql = $"""
             SELECT s.id, s.name, s.fqn, s.kind_name AS Kind, f.path AS FilePath, s.start_line AS StartLine, s.start_col AS StartCol,
                    s.end_line AS EndLine, s.end_col AS EndCol, s.signature,
                    s.modifiers AS Modifiers, s.accessibility AS Accessibility, s.xml_summary AS XmlSummary,
                    f.is_generated AS IsGenerated, s.test_framework AS TestFramework,
-                   s.canonical_key AS CanonicalKey
+                   s.canonical_key AS CanonicalKey,
+                   e.payload     AS PayloadJson
             FROM edges e
             JOIN symbols s ON s.id = e.src
             JOIN files   f ON f.id = s.file_id
@@ -651,20 +654,23 @@ public sealed class SqliteGraphStore : IGraphStore
             ORDER BY f.path, s.start_line
             LIMIT @limit;
             """;
-        var rows = await _connection.QueryAsync<RawSymbolHit>(new CommandDefinition(
+        var rows = await _connection.QueryAsync<RawEdgeHit>(new CommandDefinition(
             sql, new { id = symbolId, limit, kind = edgeKind }, cancellationToken: ct)).ConfigureAwait(false);
         return rows.Select(r => r.ToHit()).ToList();
     }
 
     public async Task<IReadOnlyList<SymbolHit>> ListCalleesAsync(long symbolId, int limit = 50, string? edgeKind = "calls", CancellationToken ct = default)
     {
+        // payload column is projected through to SymbolHit.PayloadJson so the markdown renderer
+        // can surface per-edge metadata as an indented sub-line when non-null.
         var kindClause = edgeKind is null ? "" : "AND e.kind_name = @kind";
         var sql = $"""
             SELECT s.id, s.name, s.fqn, s.kind_name AS Kind, f.path AS FilePath, s.start_line AS StartLine, s.start_col AS StartCol,
                    s.end_line AS EndLine, s.end_col AS EndCol, s.signature,
                    s.modifiers AS Modifiers, s.accessibility AS Accessibility, s.xml_summary AS XmlSummary,
                    f.is_generated AS IsGenerated, s.test_framework AS TestFramework,
-                   s.canonical_key AS CanonicalKey
+                   s.canonical_key AS CanonicalKey,
+                   e.payload     AS PayloadJson
             FROM edges e
             JOIN symbols s ON s.id = e.dst
             JOIN files   f ON f.id = s.file_id
@@ -672,7 +678,7 @@ public sealed class SqliteGraphStore : IGraphStore
             ORDER BY f.path, s.start_line
             LIMIT @limit;
             """;
-        var rows = await _connection.QueryAsync<RawSymbolHit>(new CommandDefinition(
+        var rows = await _connection.QueryAsync<RawEdgeHit>(new CommandDefinition(
             sql, new { id = symbolId, limit, kind = edgeKind }, cancellationToken: ct)).ConfigureAwait(false);
         return rows.Select(r => r.ToHit()).ToList();
     }
@@ -727,6 +733,26 @@ public sealed class SqliteGraphStore : IGraphStore
             Id, Name, Fqn, Kind, FilePath,
             (int)StartLine, (int)StartCol, (int)EndLine, (int)EndCol, Signature,
             Modifiers, (int)Accessibility, XmlSummary, IsGenerated != 0, TestFramework, CanonicalKey);
+    }
+
+    /// <summary>
+    /// Edge-walking projection used by <see cref="ListCallersAsync"/> /
+    /// <see cref="ListCalleesAsync"/>: identical to <see cref="RawSymbolHit"/> plus the
+    /// originating <c>edges.payload</c> column. Kept as a separate record because Dapper's
+    /// constructor binding looks for an exact column-to-parameter match — adding a default-null
+    /// trailing parameter to <see cref="RawSymbolHit"/> would silently break every other SQL
+    /// projection that doesn't return <c>PayloadJson</c>.
+    /// </summary>
+    private sealed record RawEdgeHit(long Id, string Name, string Fqn, string Kind, string FilePath,
+        long StartLine, long StartCol, long EndLine, long EndCol, string? Signature,
+        string? Modifiers, long Accessibility, string? XmlSummary, long IsGenerated, string? TestFramework,
+        string? CanonicalKey, string? PayloadJson)
+    {
+        public SymbolHit ToHit() => new(
+            Id, Name, Fqn, Kind, FilePath,
+            (int)StartLine, (int)StartCol, (int)EndLine, (int)EndCol, Signature,
+            Modifiers, (int)Accessibility, XmlSummary, IsGenerated != 0, TestFramework, CanonicalKey,
+            PayloadJson);
     }
 
     private sealed record RawReferenceHit(long Id, long SymbolId, string FilePath, long Line, long Col, long Kind, long IsGenerated)

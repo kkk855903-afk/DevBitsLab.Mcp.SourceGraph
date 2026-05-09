@@ -10,6 +10,7 @@
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/DevBitsLab.Mcp.SourceGraph.Tests/DevBitsLab.Mcp.SourceGraph.Tests.csproj" />
+    <Project Path="tests/DevBitsLab.Mcp.SourceGraph.IntegrationTests/DevBitsLab.Mcp.SourceGraph.IntegrationTests.csproj" />
   </Folder>
   <Folder Name="/bench/">
     <Project Path="bench/DevBitsLab.Mcp.SourceGraph.Benchmarks/DevBitsLab.Mcp.SourceGraph.Benchmarks.csproj" />

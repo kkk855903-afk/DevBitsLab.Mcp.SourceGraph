@@ -16,6 +16,12 @@ internal sealed class CommandLine
     /// <summary>True when <c>--no-instructions</c> was passed; suppresses the server-published
     /// usage guidance string in the MCP <c>initialize</c> response.</summary>
     public bool NoInstructions { get; private init; }
+    /// <summary>True when <c>--strict</c> was passed; consumed by <c>vocabulary list</c> to exit
+    /// non-zero when drift candidates are reported.</summary>
+    public bool Strict { get; private init; }
+    /// <summary>The scope id passed via <c>--scope &lt;id&gt;</c>; consumed by <c>vocabulary list</c>
+    /// to filter the output to a single scope. Null means every scope.</summary>
+    public string? ScopeId { get; private init; }
     /// <summary>Positional rest args (used by `scopes add`, `scopes remove`, etc.).</summary>
     public IReadOnlyList<string> Positional { get; private init; } = Array.Empty<string>();
 
@@ -32,6 +38,8 @@ internal sealed class CommandLine
         var noEmbeddings = false;
         var noHistory = false;
         var noInstructions = false;
+        var strict = false;
+        string? scopeId = null;
         var positional = new List<string>();
 
         for (var i = 1; i < args.Length; i++)
@@ -61,6 +69,12 @@ internal sealed class CommandLine
                     break;
                 case "--no-instructions":
                     noInstructions = true;
+                    break;
+                case "--strict":
+                    strict = true;
+                    break;
+                case "--scope":
+                    scopeId = RequireArg(args, ref i, a);
                     break;
                 default:
                     if (subcommand == "index" && solution is null && !a.StartsWith('-'))
@@ -93,6 +107,8 @@ internal sealed class CommandLine
             NoEmbeddings = noEmbeddings,
             NoHistory = noHistory,
             NoInstructions = noInstructions,
+            Strict = strict,
+            ScopeId = scopeId,
             Positional = positional,
         };
     }
@@ -170,6 +186,14 @@ internal sealed class CommandLine
           sourcegraph-mcp scopes remove <name> [--root <path>]
               Remove a scope from .sourcegraph.json.
 
+          sourcegraph-mcp vocabulary list [--scope <id>] [--strict] [--root <path>]
+              Diagnostic dump of the active kind vocabulary per scope: every distinct edge_kind,
+              symbol_kind, and annotation_flavor in storage, attributed to `[sdk]`, `[plugin: ...]`,
+              or `[unknown]`, with live emission counts. Each kind list is followed by a "Drift
+              candidates" section: pairs within Levenshtein distance ≤ 2 that may indicate two
+              indexers emitting near-duplicate identifiers (e.g. `bind-path` vs `binds-path`).
+              Exits 0 by default; with --strict, exits 2 when any drift candidate is reported.
+
         Common flags:
           --root <path>     Repository root used for `.sourcegraph.json` discovery and scope DBs.
                             Defaults to the directory holding `--solution`, then CWD.
@@ -181,6 +205,10 @@ internal sealed class CommandLine
                             git on PATH or in CI runs where per-symbol history isn't needed.
           --no-instructions Don't publish server-side usage guidance in the MCP `initialize`
                             response. Equivalent to setting SOURCEGRAPH_NO_INSTRUCTIONS=1.
+          --scope <id>      Restrict the operation to a single scope. Currently consumed by
+                            `vocabulary list`; ignored elsewhere.
+          --strict          Treat warnings as errors. Currently consumed by `vocabulary list`,
+                            which exits 2 on drift candidates when set.
 
         Defaults:
           --db   ./.sourcegraph/scopes/default.db   (created if missing; legacy graph.db is migrated)

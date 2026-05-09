@@ -19,6 +19,12 @@
          plugin pinned at <Version>1.0.0</Version> stays buildable across server minor bumps. -->
     <PackageId>DevBitsLab.Mcp.SourceGraph.Sdk</PackageId>
     <!--
+      2.1.0 (harden-sdk-pre-xaml): additive only — adds PayloadKeys (kebab-case constants for the
+      well-known keys plugins put in EdgeEmitted.Metadata: path, mode, converter, …) and
+      CanonicalKeys (helpers ForType / ForMethod / ForField / ForProperty constructing
+      doc-comment-id-shaped C# canonical keys, so cross-language plugins don't reimplement
+      Roslyn's format). No breaking changes; plugins built against 2.0 keep working.
+
       2.0.0 (open-language-contract): breaking SDK reform ahead of XAML and the JS/TS/Vue/Svelte
       languages. EdgeKind / PluginSymbolKind enums replaced with kebab-case strings + EdgeKinds /
       SymbolKinds constants classes. EdgeEmitted gains an IReadOnlyDictionary<string,string>?
@@ -31,7 +37,7 @@
 
       1.0.0: initial plugin SDK shape (ILanguageIndexer / ICodeAnalyzer / IMcpToolPlugin).
     -->
-    <Version>2.0.0</Version>
+    <Version>2.1.0</Version>
     <Description>Plugin SDK for DevBitsLab.Mcp.SourceGraph. Public contracts (ILanguageIndexer, ICodeAnalyzer, IMcpToolPlugin) plus the IndexEvent discriminated union and helper base classes for authoring third-party plugins. Targets netstandard2.0 so a single plugin DLL works with every supported host version.</Description>
     <Authors>DevBitsLab</Authors>
     <PackageTags>mcp;sourcegraph;plugin-sdk;roslyn;analyzers</PackageTags>

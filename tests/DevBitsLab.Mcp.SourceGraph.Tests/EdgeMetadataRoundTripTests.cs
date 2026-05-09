@@ -150,4 +150,85 @@ public sealed class EdgeMetadataRoundTripTests : IAsyncLifetime
         // serialise step and writes NULL. Tools that introspect payload should see a clean NULL.
         payload.Should().BeNull();
     }
+
+    [Fact]
+    public async Task ListCallers_surfacesPayloadJson_fromOriginatingEdge()
+    {
+        // Read-side coverage for harden-sdk-pre-xaml §7: the SQL projection on ListCallersAsync
+        // includes edges.payload and SymbolHit.PayloadJson surfaces it verbatim, so the markdown
+        // renderer can decode it into a per-row sub-line. The write side is already covered by the
+        // tests above; this asserts the bytes round-trip through a real graph query.
+        var srcId = await SeedSymbolAsync("csharp:M:Sample.ReadSide.Caller", "Caller");
+        var dstId = await SeedSymbolAsync("csharp:M:Sample.ReadSide.Target", "Target");
+
+        var metadata = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["path"] = "User.Name",
+            ["mode"] = "two-way",
+        };
+        await _store!.BulkInsertEdgesAsync(new[]
+        {
+            new Edge(srcId, dstId, "binds-path", metadata),
+        });
+
+        var callers = await _store.ListCallersAsync(dstId, limit: 50, edgeKind: "binds-path");
+
+        callers.Should().HaveCount(1);
+        var caller = callers[0];
+        caller.Id.Should().Be(srcId);
+        caller.PayloadJson.Should().NotBeNull(
+            "the edge had non-empty Metadata — the read path is required to surface the JSON column");
+        var roundTripped = JsonSerializer.Deserialize<Dictionary<string, string>>(caller.PayloadJson!);
+        roundTripped.Should().NotBeNull();
+        roundTripped!["path"].Should().Be("User.Name");
+        roundTripped["mode"].Should().Be("two-way");
+    }
+
+    [Fact]
+    public async Task ListCallees_surfacesPayloadJson_fromOriginatingEdge()
+    {
+        // Mirror of the inbound test for the outbound path (list_callees uses the dst-side join);
+        // §7 plumbs payload through both edge-walking SQL strings.
+        var srcId = await SeedSymbolAsync("csharp:M:Sample.Outbound.Source", "OutSource");
+        var dstId = await SeedSymbolAsync("csharp:M:Sample.Outbound.Target", "OutTarget");
+
+        var metadata = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["event"] = "Click",
+            ["handler"] = "OnClick",
+        };
+        await _store!.BulkInsertEdgesAsync(new[]
+        {
+            new Edge(srcId, dstId, "wires-event", metadata),
+        });
+
+        var callees = await _store.ListCalleesAsync(srcId, limit: 50, edgeKind: "wires-event");
+
+        callees.Should().HaveCount(1);
+        callees[0].PayloadJson.Should().NotBeNull();
+        var roundTripped = JsonSerializer.Deserialize<Dictionary<string, string>>(callees[0].PayloadJson!);
+        roundTripped.Should().NotBeNull();
+        roundTripped!["event"].Should().Be("Click");
+        roundTripped["handler"].Should().Be("OnClick");
+    }
+
+    [Fact]
+    public async Task ListCallers_returnsNullPayloadJson_whenEdgeHasNoMetadata()
+    {
+        // Edges without metadata land NULL in the payload column (see the *NullPayload* tests
+        // above). The read path must surface that as null on SymbolHit, not "" or "{}", so the
+        // rendering helper can short-circuit and skip the sub-line entirely.
+        var srcId = await SeedSymbolAsync("csharp:M:Sample.NoPayload.Caller", "NPCaller");
+        var dstId = await SeedSymbolAsync("csharp:M:Sample.NoPayload.Target", "NPTarget");
+
+        await _store!.BulkInsertEdgesAsync(new[]
+        {
+            new Edge(srcId, dstId, EdgeKinds.Calls, Metadata: null),
+        });
+
+        var callers = await _store.ListCallersAsync(dstId, limit: 50, edgeKind: EdgeKinds.Calls);
+
+        callers.Should().HaveCount(1);
+        callers[0].PayloadJson.Should().BeNull();
+    }
 }

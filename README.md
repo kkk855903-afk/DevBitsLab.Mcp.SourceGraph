@@ -154,8 +154,8 @@ to the client at handshake time.
 |---|---|
 | `find_definition` | Where is X defined? |
 | `find_references` | Who uses or calls X? (file:line list, optionally including source-generated files) |
-| `list_callers` | Inbound edges into X — default `kind=calls`; also `uses_type`, `overrides`, `implements_member`, `instantiates`, `throws`, `all` |
-| `list_callees` | Outbound edges from X (same `kind` taxonomy) |
+| `list_callers` | Inbound edges into X — default `kind=calls`; also `uses_type`, `overrides`, `implements_member`, `instantiates`, `throws`, `all`. When an edge carries per-edge metadata (e.g. a future XAML `binds-path` edge with `path`, `mode`, `converter` fields), the markdown shows an indented `payload: { … }` sub-line under the row, capped at 5 keys with `(N more)` if elided. |
+| `list_callees` | Outbound edges from X (same `kind` taxonomy; same `payload:` sub-line behaviour as `list_callers`). |
 | `list_symbols_in_file` | What's in this file? (kind, accessibility, modifiers, XML summary) |
 | `list_members` | Direct members of a class / struct / interface / namespace by FQN, optionally filtered by accessibility |
 | `find_implementations` | Concrete members satisfying an interface member |
@@ -283,6 +283,7 @@ sourcegraph-mcp <subcommand> [options]
 | `scopes remove <name> [--root <path>]` | Remove a scope. |
 | `plugins list [--root <path>]` | List plugins declared in `.sourcegraph.json` with their version, status, registered contracts, and source path. |
 | `plugins info <name> [--root <path>]` | Show the full record for one plugin: status reason, declared interfaces, registered tool names. |
+| `vocabulary list [--root <path>] [--scope <id>] [--strict]` | Per-scope diagnostic over the soft-registry kind vocabulary. Lists `edge_kinds` / `symbol_kinds` / `annotation_flavors` with each entry tagged by source (`sdk` constant vs `plugin: <id>@<version>` vs `unknown`) and live emission count, plus a "Drift candidates" section flagging Levenshtein-near pairs (`bind-path` ~ `binds-path`) within the same scope. Default exit `0`; `--strict` exits `2` on any drift candidate so CI can wire it as a gate. |
 
 Common flags:
 

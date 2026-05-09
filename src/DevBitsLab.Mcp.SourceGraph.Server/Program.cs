@@ -1,3 +1,5 @@
+using System.Text.Json;
+using System.Text.Json.Nodes;
 using DevBitsLab.Mcp.SourceGraph.Core;
 using DevBitsLab.Mcp.SourceGraph.Embeddings;
 using DevBitsLab.Mcp.SourceGraph.Indexing;
@@ -42,6 +44,7 @@ return cli.Subcommand switch
     "init-scopes" => await ScopesCli.RunInitAsync(cli).ConfigureAwait(false),
     "scopes" => await ScopesCli.RunSubcommandAsync(cli).ConfigureAwait(false),
     "plugins" => await PluginsCli.RunSubcommandAsync(cli).ConfigureAwait(false),
+    "vocabulary" => await VocabularyCli.RunSubcommandAsync(cli).ConfigureAwait(false),
     _ => Unknown(cli.Subcommand),
 };
 
@@ -224,29 +227,39 @@ static async Task<int> RunServeAsync(CommandLine cli)
             o.ServerInstructions = ServerInstructions.Template;
             // Capabilities.Experimental is the MCP spec's extension point for non-standard
             // server capabilities; we slot the vocabulary in under a namespaced key so unrelated
-            // clients ignore it. The value is a small typed record that System.Text.Json
-            // serialises as `{ "edge_kinds": [...union...], "symbol_kinds": [...], ...,
-            // "scopes": { "<id>": { "edge_kinds": [...], ... } } }`. The top-level lists are the
-            // server-wide union across every scope; the `scopes` map carries the per-scope
-            // breakdown for clients that need to validate a tool argument against a specific
-            // scope's vocabulary.
+            // clients ignore it. The wire shape is `{ "edge_kinds": [...union...],
+            // "symbol_kinds": [...], ..., "scopes": { "<id>": { "edge_kinds": [...], ... } } }`.
+            // The top-level lists are the server-wide union across every scope; the `scopes` map
+            // carries the per-scope breakdown for clients that need to validate a tool argument
+            // against a specific scope's vocabulary.
+            //
+            // We build the value as a `JsonObject` rather than an anonymous type because the MCP
+            // SDK's source-generated `McpJsonUtilities+JsonContext` rejects anonymous-type
+            // `JsonTypeInfo` lookups at serialise time (NotSupportedException). `JsonObject`
+            // derives from `JsonNode` which the SDK's context handles natively as opaque JSON, so
+            // the serialiser writes it through unchanged. The emitted JSON is byte-for-byte
+            // identical to what the anonymous-type path produced.
             o.Capabilities ??= new ModelContextProtocol.Protocol.ServerCapabilities();
             o.Capabilities.Experimental ??= new Dictionary<string, object>(StringComparer.Ordinal);
-            o.Capabilities.Experimental[ServerVocabulary.CapabilityKey] = new
+
+            var perScope = new JsonObject();
+            foreach (var kv in vocabulary.Scopes)
             {
-                edge_kinds = vocabulary.EdgeKinds,
-                symbol_kinds = vocabulary.SymbolKinds,
-                annotation_flavors = vocabulary.AnnotationFlavors,
-                scopes = vocabulary.Scopes.ToDictionary(
-                    kv => kv.Key,
-                    kv => (object)new
-                    {
-                        edge_kinds = kv.Value.EdgeKinds,
-                        symbol_kinds = kv.Value.SymbolKinds,
-                        annotation_flavors = kv.Value.AnnotationFlavors,
-                    },
-                    StringComparer.Ordinal),
+                perScope[kv.Key] = new JsonObject
+                {
+                    ["edge_kinds"] = JsonSerializer.SerializeToNode(kv.Value.EdgeKinds),
+                    ["symbol_kinds"] = JsonSerializer.SerializeToNode(kv.Value.SymbolKinds),
+                    ["annotation_flavors"] = JsonSerializer.SerializeToNode(kv.Value.AnnotationFlavors),
+                };
+            }
+            var vocabNode = new JsonObject
+            {
+                ["edge_kinds"] = JsonSerializer.SerializeToNode(vocabulary.EdgeKinds),
+                ["symbol_kinds"] = JsonSerializer.SerializeToNode(vocabulary.SymbolKinds),
+                ["annotation_flavors"] = JsonSerializer.SerializeToNode(vocabulary.AnnotationFlavors),
+                ["scopes"] = perScope,
             };
+            o.Capabilities.Experimental[ServerVocabulary.CapabilityKey] = vocabNode;
         });
     }
 

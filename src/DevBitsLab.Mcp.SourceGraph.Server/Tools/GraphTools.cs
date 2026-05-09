@@ -1,5 +1,6 @@
 using System.ComponentModel;
 using System.Text;
+using System.Text.Json;
 using DevBitsLab.Mcp.SourceGraph.Core;
 using DevBitsLab.Mcp.SourceGraph.Embeddings;
 using DevBitsLab.Mcp.SourceGraph.Sdk;
@@ -203,6 +204,8 @@ public static class GraphTools
                 foreach (var c in callers)
                 {
                     sb.AppendLine($"- **{c.Fqn}** ({KindLabel(c.Kind)}) at {Format.Location(c.FilePath, c.StartLine, c.StartCol)}");
+                    var payloadLine = Format.PayloadSubLine(c.PayloadJson);
+                    if (payloadLine is not null) sb.AppendLine(payloadLine);
                 }
                 return sb.ToString();
             }, ct));
@@ -237,6 +240,8 @@ public static class GraphTools
                 foreach (var c in callees)
                 {
                     sb.AppendLine($"- **{c.Fqn}** ({KindLabel(c.Kind)}) at {Format.Location(c.FilePath, c.StartLine, c.StartCol)}");
+                    var payloadLine = Format.PayloadSubLine(c.PayloadJson);
+                    if (payloadLine is not null) sb.AppendLine(payloadLine);
                 }
                 return sb.ToString();
             }, ct));
@@ -343,6 +348,8 @@ public static class GraphTools
                     var ca = await host.Store.GetAnnotationsForSymbolAsync(c.Id, ct).ConfigureAwait(false);
                     var caLine = AnnotationFormat.OneLine(ca, multipleFlavors);
                     if (caLine is not null) sb.AppendLine($"  {caLine}");
+                    var payloadLine = Format.PayloadSubLine(c.PayloadJson);
+                    if (payloadLine is not null) sb.AppendLine(payloadLine);
                 }
                 if (callers.Count == 0) sb.AppendLine("- (none)");
                 sb.AppendLine();
@@ -356,6 +363,8 @@ public static class GraphTools
                     var ca = await host.Store.GetAnnotationsForSymbolAsync(c.Id, ct).ConfigureAwait(false);
                     var caLine = AnnotationFormat.OneLine(ca, multipleFlavors);
                     if (caLine is not null) sb.AppendLine($"  {caLine}");
+                    var payloadLine = Format.PayloadSubLine(c.PayloadJson);
+                    if (payloadLine is not null) sb.AppendLine(payloadLine);
                 }
                 if (callees.Count == 0) sb.AppendLine("- (none)");
                 return sb.ToString();
@@ -378,6 +387,11 @@ public static class GraphTools
                 var multipleFlavors = await HasMultipleAnnotationFlavorsAsync(host.Store, ct).ConfigureAwait(false);
                 var sb = new StringBuilder();
                 sb.AppendLine($"Top {rows.Count} symbol(s) in '{namespaceOrPath}' (by inbound calls):");
+                // Note: module_summary deliberately omits payload sub-lines per harden-sdk-pre-xaml
+                // design.md decision (renderer dense by design — top-K rows already carry FQN +
+                // kind + location + summary + annotations, plus an in-degree prefix; per-edge
+                // payload would push the row past readable). The dedicated edge-walking tools
+                // (list_callers, list_callees, neighborhood) surface payload instead.
                 foreach (var row in rows)
                 {
                     sb.Append($"- in-deg {row.InDegree,3} — **{row.Symbol.Fqn}** ({Format.KindWithAttrs(row.Symbol)}) at {Format.Location(row.Symbol.FilePath, row.Symbol.StartLine, row.Symbol.StartCol)}");
@@ -878,6 +892,62 @@ internal static class Format
         var time = history.LastAuthoredAt is { } t ? t.ToString("yyyy-MM-dd") : "?";
         return $"last touched {time} by {author} ({sha})";
     }
+
+    /// <summary>
+    /// Render an indented <c>    payload: { key: "value", ... }</c> sub-line for an edge whose
+    /// originating <c>edges.payload</c> column was non-null. Returns <c>null</c> when
+    /// <paramref name="payloadJson"/> is null, empty, blank, or fails to deserialise as a JSON
+    /// object (defensive: storage stores opaque JSON, so a malformed string never crashes the
+    /// renderer — it just gets dropped). Caps the output to <see cref="PayloadKeyLimit"/> keys;
+    /// when more keys are present, appends <c> (N more)</c> at the end so the agent knows the
+    /// rendered slice is partial. String values are rendered with surrounding double quotes;
+    /// non-string JSON values (numbers, booleans, nulls, objects, arrays) round-trip through
+    /// <see cref="JsonElement.GetRawText"/>.
+    /// </summary>
+    public static string? PayloadSubLine(string? payloadJson)
+    {
+        if (string.IsNullOrWhiteSpace(payloadJson)) return null;
+        Dictionary<string, JsonElement>? parsed;
+        try
+        {
+            parsed = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(payloadJson);
+        }
+        catch (JsonException)
+        {
+            // Defensive: payload column is opaque JSON; any non-object shape (array literal, bare
+            // string, etc.) gets dropped so a malformed row never breaks tool output.
+            return null;
+        }
+        if (parsed is null || parsed.Count == 0) return null;
+
+        var sb = new StringBuilder();
+        sb.Append("    payload: { ");
+        var rendered = 0;
+        foreach (var kv in parsed)
+        {
+            if (rendered >= PayloadKeyLimit) break;
+            if (rendered > 0) sb.Append(", ");
+            sb.Append(kv.Key);
+            sb.Append(": ");
+            // Use GetRawText() for every JSON value kind: for strings it returns the JSON-encoded
+            // form (already wrapped in double quotes, with embedded quotes / backslashes / control
+            // characters escaped per RFC 8259), so a binding path containing a quote or newline
+            // can't break the markdown line. Numbers, bools, nulls, and nested object/array shapes
+            // also round-trip verbatim through GetRawText.
+            sb.Append(kv.Value.GetRawText());
+            rendered++;
+        }
+        if (parsed.Count > PayloadKeyLimit)
+        {
+            sb.Append(" (");
+            sb.Append(parsed.Count - PayloadKeyLimit);
+            sb.Append(" more)");
+        }
+        sb.Append(" }");
+        return sb.ToString();
+    }
+
+    private const int PayloadKeyLimit = 5;
 }
 
 internal static class AnnotationFormat

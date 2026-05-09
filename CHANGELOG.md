@@ -11,6 +11,37 @@ below note which package the change applies to.
 ## [Unreleased]
 
 ### Added
+- **Sdk 2.1.0** — `PayloadKeys` static class with kebab-case constants
+  for the well-known keys plugins put in `EdgeEmitted.Metadata` (`path`,
+  `mode`, `converter`, `converter-parameter`, `event`, `handler`,
+  `data-type`, `target-type`, `key`, `based-on`, `element-name`,
+  `relative-source`, `fallback-value`, `string-format`,
+  `update-source-trigger`). Locks the wire vocabulary before any
+  cross-language indexer emits.
+- **Sdk 2.1.0** — `CanonicalKeys` helpers (`ForType`, `ForMethod`,
+  `ForField`, `ForProperty`) constructing doc-comment-id-shaped C#
+  canonical keys (`csharp:T:` / `csharp:M:` / `csharp:F:` / `csharp:P:`).
+  Cross-language plugins reuse these instead of reimplementing Roslyn's
+  format; tested for byte-equality against
+  `ISymbol.GetDocumentationCommentId()`.
+- Out-of-process stdio MCP integration test project
+  (`tests/DevBitsLab.Mcp.SourceGraph.IntegrationTests/`) using
+  `ModelContextProtocol.Client` + `StdioClientTransport`; locks the
+  `Capabilities.Experimental["sourcegraph.vocabulary"]` contract on
+  every `initialize` against a freshly-spawned server.
+- `QueryPlanTests` — `EXPLAIN QUERY PLAN` regression that asserts the
+  four hot edge-walking SQL paths use `idx_edges_kind_name` /
+  `idx_edges_dst` (or the PK auto-index) and never fall back to
+  `SCAN edges`. Pins index selection across schema tweaks.
+- `list_callers`, `list_callees`, and `neighborhood` now render a
+  non-null `payload` JSON value as an indented sub-line under each
+  edge row (capped at 5 keys with `(N more)` overflow). No-op for
+  current data; lights up the moment any indexer fills the column.
+- `sourcegraph-mcp vocabulary list` CLI subcommand — per-scope
+  diagnostic over the soft-registry kind vocabulary with source
+  attribution (`sdk` / `plugin: <id>@<version>` / `unknown`) and live
+  emission counts; Levenshtein-≤2 drift detection inside each scope's
+  kind list; optional `--strict` flag for CI gating.
 - Multi-OS CI workflow (`ci.yml`) running build + test on
   `ubuntu-latest`, `macos-latest`, and `windows-latest` for every push and PR.
 - CodeQL static analysis (`codeql.yml`) on push, PR, and a weekly schedule.
@@ -39,6 +70,13 @@ below note which package the change applies to.
   and the scope-router data flow.
 - README sections covering the platform support matrix and configurable
   resource limits.
+
+### Fixed
+- `Capabilities.Experimental["sourcegraph.vocabulary"]` no longer crashes
+  the `initialize` handler under MCP SDK 1.2.0's source-generated JSON
+  context. The payload was an anonymous type rejected by
+  `McpJsonUtilities+JsonContext`; replaced with a `JsonObject` graph
+  that the SDK's context handles natively. Wire shape unchanged.
 
 ## [0.7.0] - 2026-05-06
 

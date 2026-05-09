@@ -19,7 +19,17 @@ public sealed record SymbolHit(
     bool IsGenerated = false,
     string? TestFramework = null,
     /// <summary>Roslyn DocumentationCommentId; identifies the same symbol across scope DBs.</summary>
-    string? CanonicalKey = null);
+    string? CanonicalKey = null,
+    /// <summary>
+    /// When the hit comes from an edge-walking query (<c>list_callers</c>, <c>list_callees</c>,
+    /// <c>neighborhood</c>), this carries the originating <c>edges.payload</c> column verbatim —
+    /// itself nullable when the originating edge had no
+    /// <see cref="DevBitsLab.Mcp.SourceGraph.Sdk.IndexEvent.EdgeEmitted.Metadata"/>. When the hit
+    /// comes from any other query (symbol search, FTS, annotation scan, etc.), this is always
+    /// <c>null</c>. The renderer decodes the JSON into per-edge metadata sub-lines; storage does
+    /// not validate the shape.
+    /// </summary>
+    string? PayloadJson = null);
 
 public sealed record ReferenceHit(
     long Id,
