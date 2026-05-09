@@ -16,7 +16,7 @@ public sealed class ColdIndexTests
     /// <summary>
     /// Initial index can take meaningful wall time on a cold worktree (Roslyn workspace open
     /// + first compilation + symbol enumeration). This cap is much wider than the harness's
-    /// default <c>ProcessExitTimeout</c> (10s) which only covers the `initialize` handshake;
+    /// default <c>HandshakeTimeout</c> (60s) which only covers the `initialize` handshake;
     /// <c>find_definition</c> blocks until the indexer has produced enough graph data to answer.
     /// </summary>
     private static readonly TimeSpan IndexAndQueryTimeout = TimeSpan.FromMinutes(2);

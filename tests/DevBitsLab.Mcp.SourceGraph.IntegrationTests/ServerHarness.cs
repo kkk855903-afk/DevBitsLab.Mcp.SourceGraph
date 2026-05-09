@@ -39,6 +39,19 @@ internal sealed class ServerHarness : IAsyncDisposable
     /// </summary>
     public static readonly TimeSpan ProcessExitTimeout = TimeSpan.FromSeconds(10);
 
+    /// <summary>
+    /// Hard cap on how long we wait for the spawned <c>dotnet run --no-build … serve</c> child
+    /// to complete the MCP <c>initialize</c> handshake. This is intentionally separate from
+    /// <see cref="ProcessExitTimeout"/>: the cold spawn path covers process creation, .NET host
+    /// boot, JIT of the server assembly, MSBuildLocator + Roslyn workspace warm-up, scope config
+    /// load, and the initial JSON-RPC exchange. On a constrained CI runner (especially Windows,
+    /// where the integration suite spawns multiple harnesses in parallel) that easily exceeds
+    /// the 10s teardown budget, so we give the handshake a much wider window. A server that
+    /// genuinely deadlocks during init still fails the test inside <see cref="HandshakeTimeout"/>
+    /// — just not on the first slow CI scheduling slice.
+    /// </summary>
+    public static readonly TimeSpan HandshakeTimeout = TimeSpan.FromSeconds(60);
+
     private readonly McpClient _client;
     private readonly ConcurrentQueue<string> _stderrLines;
     private bool _disposed;
@@ -72,7 +85,7 @@ internal sealed class ServerHarness : IAsyncDisposable
     ///
     /// <para>Cancellation: <paramref name="cancellationToken"/> cancels the
     /// <c>McpClient.CreateAsync</c> handshake. The harness uses an outer timeout of
-    /// <see cref="ProcessExitTimeout"/> derived from this token via
+    /// <see cref="HandshakeTimeout"/> derived from this token via
     /// <c>CancellationTokenSource.CreateLinkedTokenSource</c> so a server that never sends an
     /// <c>InitializeResult</c> doesn't hang the test runner.</para>
     /// </summary>
@@ -127,10 +140,13 @@ internal sealed class ServerHarness : IAsyncDisposable
 
         var transport = new StdioClientTransport(transportOptions, NullLoggerFactory.Instance);
 
-        // Cap the handshake at ProcessExitTimeout. A server that never replies to `initialize`
+        // Cap the handshake at HandshakeTimeout. A server that never replies to `initialize`
         // (deadlock, missing fixture, ungraceful crash) fails the test fast instead of hanging.
+        // This is intentionally wider than ProcessExitTimeout — the cold spawn path
+        // (process create + JIT + Roslyn warm-up + scope load) routinely exceeds the 10s
+        // teardown budget under parallel CI load, particularly on Windows runners.
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        cts.CancelAfter(ProcessExitTimeout);
+        cts.CancelAfter(HandshakeTimeout);
 
         // McpClient.CreateAsync takes ownership of `transport` on success — disposing the
         // returned client also disposes the transport. On failure the ownership transfer never
@@ -150,7 +166,7 @@ internal sealed class ServerHarness : IAsyncDisposable
             // Internal handshake timeout fired (caller didn't cancel). Surface a clearer error so
             // the failing test points at the actual cause instead of a generic OCE.
             throw new TimeoutException(
-                $"sourcegraph-mcp server did not complete the MCP `initialize` handshake within {ProcessExitTimeout}. " +
+                $"sourcegraph-mcp server did not complete the MCP `initialize` handshake within {HandshakeTimeout}. " +
                 $"Captured stderr: {string.Join(Environment.NewLine, stderrLines)}");
         }
         finally

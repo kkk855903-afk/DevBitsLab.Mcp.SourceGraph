@@ -88,7 +88,7 @@ public sealed class DiagnosticsAndGeneratorTests : IAsyncLifetime
         // severity = 2 (Warning) filters via >= 2, which catches both warnings and errors.
         var rows = await _store!.FindDiagnosticsAsync(severity: 2, code: null, symbolId: null);
         rows.Should().Contain(d => d.Code == "CS0618");
-        rows.Should().AllSatisfy(d => d.Severity.Should().BeGreaterOrEqualTo(2));
+        rows.Should().AllSatisfy(d => d.Severity.Should().BeGreaterThanOrEqualTo(2));
     }
 
     [Fact]

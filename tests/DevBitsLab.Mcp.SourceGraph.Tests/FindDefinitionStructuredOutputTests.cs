@@ -180,7 +180,7 @@ public sealed class FindDefinitionStructuredOutputTests : IAsyncLifetime, IDispo
             h.FilePath.Should().NotBeNullOrEmpty();
             h.Line.Should().BeGreaterThan(0);
             // Column may legitimately be 0 (column origin is 0-based in our storage).
-            h.Column.Should().BeGreaterOrEqualTo(0);
+            h.Column.Should().BeGreaterThanOrEqualTo(0);
         }
     }
 
