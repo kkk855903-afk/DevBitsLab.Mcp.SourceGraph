@@ -61,12 +61,13 @@ public abstract class LanguageIndexerBase : ILanguageIndexer
 /// </summary>
 public sealed class IndexContext
 {
-    public IndexContext(string filePath, byte[] contents, string scopeId, string repoRoot)
+    public IndexContext(string filePath, byte[] contents, string scopeId, string repoRoot, ILanguageProject? project = null)
     {
         FilePath = filePath;
         Contents = contents;
         ScopeId = scopeId;
         RepoRoot = repoRoot;
+        Project = project;
     }
 
     /// <summary>Absolute path to the file being indexed.</summary>
@@ -80,6 +81,15 @@ public sealed class IndexContext
 
     /// <summary>Repo root directory (i.e. <see cref="ScopeId"/>'s <c>Scope.Root</c>).</summary>
     public string RepoRoot { get; }
+
+    /// <summary>
+    /// The language project that owns this file, when one was discovered by an
+    /// <see cref="ILanguageProjectFactory"/>. Plugin-private state (resource caches, language
+    /// service handles, …) lives on the plugin's own <see cref="ILanguageProject"/> subclass and
+    /// is reused across every per-document call belonging to the same project. <c>null</c> when
+    /// the file isn't owned by any discovered project.
+    /// </summary>
+    public ILanguageProject? Project { get; }
 
     /// <summary>Convenience: <see cref="System.Text.Encoding.UTF8"/>-decoded text view of <see cref="Contents"/>.</summary>
     public string GetText() => System.Text.Encoding.UTF8.GetString(Contents);

@@ -283,7 +283,7 @@ public sealed class LiveIndexService : BackgroundService
     /// <summary>
     /// Walk every file the indexer just touched and dispatch every loaded analyzer against it.
     /// Events are synthesised from the per-scope store's current rows: <c>SymbolDeclared</c> per
-    /// indexed symbol in the file plus <c>AttributeAttached</c> per attribute on those symbols.
+    /// indexed symbol in the file plus <c>AnnotationAttached</c> per annotation on those symbols.
     /// This is the simplest way to bridge the workspace-aware bulk indexer to the per-document
     /// SDK contract without requiring the indexer itself to capture the live event stream — the
     /// store is the source of truth either way.
@@ -324,7 +324,7 @@ public sealed class LiveIndexService : BackgroundService
             }
 
             // Synthesise the IndexEvent stream: every symbol declared in this file plus every
-            // attribute attached to those symbols.
+            // annotation attached to those symbols.
             var events = new List<Sdk.IndexEvent>();
             if (keysByFileId.TryGetValue(file.Id, out var keys))
             {
@@ -333,27 +333,28 @@ public sealed class LiveIndexService : BackgroundService
                     var sym = await host.Store.GetSymbolByIdAsync(symbolIdByKey[key], ct).ConfigureAwait(false);
                     if (sym is null) continue;
                     events.Add(new Sdk.IndexEvent.SymbolDeclared(
-                        CanonicalKey: key,
-                        Name: sym.Name,
-                        Fqn: sym.Fqn,
-                        Kind: MapToPluginKind(sym.Kind),
-                        StartLine: sym.StartLine,
-                        StartColumn: sym.StartCol,
-                        EndLine: sym.EndLine,
-                        EndColumn: sym.EndCol,
-                        Signature: sym.Signature,
-                        Modifiers: sym.Modifiers,
-                        Accessibility: sym.Accessibility,
-                        XmlSummary: sym.XmlSummary));
+                        canonicalKey: key,
+                        name: sym.Name,
+                        fqn: sym.Fqn,
+                        kind: sym.Kind,
+                        startLine: sym.StartLine,
+                        startColumn: sym.StartCol,
+                        endLine: sym.EndLine,
+                        endColumn: sym.EndCol,
+                        signature: sym.Signature,
+                        modifiers: sym.Modifiers,
+                        accessibility: sym.Accessibility,
+                        xmlSummary: sym.XmlSummary));
 
-                    var attrs = await host.Store.GetAttributesForSymbolAsync(sym.Id, ct).ConfigureAwait(false);
-                    foreach (var a in attrs)
+                    var anns = await host.Store.GetAnnotationsForSymbolAsync(sym.Id, ct).ConfigureAwait(false);
+                    foreach (var a in anns)
                     {
-                        events.Add(new Sdk.IndexEvent.AttributeAttached(
-                            SymbolCanonicalKey: key,
-                            AttributeName: a.Name,
-                            AttributeFullName: a.FullName,
-                            ArgsJson: a.ArgsJson));
+                        events.Add(new Sdk.IndexEvent.AnnotationAttached(
+                            symbolCanonicalKey: key,
+                            annotationName: a.Name,
+                            flavor: a.Flavor,
+                            fullName: a.FullName,
+                            argsJson: a.ArgsJson));
                     }
                 }
             }
@@ -370,24 +371,6 @@ public sealed class LiveIndexService : BackgroundService
                 ct).ConfigureAwait(false);
         }
     }
-
-    /// <summary>Storage-side <see cref="Core.SymbolKind"/> -&gt; SDK <see cref="Sdk.PluginSymbolKind"/>.</summary>
-    private static Sdk.PluginSymbolKind MapToPluginKind(Core.SymbolKind k) => k switch
-    {
-        Core.SymbolKind.Namespace => Sdk.PluginSymbolKind.Namespace,
-        Core.SymbolKind.Class => Sdk.PluginSymbolKind.Class,
-        Core.SymbolKind.Struct => Sdk.PluginSymbolKind.Struct,
-        Core.SymbolKind.Interface => Sdk.PluginSymbolKind.Interface,
-        Core.SymbolKind.Enum => Sdk.PluginSymbolKind.Enum,
-        Core.SymbolKind.EnumMember => Sdk.PluginSymbolKind.EnumMember,
-        Core.SymbolKind.Delegate => Sdk.PluginSymbolKind.Delegate,
-        Core.SymbolKind.Method => Sdk.PluginSymbolKind.Method,
-        Core.SymbolKind.Constructor => Sdk.PluginSymbolKind.Constructor,
-        Core.SymbolKind.Property => Sdk.PluginSymbolKind.Property,
-        Core.SymbolKind.Field => Sdk.PluginSymbolKind.Field,
-        Core.SymbolKind.Event => Sdk.PluginSymbolKind.Event,
-        _ => Sdk.PluginSymbolKind.Other,
-    };
 
     private static string? ResolvePrimarySolution(Scope scope)
     {

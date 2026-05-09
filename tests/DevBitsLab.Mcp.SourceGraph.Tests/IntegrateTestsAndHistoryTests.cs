@@ -15,8 +15,9 @@ namespace DevBitsLab.Mcp.SourceGraph.Tests;
 /// fixture solution (which now includes <c>Sample.Tests</c>) and verifies:
 ///   1. <c>symbols.test_framework</c> is set to <c>xunit | nunit | mstest</c> for the
 ///      decorated test methods.
-///   2. <c>EdgeKind.Tests</c> edges land from each test method to the first non-trivial
-///      production-code call inside its body.
+///   2. <c>"tests"</c> edges land from each test method to the first non-trivial
+///      production-code call inside its body (kebab-case kind name introduced by
+///      open-language-contract; see <c>EdgeKinds.Tests</c> for the constant).
 ///
 /// History pipeline coverage is intentionally lighter (one disabled-mode test): wiring it up
 /// requires git, which we don't assume in CI.

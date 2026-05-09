@@ -3,6 +3,7 @@ using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
 using DevBitsLab.Mcp.SourceGraph.Indexing;
+using DevBitsLab.Mcp.SourceGraph.Sdk;
 using DevBitsLab.Mcp.SourceGraph.Storage;
 using FluentAssertions;
 using Xunit;
@@ -92,7 +93,7 @@ public sealed class IndexFixtureTests : IAsyncLifetime
     public async Task Calculator_classRow_hasSummaryAndNoModifiers()
     {
         var hits = await _store!.FindSymbolsAsync("Sample.Domain.Calculator");
-        var calc = hits.Should().Contain(h => h.Kind == DevBitsLab.Mcp.SourceGraph.Core.SymbolKind.Class).Which;
+        var calc = hits.Should().Contain(h => h.Kind == SymbolKinds.Class).Which;
         calc.Modifiers.Should().BeNullOrEmpty();
         calc.XmlSummary.Should().NotBeNullOrEmpty();
         calc.XmlSummary!.Should().Contain("Simple integer arithmetic");
@@ -102,7 +103,7 @@ public sealed class IndexFixtureTests : IAsyncLifetime
     public async Task ListMembers_Calculator_returnsAllPublicMethods()
     {
         var hits = await _store!.FindSymbolsAsync("Sample.Domain.Calculator");
-        var calc = hits.First(h => h.Kind == DevBitsLab.Mcp.SourceGraph.Core.SymbolKind.Class);
+        var calc = hits.First(h => h.Kind == SymbolKinds.Class);
         var members = await _store.ListMembersAsync(calc.Id);
         // Calculator gained MakeGreeter (Instantiates demo) and Divide (Throws demo) from
         // expand-edge-types; assert the foundational three are present and every member is public.

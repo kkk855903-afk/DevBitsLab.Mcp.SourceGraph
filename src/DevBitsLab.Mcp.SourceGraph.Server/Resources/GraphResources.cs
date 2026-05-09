@@ -1,9 +1,8 @@
 using System.ComponentModel;
 using System.Text;
-using DevBitsLab.Mcp.SourceGraph.Core;
+using DevBitsLab.Mcp.SourceGraph.Sdk;
 using DevBitsLab.Mcp.SourceGraph.Server.Scoping;
 using DevBitsLab.Mcp.SourceGraph.Server.Tools;
-using DevBitsLab.Mcp.SourceGraph.Storage;
 using ModelContextProtocol.Server;
 
 namespace DevBitsLab.Mcp.SourceGraph.Server.Resources;
@@ -50,7 +49,7 @@ public static class GraphResources
 
         var callers = await store.ListCallersAsync(id, 10, ct: ct).ConfigureAwait(false);
         var callees = await store.ListCalleesAsync(id, 10, ct: ct).ConfigureAwait(false);
-        var attrs = await store.GetAttributesForSymbolAsync(id, ct).ConfigureAwait(false);
+        var anns = await store.GetAnnotationsForSymbolAsync(id, ct).ConfigureAwait(false);
 
         var sb = new StringBuilder();
         sb.AppendLine($"# {hit.Fqn}");
@@ -74,9 +73,9 @@ public static class GraphResources
             }
         }
         sb.AppendLine();
-        sb.AppendLine($"## Attributes ({attrs.Count})");
-        if (attrs.Count == 0) sb.AppendLine("_(none)_");
-        else foreach (var a in attrs) sb.AppendLine(AttributeFormat.Card(a));
+        sb.AppendLine($"## Annotations ({anns.Count})");
+        if (anns.Count == 0) sb.AppendLine("_(none)_");
+        else foreach (var a in anns) sb.AppendLine(AnnotationFormat.Card(a));
         sb.AppendLine();
         sb.AppendLine($"## Callers ({callers.Count})");
         if (callers.Count == 0) sb.AppendLine("_(none)_");
@@ -106,10 +105,13 @@ public static class GraphResources
         sb.AppendLine();
         foreach (var h in hits)
         {
+            // Render a section header for top-level type/namespace declarations and a list item
+            // for everything else. The kind comes through as a kebab-case string from storage so
+            // we compare against the SDK constants directly.
             var prefix = h.Kind switch
             {
-                SymbolKind.Namespace => "##",
-                SymbolKind.Class or SymbolKind.Struct or SymbolKind.Interface or SymbolKind.Enum => "###",
+                SymbolKinds.Namespace => "##",
+                SymbolKinds.Class or SymbolKinds.Struct or SymbolKinds.Interface or SymbolKinds.Enum or SymbolKinds.Record => "###",
                 _ => "-",
             };
             if (prefix.StartsWith('#'))

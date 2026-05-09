@@ -366,14 +366,14 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         // accumulating the union of canonical keys per fileId before we reconcile.
         // Per fileId we also record (childKey -> parentKey) so pass-1c can resolve the parent
         // canonical key into its row id (which only exists after the corresponding upsert).
-        // Attributes are gathered as PendingAttributes during this phase; their
+        // Annotations are gathered as PendingAnnotations during this phase; their
         // attribute_symbol_id is resolved after the whole pass completes, so a use site can
         // link to a user-defined attribute class declared in another file we haven't walked
         // yet (e.g. [Legacy] on Greeter.cs resolving to LegacyAttribute.cs even though
         // Greeter.cs is processed first alphabetically).
         var newKeysForFile = new Dictionary<long, HashSet<string>>();
         var parentKeyByChildKey = new Dictionary<string, string>(StringComparer.Ordinal);
-        var pendingAttrsByFile = new Dictionary<long, List<PendingAttribute>>();
+        var pendingAttrsByFile = new Dictionary<long, List<PendingAnnotation>>();
         var seenSymbolForAttr = new Dictionary<long, HashSet<string>>();
         // Test framework detection: keyed by symbol id, value = "xunit"/"nunit"/"mstest".
         // Populated as we walk method symbols in pass 1; flushed in a single batch update once
@@ -384,7 +384,7 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         {
             var fileKeys = new HashSet<string>(StringComparer.Ordinal);
             newKeysForFile[fileId] = fileKeys;
-            var pendingAttrs = new List<PendingAttribute>();
+            var pendingAttrs = new List<PendingAnnotation>();
             pendingAttrsByFile[fileId] = pendingAttrs;
             var attrSeen = new HashSet<string>(StringComparer.Ordinal);
             seenSymbolForAttr[fileId] = attrSeen;
@@ -444,13 +444,13 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                         testFrameworkBySymbolId[id] = testFramework;
                     }
 
-                    // Attributes: only collect once per (file, symbol) tuple even if the symbol
+                    // Annotations: only collect once per (file, symbol) tuple even if the symbol
                     // was discovered in multiple TFM iterations. If the same attribute is
                     // visible across TFM iterations of the same source file we don't want to
                     // double-store it.
                     if (attrSeen.Add(key))
                     {
-                        AttributeExtractor.AppendAttributes(symbol, id, pendingAttrs);
+                        AttributeExtractor.AppendAnnotations(symbol, id, pendingAttrs);
 
                         // Enqueue an embedding request once per (file, symbol). The sink is
                         // a no-op when --no-embeddings was passed or the model isn't available;
@@ -505,7 +505,7 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
             }
         }
 
-        // PASS 1 — phase D: resolve and bulk-insert attributes per file, now that every changed
+        // PASS 1 — phase D: resolve and bulk-insert annotations per file, now that every changed
         // file has had its symbols upserted into _symbolIdByKey. Doing this in a separate sweep
         // lets a use-site reference an attribute class that lives in a file we hadn't walked yet
         // when we extracted the use site.
@@ -513,7 +513,7 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         {
             if (pendingAttrs.Count == 0) continue;
             var resolved = pendingAttrs.Select(p => AttributeExtractor.Resolve(p, _symbolIdByKey)).ToList();
-            await _store.BulkInsertAttributesAsync(resolved, ct).ConfigureAwait(false);
+            await _store.BulkInsertAnnotationsAsync(resolved, ct).ConfigureAwait(false);
         }
 
         // PASS 1 — phase E: flush detected test_framework values for the methods we walked.
@@ -550,8 +550,10 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
             var edgeBatch = new List<Edge>(capacity: 64);
             // Dedupe edges within this file's pass-2 to avoid bombarding SQLite with duplicates that
             // INSERT OR IGNORE would just throw away. Tuple key keeps it allocation-light.
-            var emittedEdges = new HashSet<(long src, long dst, EdgeKind kind)>();
-            void AddEdge(long src, long dst, EdgeKind kind)
+            // Edge kind is now a kebab-case TEXT identifier rather than an int enum; comparing by
+            // ordinal is the cheapest stable form.
+            var emittedEdges = new HashSet<(long src, long dst, string kind)>();
+            void AddEdge(long src, long dst, string kind)
             {
                 if (src == dst) return;
                 if (emittedEdges.Add((src, dst, kind)))
@@ -636,7 +638,7 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                         var encKey = SymbolMapping.CanonicalKey(enclosing);
                         if (encKey is not null && _symbolIdByKey.TryGetValue(encKey, out var srcId))
                         {
-                            AddEdge(srcId, symId, EdgeKind.Calls);
+                            AddEdge(srcId, symId, EdgeKinds.Calls);
                         }
                     }
                 }
@@ -659,8 +661,8 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                                 var encKey = SymbolMapping.CanonicalKey(enclosing);
                                 if (encKey is not null && _symbolIdByKey.TryGetValue(encKey, out var srcId))
                                 {
-                                    AddEdge(srcId, dstId, EdgeKind.Instantiates);
-                                    AddEdge(srcId, dstId, EdgeKind.UsesType);
+                                    AddEdge(srcId, dstId, EdgeKinds.Instantiates);
+                                    AddEdge(srcId, dstId, EdgeKinds.UsesType);
                                 }
                             }
                         }
@@ -686,7 +688,7 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                 if (enclosing is null) continue;
                 var encKey = SymbolMapping.CanonicalKey(enclosing);
                 if (encKey is null || !_symbolIdByKey.TryGetValue(encKey, out var srcId)) continue;
-                AddEdge(srcId, dstId, EdgeKind.Throws);
+                AddEdge(srcId, dstId, EdgeKinds.Throws);
             }
 
             // Inherits / Implements edges from BaseListSyntax + UsesType for the same targets.
@@ -707,11 +709,11 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                         if (baseKey is null || !_symbolIdByKey.TryGetValue(baseKey, out var dstId)) continue;
 
                         var ek = baseSym is INamedTypeSymbol nt && nt.TypeKind == TypeKind.Interface
-                            ? EdgeKind.Implements
-                            : EdgeKind.Inherits;
+                            ? EdgeKinds.Implements
+                            : EdgeKinds.Inherits;
                         AddEdge(srcId, dstId, ek);
                         // Also a UsesType edge so kind=uses_type can answer "every consumer of B".
-                        AddEdge(srcId, dstId, EdgeKind.UsesType);
+                        AddEdge(srcId, dstId, EdgeKinds.UsesType);
                     }
                 }
 
@@ -910,8 +912,8 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
             _ => null,
         };
 
-        var kindLabel = coreSymbol.Kind.ToString().ToLowerInvariant();
-        var text = SymbolTextBuilder.Build(kindLabel, coreSymbol.Fqn, coreSymbol.XmlSummary, coreSymbol.Signature, body);
+        // coreSymbol.Kind is already a lowercase kebab-case identifier (e.g. "method", "enum-member").
+        var text = SymbolTextBuilder.Build(coreSymbol.Kind, coreSymbol.Fqn, coreSymbol.XmlSummary, coreSymbol.Signature, body);
 
         if (SymbolTextBuilder.ShouldSkip(filePath, coreSymbol.XmlSummary, coreSymbol.Signature, body)) return;
 
@@ -924,6 +926,12 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         var symbolRows = await _store.GetAllSymbolKeysAsync(ct).ConfigureAwait(false);
         foreach (var row in symbolRows)
         {
+            // Schema v11 dropped the legacy unprefixed key format; every row written by this
+            // indexer carries the "csharp:" scheme. Assert in DEBUG so a regression in any
+            // emission site fails loudly during tests rather than corrupting the in-memory map.
+            Debug.Assert(
+                row.CanonicalKey.StartsWith(SymbolMapping.CanonicalKeyScheme, StringComparison.Ordinal),
+                $"Expected csharp:-prefixed canonical key from store, got '{row.CanonicalKey}'");
             _symbolIdByKey[row.CanonicalKey] = row.Id;
             if (!_keysByFileId.TryGetValue(row.FileId, out var keys))
             {
@@ -1044,7 +1052,7 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
     /// when those types are themselves indexed. BCL types are skipped by the
     /// <c>_symbolIdByKey</c> lookup.
     /// </summary>
-    private void EmitUsesTypeForSignature(ISymbol member, long memberId, Action<long, long, EdgeKind> addEdge)
+    private void EmitUsesTypeForSignature(ISymbol member, long memberId, Action<long, long, string> addEdge)
     {
         IEnumerable<ITypeSymbol> types = member switch
         {
@@ -1059,7 +1067,7 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
             var key = SymbolMapping.CanonicalKey(t);
             if (key is null) continue;
             if (!_symbolIdByKey.TryGetValue(key, out var typeId)) continue;
-            addEdge(memberId, typeId, EdgeKind.UsesType);
+            addEdge(memberId, typeId, EdgeKinds.UsesType);
         }
 
         static IEnumerable<ITypeSymbol> SignatureTypes(IMethodSymbol m)
@@ -1089,14 +1097,14 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
     }
 
     /// <summary>
-    /// Emits a single <see cref="EdgeKind.Tests"/> edge from a test method (id =
+    /// Emits a single <see cref="EdgeKinds.Tests"/> edge from a test method (id =
     /// <paramref name="testMemberId"/>) to the first non-trivial production-code call inside
     /// the method's body. "Non-trivial" excludes calls into other test methods, calls into a
     /// type whose <c>[TestFixture]</c>/<c>[TestClass]</c> marker labels it as a test fixture,
     /// and calls into files under a <c>/tests/</c> path segment. We pick only the first such
     /// call to keep the edge focused and avoid noisy 1:N fanout per parametrised test.
     /// </summary>
-    private void EmitTestsEdge(SyntaxNode methodNode, SemanticModel model, long testMemberId, Action<long, long, EdgeKind> addEdge, CancellationToken ct)
+    private void EmitTestsEdge(SyntaxNode methodNode, SemanticModel model, long testMemberId, Action<long, long, string> addEdge, CancellationToken ct)
     {
         // Methods we walk include MethodDeclarationSyntax but EnumerateDeclarations also yields
         // type/property/etc. nodes. Restrict ourselves to method bodies and expression-bodied
@@ -1111,7 +1119,7 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
             if (key is null) continue;
             if (!_symbolIdByKey.TryGetValue(key, out var dstId)) continue;
             if (dstId == testMemberId) continue;
-            addEdge(testMemberId, dstId, EdgeKind.Tests);
+            addEdge(testMemberId, dstId, EdgeKinds.Tests);
             return; // first non-trivial production call wins
         }
     }
@@ -1139,7 +1147,7 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
     /// Emits OverridesMember edges when <paramref name="member"/>'s Roslyn Overridden* property
     /// points at an indexed symbol.
     /// </summary>
-    private void EmitOverrides(ISymbol member, long memberId, Action<long, long, EdgeKind> addEdge)
+    private void EmitOverrides(ISymbol member, long memberId, Action<long, long, string> addEdge)
     {
         ISymbol? overridden = member switch
         {
@@ -1151,14 +1159,14 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         if (overridden is null) return;
         var key = SymbolMapping.CanonicalKey(overridden);
         if (key is null || !_symbolIdByKey.TryGetValue(key, out var dstId)) return;
-        addEdge(memberId, dstId, EdgeKind.OverridesMember);
+        addEdge(memberId, dstId, EdgeKinds.OverridesMember);
     }
 
     /// <summary>
     /// Walks <paramref name="typeSymbol"/>'s implemented interfaces and emits ImplementsMember
     /// edges from each implementing member to the satisfied interface member.
     /// </summary>
-    private void EmitMemberImplements(INamedTypeSymbol typeSymbol, Action<long, long, EdgeKind> addEdge)
+    private void EmitMemberImplements(INamedTypeSymbol typeSymbol, Action<long, long, string> addEdge)
     {
         if (typeSymbol.TypeKind is TypeKind.Interface) return; // interface declarations don't implement
         foreach (var iface in typeSymbol.AllInterfaces)
@@ -1174,7 +1182,7 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                 if (srcKey is null || !_symbolIdByKey.TryGetValue(srcKey, out var srcId)) continue;
                 var dstKey = SymbolMapping.CanonicalKey(ifaceMember);
                 if (dstKey is null || !_symbolIdByKey.TryGetValue(dstKey, out var dstId)) continue;
-                addEdge(srcId, dstId, EdgeKind.ImplementsMember);
+                addEdge(srcId, dstId, EdgeKinds.ImplementsMember);
             }
         }
     }
@@ -1266,56 +1274,64 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         {
             string? name = null;
             string? fqn = null;
-            Sdk.PluginSymbolKind kind = Sdk.PluginSymbolKind.Other;
+            string kind = Sdk.SymbolKinds.Other;
             switch (node)
             {
                 case ClassDeclarationSyntax c:
                     name = c.Identifier.ValueText;
                     fqn = QualifyTypeName(c, name);
-                    kind = Sdk.PluginSymbolKind.Class;
+                    kind = Sdk.SymbolKinds.Class;
                     break;
                 case StructDeclarationSyntax s:
                     name = s.Identifier.ValueText;
                     fqn = QualifyTypeName(s, name);
-                    kind = Sdk.PluginSymbolKind.Struct;
+                    kind = Sdk.SymbolKinds.Struct;
                     break;
                 case InterfaceDeclarationSyntax iface:
                     name = iface.Identifier.ValueText;
                     fqn = QualifyTypeName(iface, name);
-                    kind = Sdk.PluginSymbolKind.Interface;
+                    kind = Sdk.SymbolKinds.Interface;
                     break;
                 case RecordDeclarationSyntax r:
                     name = r.Identifier.ValueText;
                     fqn = QualifyTypeName(r, name);
-                    kind = Sdk.PluginSymbolKind.Record;
+                    kind = Sdk.SymbolKinds.Record;
                     break;
                 case EnumDeclarationSyntax en:
                     name = en.Identifier.ValueText;
                     fqn = QualifyTypeName(en, name);
-                    kind = Sdk.PluginSymbolKind.Enum;
+                    kind = Sdk.SymbolKinds.Enum;
                     break;
                 case MethodDeclarationSyntax m:
                     name = m.Identifier.ValueText;
                     fqn = QualifyMemberName(m, name);
-                    kind = Sdk.PluginSymbolKind.Method;
+                    kind = Sdk.SymbolKinds.Method;
                     break;
                 case PropertyDeclarationSyntax p:
                     name = p.Identifier.ValueText;
                     fqn = QualifyMemberName(p, name);
-                    kind = Sdk.PluginSymbolKind.Property;
+                    kind = Sdk.SymbolKinds.Property;
                     break;
             }
             if (name is null || fqn is null) continue;
             var span = node.GetLocation().GetLineSpan();
+            // Syntax-tree-only path: no semantics, so we cannot derive a Roslyn DocumentationCommentId.
+            // Fall back to a stable position+name shape under the reserved <c>csharp:</c> scheme so
+            // the SDK's CanonicalKeyValidator accepts the emission. Include a forward-slash-
+            // normalised file component (repo-relative when possible, absolute otherwise) so two
+            // files declaring the same symbol name on the same line don't collide on the upsert
+            // primary key. The "approx" sub-form signals these are best-effort keys; bulk-mode
+            // workspaces always emit the doc-id form.
+            var keyPath = NormalizePathForKey(ctx.FilePath, ctx.RepoRoot);
             events.Add(new Sdk.IndexEvent.SymbolDeclared(
-                CanonicalKey: $"R:{ctx.FilePath}#{span.StartLinePosition.Line}:{name}",
-                Name: name,
-                Fqn: fqn,
-                Kind: kind,
-                StartLine: span.StartLinePosition.Line + 1,
-                StartColumn: span.StartLinePosition.Character + 1,
-                EndLine: span.EndLinePosition.Line + 1,
-                EndColumn: span.EndLinePosition.Character + 1));
+                canonicalKey: $"{SymbolMapping.CanonicalKeyScheme}approx:{keyPath}#{span.StartLinePosition.Line}:{name}",
+                name: name,
+                fqn: fqn,
+                kind: kind,
+                startLine: span.StartLinePosition.Line + 1,
+                startColumn: span.StartLinePosition.Character + 1,
+                endLine: span.EndLinePosition.Line + 1,
+                endColumn: span.EndLinePosition.Character + 1));
         }
         events.Add(new Sdk.IndexEvent.FileScanned(ctx.FilePath, sha, IsGenerated: false));
         return events;
@@ -1335,6 +1351,25 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         var typeName = typeDecl.Identifier.ValueText;
         var nsName = typeDecl.Ancestors().OfType<BaseNamespaceDeclarationSyntax>().FirstOrDefault()?.Name.ToString();
         return string.IsNullOrEmpty(nsName) ? $"{typeName}.{name}" : $"{nsName}.{typeName}.{name}";
+    }
+
+    /// <summary>
+    /// Build the file component used in the <c>csharp:approx:&lt;path&gt;#&lt;line&gt;:&lt;name&gt;</c>
+    /// fallback canonical key produced by the syntax-tree-only path. Repo-relative when
+    /// <paramref name="filePath"/> sits under <paramref name="repoRoot"/> (so two clones of the
+    /// same repo at different absolute locations produce identical keys); absolute otherwise.
+    /// Always forward-slashed so the SDK's <c>CanonicalKeyValidator</c> (which forbids
+    /// backslashes) accepts the result on Windows.
+    /// </summary>
+    private static string NormalizePathForKey(string filePath, string repoRoot)
+    {
+        var relative = !string.IsNullOrEmpty(repoRoot)
+            ? Path.GetRelativePath(repoRoot, filePath)
+            : filePath;
+        // GetRelativePath returns the input verbatim when it can't be made relative; fall back
+        // to the original absolute path in that case so we still emit something stable.
+        var chosen = relative.StartsWith("..", StringComparison.Ordinal) ? filePath : relative;
+        return chosen.Replace('\\', '/');
     }
 }
 

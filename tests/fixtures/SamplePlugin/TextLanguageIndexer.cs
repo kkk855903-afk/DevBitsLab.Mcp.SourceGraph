@@ -9,6 +9,14 @@ namespace SamplePlugin;
 /// a single <see cref="IndexEvent.SymbolDeclared"/> + a <see cref="IndexEvent.FileScanned"/>.
 /// Trivially demonstrates the contract round-trips: the test fixture creates a sentinel .txt
 /// file, runs the dispatcher, and asserts the symbol shows up in the per-scope graph DB.
+///
+/// <para>NOTE on canonical-key scheme: the SDK validator (open-language-contract) restricts
+/// emissions to the reserved-and-enforced scheme set (<c>csharp</c>, <c>xaml</c>) at v1.
+/// Until a sample / test scheme is reserved, this fixture borrows the <c>csharp:</c> scheme
+/// for its keys even though the file's extension is <c>.txt</c>. The host doesn't bind
+/// scheme to extension — only the scheme is validated — so this works at the contract level.
+/// A future SDK release that reserves a <c>sample:</c> or <c>plugin:</c> scheme should swap
+/// these literals.</para>
 /// </summary>
 public sealed class TextLanguageIndexer : LanguageIndexerBase
 {
@@ -27,17 +35,20 @@ public sealed class TextLanguageIndexer : LanguageIndexerBase
         if (match.Success)
         {
             var name = match.Groups[1].Value;
-            // The canonical key needs to be globally stable. Path + first-identifier is good enough
-            // for the fixture; a real plugin would derive a more robust key.
+            // The canonical key needs to be globally stable. We borrow the `csharp:` scheme
+            // (see class summary) and form a key from a path-derived identifier slug + name.
+            // The validator forbids backslashes in keys; replace any so cross-platform paths
+            // round-trip. The fixture indexer doesn't need a full Roslyn DocumentationCommentId.
+            var slug = ctx.FilePath.Replace('\\', '/');
             events.Add(new IndexEvent.SymbolDeclared(
-                CanonicalKey: $"txt:{ctx.FilePath}#{name}",
-                Name: name,
-                Fqn: name,
-                Kind: PluginSymbolKind.Other,
-                StartLine: 1,
-                StartColumn: 1,
-                EndLine: 1,
-                EndColumn: name.Length + 1));
+                canonicalKey: $"csharp:T:Sample.Text.{name}@{slug}",
+                name: name,
+                fqn: $"Sample.Text.{name}",
+                kind: SymbolKinds.Other,
+                startLine: 1,
+                startColumn: 1,
+                endLine: 1,
+                endColumn: name.Length + 1));
         }
         // SHA256.HashData is a net5+ API; netstandard2.0 doesn't have it, so use the instance form.
         using (var sha = System.Security.Cryptography.SHA256.Create())

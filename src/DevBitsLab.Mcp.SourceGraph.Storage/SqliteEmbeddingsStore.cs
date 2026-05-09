@@ -88,7 +88,7 @@ public sealed class SqliteEmbeddingsStore : IEmbeddingsStore
         return !existing.ContentHash.AsSpan().SequenceEqual(contentHash);
     }
 
-    public async Task<IReadOnlyList<EmbeddingHit>> SearchAsync(IReadOnlyList<float> queryEmbedding, int k, Core.SymbolKind? kindFilter = null, CancellationToken ct = default)
+    public async Task<IReadOnlyList<EmbeddingHit>> SearchAsync(IReadOnlyList<float> queryEmbedding, int k, string? kindFilter = null, CancellationToken ct = default)
     {
         if (queryEmbedding.Count != _dimension)
         {
@@ -112,11 +112,11 @@ public sealed class SqliteEmbeddingsStore : IEmbeddingsStore
             {(kindFilter is null ? "" : "JOIN symbols sym ON sym.id = s.symbol_id")}
             WHERE s.embedding MATCH @vec
               AND k = @k
-              {(kindFilter is null ? "" : "AND sym.kind = @kind")}
+              {(kindFilter is null ? "" : "AND sym.kind_name = @kind")}
             ORDER BY s.distance;
             """;
         var rows = await _connection.QueryAsync<RawHit>(new CommandDefinition(
-            sql, new { vec = bytes, k, kind = (int?)kindFilter }, cancellationToken: ct)).ConfigureAwait(false);
+            sql, new { vec = bytes, k, kind = kindFilter }, cancellationToken: ct)).ConfigureAwait(false);
         return rows.Select(r => new EmbeddingHit(r.SymbolId, CosineFromL2(r.Distance))).ToList();
     }
 
@@ -154,7 +154,7 @@ public sealed class DisabledEmbeddingsStore : IEmbeddingsStore
     public int Dimension => _dimension;
     public Task UpsertAsync(long symbolId, byte[] contentHash, IReadOnlyList<float> embedding, string modelVersion, CancellationToken ct = default) => Task.CompletedTask;
     public Task<bool> ShouldReembedAsync(long symbolId, byte[] contentHash, string modelVersion, CancellationToken ct = default) => Task.FromResult(false);
-    public Task<IReadOnlyList<EmbeddingHit>> SearchAsync(IReadOnlyList<float> queryEmbedding, int k, Core.SymbolKind? kindFilter = null, CancellationToken ct = default) =>
+    public Task<IReadOnlyList<EmbeddingHit>> SearchAsync(IReadOnlyList<float> queryEmbedding, int k, string? kindFilter = null, CancellationToken ct = default) =>
         Task.FromResult<IReadOnlyList<EmbeddingHit>>(Array.Empty<EmbeddingHit>());
     public Task<long> CountAsync(CancellationToken ct = default) => Task.FromResult(0L);
 }

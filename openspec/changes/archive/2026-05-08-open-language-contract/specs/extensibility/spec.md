@@ -1,89 +1,4 @@
-# Extensibility
-
-## Purpose
-
-Open the indexing pipeline and the MCP tool surface to third-party extension
-without forking the repo. Three contracts (`ILanguageIndexer`, `ICodeAnalyzer`,
-`IMcpToolPlugin`) shipped via a separate NuGet SDK package let plugin authors
-add new languages, custom analyzers, and prefix-namespaced MCP tools. Plugin
-discovery happens via `.sourcegraph.json` `plugins[]`; per-plugin
-`AssemblyLoadContext` isolation keeps failures contained and prevents
-dependency conflicts.
-
-## Requirements
-
-### Requirement: ILanguageIndexer plugin contract
-The SDK SHALL expose an `ILanguageIndexer` contract that declares the file extensions it handles and produces a stream of `IndexEvent` values for a given document.
-
-#### Scenario: Built-in C# indexer implements the contract
-- **WHEN** the server starts
-- **THEN** `RoslynLanguageIndexer` is registered for `.cs` files and routes pass-1 / pass-2 work through `IndexEvent` emissions
-
-#### Scenario: Third-party indexer registered
-- **WHEN** a plugin in `.sourcegraph.json` declares `ILanguageIndexer` for `.py`
-- **THEN** the server dispatches `.py` files to that plugin and ignores them in the C# indexer
-
-### Requirement: ICodeAnalyzer plugin contract
-The SDK SHALL expose an `ICodeAnalyzer` contract whose `AnalyzeAsync` is invoked once per indexed document with a context and an `IGraphEmitter`, allowing the analyzer to add symbols, references, edges, or attributes.
-
-#### Scenario: Custom analyzer emits an Endpoint symbol
-- **WHEN** an `AspNetCoreEndpointAnalyzer` runs against a document containing `app.MapGet("/api", h)`
-- **THEN** it emits a synthetic `Endpoint` symbol via `IGraphEmitter` and the server persists it via the same `UpsertSymbolAsync` path used by the built-in indexer
-
-### Requirement: IMcpToolPlugin contract
-The SDK SHALL expose an `IMcpToolPlugin` contract whose `RegisterAsync` adds tools to the MCP server; tool names emitted by a plugin SHALL be prefixed with the plugin's declared `Prefix` followed by `.`.
-
-#### Scenario: Plugin tool name prefixing
-- **WHEN** a plugin with `Prefix = "mediatr"` registers `find_handlers`
-- **THEN** the MCP server exposes the tool as `mediatr.find_handlers` and built-in tools (e.g. `find_definition`) keep unprefixed names
-
-### Requirement: Plugin discovery via .sourcegraph.json
-The host SHALL load plugins listed under `plugins[]` in `.sourcegraph.json`, supporting both NuGet packages (`{package, version}`) and DLL paths (`{path}`).
-
-#### Scenario: NuGet plugin loaded
-- **WHEN** `.sourcegraph.json` lists `{ "package": "DevBitsLab.Mcp.SourceGraph.Analyzers.AspNetCore", "version": "1.0.0" }`
-- **THEN** the host restores it into `<repo>/.sourcegraph/plugins/restore/` and loads its assembly into a dedicated `AssemblyLoadContext`
-
-#### Scenario: Path plugin loaded
-- **WHEN** `.sourcegraph.json` lists `{ "path": ".sourcegraph/plugins/MyAnalyzer.dll" }`
-- **THEN** the host loads that DLL directly into a per-plugin ALC
-
-### Requirement: Per-plugin failure isolation
-A plugin whose contract methods throw SHALL be marked `failed` in the registry; the rest of the system continues to operate, and the failure is surfaced via `plugins list`.
-
-#### Scenario: Bad plugin doesn't crash the host
-- **WHEN** an `ICodeAnalyzer.AnalyzeAsync` throws on a particular document
-- **THEN** the analyzer is marked `failed` for that pass, other analyzers complete, the indexer returns success, and `plugins list` reports the failure with the exception type and message
-
-### Requirement: Plugin status introspection
-The CLI SHALL expose `plugins list` and `plugins info <name>` subcommands that report every loaded plugin's id, version, status (`loaded | failed | disabled`), implemented contracts, and registered tools / file extensions.
-
-#### Scenario: Inspect plugins
-- **WHEN** the user runs `sourcegraph-mcp plugins list` after starting a server with two plugins (one healthy, one failed)
-- **THEN** the output is a table showing both plugins with their statuses and versions
-
-### Requirement: IToolRegistry.AddTool trigger overload
-`IToolRegistry` SHALL expose two `AddTool` overloads:
-- `AddTool(string toolName, string description, Delegate handler)` — the original 3-arg signature, retained unchanged from SDK 1.0.0 so plugins compiled against the earlier interface remain binary-compatible (plugins consume `IToolRegistry`, they don't implement it; adding methods to the interface is therefore safe for the plugin side).
-- `AddTool(string toolName, string description, Delegate handler, string trigger)` — a new 4-arg overload added in SDK 1.1.0 that takes a required, non-empty trigger phrase.
-
-When a tool is added via the 4-arg overload, the host SHALL append `Use when: <trigger>` as the final paragraph of the tool's effective description before registering the tool with the underlying MCP server. When a tool is added via the 3-arg overload, the description SHALL pass through unchanged.
-
-#### Scenario: Plugin registers a tool with the trigger overload
-- **WHEN** a plugin's `RegisterAsync` calls `registry.AddTool("find_handlers", "Find MediatR handlers for a request type.", handler, trigger: "\"who handles MediatR request X?\"")`
-- **THEN** the host's `tools/list` response includes a tool whose description ends with the line `Use when: "who handles MediatR request X?"`
-
-#### Scenario: Plugin registers a tool with the original 3-arg overload
-- **WHEN** a plugin's `RegisterAsync` calls `registry.AddTool("find_handlers", "Find MediatR handlers.", handler)` (no trigger)
-- **THEN** the host's `tools/list` response includes the tool whose description matches the supplied text verbatim, with no appended line
-
-#### Scenario: Plugin compiled against SDK 1.0.0 stays binary-compatible
-- **WHEN** a plugin DLL compiled against SDK 1.0.0 (which only knew the 3-arg `AddTool`) is loaded by the host running SDK 1.1.0
-- **THEN** the plugin's calls to the 3-arg overload resolve at runtime to the unchanged interface method, the plugin loads without recompilation, and its tools register normally with no `Use when:` line appended
-
-#### Scenario: Trigger overload rejects an empty trigger
-- **WHEN** a plugin calls `registry.AddTool("x", "y", handler, trigger: "  ")` with whitespace-only trigger
-- **THEN** the host throws `ArgumentException` (the 4-arg overload's contract is "trigger is required and non-empty"; plugins that don't have a trigger should call the 3-arg overload instead)
+## ADDED Requirements
 
 ### Requirement: Open kind vocabularies on the SDK
 The SDK SHALL expose edge kinds and symbol kinds as `string` values at the plugin contract boundary, NOT as closed enums. Static `EdgeKinds` and `SymbolKinds` classes SHALL provide kebab-case constants for the values defined by the host (`"calls"`, `"inherits"`, `"implements"`, `"uses-type"`, `"overrides-member"`, `"implements-member"`, `"instantiates"`, `"throws"`, `"tests"` for edges; `"namespace"`, `"class"`, `"interface"`, `"struct"`, `"enum"`, `"delegate"`, `"method"`, `"constructor"`, `"property"`, `"field"`, `"event"`, `"enum-member"`, `"operator"`, `"record"` for symbols). Plugins MAY emit any kebab-case identifier; the host stores the kind as TEXT and does NOT reject unknown kebab-case kinds.
@@ -170,11 +85,11 @@ The host SHALL load `ILanguageProjectFactory` instances from registered plugins,
 - **THEN** `ctx.Project` is the same `ILanguageProject` instance the factory returned for `ProjectX`
 
 ### Requirement: MCP initialize response publishes the active vocabulary
-The MCP server's `initialize` response SHALL include three top-level string arrays alongside the existing usage-instructions surface: `edge_kinds`, `symbol_kinds`, `annotation_flavors`. Each top-level array SHALL list the **server-wide union** across every configured scope's vocabulary, sorted lowercase and deduplicated. The response SHALL ALSO include a `scopes` map keyed by scope id, where each value is a `{ edge_kinds, symbol_kinds, annotation_flavors }` triple carrying the per-scope vocabulary; clients that need to validate a tool argument against a specific scope read the per-scope entry rather than the union. Each scope's vocabulary is the union of (a) the SDK's well-known constants (so a built-in kind like `"calls"` is published even on a fresh / never-indexed scope) and (b) the distinct kinds already present in that scope's storage.
+The MCP server's `initialize` response SHALL include three string arrays alongside the existing usage-instructions surface: `edge_kinds`, `symbol_kinds`, `annotation_flavors`. Each array SHALL list the distinct kebab-case identifiers that the active scope's loaded indexers are configured to emit (sourced from the constants the indexers reference plus any kinds already present in the scope's storage from a previous index). The arrays SHALL be sorted, lowercase, and deduplicated.
 
-#### Scenario: Single-scope server
-- **WHEN** an MCP client completes the initialize handshake against a server with one scope (`default`) using the built-in C# Roslyn indexer
-- **THEN** the top-level `edge_kinds` contains the built-in C# constants (`"calls"`, `"inherits"`, `"implements"`, `"uses-type"`, `"overrides-member"`, `"implements-member"`, `"instantiates"`, `"throws"`, `"tests"`) and equals `scopes["default"].edge_kinds`; `symbol_kinds` and `annotation_flavors` mirror the same union-equals-per-scope shape
+#### Scenario: Single-language scope
+- **WHEN** an MCP client completes the initialize handshake against a scope that only has the built-in C# Roslyn indexer loaded
+- **THEN** `edge_kinds` contains the built-in C# constants (`"calls"`, `"inherits"`, `"implements"`, `"uses-type"`, `"overrides-member"`, `"implements-member"`, `"instantiates"`, `"throws"`, `"tests"`); `symbol_kinds` contains the built-in symbol constants; `annotation_flavors` contains `["csharp-attribute"]`
 
 #### Scenario: Vocabulary publishing suppressed via flag
 - **WHEN** the server is started with `--no-instructions` (or `SOURCEGRAPH_NO_INSTRUCTIONS=1`)

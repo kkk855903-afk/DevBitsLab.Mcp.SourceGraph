@@ -9,7 +9,7 @@
     <PackAsTool>true</PackAsTool>
     <ToolCommandName>sourcegraph-mcp</ToolCommandName>
     <PackageId>DevBitsLab.Mcp.SourceGraph.Tool</PackageId>
-    <Version>0.7.0</Version>
+    <Version>0.8.0</Version>
     <Description>Live code source graph MCP server for .NET solutions. Indexes C#/Roslyn into SQLite + FTS5 and exposes graph queries (find_definition, find_references, list_callers, neighborhood, impact_of_change, find_diagnostics, list_generated_files, list_tests_for, who_authored, recent_changes, ...) over stdio MCP. Watches the filesystem for incremental updates. v0.4 adds optional code-aware semantic_search backed by ONNX embeddings + sqlite-vec (gated behind --no-embeddings), Roslyn diagnostics indexing, source-generator document tracking, test-method discrimination + Tests edges, and per-symbol git blame history.</Description>
     <Authors>DevBitsLab</Authors>
     <PackageTags>mcp;roslyn;code-graph;source-graph;claude;cursor;agent</PackageTags>

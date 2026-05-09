@@ -2,6 +2,7 @@ using System.ComponentModel;
 using System.Text;
 using DevBitsLab.Mcp.SourceGraph.Core;
 using DevBitsLab.Mcp.SourceGraph.Embeddings;
+using DevBitsLab.Mcp.SourceGraph.Sdk;
 using DevBitsLab.Mcp.SourceGraph.Server.Observability;
 using DevBitsLab.Mcp.SourceGraph.Server.Scoping;
 using DevBitsLab.Mcp.SourceGraph.Storage;
@@ -33,6 +34,7 @@ public static class GraphTools
 
                 // Pre-fetch history rows in one batch so we don't fire a query per hit.
                 var historyById = await host.Store.GetSymbolHistoryBatchAsync(hits.Select(h => h.Id).ToList(), ct).ConfigureAwait(false);
+                var multipleFlavors = await HasMultipleAnnotationFlavorsAsync(host.Store, ct).ConfigureAwait(false);
 
                 var sb = new StringBuilder();
                 sb.AppendLine($"Found {hits.Count} match(es) for '{symbol}':");
@@ -44,9 +46,9 @@ public static class GraphTools
                     if (!string.IsNullOrEmpty(h.Signature)) sb.AppendLine($"  - `{h.Signature}`");
                     var oneLine = Format.OneLineSummary(h.XmlSummary);
                     if (!string.IsNullOrEmpty(oneLine)) sb.AppendLine($"  - _{oneLine}_");
-                    var attrs = await host.Store.GetAttributesForSymbolAsync(h.Id, ct).ConfigureAwait(false);
-                    var attrLine = AttributeFormat.OneLine(attrs);
-                    if (attrLine is not null) sb.AppendLine($"  - {attrLine}");
+                    var anns = await host.Store.GetAnnotationsForSymbolAsync(h.Id, ct).ConfigureAwait(false);
+                    var annLine = AnnotationFormat.OneLine(anns, multipleFlavors);
+                    if (annLine is not null) sb.AppendLine($"  - {annLine}");
                     if (historyById.TryGetValue(h.Id, out var hist))
                     {
                         var line = Format.HistoryLine(hist);
@@ -57,35 +59,36 @@ public static class GraphTools
             }, ct));
 
     [McpServerTool]
-    [ToolTrigger("\"find every POST endpoint\", \"what's been deprecated?\", \"find all DI singletons\"")]
-    [Description("Find every symbol that carries an attribute by short name (e.g. 'HttpGet', 'Obsolete', 'Authorize'). Optional argValue does a trigram match against the attribute's serialised arguments (e.g. argValue='/api/v2' to find route attributes whose path contains that substring).")]
-    public static Task<string> FindByAttributeAsync(
+    [ToolTrigger("\"find every POST endpoint\", \"what's been deprecated?\", \"find all DI singletons\", \"every controller decorated with @Component\"")]
+    [Description("Find every symbol that carries an annotation by short name (e.g. 'HttpGet', 'Obsolete', 'Authorize', 'Component'). Annotations span .NET attributes, TS decorators, Vue directives, etc. — `flavor` filters to one annotation pattern (e.g. 'csharp-attribute'), null matches across all flavors. Optional argValue does a trigram match against the annotation's serialised arguments (e.g. argValue='/api/v2' to find route attributes whose path contains that substring).")]
+    public static Task<string> FindByAnnotationAsync(
         ScopeRouter router,
-        [Description("Attribute short name (e.g. 'HttpGet', 'Obsolete', 'Authorize'). Trailing 'Attribute' is implied; use the form you'd type in source.")] string name,
-        [Description("Optional substring to match against the attribute's arguments via FTS5 trigram (>= 3 chars). E.g. '/api/users' or 'Use Foo'.")] string? argValue = null,
-        [Description("Optional kind filter: class|method|property|field|...")] string? kind = null,
+        [Description("Annotation short name (e.g. 'HttpGet', 'Obsolete', 'Authorize'). Trailing 'Attribute' is implied; use the form you'd type in source.")] string name,
+        [Description("Optional flavor filter (kebab-case, e.g. 'csharp-attribute', 'ts-decorator'). Null matches across all flavors. Call `list_scopes` and inspect `annotation_flavors` from the initialize response to discover what's available.")] string? flavor = null,
+        [Description("Optional substring to match against the annotation's arguments via FTS5 trigram (>= 3 chars). E.g. '/api/users' or 'Use Foo'.")] string? argValue = null,
+        [Description("Optional kebab-case symbol kind filter: class|method|property|field|...")] string? kind = null,
         [Description("Maximum results (default 50)")] int limit = 50,
         [Description(ScopeDescription)] string? scope = null,
         CancellationToken ct = default) =>
-        ToolMetrics.TrackAsync("find_by_attribute", new { name, argValue, kind, limit, scope }, () =>
+        ToolMetrics.TrackAsync("find_by_annotation", new { name, flavor, argValue, kind, limit, scope }, () =>
             ScopedExecution.RunAsync(router, scope, async host =>
             {
-                SymbolKind? kindFilter = string.IsNullOrEmpty(kind)
-                    ? null
-                    : Enum.TryParse<SymbolKind>(kind, ignoreCase: true, out var k) ? k : null;
-                var hits = await host.Store.FindByAttributeAsync(name, argValue, kindFilter, limit, ct).ConfigureAwait(false);
+                var kindFilter = NormaliseKindFilter(kind);
+                var hits = await host.Store.FindByAnnotationAsync(name, flavor, argValue, kindFilter, limit, ct).ConfigureAwait(false);
                 if (hits.Count == 0)
                 {
                     var argsClause = string.IsNullOrEmpty(argValue) ? "" : $" with argValue ~ '{argValue}'";
-                    return $"No symbols carry [{name}]{argsClause}.";
+                    var flavorClause = string.IsNullOrEmpty(flavor) ? "" : $" (flavor='{flavor}')";
+                    return $"No symbols carry [{name}]{flavorClause}{argsClause}.";
                 }
+                var multipleFlavors = await HasMultipleAnnotationFlavorsAsync(host.Store, ct).ConfigureAwait(false);
                 var sb = new StringBuilder();
                 sb.AppendLine($"{hits.Count} symbol(s) carry [{name}]:");
                 foreach (var h in hits)
                 {
                     sb.AppendLine($"- **{h.Fqn}** ({Format.KindWithAttrs(h)}) at {Format.Location(h.FilePath, h.StartLine, h.StartCol)}");
-                    var attrs = await host.Store.GetAttributesForSymbolAsync(h.Id, ct).ConfigureAwait(false);
-                    var line = AttributeFormat.OneLine(attrs);
+                    var anns = await host.Store.GetAnnotationsForSymbolAsync(h.Id, ct).ConfigureAwait(false);
+                    var line = AnnotationFormat.OneLine(anns, multipleFlavors);
                     if (line is not null) sb.AppendLine($"  - {line}");
                 }
                 return sb.ToString();
@@ -148,6 +151,7 @@ public static class GraphTools
                 if (hits.Count == 0) return $"No indexed symbols found in '{path}'. The file may not be part of an indexed solution, or may not exist.";
 
                 var historyById = await host.Store.GetSymbolHistoryBatchAsync(hits.Select(h => h.Id).ToList(), ct).ConfigureAwait(false);
+                var multipleFlavors = await HasMultipleAnnotationFlavorsAsync(host.Store, ct).ConfigureAwait(false);
 
                 var sb = new StringBuilder();
                 sb.AppendLine($"{hits.Count} symbol(s) in {hits[0].FilePath}:");
@@ -157,8 +161,8 @@ public static class GraphTools
                     if (!string.IsNullOrEmpty(h.Signature)) sb.AppendLine($"    `{h.Signature}`");
                     var oneLine = Format.OneLineSummary(h.XmlSummary);
                     if (!string.IsNullOrEmpty(oneLine)) sb.AppendLine($"    _{oneLine}_");
-                    var attrs = await host.Store.GetAttributesForSymbolAsync(h.Id, ct).ConfigureAwait(false);
-                    var line = AttributeFormat.OneLine(attrs);
+                    var anns = await host.Store.GetAnnotationsForSymbolAsync(h.Id, ct).ConfigureAwait(false);
+                    var line = AnnotationFormat.OneLine(anns, multipleFlavors);
                     if (line is not null) sb.AppendLine($"    {line}");
                     if (historyById.TryGetValue(h.Id, out var hist))
                     {
@@ -171,19 +175,23 @@ public static class GraphTools
 
     [McpServerTool]
     [ToolTrigger("\"who calls X?\" or \"who consumes type X?\"")]
-    [Description("List inbound edges into a target symbol. Default kind=calls (i.e. callers). Use kind=uses_type to find consumers of a type, kind=overrides for derived implementations, kind=implements_member for members satisfying an interface, kind=instantiates for `new T()` sites, kind=throws for throw sites, or kind=all for every edge kind.")]
+    [Description("List inbound edges into a target symbol. Default kind=calls (i.e. callers). Use kind=uses-type to find consumers of a type, kind=overrides-member for derived implementations, kind=implements-member for members satisfying an interface, kind=instantiates for `new T()` sites, kind=throws for throw sites, kind=tests for inbound test edges, or kind=all for every edge kind. Plugin-defined kinds (any kebab-case identifier) are accepted as-is.")]
     public static Task<string> ListCallersAsync(
         ScopeRouter router,
         [Description("Target symbol name or FQN")] string symbol,
         [Description("Maximum number of results to return (default 50)")] int limit = 50,
-        [Description("Edge kind to walk: calls (default) | uses_type | overrides | implements_member | instantiates | throws | all")] string? kind = null,
+        [Description("Edge kind to walk (kebab-case): calls (default) | uses-type | overrides-member | implements-member | instantiates | throws | tests | all. Plugin-defined kinds are accepted.")] string? kind = null,
         [Description(ScopeDescription)] string? scope = null,
         CancellationToken ct = default) =>
         ToolMetrics.TrackAsync("list_callers", new { symbol, limit, kind, scope }, () =>
             ScopedExecution.RunAsync(router, scope, async host =>
             {
-                var (edgeKind, label, errorMsg) = ParseEdgeKind(kind);
-                if (errorMsg is not null) return errorMsg;
+                var (edgeKind, label, isAll) = NormaliseEdgeKindParam(kind);
+                if (!isAll && edgeKind is not null)
+                {
+                    var unknownNote = await CheckUnknownEdgeKindAsync(host.Store, edgeKind, ct).ConfigureAwait(false);
+                    if (unknownNote is not null) return unknownNote;
+                }
 
                 var hits = await host.Store.FindSymbolsAsync(symbol, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
                 if (hits.Count == 0) return $"No symbol found for '{symbol}'.";
@@ -201,19 +209,23 @@ public static class GraphTools
 
     [McpServerTool]
     [ToolTrigger("\"what does X call?\" or \"what types does X use?\"")]
-    [Description("List outbound edges from the target symbol. Default kind=calls (callees). Use kind=uses_type for types touched in this member's signature/body, kind=overrides for the base it overrides, kind=implements_member for the interface member it satisfies, kind=instantiates for types it constructs, kind=throws for exception types it throws, or kind=all.")]
+    [Description("List outbound edges from the target symbol. Default kind=calls (callees). Use kind=uses-type for types touched in this member's signature/body, kind=overrides-member for the base it overrides, kind=implements-member for the interface member it satisfies, kind=instantiates for types it constructs, kind=throws for exception types it throws, kind=tests for outbound test edges, or kind=all. Plugin-defined kinds (any kebab-case identifier) are accepted as-is.")]
     public static Task<string> ListCalleesAsync(
         ScopeRouter router,
         [Description("Source symbol name or FQN")] string symbol,
         [Description("Maximum number of results to return (default 50)")] int limit = 50,
-        [Description("Edge kind to walk: calls (default) | uses_type | overrides | implements_member | instantiates | throws | all")] string? kind = null,
+        [Description("Edge kind to walk (kebab-case): calls (default) | uses-type | overrides-member | implements-member | instantiates | throws | tests | all. Plugin-defined kinds are accepted.")] string? kind = null,
         [Description(ScopeDescription)] string? scope = null,
         CancellationToken ct = default) =>
         ToolMetrics.TrackAsync("list_callees", new { symbol, limit, kind, scope }, () =>
             ScopedExecution.RunAsync(router, scope, async host =>
             {
-                var (edgeKind, label, errorMsg) = ParseEdgeKind(kind);
-                if (errorMsg is not null) return errorMsg;
+                var (edgeKind, label, isAll) = NormaliseEdgeKindParam(kind);
+                if (!isAll && edgeKind is not null)
+                {
+                    var unknownNote = await CheckUnknownEdgeKindAsync(host.Store, edgeKind, ct).ConfigureAwait(false);
+                    if (unknownNote is not null) return unknownNote;
+                }
 
                 var hits = await host.Store.FindSymbolsAsync(symbol, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
                 if (hits.Count == 0) return $"No symbol found for '{symbol}'.";
@@ -231,7 +243,7 @@ public static class GraphTools
 
     [McpServerTool]
     [ToolTrigger("\"who implements IGreeter.Greet?\"")]
-    [Description("Find every concrete member that implements an interface member (uses ImplementsMember edges).")]
+    [Description("Find every concrete member that implements an interface member (uses implements-member edges).")]
     public static Task<string> FindImplementationsAsync(
         ScopeRouter router,
         [Description("Interface member name or FQN, e.g. 'IGreeter.Greet'")] string symbol,
@@ -265,16 +277,14 @@ public static class GraphTools
     public static Task<string> SearchSymbolsAsync(
         ScopeRouter router,
         [Description("Search query (a few characters, words, or substring of name/FQN/signature)")] string query,
-        [Description("Optional kind filter: class|method|property|field|interface|namespace|...")] string? kind = null,
+        [Description("Optional kebab-case symbol kind filter: class|method|property|field|interface|namespace|...")] string? kind = null,
         [Description("Maximum results (default 25)")] int topK = 25,
         [Description(ScopeDescription)] string? scope = null,
         CancellationToken ct = default) =>
         ToolMetrics.TrackAsync("search_symbols", new { query, kind, topK, scope }, () =>
             ScopedExecution.RunAsync(router, scope, async host =>
             {
-                SymbolKind? kindFilter = string.IsNullOrEmpty(kind)
-                    ? null
-                    : Enum.TryParse<SymbolKind>(kind, ignoreCase: true, out var k) ? k : null;
+                var kindFilter = NormaliseKindFilter(kind);
 
                 var hits = await host.Store.SearchSymbolsAsync(query, kindFilter, topK, ct).ConfigureAwait(false);
                 if (hits.Count == 0) return $"No symbols match '{query}'.";
@@ -289,19 +299,23 @@ public static class GraphTools
 
     [McpServerTool]
     [ToolTrigger("\"give me a quick overview around X\" — orient before diving in")]
-    [Description("Get the immediate graph neighborhood of a symbol: callers, callees, and inheritance/implements edges. Default kind=calls; pass kind=uses_type, overrides, implements_member, instantiates, throws, or all to inspect other edge layers.")]
+    [Description("Get the immediate graph neighborhood of a symbol: callers, callees, and inheritance/implements edges. Default kind=calls; pass kind=uses-type, overrides-member, implements-member, instantiates, throws, tests, all, or any plugin-defined kebab-case kind to inspect other edge layers.")]
     public static Task<string> NeighborhoodAsync(
         ScopeRouter router,
         [Description("Symbol name or FQN")] string symbol,
         [Description("Max items per category (default 20)")] int perCategory = 20,
-        [Description("Edge kind to walk: calls (default) | uses_type | overrides | implements_member | instantiates | throws | all")] string? kind = null,
+        [Description("Edge kind to walk (kebab-case): calls (default) | uses-type | overrides-member | implements-member | instantiates | throws | tests | all. Plugin-defined kinds are accepted.")] string? kind = null,
         [Description(ScopeDescription)] string? scope = null,
         CancellationToken ct = default) =>
         ToolMetrics.TrackAsync("neighborhood", new { symbol, perCategory, kind, scope }, () =>
             ScopedExecution.RunAsync(router, scope, async host =>
             {
-                var (edgeKind, label, errorMsg) = ParseEdgeKind(kind);
-                if (errorMsg is not null) return errorMsg;
+                var (edgeKind, label, isAll) = NormaliseEdgeKindParam(kind);
+                if (!isAll && edgeKind is not null)
+                {
+                    var unknownNote = await CheckUnknownEdgeKindAsync(host.Store, edgeKind, ct).ConfigureAwait(false);
+                    if (unknownNote is not null) return unknownNote;
+                }
 
                 var hits = await host.Store.FindSymbolsAsync(symbol, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
                 if (hits.Count == 0) return $"No symbol found for '{symbol}'.";
@@ -309,14 +323,15 @@ public static class GraphTools
                 var callers = await host.Store.ListCallersAsync(top.Id, perCategory, edgeKind, ct).ConfigureAwait(false);
                 var callees = await host.Store.ListCalleesAsync(top.Id, perCategory, edgeKind, ct).ConfigureAwait(false);
 
+                var multipleFlavors = await HasMultipleAnnotationFlavorsAsync(host.Store, ct).ConfigureAwait(false);
                 var sb = new StringBuilder();
                 sb.AppendLine($"Neighborhood of **{top.Fqn}** ({Format.KindWithAttrs(top)}) [kind={label}]");
                 sb.AppendLine($"definition: {Format.Location(top.FilePath, top.StartLine, top.StartCol)}");
                 var topSummary = Format.OneLineSummary(top.XmlSummary);
                 if (!string.IsNullOrEmpty(topSummary)) sb.AppendLine($"_{topSummary}_");
-                var topAttrs = await host.Store.GetAttributesForSymbolAsync(top.Id, ct).ConfigureAwait(false);
-                var topAttrLine = AttributeFormat.OneLine(topAttrs);
-                if (topAttrLine is not null) sb.AppendLine(topAttrLine);
+                var topAnns = await host.Store.GetAnnotationsForSymbolAsync(top.Id, ct).ConfigureAwait(false);
+                var topAnnLine = AnnotationFormat.OneLine(topAnns, multipleFlavors);
+                if (topAnnLine is not null) sb.AppendLine(topAnnLine);
                 sb.AppendLine();
                 sb.AppendLine($"### Inbound ({callers.Count})");
                 foreach (var c in callers)
@@ -325,8 +340,8 @@ public static class GraphTools
                     var s = Format.OneLineSummary(c.XmlSummary);
                     if (!string.IsNullOrEmpty(s)) sb.Append(" — _" + s + "_");
                     sb.AppendLine();
-                    var ca = await host.Store.GetAttributesForSymbolAsync(c.Id, ct).ConfigureAwait(false);
-                    var caLine = AttributeFormat.OneLine(ca);
+                    var ca = await host.Store.GetAnnotationsForSymbolAsync(c.Id, ct).ConfigureAwait(false);
+                    var caLine = AnnotationFormat.OneLine(ca, multipleFlavors);
                     if (caLine is not null) sb.AppendLine($"  {caLine}");
                 }
                 if (callers.Count == 0) sb.AppendLine("- (none)");
@@ -338,8 +353,8 @@ public static class GraphTools
                     var s = Format.OneLineSummary(c.XmlSummary);
                     if (!string.IsNullOrEmpty(s)) sb.Append(" — _" + s + "_");
                     sb.AppendLine();
-                    var ca = await host.Store.GetAttributesForSymbolAsync(c.Id, ct).ConfigureAwait(false);
-                    var caLine = AttributeFormat.OneLine(ca);
+                    var ca = await host.Store.GetAnnotationsForSymbolAsync(c.Id, ct).ConfigureAwait(false);
+                    var caLine = AnnotationFormat.OneLine(ca, multipleFlavors);
                     if (caLine is not null) sb.AppendLine($"  {caLine}");
                 }
                 if (callees.Count == 0) sb.AppendLine("- (none)");
@@ -360,6 +375,7 @@ public static class GraphTools
             {
                 var rows = await host.Store.ModuleSummaryAsync(namespaceOrPath, topK, ct).ConfigureAwait(false);
                 if (rows.Count == 0) return $"No symbols matched module '{namespaceOrPath}'.";
+                var multipleFlavors = await HasMultipleAnnotationFlavorsAsync(host.Store, ct).ConfigureAwait(false);
                 var sb = new StringBuilder();
                 sb.AppendLine($"Top {rows.Count} symbol(s) in '{namespaceOrPath}' (by inbound calls):");
                 foreach (var row in rows)
@@ -368,8 +384,8 @@ public static class GraphTools
                     var s = Format.OneLineSummary(row.Symbol.XmlSummary);
                     if (!string.IsNullOrEmpty(s)) sb.Append(" — _" + s + "_");
                     sb.AppendLine();
-                    var attrs = await host.Store.GetAttributesForSymbolAsync(row.Symbol.Id, ct).ConfigureAwait(false);
-                    var line = AttributeFormat.OneLine(attrs);
+                    var anns = await host.Store.GetAnnotationsForSymbolAsync(row.Symbol.Id, ct).ConfigureAwait(false);
+                    var line = AnnotationFormat.OneLine(anns, multipleFlavors);
                     if (line is not null) sb.AppendLine($"  - {line}");
                 }
                 return sb.ToString();
@@ -377,20 +393,24 @@ public static class GraphTools
 
     [McpServerTool]
     [ToolTrigger("\"what would change if I edit X?\" — transitive callers")]
-    [Description("Compute the transitive set of upstream callers for a symbol (impact of changing it). Walks the call graph backward up to maxDepth. Default kind=calls; pass kind=uses_type, overrides, implements_member, instantiates, throws, or all to traverse other edge layers.")]
+    [Description("Compute the transitive set of upstream callers for a symbol (impact of changing it). Walks the call graph backward up to maxDepth. Default kind=calls; pass kind=uses-type, overrides-member, implements-member, instantiates, throws, tests, all, or any plugin-defined kebab-case kind to traverse other edge layers.")]
     public static Task<string> ImpactOfChangeAsync(
         ScopeRouter router,
         [Description("Symbol name or FQN")] string symbol,
         [Description("Maximum traversal depth (default 4)")] int maxDepth = 4,
         [Description("Maximum results (default 100)")] int limit = 100,
-        [Description("Edge kind to walk: calls (default) | uses_type | overrides | implements_member | instantiates | throws | all")] string? kind = null,
+        [Description("Edge kind to walk (kebab-case): calls (default) | uses-type | overrides-member | implements-member | instantiates | throws | tests | all. Plugin-defined kinds are accepted.")] string? kind = null,
         [Description(ScopeDescription)] string? scope = null,
         CancellationToken ct = default) =>
         ToolMetrics.TrackAsync("impact_of_change", new { symbol, maxDepth, limit, kind, scope }, () =>
             ScopedExecution.RunAsync(router, scope, async host =>
             {
-                var (edgeKind, label, errorMsg) = ParseEdgeKind(kind);
-                if (errorMsg is not null) return errorMsg;
+                var (edgeKind, label, isAll) = NormaliseEdgeKindParam(kind);
+                if (!isAll && edgeKind is not null)
+                {
+                    var unknownNote = await CheckUnknownEdgeKindAsync(host.Store, edgeKind, ct).ConfigureAwait(false);
+                    if (unknownNote is not null) return unknownNote;
+                }
 
                 var hits = await host.Store.FindSymbolsAsync(symbol, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
                 if (hits.Count == 0) return $"No symbol found for '{symbol}'.";
@@ -457,7 +477,7 @@ public static class GraphTools
         ICodeEmbeddingGenerator generator,
         [Description("Free-text intent query, e.g. 'retry on transient errors', 'masks PII in logs'")] string query,
         [Description("Top-K results to return (default 20)")] int k = 20,
-        [Description("Optional kind filter: class|method|property|field|interface|namespace|...")] string? kind = null,
+        [Description("Optional kebab-case symbol kind filter: class|method|property|field|interface|namespace|...")] string? kind = null,
         [Description(ScopeDescription)] string? scope = null,
         CancellationToken ct = default) =>
         ToolMetrics.TrackAsync("semantic_search", new { query, k, kind, scope }, () =>
@@ -472,9 +492,7 @@ public static class GraphTools
                     return "semantic_search: provide a non-empty query.";
                 }
 
-                SymbolKind? kindFilter = string.IsNullOrEmpty(kind)
-                    ? null
-                    : Enum.TryParse<SymbolKind>(kind, ignoreCase: true, out var kk) ? kk : null;
+                var kindFilter = NormaliseKindFilter(kind);
 
                 var queryEmbeddings = await generator.EmbedAsync(new[] { query }, ct).ConfigureAwait(false);
                 if (queryEmbeddings.Count == 0)
@@ -634,24 +652,32 @@ public static class GraphTools
             return sb.ToString();
         });
 
-    private static string KindLabel(SymbolKind kind) => kind switch
+    /// <summary>
+    /// Render a kebab-case symbol kind (or any plugin-defined kind) as a human-friendly label.
+    /// We map well-known C# kinds to the same legacy spellings the v0.4 enum produced; unknown
+    /// kebab-case kinds pass through as-is so plugin-defined kinds (e.g. <c>"vue-component"</c>)
+    /// surface unmodified in tool output.
+    /// </summary>
+    private static string KindLabel(string kind) => kind switch
     {
-        SymbolKind.Namespace => "namespace",
-        SymbolKind.Class => "class",
-        SymbolKind.Struct => "struct",
-        SymbolKind.Interface => "interface",
-        SymbolKind.Enum => "enum",
-        SymbolKind.EnumMember => "enum member",
-        SymbolKind.Delegate => "delegate",
-        SymbolKind.Method => "method",
-        SymbolKind.Constructor => "ctor",
-        SymbolKind.Property => "property",
-        SymbolKind.Field => "field",
-        SymbolKind.Event => "event",
-        SymbolKind.Local => "local",
-        SymbolKind.Parameter => "parameter",
-        SymbolKind.TypeParameter => "type parameter",
-        _ => "?",
+        SymbolKinds.Namespace => "namespace",
+        SymbolKinds.Class => "class",
+        SymbolKinds.Struct => "struct",
+        SymbolKinds.Interface => "interface",
+        SymbolKinds.Enum => "enum",
+        SymbolKinds.EnumMember => "enum member",
+        SymbolKinds.Delegate => "delegate",
+        SymbolKinds.Method => "method",
+        SymbolKinds.Constructor => "ctor",
+        SymbolKinds.Property => "property",
+        SymbolKinds.Field => "field",
+        SymbolKinds.Event => "event",
+        SymbolKinds.Local => "local",
+        SymbolKinds.Parameter => "parameter",
+        SymbolKinds.TypeParameter => "type parameter",
+        SymbolKinds.Operator => "operator",
+        SymbolKinds.Record => "record",
+        _ => string.IsNullOrEmpty(kind) ? "?" : kind,
     };
 
     private static string RefKindLabel(ReferenceKind kind) => kind switch
@@ -714,29 +740,79 @@ public static class GraphTools
         _ => "?",
     };
 
-    internal static string KindLabelOf(SymbolKind kind) => KindLabel(kind);
+    internal static string KindLabelOf(string kind) => KindLabel(kind);
 
     /// <summary>
-    /// Parses the optional `kind` parameter accepted by list_callers/list_callees/neighborhood/impact_of_change.
-    /// Returns (edgeKind, label, errorMsg). errorMsg non-null means caller should short-circuit with it.
-    /// edgeKind null means "walk every kind" (kind = "all"). label is the canonical lowercase token.
+    /// Normalise the user-supplied kebab-case kind filter for storage queries. Empty or whitespace
+    /// becomes <c>null</c> ("all kinds"); other values are lowercased and trimmed but otherwise
+    /// passed through verbatim — so plugin-defined kinds work without a host-side allow-list. The
+    /// underscore-flavored aliases ("uses_type", "implements_member", …) are tolerated as a thin
+    /// migration helper for clients pinned to v0.6 syntax.
     /// </summary>
-    private static (EdgeKind? edgeKind, string label, string? errorMsg) ParseEdgeKind(string? kind)
+    private static string? NormaliseKindFilter(string? raw)
     {
-        if (string.IsNullOrEmpty(kind)) return (EdgeKind.Calls, "calls", null);
-        var normalised = kind.Trim().ToLowerInvariant();
-        return normalised switch
-        {
-            "calls" or "call" => (EdgeKind.Calls, "calls", null),
-            "uses_type" or "usestype" or "uses-type" => (EdgeKind.UsesType, "uses_type", null),
-            "overrides" or "overrides_member" or "override" => (EdgeKind.OverridesMember, "overrides_member", null),
-            "implements" or "implements_member" or "impl" => (EdgeKind.ImplementsMember, "implements_member", null),
-            "instantiates" or "new" => (EdgeKind.Instantiates, "instantiates", null),
-            "throws" or "throw" => (EdgeKind.Throws, "throws", null),
-            "inherits" or "inherit" => (EdgeKind.Inherits, "inherits", null),
-            "all" or "any" or "*" => (null, "all", null),
-            _ => (EdgeKind.Calls, "calls", $"Unknown kind '{kind}'. Expected one of: calls | uses_type | overrides | implements_member | instantiates | throws | all."),
-        };
+        if (string.IsNullOrWhiteSpace(raw)) return null;
+        var trimmed = raw.Trim().ToLowerInvariant();
+        // Translate underscores → hyphens for legacy callers (matches the kebab-case convention).
+        return trimmed.Replace('_', '-');
+    }
+
+    /// <summary>
+    /// Parse the optional <c>kind</c> parameter accepted by list_callers/list_callees/neighborhood/impact_of_change.
+    /// Returns <c>(edgeKind, label, isAll)</c>. <c>isAll = true</c> means the user asked for every
+    /// kind (translated to a null edgeKind for the storage call). Any other input is passed through
+    /// as kebab-case so plugin-defined edge kinds work without a host-side allow-list. Underscore
+    /// aliases are tolerated.
+    /// </summary>
+    private static (string? edgeKind, string label, bool isAll) NormaliseEdgeKindParam(string? raw)
+    {
+        if (string.IsNullOrEmpty(raw)) return (EdgeKinds.Calls, EdgeKinds.Calls, false);
+        var normalised = raw.Trim().ToLowerInvariant().Replace('_', '-');
+        if (normalised is "all" or "any" or "*") return (null, "all", true);
+        // Compatibility shims for the v0.6 spelling: "overrides" → "overrides-member",
+        // "implements" → "implements-member" (the unqualified form was the old tool-arg shorthand).
+        if (normalised == "overrides") normalised = EdgeKinds.OverridesMember;
+        if (normalised == "implements") normalised = EdgeKinds.ImplementsMember;
+        return (normalised, normalised, false);
+    }
+
+    /// <summary>
+    /// Check whether an edge kind is in the active scope's published <c>edge_kinds</c> vocabulary
+    /// — the union of the SDK's well-known constants (which the indexer is configured to emit
+    /// regardless of whether storage has any rows yet) with the distinct kinds already present in
+    /// storage. Returning <c>null</c> means "kind is valid, proceed with the query"; a non-null
+    /// string is a one-line note pointing at the active vocabulary so the agent can pick a real
+    /// one. SDK constants in the union mean a fresh / never-indexed scope still accepts a
+    /// built-in kind name like <c>"calls"</c> instead of false-flagging it as "unknown".
+    /// </summary>
+    private static async Task<string?> CheckUnknownEdgeKindAsync(IGraphStore store, string edgeKind, CancellationToken ct)
+    {
+        if (ServerVocabulary.SdkEdgeKinds.Contains(edgeKind)) return null;
+        var stored = await store.GetDistinctEdgeKindsAsync(ct).ConfigureAwait(false);
+        if (stored.Contains(edgeKind, StringComparer.Ordinal)) return null;
+        // Be lenient when no edges are stored AND the kind isn't a built-in (graph is empty /
+        // not indexed yet, plugin-defined kind we can't disprove) — let the storage call run;
+        // it'll return zero rows.
+        if (stored.Count == 0) return null;
+        var union = ServerVocabulary.SdkEdgeKinds
+            .Concat(stored)
+            .Distinct(StringComparer.Ordinal)
+            .OrderBy(k => k, StringComparer.Ordinal);
+        var avail = string.Join(", ", union);
+        return $"Edge kind `{edgeKind}` isn't in this scope's published `edge_kinds` vocabulary. Available: [{avail}]. Use `kind=all` to walk every kind.";
+    }
+
+    /// <summary>
+    /// Fast probe used by the renderers: when a scope has more than one annotation flavor present
+    /// (e.g. csharp-attribute + ts-decorator in a polyglot repo), every annotation line gets a
+    /// <c>(flavor)</c> suffix so the agent can tell them apart. With one flavor we omit the
+    /// suffix to keep output dense. Calling this per-render is cheap — the underlying query is a
+    /// distinct over a small column.
+    /// </summary>
+    private static async Task<bool> HasMultipleAnnotationFlavorsAsync(IGraphStore store, CancellationToken ct)
+    {
+        var flavors = await store.GetDistinctAnnotationFlavorsAsync(ct).ConfigureAwait(false);
+        return flavors.Count > 1;
     }
 }
 
@@ -804,39 +880,48 @@ internal static class Format
     }
 }
 
-internal static class AttributeFormat
+internal static class AnnotationFormat
 {
     /// <summary>
-    /// Render the attribute set as a single annotation line, e.g.
-    /// <c>attributes: [HttpGet("/api/users"), Authorize, Obsolete]</c>. Returns
-    /// <c>null</c> when there are no attributes so callers can skip the line entirely.
+    /// Render the annotation set as a single line, e.g.
+    /// <c>annotations: [HttpGet("/api/users"), Authorize, Obsolete]</c>. When the active scope
+    /// has more than one annotation flavor (e.g. csharp-attribute + ts-decorator), each entry is
+    /// suffixed with its flavor in parentheses so the agent can tell them apart. Returns
+    /// <c>null</c> when there are no annotations so callers can skip the line entirely.
     /// </summary>
-    public static string? OneLine(IReadOnlyList<AttributeRecord> attrs)
+    public static string? OneLine(IReadOnlyList<AnnotationRecord> annotations, bool includeFlavor)
     {
-        if (attrs.Count == 0) return null;
+        if (annotations.Count == 0) return null;
         var sb = new StringBuilder();
-        sb.Append("attributes: [");
-        for (var i = 0; i < attrs.Count; i++)
+        sb.Append("annotations: [");
+        for (var i = 0; i < annotations.Count; i++)
         {
             if (i > 0) sb.Append(", ");
-            sb.Append(attrs[i].Name);
-            var preview = ArgPreview(attrs[i].ArgsJson);
+            sb.Append(annotations[i].Name);
+            var preview = ArgPreview(annotations[i].ArgsJson);
             if (preview is not null) sb.Append(preview);
+            if (includeFlavor && !string.IsNullOrEmpty(annotations[i].Flavor))
+            {
+                sb.Append(" (");
+                sb.Append(annotations[i].Flavor);
+                sb.Append(')');
+            }
         }
         sb.Append(']');
         return sb.ToString();
     }
 
     /// <summary>
-    /// Render an attribute card row for the <c>graph://symbol/{id}</c> resource.
+    /// Render an annotation card row for the <c>graph://symbol/{id}</c> resource.
     /// Includes the full name and the raw args JSON so an agent can pick out the
     /// values it needs.
     /// </summary>
-    public static string Card(AttributeRecord attr)
+    public static string Card(AnnotationRecord ann)
     {
-        var args = string.IsNullOrEmpty(attr.ArgsJson) ? "" : $" — `{attr.ArgsJson}`";
-        var link = attr.AttributeSymbolId is null ? "" : $" → symbol#{attr.AttributeSymbolId}";
-        return $"- `[{attr.Name}]` ({attr.FullName}){link}{args}";
+        var args = string.IsNullOrEmpty(ann.ArgsJson) ? "" : $" — `{ann.ArgsJson}`";
+        var link = ann.AttributeSymbolId is null ? "" : $" → symbol#{ann.AttributeSymbolId}";
+        var flavor = string.IsNullOrEmpty(ann.Flavor) ? "" : $" [{ann.Flavor}]";
+        return $"- `[{ann.Name}]` ({ann.FullName}){flavor}{link}{args}";
     }
 
     private static string? ArgPreview(string? argsJson)

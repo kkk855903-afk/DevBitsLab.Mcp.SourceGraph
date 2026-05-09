@@ -40,7 +40,7 @@ public class SymbolSearchBenchmarks
                 Id: 0,
                 Name: $"Method{i}",
                 Fqn: $"Bench.Synthetic.Class{i % 100}.Method{i}",
-                Kind: SymbolKind.Method,
+                Kind: "method",
                 FileId: fileId,
                 StartLine: i,
                 StartCol: 0,
@@ -49,7 +49,7 @@ public class SymbolSearchBenchmarks
                 Signature: $"void Method{i}()",
                 ContainerId: null);
             await _store.UpsertSymbolAsync(
-                canonicalKey: $"bench:method:{i}",
+                canonicalKey: $"csharp:M:Bench.Synthetic.Class{i % 100}.Method{i}",
                 symbol: symbol).ConfigureAwait(false);
         }
     }

@@ -4,22 +4,22 @@ using Microsoft.CodeAnalysis;
 namespace DevBitsLab.Mcp.SourceGraph.Indexing;
 
 /// <summary>
-/// Captured attribute attached to an indexed symbol, in its pre-resolution form.
-/// <see cref="AttributeClassKey"/> is the canonical key of the attribute's class; it
-/// resolves to an <c>attribute_symbol_id</c> once the indexer has finished walking
-/// every file in the changed set, since the attribute class might live in a file we
-/// haven't touched yet at the moment we walk a use site.
+/// Captured annotation (a .NET attribute) attached to an indexed symbol, in its pre-resolution
+/// form. <see cref="AnnotationClassKey"/> is the canonical key of the attribute's class; it
+/// resolves to an <c>attribute_symbol_id</c> once the indexer has finished walking every file
+/// in the changed set, since the attribute class might live in a file we haven't touched yet at
+/// the moment we walk a use site.
 /// </summary>
-internal readonly record struct PendingAttribute(
+internal readonly record struct PendingAnnotation(
     long SymbolId,
     string Name,
     string FullName,
     string? ArgsJson,
-    string? AttributeClassKey);
+    string? AnnotationClassKey);
 
 /// <summary>
 /// Walks <see cref="ISymbol.GetAttributes"/> and turns each <see cref="AttributeData"/>
-/// into a <see cref="PendingAttribute"/> ready for resolution. Constructor and named
+/// into a <see cref="PendingAnnotation"/> ready for resolution. Constructor and named
 /// argument values are unwrapped from Roslyn's <see cref="TypedConstant"/> shape into
 /// CLR-native objects (string, primitive, enum value, type display string, arrays) so
 /// the JSON serialiser in Core sees the canonical shape it expects.
@@ -28,10 +28,13 @@ internal static class AttributeExtractor
 {
     private static readonly SymbolDisplayFormat TypeFormat = SymbolDisplayFormat.FullyQualifiedFormat;
 
-    public static void AppendAttributes(
+    /// <summary>Annotation flavor emitted for every C# <c>[Attribute]</c>.</summary>
+    public const string CSharpAttributeFlavor = "csharp-attribute";
+
+    public static void AppendAnnotations(
         ISymbol symbol,
         long symbolId,
-        List<PendingAttribute> sink)
+        List<PendingAnnotation> sink)
     {
         var attrs = symbol.GetAttributes();
         if (attrs.IsDefaultOrEmpty) return;
@@ -62,7 +65,7 @@ internal static class AttributeExtractor
                 argsJson = AttributeArgsJson.Serialize(new AttributeArgs(ctor, named));
             }
 
-            sink.Add(new PendingAttribute(
+            sink.Add(new PendingAnnotation(
                 symbolId,
                 name,
                 fullName,
@@ -72,21 +75,27 @@ internal static class AttributeExtractor
     }
 
     /// <summary>
-    /// Resolve each pending attribute's <c>attribute_symbol_id</c> against the
-    /// (now fully populated) symbol-id map. Attributes whose class lives outside
+    /// Resolve each pending annotation's <c>attribute_symbol_id</c> against the
+    /// (now fully populated) symbol-id map. Annotations whose class lives outside
     /// the indexed graph (BCL types, NuGet types) get <c>null</c>.
     /// </summary>
-    public static AttributeRecord Resolve(
-        PendingAttribute pending,
+    public static AnnotationRecord Resolve(
+        PendingAnnotation pending,
         IReadOnlyDictionary<string, long> symbolIdByKey)
     {
         long? attrSymbolId = null;
-        if (pending.AttributeClassKey is not null
-            && symbolIdByKey.TryGetValue(pending.AttributeClassKey, out var hit))
+        if (pending.AnnotationClassKey is not null
+            && symbolIdByKey.TryGetValue(pending.AnnotationClassKey, out var hit))
         {
             attrSymbolId = hit;
         }
-        return new AttributeRecord(pending.SymbolId, pending.Name, pending.FullName, pending.ArgsJson, attrSymbolId);
+        return new AnnotationRecord(
+            pending.SymbolId,
+            pending.Name,
+            pending.FullName,
+            CSharpAttributeFlavor,
+            pending.ArgsJson,
+            attrSymbolId);
     }
 
     private static object? UnwrapTypedConstant(TypedConstant tc)
@@ -116,7 +125,7 @@ internal static class AttributeExtractor
     /// C# attribute usage drops the trailing <c>"Attribute"</c> from the type's short name
     /// (<c>[HttpGet]</c> resolves to <c>HttpGetAttribute</c>). We store the user-visible form
     /// so <c>find_by_attribute(name = "HttpGet")</c> works without forcing the agent to know
-    /// the trailing suffix. <see cref="AttributeRecord.FullName"/> retains the full type for
+    /// the trailing suffix. <see cref="AnnotationRecord.FullName"/> retains the full type for
     /// disambiguation.
     /// </summary>
     private static string StripAttributeSuffix(string name)

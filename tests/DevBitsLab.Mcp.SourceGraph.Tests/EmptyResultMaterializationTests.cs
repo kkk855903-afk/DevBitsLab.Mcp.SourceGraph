@@ -2,6 +2,7 @@ using System;
 using System.IO;
 using System.Threading.Tasks;
 using DevBitsLab.Mcp.SourceGraph.Core;
+using DevBitsLab.Mcp.SourceGraph.Sdk;
 using DevBitsLab.Mcp.SourceGraph.Storage;
 using FluentAssertions;
 using Xunit;
@@ -85,11 +86,11 @@ public sealed class EmptyResultMaterializationTests : IAsyncLifetime
             indexedAt: DateTimeOffset.UtcNow,
             isGenerated: false);
 
-        await _store.UpsertSymbolAsync("M:Sample.Foo.Bar", new Symbol(
+        await _store.UpsertSymbolAsync("csharp:M:Sample.Foo.Bar", new Symbol(
             Id: 0,
             Name: "Bar",
             Fqn: "Sample.Foo.Bar",
-            Kind: SymbolKind.Method,
+            Kind: SymbolKinds.Method,
             FileId: fileId,
             StartLine: 1, StartCol: 1, EndLine: 5, EndCol: 1,
             Signature: "void Bar()",
@@ -104,7 +105,7 @@ public sealed class EmptyResultMaterializationTests : IAsyncLifetime
         var hit = rows[0];
         hit.Symbol.Fqn.Should().Be("Sample.Foo.Bar");
         hit.Symbol.Name.Should().Be("Bar");
-        hit.Symbol.Kind.Should().Be(SymbolKind.Method);
+        hit.Symbol.Kind.Should().Be(SymbolKinds.Method);
         hit.Symbol.StartLine.Should().Be(1);
         hit.Symbol.IsGenerated.Should().BeFalse();
         hit.InDegree.Should().Be(0); // no edges populated

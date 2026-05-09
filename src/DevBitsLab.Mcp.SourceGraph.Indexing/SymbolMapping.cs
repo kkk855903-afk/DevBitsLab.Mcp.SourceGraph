@@ -1,7 +1,7 @@
 using System.Text;
 using System.Xml;
+using DevBitsLab.Mcp.SourceGraph.Sdk;
 using Microsoft.CodeAnalysis;
-using CoreSymbolKind = DevBitsLab.Mcp.SourceGraph.Core.SymbolKind;
 
 namespace DevBitsLab.Mcp.SourceGraph.Indexing;
 
@@ -41,30 +41,48 @@ internal static class SymbolMapping
     public static string Fqn(ISymbol symbol) => symbol.ToDisplayString(FqnFormat);
     public static string Signature(ISymbol symbol) => symbol.ToDisplayString(SignatureFormat);
 
-    public static string? CanonicalKey(ISymbol symbol) =>
-        symbol.OriginalDefinition.GetDocumentationCommentId() ?? symbol.OriginalDefinition.ToDisplayString(FqnFormat);
+    /// <summary>
+    /// Scheme prefix attached to every canonical key emitted by the C# Roslyn indexer.
+    /// The SDK's <see cref="DevBitsLab.Mcp.SourceGraph.Sdk.Validation.CanonicalKeyValidator"/>
+    /// rejects emissions outside the reserved set, so every read and write must include the prefix.
+    /// </summary>
+    public const string CanonicalKeyScheme = "csharp:";
 
-    public static CoreSymbolKind ToCoreKind(ISymbol symbol) => symbol switch
+    /// <summary>
+    /// URI-prefixed canonical key for <paramref name="symbol"/>. Returns <c>null</c> when Roslyn
+    /// has neither a doc-id nor a display string for the symbol (e.g. degenerate error symbols).
+    /// </summary>
+    public static string? CanonicalKey(ISymbol symbol)
     {
-        INamespaceSymbol => CoreSymbolKind.Namespace,
+        var raw = symbol.OriginalDefinition.GetDocumentationCommentId() ?? symbol.OriginalDefinition.ToDisplayString(FqnFormat);
+        return raw is null ? null : CanonicalKeyScheme + raw;
+    }
+
+    /// <summary>
+    /// Kebab-case symbol-kind identifier for <paramref name="symbol"/>; values come from
+    /// <see cref="SymbolKinds"/>. The unmatched case folds onto <see cref="SymbolKinds.Other"/>.
+    /// </summary>
+    public static string ToCoreKind(ISymbol symbol) => symbol switch
+    {
+        INamespaceSymbol => SymbolKinds.Namespace,
         ITypeSymbol t => t.TypeKind switch
         {
-            TypeKind.Class => CoreSymbolKind.Class,
-            TypeKind.Struct => CoreSymbolKind.Struct,
-            TypeKind.Interface => CoreSymbolKind.Interface,
-            TypeKind.Enum => CoreSymbolKind.Enum,
-            TypeKind.Delegate => CoreSymbolKind.Delegate,
-            TypeKind.TypeParameter => CoreSymbolKind.TypeParameter,
-            _ => CoreSymbolKind.Class,
+            TypeKind.Class => SymbolKinds.Class,
+            TypeKind.Struct => SymbolKinds.Struct,
+            TypeKind.Interface => SymbolKinds.Interface,
+            TypeKind.Enum => SymbolKinds.Enum,
+            TypeKind.Delegate => SymbolKinds.Delegate,
+            TypeKind.TypeParameter => SymbolKinds.TypeParameter,
+            _ => SymbolKinds.Class,
         },
-        IMethodSymbol m => m.MethodKind == MethodKind.Constructor ? CoreSymbolKind.Constructor : CoreSymbolKind.Method,
-        IPropertySymbol => CoreSymbolKind.Property,
-        IFieldSymbol f when f.ContainingType?.TypeKind == TypeKind.Enum => CoreSymbolKind.EnumMember,
-        IFieldSymbol => CoreSymbolKind.Field,
-        IEventSymbol => CoreSymbolKind.Event,
-        IParameterSymbol => CoreSymbolKind.Parameter,
-        ILocalSymbol => CoreSymbolKind.Local,
-        _ => CoreSymbolKind.Unknown,
+        IMethodSymbol m => m.MethodKind == MethodKind.Constructor ? SymbolKinds.Constructor : SymbolKinds.Method,
+        IPropertySymbol => SymbolKinds.Property,
+        IFieldSymbol f when f.ContainingType?.TypeKind == TypeKind.Enum => SymbolKinds.EnumMember,
+        IFieldSymbol => SymbolKinds.Field,
+        IEventSymbol => SymbolKinds.Event,
+        IParameterSymbol => SymbolKinds.Parameter,
+        ILocalSymbol => SymbolKinds.Local,
+        _ => SymbolKinds.Other,
     };
 
     public static bool IsIndexable(ISymbol symbol) => symbol switch

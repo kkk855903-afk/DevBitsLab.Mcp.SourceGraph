@@ -30,11 +30,20 @@ public interface IGraphStore : IAsyncDisposable
     Task BatchUpdateContainerIdsAsync(IReadOnlyList<(long ChildId, long ParentId)> pairs, CancellationToken ct = default);
 
     Task BulkInsertReferencesAsync(IEnumerable<SymbolReference> references, CancellationToken ct = default);
+
+    /// <summary>
+    /// Bulk-insert edges. <see cref="Edge.Metadata"/> is JSON-serialised into the
+    /// <c>edges.payload</c> column when non-null. <see cref="Edge.Kind"/> is the kebab-case
+    /// kind identifier (e.g. <c>"calls"</c>, <c>"binds-path"</c>).
+    /// </summary>
     Task BulkInsertEdgesAsync(IEnumerable<Edge> edges, CancellationToken ct = default);
 
-    /// <summary>Bulk-insert the attributes attached to a set of symbols. Run after the symbols
-    /// themselves are upserted, so <c>symbol_id</c> already resolves to a stable row.</summary>
-    Task BulkInsertAttributesAsync(IEnumerable<AttributeRecord> attributes, CancellationToken ct = default);
+    /// <summary>
+    /// Bulk-insert the annotations attached to a set of symbols. Run after the symbols
+    /// themselves are upserted, so <c>symbol_id</c> already resolves to a stable row.
+    /// <see cref="AnnotationRecord.Flavor"/> discriminates annotation patterns across languages.
+    /// </summary>
+    Task BulkInsertAnnotationsAsync(IEnumerable<AnnotationRecord> annotations, CancellationToken ct = default);
 
     /// <summary>
     /// Set <c>symbols.test_framework</c> for the given symbol ids. Pairs whose <c>symbol_id</c>
@@ -84,7 +93,7 @@ public interface IGraphStore : IAsyncDisposable
     Task<IReadOnlyList<SymbolSpan>> GetSymbolSpansForFileAsync(long fileId, CancellationToken ct = default);
 
     /// <summary>
-    /// Inbound <c>Tests</c> edges for <paramref name="symbolId"/> — every test method that
+    /// Inbound <c>tests</c> edges for <paramref name="symbolId"/> — every test method that
     /// targets this production symbol. Returns the SymbolHit + the framework recorded on
     /// the test method's row.
     /// </summary>
@@ -101,28 +110,42 @@ public interface IGraphStore : IAsyncDisposable
     Task<IReadOnlyList<ReferenceHit>> FindReferencesAsync(long symbolId, int limit = 200, CancellationToken ct = default);
     Task<IReadOnlyList<SymbolHit>> ListSymbolsInFileAsync(string filePath, CancellationToken ct = default);
     Task<SymbolHit?> GetSymbolByIdAsync(long symbolId, CancellationToken ct = default);
+
     /// <summary>
-    /// Lists named callers of <paramref name="symbolId"/>. With the default <paramref name="edgeKind"/> = <see cref="EdgeKind.Calls"/>
-    /// this preserves the legacy behaviour. Pass a different kind to walk other edge types
-    /// (e.g. <see cref="EdgeKind.UsesType"/> to get type consumers); pass <c>null</c> to walk every edge kind.
+    /// Lists named callers of <paramref name="symbolId"/>. With the default
+    /// <paramref name="edgeKind"/> = <c>"calls"</c> this preserves the legacy behaviour. Pass a
+    /// different kebab-case kind (<c>"uses-type"</c>, <c>"renders-component"</c>, …) to walk
+    /// other edge types; pass <c>null</c> to walk every edge kind.
     /// </summary>
-    Task<IReadOnlyList<SymbolHit>> ListCallersAsync(long symbolId, int limit = 50, EdgeKind? edgeKind = EdgeKind.Calls, CancellationToken ct = default);
+    Task<IReadOnlyList<SymbolHit>> ListCallersAsync(long symbolId, int limit = 50, string? edgeKind = "calls", CancellationToken ct = default);
+
     /// <summary>
-    /// Lists outgoing targets from <paramref name="symbolId"/>. With the default <paramref name="edgeKind"/> = <see cref="EdgeKind.Calls"/>
-    /// this preserves the legacy behaviour. Pass a different kind to walk other edge types; pass <c>null</c> to walk every edge kind.
+    /// Lists outgoing targets from <paramref name="symbolId"/>. With the default
+    /// <paramref name="edgeKind"/> = <c>"calls"</c> this preserves the legacy behaviour. Pass a
+    /// different kebab-case kind to walk other edge types; pass <c>null</c> to walk every kind.
     /// </summary>
-    Task<IReadOnlyList<SymbolHit>> ListCalleesAsync(long symbolId, int limit = 50, EdgeKind? edgeKind = EdgeKind.Calls, CancellationToken ct = default);
-    /// <summary>Lists every member that satisfies the named interface member via <see cref="EdgeKind.ImplementsMember"/> edges.</summary>
+    Task<IReadOnlyList<SymbolHit>> ListCalleesAsync(long symbolId, int limit = 50, string? edgeKind = "calls", CancellationToken ct = default);
+
+    /// <summary>Lists every member that satisfies the named interface member via <c>"implements-member"</c> edges.</summary>
     Task<IReadOnlyList<SymbolHit>> ListImplementationsAsync(long symbolId, int limit = 50, CancellationToken ct = default);
-    /// <summary>Lists every member that consumes the given type via <see cref="EdgeKind.UsesType"/> edges.</summary>
+
+    /// <summary>Lists every member that consumes the given type via <c>"uses-type"</c> edges.</summary>
     Task<IReadOnlyList<SymbolHit>> ListUsersOfTypeAsync(long symbolId, int limit = 50, CancellationToken ct = default);
-    Task<IReadOnlyList<SymbolHit>> SearchSymbolsAsync(string ftsQuery, Core.SymbolKind? kindFilter = null, int limit = 25, CancellationToken ct = default);
-    Task<IReadOnlyList<ModuleSymbol>> ModuleSummaryAsync(string namespaceOrPathPrefix, int limit = 25, CancellationToken ct = default);
+
     /// <summary>
-    /// Walks the upstream graph of <paramref name="symbolId"/> via the given <paramref name="edgeKind"/> (default = <see cref="EdgeKind.Calls"/>)
-    /// up to <paramref name="maxDepth"/> hops. Pass <c>null</c> to walk every edge kind.
+    /// FTS-backed symbol search. <paramref name="kindFilter"/> is the kebab-case symbol kind
+    /// (<c>"class"</c>, <c>"method"</c>, …) — pass <c>null</c> for all kinds.
     /// </summary>
-    Task<IReadOnlyList<ImpactedSymbol>> ImpactOfChangeAsync(long symbolId, int maxDepth = 4, int limit = 100, EdgeKind? edgeKind = EdgeKind.Calls, CancellationToken ct = default);
+    Task<IReadOnlyList<SymbolHit>> SearchSymbolsAsync(string ftsQuery, string? kindFilter = null, int limit = 25, CancellationToken ct = default);
+
+    Task<IReadOnlyList<ModuleSymbol>> ModuleSummaryAsync(string namespaceOrPathPrefix, int limit = 25, CancellationToken ct = default);
+
+    /// <summary>
+    /// Walks the upstream graph of <paramref name="symbolId"/> via the given
+    /// <paramref name="edgeKind"/> (default = <c>"calls"</c>) up to <paramref name="maxDepth"/>
+    /// hops. Pass <c>null</c> to walk every edge kind.
+    /// </summary>
+    Task<IReadOnlyList<ImpactedSymbol>> ImpactOfChangeAsync(long symbolId, int maxDepth = 4, int limit = 100, string? edgeKind = "calls", CancellationToken ct = default);
 
     /// <summary>
     /// Direct children of a container (rows whose <c>container_id = containerId</c>),
@@ -132,16 +155,18 @@ public interface IGraphStore : IAsyncDisposable
     Task<IReadOnlyList<SymbolHit>> ListMembersAsync(long containerId, int? accessibilityFilter = null, int limit = 200, CancellationToken ct = default);
 
     /// <summary>
-    /// Find symbols that carry an attribute with the given short <paramref name="name"/>
-    /// (e.g. <c>"HttpGet"</c>). When <paramref name="argSubstring"/> is non-null, restrict
-    /// results to attributes whose serialised arguments match the substring via the FTS5
-    /// trigram index over <c>attributes_fts.args_text</c>. <paramref name="kindFilter"/>
-    /// narrows by symbol kind (e.g. only methods).
+    /// Find symbols that carry an annotation with the given short <paramref name="name"/>
+    /// (e.g. <c>"HttpGet"</c>). When <paramref name="flavor"/> is non-null, restrict to
+    /// annotations of that flavor (<c>"csharp-attribute"</c>, <c>"ts-decorator"</c>, …);
+    /// <c>null</c> matches across all flavors. When <paramref name="argSubstring"/> is non-null,
+    /// restrict results to annotations whose serialised arguments match the substring via the
+    /// FTS5 trigram index over <c>annotations_fts.args_text</c>. <paramref name="kindFilter"/>
+    /// narrows by kebab-case symbol kind (e.g. <c>"method"</c>).
     /// </summary>
-    Task<IReadOnlyList<SymbolHit>> FindByAttributeAsync(string name, string? argSubstring, Core.SymbolKind? kindFilter, int limit, CancellationToken ct = default);
+    Task<IReadOnlyList<SymbolHit>> FindByAnnotationAsync(string name, string? flavor, string? argSubstring, string? kindFilter, int limit, CancellationToken ct = default);
 
-    /// <summary>Return every attribute attached to <paramref name="symbolId"/>, in row-id (insert) order.</summary>
-    Task<IReadOnlyList<AttributeRecord>> GetAttributesForSymbolAsync(long symbolId, CancellationToken ct = default);
+    /// <summary>Return every annotation attached to <paramref name="symbolId"/>, in row-id (insert) order.</summary>
+    Task<IReadOnlyList<AnnotationRecord>> GetAnnotationsForSymbolAsync(long symbolId, CancellationToken ct = default);
 
     /// <summary>
     /// Replace the diagnostic set for <paramref name="fileId"/>: deletes every existing row with
@@ -178,6 +203,19 @@ public interface IGraphStore : IAsyncDisposable
     /// generated refs; pass <c>includeGenerated = true</c> to include them.
     /// </summary>
     Task<IReadOnlyList<ReferenceHit>> FindReferencesAsync(long symbolId, bool includeGenerated, int limit = 200, CancellationToken ct = default);
+
+    /// <summary>
+    /// Distinct edge kind names already present in the store, sorted lowercase. Used by the
+    /// vocabulary publisher to enrich the MCP <c>initialize</c> response with what's actually
+    /// queryable in this scope.
+    /// </summary>
+    Task<IReadOnlyList<string>> GetDistinctEdgeKindsAsync(CancellationToken ct = default);
+
+    /// <summary>Distinct symbol kind names already present in the store, sorted lowercase.</summary>
+    Task<IReadOnlyList<string>> GetDistinctSymbolKindsAsync(CancellationToken ct = default);
+
+    /// <summary>Distinct annotation flavors already present in the store, sorted lowercase.</summary>
+    Task<IReadOnlyList<string>> GetDistinctAnnotationFlavorsAsync(CancellationToken ct = default);
 }
 
 public sealed record ModuleSymbol(SymbolHit Symbol, int InDegree);

@@ -17,37 +17,106 @@ public sealed class SdkContractsTests
     public void IndexEvent_SymbolDeclared_holdsAllFields()
     {
         var ev = new IndexEvent.SymbolDeclared(
-            CanonicalKey: "ns.Foo.Bar",
-            Name: "Bar",
-            Fqn: "ns.Foo.Bar",
-            Kind: PluginSymbolKind.Method,
-            StartLine: 12,
-            StartColumn: 4,
-            EndLine: 14,
-            EndColumn: 4,
-            Signature: "void Bar()",
-            ContainerCanonicalKey: "ns.Foo",
-            Modifiers: "public",
-            Accessibility: 6,
-            XmlSummary: "Does Bar.");
+            canonicalKey: "csharp:T:Ns.Foo.Bar",
+            name: "Bar",
+            fqn: "ns.Foo.Bar",
+            kind: SymbolKinds.Method,
+            startLine: 12,
+            startColumn: 4,
+            endLine: 14,
+            endColumn: 4,
+            signature: "void Bar()",
+            containerCanonicalKey: "csharp:T:Ns.Foo",
+            modifiers: "public",
+            accessibility: 6,
+            xmlSummary: "Does Bar.");
         ev.Name.Should().Be("Bar");
-        ev.Kind.Should().Be(PluginSymbolKind.Method);
-        ev.ContainerCanonicalKey.Should().Be("ns.Foo");
+        ev.Kind.Should().Be(SymbolKinds.Method);
+        ev.ContainerCanonicalKey.Should().Be("csharp:T:Ns.Foo");
+    }
+
+    [Fact]
+    public void IndexEvent_SymbolDeclared_rejectsNonKebabCaseKind()
+    {
+        // A bare "Method" (PascalCase) is not kebab-case; the constructor validator must
+        // reject before storage. Catches plugin authors who forget the open-language-contract
+        // constraint that emitted kinds must round-trip the kebab-case validator.
+        var act = () => new IndexEvent.SymbolDeclared(
+            canonicalKey: "csharp:T:Ns.Foo",
+            name: "Foo",
+            fqn: "Ns.Foo",
+            kind: "Method",
+            startLine: 1, startColumn: 1, endLine: 1, endColumn: 1);
+        act.Should().Throw<ArgumentException>();
+    }
+
+    [Fact]
+    public void IndexEvent_SymbolDeclared_rejectsUnknownScheme()
+    {
+        // The validator only accepts schemes from the enforced set ({csharp, xaml} at v1).
+        // A "python:M:foo" key is well-formed kebab-but-not-reserved; the constructor must throw.
+        var act = () => new IndexEvent.SymbolDeclared(
+            canonicalKey: "python:M:Ns.Foo",
+            name: "Foo",
+            fqn: "Ns.Foo",
+            kind: SymbolKinds.Method,
+            startLine: 1, startColumn: 1, endLine: 1, endColumn: 1);
+        act.Should().Throw<ArgumentException>();
     }
 
     [Fact]
     public void IndexEvent_EdgeEmitted_carriesEdgeKindByName()
     {
-        var ev = new IndexEvent.EdgeEmitted("a", "b", "Calls");
-        ev.EdgeKindName.Should().Be("Calls");
+        var ev = new IndexEvent.EdgeEmitted("csharp:T:A", "csharp:T:B", EdgeKinds.Calls);
+        ev.EdgeKindName.Should().Be("calls");
     }
 
     [Fact]
-    public void IndexEvent_AttributeAttached_carriesArgsJson()
+    public void IndexEvent_EdgeEmitted_carriesMetadataDictionary()
     {
-        var ev = new IndexEvent.AttributeAttached("sym", "Decorated", "Sample.DecoratedAttribute", ArgsJson: "{}");
+        // open-language-contract added the optional metadata map for binding paths / event names
+        // / prop lists. Non-null metadata round-trips through the record's getter.
+        var meta = new Dictionary<string, string> { ["path"] = "User.Name", ["mode"] = "two-way" };
+        var ev = new IndexEvent.EdgeEmitted("csharp:T:A", "csharp:T:B", EdgeKinds.UsesType, meta);
+        ev.Metadata.Should().NotBeNull();
+        ev.Metadata!["path"].Should().Be("User.Name");
+        ev.Metadata!["mode"].Should().Be("two-way");
+    }
+
+    [Fact]
+    public void IndexEvent_EdgeEmitted_rejectsNonKebabCaseKind()
+    {
+        // open-language-contract requires the edge kind to satisfy the kebab-case validator.
+        // PascalCase "Calls" must be rejected; lowercase "calls" passes.
+        var act = () => new IndexEvent.EdgeEmitted("csharp:T:A", "csharp:T:B", "Calls");
+        act.Should().Throw<ArgumentException>();
+    }
+
+    [Fact]
+    public void IndexEvent_AnnotationAttached_carriesFlavorAndArgsJson()
+    {
+        // AttributeAttached → AnnotationAttached: the new event introduces a kebab-case flavor
+        // discriminator so cross-language emitters can disambiguate decorators / directives.
+        var ev = new IndexEvent.AnnotationAttached(
+            symbolCanonicalKey: "csharp:T:Sym",
+            annotationName: "Decorated",
+            flavor: "csharp-attribute",
+            fullName: "Sample.DecoratedAttribute",
+            argsJson: "{}");
+        ev.AnnotationName.Should().Be("Decorated");
+        ev.Flavor.Should().Be("csharp-attribute");
         ev.ArgsJson.Should().Be("{}");
-        ev.AttributeClassCanonicalKey.Should().BeNull();
+        ev.TargetCanonicalKey.Should().BeNull();
+    }
+
+    [Fact]
+    public void IndexEvent_AnnotationAttached_rejectsNonKebabCaseFlavor()
+    {
+        var act = () => new IndexEvent.AnnotationAttached(
+            symbolCanonicalKey: "csharp:T:Sym",
+            annotationName: "Decorated",
+            flavor: "CSharpAttribute");
+        act.Should().Throw<ArgumentException>();
     }
 
     [Fact]

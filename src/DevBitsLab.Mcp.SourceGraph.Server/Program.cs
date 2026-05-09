@@ -202,12 +202,52 @@ static async Task<int> RunServeAsync(CommandLine cli)
     // tools over Grep+Read for symbol-level questions, and to call usage_stats at end of turn
     // to verify the graph was actually queried. Suppressed by --no-instructions or
     // SOURCEGRAPH_NO_INSTRUCTIONS=1 — clients that don't honour the field already ignore it.
+    //
+    // Phase F: alongside the instructions string we publish the open-language vocabulary
+    // (edge_kinds, symbol_kinds, annotation_flavors) under
+    // `capabilities.experimental["sourcegraph.vocabulary"]`. Computed up-front by reading the
+    // distinct-kind columns of every scope DB and unioning with the SDK's constants. Same
+    // suppression knob as the instructions string so an operator can disable both with one flag.
     var noInstructions = ServerInstructions.ShouldSuppress(
         cli.NoInstructions,
         Environment.GetEnvironmentVariable(ServerInstructions.EnvVarName));
     if (!noInstructions)
     {
-        builder.Services.Configure<McpServerOptions>(o => o.ServerInstructions = ServerInstructions.Template);
+        // Use Program as the logger category — ServerVocabulary is static so it can't be a
+        // generic type argument; the category name is just for log filtering.
+        var vocabLogger = StartupLogging.CreateLogger<Program>();
+        var vocabulary = await ServerVocabulary
+            .ComputeAsync(scopeConfig.Scopes, vocabLogger)
+            .ConfigureAwait(false);
+        builder.Services.Configure<McpServerOptions>(o =>
+        {
+            o.ServerInstructions = ServerInstructions.Template;
+            // Capabilities.Experimental is the MCP spec's extension point for non-standard
+            // server capabilities; we slot the vocabulary in under a namespaced key so unrelated
+            // clients ignore it. The value is a small typed record that System.Text.Json
+            // serialises as `{ "edge_kinds": [...union...], "symbol_kinds": [...], ...,
+            // "scopes": { "<id>": { "edge_kinds": [...], ... } } }`. The top-level lists are the
+            // server-wide union across every scope; the `scopes` map carries the per-scope
+            // breakdown for clients that need to validate a tool argument against a specific
+            // scope's vocabulary.
+            o.Capabilities ??= new ModelContextProtocol.Protocol.ServerCapabilities();
+            o.Capabilities.Experimental ??= new Dictionary<string, object>(StringComparer.Ordinal);
+            o.Capabilities.Experimental[ServerVocabulary.CapabilityKey] = new
+            {
+                edge_kinds = vocabulary.EdgeKinds,
+                symbol_kinds = vocabulary.SymbolKinds,
+                annotation_flavors = vocabulary.AnnotationFlavors,
+                scopes = vocabulary.Scopes.ToDictionary(
+                    kv => kv.Key,
+                    kv => (object)new
+                    {
+                        edge_kinds = kv.Value.EdgeKinds,
+                        symbol_kinds = kv.Value.SymbolKinds,
+                        annotation_flavors = kv.Value.AnnotationFlavors,
+                    },
+                    StringComparer.Ordinal),
+            };
+        });
     }
 
     var mcpBuilder = builder.Services
@@ -394,7 +434,7 @@ static async Task<int> RunIndexAsync(CommandLine cli)
 
 /// <summary>
 /// One-shot analyzer-dispatch helper for the `index` CLI path. Mirrors what
-/// <see cref="LiveIndexService"/> does per scope: reads every indexed file's symbol+attribute
+/// <see cref="LiveIndexService"/> does per scope: reads every indexed file's symbol+annotation
 /// rows out of the store, packages them as <see cref="Sdk.IndexEvent"/>s, and runs every loaded
 /// analyzer against each file. Failures are isolated by the pipeline; the function returns
 /// normally even if some analyzers fail.
@@ -444,27 +484,28 @@ static async Task DispatchAnalyzersForOneShotAsync(
                 var sym = await store.GetSymbolByIdAsync(symbolIdByKey[key]).ConfigureAwait(false);
                 if (sym is null) continue;
                 events.Add(new IndexEvent.SymbolDeclared(
-                    CanonicalKey: key,
-                    Name: sym.Name,
-                    Fqn: sym.Fqn,
-                    Kind: MapStorageKindToPluginKind(sym.Kind),
-                    StartLine: sym.StartLine,
-                    StartColumn: sym.StartCol,
-                    EndLine: sym.EndLine,
-                    EndColumn: sym.EndCol,
-                    Signature: sym.Signature,
-                    Modifiers: sym.Modifiers,
-                    Accessibility: sym.Accessibility,
-                    XmlSummary: sym.XmlSummary));
+                    canonicalKey: key,
+                    name: sym.Name,
+                    fqn: sym.Fqn,
+                    kind: sym.Kind,
+                    startLine: sym.StartLine,
+                    startColumn: sym.StartCol,
+                    endLine: sym.EndLine,
+                    endColumn: sym.EndCol,
+                    signature: sym.Signature,
+                    modifiers: sym.Modifiers,
+                    accessibility: sym.Accessibility,
+                    xmlSummary: sym.XmlSummary));
 
-                var attrs = await store.GetAttributesForSymbolAsync(sym.Id).ConfigureAwait(false);
-                foreach (var a in attrs)
+                var anns = await store.GetAnnotationsForSymbolAsync(sym.Id).ConfigureAwait(false);
+                foreach (var a in anns)
                 {
-                    events.Add(new IndexEvent.AttributeAttached(
-                        SymbolCanonicalKey: key,
-                        AttributeName: a.Name,
-                        AttributeFullName: a.FullName,
-                        ArgsJson: a.ArgsJson));
+                    events.Add(new IndexEvent.AnnotationAttached(
+                        symbolCanonicalKey: key,
+                        annotationName: a.Name,
+                        flavor: a.Flavor,
+                        fullName: a.FullName,
+                        argsJson: a.ArgsJson));
                 }
             }
         }
@@ -474,23 +515,6 @@ static async Task DispatchAnalyzersForOneShotAsync(
             events, symbolIdByKey).ConfigureAwait(false);
     }
 }
-
-static PluginSymbolKind MapStorageKindToPluginKind(DevBitsLab.Mcp.SourceGraph.Core.SymbolKind k) => k switch
-{
-    DevBitsLab.Mcp.SourceGraph.Core.SymbolKind.Namespace => PluginSymbolKind.Namespace,
-    DevBitsLab.Mcp.SourceGraph.Core.SymbolKind.Class => PluginSymbolKind.Class,
-    DevBitsLab.Mcp.SourceGraph.Core.SymbolKind.Struct => PluginSymbolKind.Struct,
-    DevBitsLab.Mcp.SourceGraph.Core.SymbolKind.Interface => PluginSymbolKind.Interface,
-    DevBitsLab.Mcp.SourceGraph.Core.SymbolKind.Enum => PluginSymbolKind.Enum,
-    DevBitsLab.Mcp.SourceGraph.Core.SymbolKind.EnumMember => PluginSymbolKind.EnumMember,
-    DevBitsLab.Mcp.SourceGraph.Core.SymbolKind.Delegate => PluginSymbolKind.Delegate,
-    DevBitsLab.Mcp.SourceGraph.Core.SymbolKind.Method => PluginSymbolKind.Method,
-    DevBitsLab.Mcp.SourceGraph.Core.SymbolKind.Constructor => PluginSymbolKind.Constructor,
-    DevBitsLab.Mcp.SourceGraph.Core.SymbolKind.Property => PluginSymbolKind.Property,
-    DevBitsLab.Mcp.SourceGraph.Core.SymbolKind.Field => PluginSymbolKind.Field,
-    DevBitsLab.Mcp.SourceGraph.Core.SymbolKind.Event => PluginSymbolKind.Event,
-    _ => PluginSymbolKind.Other,
-};
 
 /// <summary>
 /// Run the history pipeline as a single async loop without the BackgroundService scaffolding.

@@ -80,8 +80,8 @@ public interface IGraphEmitter
     /// <summary>Emit an edge between two symbols.</summary>
     void EmitEdge(IndexEvent.EdgeEmitted edge);
 
-    /// <summary>Attach an attribute record to an existing symbol.</summary>
-    void EmitAttribute(IndexEvent.AttributeAttached attribute);
+    /// <summary>Attach an annotation record to an existing symbol.</summary>
+    void EmitAnnotation(IndexEvent.AnnotationAttached annotation);
 
     /// <summary>Record a position-level reference.</summary>
     void EmitReference(IndexEvent.ReferenceFound reference);

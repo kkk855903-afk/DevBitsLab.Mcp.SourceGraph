@@ -33,9 +33,10 @@ public interface IEmbeddingsStore
     /// Top-k nearest-neighbour query against the configured vector index. Returns
     /// <c>(symbolId, similarity)</c> pairs in descending similarity order. Similarity is the
     /// cosine similarity in <c>[-1, 1]</c>; a vec0 distance of <c>d</c> on L2-normalised vectors
-    /// is converted via <c>1 - d^2 / 2</c>.
+    /// is converted via <c>1 - d^2 / 2</c>. <paramref name="kindFilter"/> is the kebab-case
+    /// symbol kind name (e.g. <c>"method"</c>); <c>null</c> matches every kind.
     /// </summary>
-    Task<IReadOnlyList<EmbeddingHit>> SearchAsync(IReadOnlyList<float> queryEmbedding, int k, Core.SymbolKind? kindFilter = null, CancellationToken ct = default);
+    Task<IReadOnlyList<EmbeddingHit>> SearchAsync(IReadOnlyList<float> queryEmbedding, int k, string? kindFilter = null, CancellationToken ct = default);
 
     /// <summary>Total number of stored embeddings (count of rows in <c>symbol_embeddings</c>).</summary>
     Task<long> CountAsync(CancellationToken ct = default);

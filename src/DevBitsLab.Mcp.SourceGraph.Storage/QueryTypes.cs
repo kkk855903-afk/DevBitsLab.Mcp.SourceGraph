@@ -6,7 +6,7 @@ public sealed record SymbolHit(
     long Id,
     string Name,
     string Fqn,
-    SymbolKind Kind,
+    string Kind,
     string FilePath,
     int StartLine,
     int StartCol,

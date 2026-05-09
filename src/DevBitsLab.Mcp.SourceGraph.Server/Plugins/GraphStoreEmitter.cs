@@ -4,7 +4,6 @@ using DevBitsLab.Mcp.SourceGraph.Storage;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using CoreSymbol = DevBitsLab.Mcp.SourceGraph.Core.Symbol;
-using SdkPluginSymbolKind = DevBitsLab.Mcp.SourceGraph.Sdk.PluginSymbolKind;
 
 namespace DevBitsLab.Mcp.SourceGraph.Server.Plugins;
 
@@ -24,7 +23,7 @@ public sealed class GraphStoreEmitter : IGraphEmitter
 
     private readonly List<IndexEvent.SymbolDeclared> _symbols = new();
     private readonly List<IndexEvent.EdgeEmitted> _edges = new();
-    private readonly List<IndexEvent.AttributeAttached> _attributes = new();
+    private readonly List<IndexEvent.AnnotationAttached> _annotations = new();
     private readonly List<IndexEvent.ReferenceFound> _references = new();
 
     public GraphStoreEmitter(
@@ -44,13 +43,13 @@ public sealed class GraphStoreEmitter : IGraphEmitter
     /// <inheritdoc />
     public void EmitEdge(IndexEvent.EdgeEmitted edge) => _edges.Add(edge);
     /// <inheritdoc />
-    public void EmitAttribute(IndexEvent.AttributeAttached attribute) => _attributes.Add(attribute);
+    public void EmitAnnotation(IndexEvent.AnnotationAttached annotation) => _annotations.Add(annotation);
     /// <inheritdoc />
     public void EmitReference(IndexEvent.ReferenceFound reference) => _references.Add(reference);
 
     /// <summary>
     /// Resolve every queued emission into storage rows and write them. Symbols are upserted
-    /// first so subsequent edges/attributes/refs can resolve their canonical-key references to
+    /// first so subsequent edges/annotations/refs can resolve their canonical-key references to
     /// stable ids. The same key map (<see cref="_symbolIdByCanonicalKey"/>) is shared with the
     /// language indexer's pass-1 so plugin-emitted symbols can target previously-walked symbols
     /// (and vice versa).
@@ -60,12 +59,11 @@ public sealed class GraphStoreEmitter : IGraphEmitter
         // Symbols first.
         foreach (var s in _symbols)
         {
-            var coreKind = MapSymbolKind(s.Kind);
             var sym = new CoreSymbol(
                 Id: 0,
                 Name: s.Name,
                 Fqn: s.Fqn,
-                Kind: coreKind,
+                Kind: s.Kind,
                 FileId: _fileId,
                 StartLine: s.StartLine,
                 StartCol: s.StartColumn,
@@ -97,12 +95,10 @@ public sealed class GraphStoreEmitter : IGraphEmitter
                     _logger.LogDebug("Edge skipped: unknown target canonical key `{Key}`", e.TargetCanonicalKey);
                     continue;
                 }
-                if (!Enum.TryParse<EdgeKind>(e.EdgeKindName, ignoreCase: true, out var kind))
-                {
-                    _logger.LogDebug("Edge skipped: unknown edge kind `{Kind}`", e.EdgeKindName);
-                    continue;
-                }
-                resolvedEdges.Add(new Edge(src, dst, kind));
+                // Edge kind is now an open kebab-case string: pass through unchanged. The SDK has
+                // already validated kebab-case-ness at construction time. Storage accepts the
+                // string as-is (TEXT column, indexed).
+                resolvedEdges.Add(new Edge(src, dst, e.EdgeKindName, e.Metadata));
             }
             if (resolvedEdges.Count > 0)
             {
@@ -110,28 +106,32 @@ public sealed class GraphStoreEmitter : IGraphEmitter
             }
         }
 
-        // Attributes.
-        if (_attributes.Count > 0)
+        // Annotations.
+        if (_annotations.Count > 0)
         {
-            var resolvedAttrs = new List<AttributeRecord>(_attributes.Count);
-            foreach (var a in _attributes)
+            var resolvedAnnotations = new List<AnnotationRecord>(_annotations.Count);
+            foreach (var a in _annotations)
             {
                 if (!_symbolIdByCanonicalKey.TryGetValue(a.SymbolCanonicalKey, out var symId))
                 {
-                    _logger.LogDebug("Attribute skipped: unknown symbol canonical key `{Key}`", a.SymbolCanonicalKey);
+                    _logger.LogDebug("Annotation skipped: unknown symbol canonical key `{Key}`", a.SymbolCanonicalKey);
                     continue;
                 }
                 long? attrSymbolId = null;
-                if (a.AttributeClassCanonicalKey is { } akey
+                if (a.TargetCanonicalKey is { } akey
                     && _symbolIdByCanonicalKey.TryGetValue(akey, out var aid))
                 {
                     attrSymbolId = aid;
                 }
-                resolvedAttrs.Add(new AttributeRecord(symId, a.AttributeName, a.AttributeFullName, a.ArgsJson, attrSymbolId));
+                // FullName is non-null in storage's record but optional in the SDK event; if the
+                // emitter didn't supply one, fall back to the short name so legacy queries that
+                // join against a non-empty FullName still work.
+                var fullName = a.FullName ?? a.AnnotationName;
+                resolvedAnnotations.Add(new AnnotationRecord(symId, a.AnnotationName, fullName, a.Flavor, a.ArgsJson, attrSymbolId));
             }
-            if (resolvedAttrs.Count > 0)
+            if (resolvedAnnotations.Count > 0)
             {
-                await _store.BulkInsertAttributesAsync(resolvedAttrs, ct).ConfigureAwait(false);
+                await _store.BulkInsertAnnotationsAsync(resolvedAnnotations, ct).ConfigureAwait(false);
             }
         }
 
@@ -158,28 +158,4 @@ public sealed class GraphStoreEmitter : IGraphEmitter
             }
         }
     }
-
-    /// <summary>
-    /// Translate the SDK's wire-friendly symbol kind to the storage-level enum. Unknown values
-    /// degrade to <see cref="SymbolKind.Unknown"/> so a future SDK adding a new kind doesn't
-    /// break older hosts.
-    /// </summary>
-    private static SymbolKind MapSymbolKind(SdkPluginSymbolKind kind) => kind switch
-    {
-        SdkPluginSymbolKind.Namespace => SymbolKind.Namespace,
-        SdkPluginSymbolKind.Class => SymbolKind.Class,
-        SdkPluginSymbolKind.Interface => SymbolKind.Interface,
-        SdkPluginSymbolKind.Struct => SymbolKind.Struct,
-        SdkPluginSymbolKind.Enum => SymbolKind.Enum,
-        SdkPluginSymbolKind.Delegate => SymbolKind.Delegate,
-        SdkPluginSymbolKind.Method => SymbolKind.Method,
-        SdkPluginSymbolKind.Constructor => SymbolKind.Constructor,
-        SdkPluginSymbolKind.Property => SymbolKind.Property,
-        SdkPluginSymbolKind.Field => SymbolKind.Field,
-        SdkPluginSymbolKind.Event => SymbolKind.Event,
-        SdkPluginSymbolKind.EnumMember => SymbolKind.EnumMember,
-        SdkPluginSymbolKind.Operator => SymbolKind.Method,
-        SdkPluginSymbolKind.Record => SymbolKind.Class, // Roslyn records resolve to Class in our enum
-        _ => SymbolKind.Unknown,
-    };
 }

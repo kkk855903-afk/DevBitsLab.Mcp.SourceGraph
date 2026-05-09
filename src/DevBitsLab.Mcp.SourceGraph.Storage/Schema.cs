@@ -7,58 +7,26 @@ internal static class Schema
     /// drops all data tables when the on-disk version is below this, since the index can always be
     /// rebuilt from source.
     /// </summary>
-    public const int Version = 10;
+    public const int Version = 11;
 
     /// <summary>
-    /// V5 enriches the symbol row with metadata that Roslyn already exposes per symbol but which
-    /// previously required a Read-the-source round-trip to surface to an agent: a comma-joined
-    /// <c>modifiers</c> token string (canonically ordered: <c>static, async, virtual, abstract,
-    /// sealed, override, extern, readonly, partial</c>), the <c>DeclaredAccessibility</c> as an
-    /// integer enum, and the parsed <c>&lt;summary&gt;</c> text from the XML doc comment (with
-    /// <c>&lt;inheritdoc/&gt;</c> resolved up the override chain). The <c>xml_summary</c> column
-    /// also feeds the FTS5 virtual table so <c>search_symbols</c> matches against documented
-    /// behaviour, not just identifiers.
+    /// V11 (open-language-contract): kind columns flip from <c>INTEGER</c> to <c>TEXT NOT NULL</c>
+    /// holding kebab-case identifiers (<c>"calls"</c>, <c>"class"</c>, …); <c>edges</c> gains a
+    /// <c>payload TEXT NULL</c> column carrying JSON metadata for binding paths / event names /
+    /// prop names; <c>attributes</c> / <c>attributes_fts</c> are renamed to <c>annotations</c> /
+    /// <c>annotations_fts</c> with a new <c>flavor TEXT NOT NULL</c> column discriminating
+    /// <c>csharp-attribute</c> from future <c>ts-decorator</c> / <c>vue-directive</c> /
+    /// <c>svelte-action</c>. New <c>idx_edges_kind_name</c>, <c>idx_symbols_kind_name</c>, and
+    /// <c>idx_annotations_flavor</c> indexes preserve query plans against the wider TEXT columns.
     ///
-    /// V3 removes the foreign-key constraints from <c>refs</c> and <c>edges</c> that we previously
-    /// relied on for cascade-on-delete behaviour. In real-world solutions (multi-target,
-    /// linked files, shared projects, source generators) the same source path can be processed
-    /// multiple times in a single index pass; the <c>ON DELETE CASCADE</c> would race with our
-    /// in-memory <c>_symbolIdByKey</c> map and produce FK violations on insert. Cleanup is now
-    /// done explicitly in <see cref="SqliteGraphStore.ClearFileAsync"/>.
-    ///
-    /// V6 adds the <c>attributes</c> table + <c>attributes_fts</c> trigram index on top of V5,
-    /// so the indexer can record every <c>[Attribute]</c> attached to a symbol and answer
-    /// <c>find_by_attribute</c> queries (with optional argument-substring filtering).
-    ///
-    /// V7 wires in <c>sqlite-vec</c>: an optional <c>symbol_embeddings</c> <c>vec0</c> virtual
-    /// table holds 768-dim float vectors keyed by <c>symbol_id</c>, and a sibling
-    /// <c>embedding_meta(symbol_id PK, content_hash BLOB, model_version TEXT)</c> tracks the
-    /// SHA-256 of the synthesised text and the active model identity so swapping models or
-    /// editing a symbol's body re-embeds correctly. The vec0 table is created only when the
-    /// extension is loadable; <c>embedding_meta</c> is unconditional so we can persist
-    /// (or re-stage) the metadata even on hosts where the extension is missing.
-    ///
-    /// V8 adds <c>files.is_generated</c> (1 for documents obtained from
-    /// <c>Project.GetSourceGeneratedDocumentsAsync()</c>) and the <c>diagnostics</c> table
-    /// keyed by file/symbol so <c>find_diagnostics</c> can answer "show me every CS0618"
-    /// or "what's wrong in this file?" without re-running a build.
-    ///
-    /// V9 introduces test/history awareness: a <c>test_framework</c> column on
-    /// <c>symbols</c> (values <c>xunit | nunit | mstest | NULL</c>) populated by the indexer
-    /// based on attribute discrimination, and a new <c>symbol_history</c> table that caches
-    /// the most recent commit / author / authored-time for each indexed symbol from
-    /// <c>git blame --line-porcelain</c>. The cache is keyed against the source file's
-    /// <c>content_sha256</c> so we don't re-blame on every reindex. A new
-    /// <see cref="Core.EdgeKind.Tests"/> edge kind links each test method to the first
-    /// non-trivial production call it exercises.
-    ///
-    /// V10 is the storage-layout flip required by add-scoping: the on-disk DB itself didn't
-    /// gain new tables, but the host now owns one DB per scope under
-    /// <c>.sourcegraph/scopes/&lt;id&gt;.db</c> plus a separate <c>_meta.db</c> registry.
-    /// Bumping the schema version forces the rebuild path so legacy DBs in the old single-file
-    /// layout get re-applied cleanly when the migrator moves them to the new path. No new
-    /// per-row data — the registry's own version is tracked separately in
-    /// <see cref="SqliteScopeRegistry"/>.
+    /// V10 was the storage-layout flip required by add-scoping (per-scope DBs under
+    /// <c>.sourcegraph/scopes/&lt;id&gt;.db</c> + <c>_meta.db</c> registry). V9 introduced
+    /// test/history awareness, V8 added <c>files.is_generated</c> and <c>diagnostics</c>,
+    /// V7 wired in <c>sqlite-vec</c>, V6 added <c>attributes</c> + <c>attributes_fts</c>,
+    /// V5 enriched symbols with modifiers/accessibility/xml_summary, V3 dropped FK constraints
+    /// from refs/edges. V11 is the cumulative drop-and-rebuild target — there is no preserved
+    /// data path; <see cref="SqliteGraphStore.EnsureSchemaAsync"/> calls <see cref="DropAll"/>
+    /// when the on-disk version is anything below 11.
     /// </summary>
     public const string V1 = """
         CREATE TABLE IF NOT EXISTS schema_version (
@@ -78,7 +46,7 @@ internal static class Schema
             canonical_key TEXT UNIQUE NOT NULL,
             name TEXT NOT NULL,
             fqn TEXT NOT NULL,
-            kind INTEGER NOT NULL,
+            kind_name TEXT NOT NULL,
             file_id INTEGER NOT NULL,
             start_line INTEGER NOT NULL,
             start_col INTEGER NOT NULL,
@@ -95,6 +63,7 @@ internal static class Schema
         CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
         CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file_id);
         CREATE INDEX IF NOT EXISTS idx_symbols_container ON symbols(container_id);
+        CREATE INDEX IF NOT EXISTS idx_symbols_kind_name ON symbols(kind_name);
 
         CREATE TABLE IF NOT EXISTS refs (
             id INTEGER PRIMARY KEY,
@@ -110,22 +79,26 @@ internal static class Schema
         CREATE TABLE IF NOT EXISTS edges (
             src INTEGER NOT NULL,
             dst INTEGER NOT NULL,
-            kind INTEGER NOT NULL,
-            PRIMARY KEY (src, dst, kind)
+            kind_name TEXT NOT NULL,
+            payload TEXT,
+            PRIMARY KEY (src, dst, kind_name)
         );
-        CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(dst, kind);
+        CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(dst, kind_name);
+        CREATE INDEX IF NOT EXISTS idx_edges_kind_name ON edges(kind_name);
 
-        CREATE TABLE IF NOT EXISTS attributes (
+        CREATE TABLE IF NOT EXISTS annotations (
             id INTEGER PRIMARY KEY,
             symbol_id INTEGER NOT NULL,
             name TEXT NOT NULL,
             full_name TEXT NOT NULL,
+            flavor TEXT NOT NULL,
             args_json TEXT,
             attribute_symbol_id INTEGER
         );
-        CREATE INDEX IF NOT EXISTS idx_attributes_symbol ON attributes(symbol_id);
-        CREATE INDEX IF NOT EXISTS idx_attributes_name ON attributes(name);
-        CREATE INDEX IF NOT EXISTS idx_attributes_attribute_symbol_id ON attributes(attribute_symbol_id);
+        CREATE INDEX IF NOT EXISTS idx_annotations_symbol ON annotations(symbol_id);
+        CREATE INDEX IF NOT EXISTS idx_annotations_name ON annotations(name);
+        CREATE INDEX IF NOT EXISTS idx_annotations_flavor ON annotations(flavor);
+        CREATE INDEX IF NOT EXISTS idx_annotations_attribute_symbol_id ON annotations(attribute_symbol_id);
 
         CREATE TABLE IF NOT EXISTS embedding_meta (
             symbol_id INTEGER PRIMARY KEY,
@@ -134,7 +107,7 @@ internal static class Schema
         );
         CREATE INDEX IF NOT EXISTS idx_embedding_meta_model ON embedding_meta(model_version);
 
-        -- v8: Roslyn diagnostics. severity matches Microsoft.CodeAnalysis.DiagnosticSeverity
+        -- Roslyn diagnostics. severity matches Microsoft.CodeAnalysis.DiagnosticSeverity
         -- (Hidden=0, Info=1, Warning=2, Error=3) so callers can filter "WHERE severity >= 2"
         -- to get warnings and errors. symbol_id is NULL when the diagnostic's source span
         -- doesn't fall inside any indexed declaration (e.g. unused-using on a using directive).
@@ -153,7 +126,7 @@ internal static class Schema
         CREATE INDEX IF NOT EXISTS idx_diagnostics_file ON diagnostics(file_id);
         CREATE INDEX IF NOT EXISTS idx_diagnostics_symbol ON diagnostics(symbol_id);
 
-        -- v9: per-symbol git blame cache. last_authored_at is unix-millis. blamed_content_sha
+        -- Per-symbol git blame cache. last_authored_at is unix-millis. blamed_content_sha
         -- is the source file's content_sha256 at blame time so we can skip re-blaming when the
         -- file is unchanged.
         CREATE TABLE IF NOT EXISTS symbol_history (
@@ -172,7 +145,7 @@ internal static class Schema
             SELECT s.id        AS symbol_id,
                    s.fqn       AS fqn,
                    s.name      AS name,
-                   s.kind      AS kind,
+                   s.kind_name AS kind_name,
                    f.path      AS file_path,
                    s.start_line AS start_line,
                    h.last_commit_sha AS last_commit_sha,
@@ -213,20 +186,20 @@ internal static class Schema
             VALUES (new.id, new.name, new.fqn, new.signature, new.xml_summary);
         END;
 
-        -- FTS5 trigram index over the synthesised args_text column for an attribute.
-        -- Triggers on `attributes` push every insert/delete into the virtual table.
-        -- Note: `args_text` is not a real column on `attributes`; it's computed on the fly
+        -- FTS5 trigram index over the synthesised args_text column for an annotation.
+        -- Triggers on `annotations` push every insert/delete into the virtual table.
+        -- Note: `args_text` is not a real column on `annotations`; it's computed on the fly
         -- from `args_json` by stripping JSON punctuation. This keeps the schema simple
-        -- (no second column to maintain) while still letting `find_by_attribute(argValue=...)`
-        -- run a trigram match over the values that appear in attribute arguments.
-        CREATE VIRTUAL TABLE IF NOT EXISTS attributes_fts USING fts5(
+        -- (no second column to maintain) while still letting `find_by_annotation(argValue=...)`
+        -- run a trigram match over the values that appear in annotation arguments.
+        CREATE VIRTUAL TABLE IF NOT EXISTS annotations_fts USING fts5(
             args_text,
             content='',
             tokenize='trigram'
         );
 
-        CREATE TRIGGER IF NOT EXISTS attributes_ai AFTER INSERT ON attributes BEGIN
-            INSERT INTO attributes_fts(rowid, args_text)
+        CREATE TRIGGER IF NOT EXISTS annotations_ai AFTER INSERT ON annotations BEGIN
+            INSERT INTO annotations_fts(rowid, args_text)
             VALUES (
                 new.id,
                 COALESCE(
@@ -239,8 +212,8 @@ internal static class Schema
             );
         END;
 
-        CREATE TRIGGER IF NOT EXISTS attributes_ad AFTER DELETE ON attributes BEGIN
-            INSERT INTO attributes_fts(attributes_fts, rowid, args_text)
+        CREATE TRIGGER IF NOT EXISTS annotations_ad AFTER DELETE ON annotations BEGIN
+            INSERT INTO annotations_fts(annotations_fts, rowid, args_text)
             VALUES (
                 'delete',
                 old.id,
@@ -272,11 +245,18 @@ internal static class Schema
     /// Drops every data table and trigger so a fresh schema can be applied.
     /// <c>EnsureSchemaAsync</c> calls this only when the on-disk version is below
     /// <see cref="Version"/>. The index always rebuilds from source on next pass.
+    ///
+    /// Includes drops for the legacy v10-and-earlier <c>attributes</c> / <c>attributes_fts</c>
+    /// names so a v10 DB cleanly rebuilds into the v11 <c>annotations</c> tables.
     /// </summary>
     public const string DropAll = """
         DROP VIEW    IF EXISTS vw_recent_changes;
         DROP TABLE   IF EXISTS symbol_history;
         DROP TABLE   IF EXISTS diagnostics;
+        DROP TRIGGER IF EXISTS annotations_ad;
+        DROP TRIGGER IF EXISTS annotations_ai;
+        DROP TABLE   IF EXISTS annotations_fts;
+        DROP TABLE   IF EXISTS annotations;
         DROP TRIGGER IF EXISTS attributes_ad;
         DROP TRIGGER IF EXISTS attributes_ai;
         DROP TABLE   IF EXISTS attributes_fts;

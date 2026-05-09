@@ -1,3 +1,5 @@
+using System.Collections.Generic;
+
 namespace DevBitsLab.Mcp.SourceGraph.Core;
 
 public sealed record FileNode(
@@ -10,7 +12,7 @@ public sealed record Symbol(
     long Id,
     string Name,
     string Fqn,
-    SymbolKind Kind,
+    string Kind,
     long FileId,
     int StartLine,
     int StartCol,
@@ -45,21 +47,33 @@ public sealed record SymbolReference(
     int Col,
     ReferenceKind Kind);
 
+/// <summary>
+/// One edge between two symbols in the graph. <see cref="Kind"/> is a kebab-case identifier
+/// (<c>"calls"</c>, <c>"inherits"</c>, …); the SDK's <c>EdgeKinds</c> static class supplies
+/// the well-known constants. <see cref="Metadata"/> carries per-edge facts (binding paths,
+/// event names, prop names) that don't fit in the <c>(src, dst, kind)</c> triple — stored as
+/// JSON in the <c>edges.payload</c> column when non-null.
+/// </summary>
 public sealed record Edge(
     long Src,
     long Dst,
-    EdgeKind Kind);
+    string Kind,
+    IReadOnlyDictionary<string, string>? Metadata = null);
 
 /// <summary>
-/// One attribute attached to an indexed symbol, e.g. <c>[HttpGet("/api/users")]</c>.
-/// <see cref="ArgsJson"/> carries a JSON-serialised <see cref="AttributeArgs"/> payload;
-/// <see cref="AttributeSymbolId"/> joins back to <c>symbols</c> when the attribute class
-/// is itself indexed (user-defined attributes), <c>null</c> otherwise (framework/BCL).
+/// One annotation attached to an indexed symbol — a .NET <c>[Attribute]</c>, a TS
+/// <c>@Decorator</c>, a Vue <c>v-directive</c>, etc. <see cref="Flavor"/> discriminates the
+/// annotation pattern across languages (e.g. <c>"csharp-attribute"</c>, <c>"ts-decorator"</c>,
+/// <c>"vue-directive"</c>). <see cref="ArgsJson"/> carries a JSON-serialised
+/// <see cref="AttributeArgs"/> payload; <see cref="AttributeSymbolId"/> joins back to
+/// <c>symbols</c> when the annotation's defining type is itself indexed (user-defined),
+/// <c>null</c> otherwise.
 /// </summary>
-public sealed record AttributeRecord(
+public sealed record AnnotationRecord(
     long SymbolId,
     string Name,
     string FullName,
+    string Flavor,
     string? ArgsJson,
     long? AttributeSymbolId);
 
