@@ -32,14 +32,10 @@ public sealed class MultiScopeTests
         return args.ToArray();
     }
 
-    // Deferred — see openspec/changes/harden-sdk-pre-xaml/tasks.md §12.2.
-    // LiveIndexService.ExecuteAsync registers each ScopeHost with the ScopeRouter
-    // only after `await Task.WhenAll(openTasks)` completes, so the router stays empty
-    // during cold-indexing and `list_scopes` returns "No scopes registered". Unblock
-    // criterion: register scopes with the router synchronously inside OpenScopeAsync
-    // (status="indexing") before indexing starts, transitioning to status="ok" when
-    // indexing completes.
-    [Fact(Skip = "Blocked on live-index router timing — see harden-sdk-pre-xaml tasks.md §12.2")]
+    // §12.2 unblocked: LiveIndexService.OpenScopeAsync now calls _router.Register(host) inline
+    // (status="indexing") before the cold index begins, so list_scopes sees every configured
+    // scope from the moment the process accepts MCP requests.
+    [Fact]
     public async Task ListScopes_tool_reports_every_configured_scope()
     {
         var multiScopeRoot = ServerHarness.LocateFixture("MultiScope");

@@ -42,6 +42,7 @@ public static class ScopedExecution
         if (hosts.Count == 1)
         {
             var host = hosts[0];
+            await WaitUntilReadyAsync(host, ct).ConfigureAwait(false);
             if (host.Status == "degraded")
             {
                 return $"scope `{host.Scope.Id}` is degraded: {host.StatusMessage ?? "(no message)"}";
@@ -55,6 +56,7 @@ public static class ScopedExecution
         var sb = new StringBuilder();
         var results = await Task.WhenAll(hosts.Select(async h =>
         {
+            await WaitUntilReadyAsync(h, ct).ConfigureAwait(false);
             if (h.Status == "degraded")
             {
                 return (h.Scope.Id, $"scope is degraded: {h.StatusMessage ?? "(no message)"}");
@@ -115,6 +117,7 @@ public static class ScopedExecution
         if (hosts.Count == 1)
         {
             var host = hosts[0];
+            await WaitUntilReadyAsync(host, ct).ConfigureAwait(false);
             if (host.Status == "degraded")
             {
                 return DiagnosticResult(
@@ -127,6 +130,7 @@ public static class ScopedExecution
         // Structured content is dropped in the merge — we don't have a typed merge strategy yet.
         var perHost = await Task.WhenAll(hosts.Select(async h =>
         {
+            await WaitUntilReadyAsync(h, ct).ConfigureAwait(false);
             if (h.Status == "degraded")
             {
                 return (h.Scope.Id, DiagnosticResult($"scope is degraded: {h.StatusMessage ?? "(no message)"}"));
@@ -171,6 +175,20 @@ public static class ScopedExecution
         {
             Content = new List<ContentBlock> { new TextContentBlock { Text = message } },
         };
+
+    /// <summary>
+    /// When a scope is mid-cold-index (registered with <c>status="indexing"</c>) the lazy-index-
+    /// on-first-query semantics call for tools to wait until the scope settles into <c>"ok"</c> or
+    /// <c>"degraded"</c> before answering rather than short-circuiting with an empty / no-scope
+    /// diagnostic. <see cref="ScopeHost.Ready"/> completes once on the first transition out of
+    /// <c>"indexing"</c>; the wait is bounded by the caller's <see cref="CancellationToken"/> so a
+    /// stuck index can't hang a tool call indefinitely. No-op when the scope already settled.
+    /// </summary>
+    private static async Task WaitUntilReadyAsync(ScopeHost host, CancellationToken ct)
+    {
+        if (host.Status != "indexing") return;
+        await host.Ready.WaitAsync(ct).ConfigureAwait(false);
+    }
 
     /// <summary>
     /// Fan-out the typed <c>SymbolHit</c> query <paramref name="probe"/> across every resolved

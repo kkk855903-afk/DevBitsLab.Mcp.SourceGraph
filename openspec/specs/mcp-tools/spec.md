@@ -33,7 +33,7 @@ The server SHALL expose a `list_symbols_in_file` tool that lists every symbol de
 - **THEN** the response includes every symbol whose `file_id` joins to a files row whose path matches the suffix, ordered by `start_line`, each annotated with kind, accessibility, modifiers, and (if any) XML summary first sentence
 
 ### Requirement: Caller and callee enumeration
-The server SHALL expose `list_callers` and `list_callees` tools that walk `calls` edges by default, with an optional `kind` parameter that accepts a kebab-case edge kind name (`calls | uses-type | overrides-member | implements-member | instantiates | throws | tests | all`) or any future kind exposed by the active scope's plugins, to filter the edge kind walked.
+The server SHALL expose `list_callers` and `list_callees` tools that walk `calls` edges by default, with an optional `kind` parameter that accepts a kebab-case edge kind name (`calls | uses-type | overrides-member | implements-member | instantiates | throws | tests | all`) or any future kind exposed by the active scope's plugins, to filter the edge kind walked. When an edge row carries a non-null `payload` JSON value, the rendered markdown SHALL include an indented `payload:` sub-line under the edge row, displaying up to the first five key/value pairs from the payload object; if more than five pairs are present, an `(N more)` suffix SHALL indicate the elision count.
 
 #### Scenario: List callers (default = calls)
 - **WHEN** the agent invokes `list_callers(symbol = "Calculator.Add")`
@@ -51,6 +51,18 @@ The server SHALL expose `list_callers` and `list_callees` tools that walk `calls
 - **WHEN** the agent invokes `list_callers(symbol = "X", kind = "not-a-real-kind")` against a scope where no indexer emits `not-a-real-kind`
 - **THEN** the response is an empty result set with a brief note that the kind was not present in the active scope's published `edge_kinds` vocabulary (which unions the SDK constants with the scope's stored kinds, so a built-in kind like `"calls"` is never reported as unknown even on a never-indexed scope)
 
+#### Scenario: Edge with no payload renders unchanged
+- **WHEN** `list_callers` returns an edge whose `payload` column is `NULL` (e.g. a built-in C# `calls` edge today)
+- **THEN** the markdown for that row is exactly the pre-change output — no `payload:` sub-line, no behavioural difference
+
+#### Scenario: Edge with payload renders sub-line
+- **WHEN** `list_callers` returns an edge whose `payload` is `{"path":"User.Name","mode":"two-way","converter":"BoolToVisibility"}`
+- **THEN** the markdown row is followed by an indented line of the form `    payload: { path: "User.Name", mode: "two-way", converter: "BoolToVisibility" }`
+
+#### Scenario: Edge payload truncated when many keys
+- **WHEN** `list_callers` returns an edge whose `payload` carries seven key/value pairs
+- **THEN** the rendered `payload:` sub-line shows the first five keys and appends ` (2 more)` so the agent sees the truncation without inspecting the row separately
+
 ### Requirement: Free-text symbol search
 The server SHALL expose a `search_symbols` tool that runs an FTS5 trigram match over `name`, `fqn`, `signature`, and `xml_summary`, optionally filtered by kind.
 
@@ -64,14 +76,18 @@ The server SHALL expose a `search_symbols` tool that runs an FTS5 trigram match 
 - **WHEN** the agent invokes `search_symbols(query = "retry")` against a graph containing a method documented as `/// <summary>Retries the request on transient errors.</summary>`
 - **THEN** that method is in the response, found via the `xml_summary` FTS column
 
-### Requirement: Local neighborhood
+### Requirement: Neighborhood tool surfaces payload
 The server SHALL expose a `neighborhood` tool that returns the immediate
-callers and callees of a symbol in one call, capped per category.
+callers and callees of a symbol in one call, capped per category. The `neighborhood` tool SHALL render the same `payload:` sub-line under every edge row in its output, applying the same five-key cap and `(N more)` suffix rule as `list_callers` and `list_callees`.
 
 #### Scenario: Quick orientation around a symbol
 - **WHEN** the agent invokes `neighborhood(symbol = "X", perCategory = 20)`
 - **THEN** the response sections show up to 20 callers and 20 callees with
   file:line references, plus the symbol's own definition site
+
+#### Scenario: Neighborhood result with mixed payload presence
+- **WHEN** `neighborhood` returns three edges, one with payload and two without
+- **THEN** only the row with payload carries the indented `payload:` sub-line; the other two render exactly as before
 
 ### Requirement: Module summary
 The server SHALL expose a `module_summary` tool that ranks the symbols in a
@@ -428,4 +444,11 @@ When an MCP client did not include a `progressToken` on the originating `tools/c
 #### Scenario: Progress messages carry no user input
 - **WHEN** any progress notification is emitted by an opted-in tool
 - **THEN** its `Message` string is one of the documented short imperatives (`"encoding query"`, `"searching"`, `"formatting results"`, `"querying"`) and does not interpolate any caller-supplied argument value (symbol name, query text, file path, etc.) into the message
+
+### Requirement: Always-render-payload pattern is consistent across tools
+Any MCP tool that renders per-edge result rows SHALL use the same indented `payload:` sub-line pattern, the same five-key cap, and the same `(N more)` suffix when payload truncation occurs. New tools MUST NOT invent alternative payload rendering shapes; the consistency lets agents and humans skim multi-tool output without re-learning the format.
+
+#### Scenario: Future tool emits per-edge rows
+- **WHEN** a new MCP tool that walks edges (e.g. an `inspect_edge` follow-up) renders results
+- **THEN** its row format includes the same `payload:` sub-line shape with the same truncation rule, by reusing the shared rendering helper rather than implementing a parallel format
 

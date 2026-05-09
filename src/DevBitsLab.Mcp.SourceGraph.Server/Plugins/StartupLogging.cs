@@ -23,7 +23,11 @@ internal static class StartupLogging
     {
         var factory = LoggerFactory.Create(b =>
         {
-            b.SetMinimumLevel(LogLevel.Information);
+            // Match RunServeAsync's DI logger min-level. Plugin discovery + vocab computation are
+            // bootstrap-time concerns and only run inside `serve`; their info-level chatter would
+            // otherwise show up on the same stderr channel the MCP `initialize` integration tests
+            // assert is silent. Warnings/errors still flow through.
+            b.SetMinimumLevel(LogLevel.Warning);
             b.AddSimpleConsole(o =>
             {
                 o.SingleLine = true;

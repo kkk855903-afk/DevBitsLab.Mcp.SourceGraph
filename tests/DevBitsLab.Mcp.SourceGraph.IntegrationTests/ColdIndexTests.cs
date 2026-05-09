@@ -38,14 +38,11 @@ public sealed class ColdIndexTests
         return args.ToArray();
     }
 
-    // Deferred — see openspec/changes/harden-sdk-pre-xaml/tasks.md §12.3.
-    // Same root cause as §12.2 plus a tools-side gap: ScopeRouter.Resolve short-
-    // circuits with "No scopes are registered" when called during cold-indexing,
-    // and `find_definition` returns immediately rather than waiting for the lazy-
-    // index-on-first-query semantics the spec calls for. Unblock criterion: tools
-    // wait until at least one matching scope reaches status="ok" (bounded by the
-    // existing IndexAndQueryTimeout) before returning "no scopes" empties.
-    [Fact(Skip = "Blocked on lazy-index-readiness — see harden-sdk-pre-xaml tasks.md §12.3")]
+    // §12.3 unblocked: ScopedExecution.RunAsync now awaits ScopeHost.Ready when the host is
+    // mid-cold-index, bounded by the caller's CancellationToken (which the test wires to
+    // IndexAndQueryTimeout). Combined with §12.2 (the host is registered with status="indexing"
+    // before indexing starts), find_definition no longer short-circuits during cold-indexing.
+    [Fact]
     public async Task FindDefinition_resolves_known_fixture_symbol_after_initialize()
     {
         var sln = ServerHarness.LocateFixture("Sample.sln");

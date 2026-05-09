@@ -14,6 +14,8 @@ namespace DevBitsLab.Mcp.SourceGraph.Server.Scoping;
 /// </summary>
 public sealed class ScopeHost : IAsyncDisposable
 {
+    private readonly TaskCompletionSource<bool> _readiness = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
     public ScopeHost(
         Scope scope,
         SqliteGraphStore store,
@@ -28,6 +30,23 @@ public sealed class ScopeHost : IAsyncDisposable
         SolutionPath = solutionPath;
         Status = "ok";
     }
+
+    /// <summary>
+    /// Completes the first time this scope's initial bring-up settles into either <c>"ok"</c> or
+    /// <c>"degraded"</c>. Tools wait on this when called against a scope that's still
+    /// <c>"indexing"</c> so the lazy-index-on-first-query path doesn't return "no scopes" while a
+    /// cold index is in flight. Subsequent watcher-driven reindexes do not toggle <see cref="Status"/>
+    /// back to <c>"indexing"</c>, so a one-shot completion is sufficient.
+    /// </summary>
+    public Task Ready => _readiness.Task;
+
+    /// <summary>
+    /// Mark the initial bring-up as settled. Idempotent — only the first call has effect, so it's
+    /// safe to invoke from every status-transition site in <c>LiveIndexService.RunInitialIndexAsync</c>
+    /// (notably from its <c>finally</c>, which fires on both the ok and degraded paths so waiters
+    /// always see the host's terminal status rather than hang).
+    /// </summary>
+    public void MarkReady() => _readiness.TrySetResult(true);
 
     public Scope Scope { get; }
     public SqliteGraphStore Store { get; }

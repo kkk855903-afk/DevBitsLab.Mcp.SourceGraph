@@ -39,15 +39,10 @@ public sealed class InitializeTests
         return args.ToArray();
     }
 
-    // Deferred — see openspec/changes/harden-sdk-pre-xaml/tasks.md §12.1.
-    // Server emits info-level lifecycle logs to stderr (Microsoft.Hosting.Lifetime,
-    // StdioServerTransport startup) because RunServeAsync sets
-    // LogToStandardErrorThreshold = LogLevel.Trace with no min-level cap. The test's
-    // empty-stderr assertion is the spec contract; tightening the server's logging
-    // policy is a separate behavioral decision (other call sites rely on info logs in
-    // CI / shell sessions). Unblock criterion: server min-level logging cap or move
-    // info-level logs off stderr.
-    [Fact(Skip = "Blocked on server stderr leakage — see harden-sdk-pre-xaml tasks.md §12.1")]
+    // §12.1 unblocked: RunServeAsync now caps min-level to Warning so info-level lifecycle
+    // chatter (Microsoft.Hosting.Lifetime, StdioServerTransport) stays off stderr during the
+    // initialize handshake. Plugin-host startup uses StartupLogging which inherits the same cap.
+    [Fact]
     public async Task Initialize_against_Sample_returns_capabilities_within_timeout()
     {
         var sln = ServerHarness.LocateFixture("Sample.sln");

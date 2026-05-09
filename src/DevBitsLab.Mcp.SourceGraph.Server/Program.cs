@@ -60,6 +60,14 @@ static async Task<int> RunServeAsync(CommandLine cli)
 {
     var builder = Host.CreateApplicationBuilder();
     builder.Logging.AddConsole(o => o.LogToStandardErrorThreshold = LogLevel.Trace);
+    // Cap min-level to Warning during `serve`. The MCP transport speaks JSON-RPC over stdout;
+    // stderr is the only safe channel for unstructured logs but it's still observed by every
+    // client (see ServerHarness.StderrLines). Info-level lifecycle chatter from
+    // Microsoft.Hosting.Lifetime + StdioServerTransport during initialize would otherwise leak
+    // there. Warnings/errors still flow through because those genuinely indicate problems an
+    // operator should see. Other CLI verbs (index, stats, scopes, plugins, vocabulary) build
+    // their own logger and keep info-level output for terminal users.
+    builder.Logging.SetMinimumLevel(LogLevel.Warning);
 
     var repoRoot = cli.ResolvedRepoRoot();
 

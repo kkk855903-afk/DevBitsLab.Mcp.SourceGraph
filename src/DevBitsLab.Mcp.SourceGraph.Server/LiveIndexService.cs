@@ -1,3 +1,4 @@
+using System.Diagnostics.CodeAnalysis;
 using DevBitsLab.Mcp.SourceGraph.Core;
 using DevBitsLab.Mcp.SourceGraph.Embeddings;
 using DevBitsLab.Mcp.SourceGraph.Indexing;
@@ -33,6 +34,10 @@ public sealed class LiveIndexService : BackgroundService
     private readonly AnalyzerPipeline _analyzerPipeline;
     private readonly ILogger<LiveIndexService> _logger;
     private readonly ILoggerFactory _loggerFactory;
+    // Hosts prepared during StartAsync — registered with the router with status="indexing" before
+    // the MCP transport (registered after us in DI order) starts accepting requests. ExecuteAsync
+    // drives the cold-index against this list; ScopeHost.Ready completes for tools waiting on it.
+    private List<ScopeHost> _preparedHosts = new();
 
     public LiveIndexService(
         LiveIndexConfig config,
@@ -58,6 +63,36 @@ public sealed class LiveIndexService : BackgroundService
         _loggerFactory = loggerFactory;
     }
 
+    public override async Task StartAsync(CancellationToken cancellationToken)
+    {
+        // The MCP stdio transport is registered as an IHostedService after this one and starts
+        // accepting JSON-RPC requests as soon as the host's StartAsync chain completes. To close
+        // the race where list_scopes / find_definition fire against an empty router, prepare each
+        // scope here — opening its graph store, registering it with the router with
+        // status="indexing", and persisting the registry row — before yielding to the next
+        // hosted service. The actual cold index runs in ExecuteAsync; tools that hit a still-
+        // indexing scope wait on ScopeHost.Ready until the indexer settles.
+        if (_config.Scopes.Count > 0)
+        {
+            await _registry.EnsureSchemaAsync(cancellationToken).ConfigureAwait(false);
+
+            _logger.LogInformation("Preparing {Count} scope(s) for live indexing: {Ids}",
+                _config.Scopes.Count, string.Join(", ", _config.Scopes.Select(s => s.Id)));
+
+            // Prepare scopes concurrently — store creation + schema migration + registration are
+            // independent across scopes. PrepareScopeAsync's broad catch swallows in-scope
+            // failures and returns null; OperationCanceledException is rethrown (so cooperative
+            // shutdown propagates) and registry writes in the catch path are best-effort
+            // (try/catch around the degraded upsert), so neither path leaks past this barrier.
+            var prepareTasks = _config.Scopes
+                .Select(scope => PrepareScopeAsync(scope, cancellationToken))
+                .ToArray();
+            var prepared = await Task.WhenAll(prepareTasks).ConfigureAwait(false);
+            _preparedHosts = prepared.Where(h => h is not null).Select(h => h!).ToList();
+        }
+        await base.StartAsync(cancellationToken).ConfigureAwait(false);
+    }
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         // BackgroundService.ExecuteAsync is awaited by the host's StartAsync chain in some
@@ -65,30 +100,25 @@ public sealed class LiveIndexService : BackgroundService
         // long-running cold-index work from the startup path so MCP stdio transport (which sits
         // alongside us in the same host) starts processing requests right away.
         await Task.Yield();
-        if (_config.Scopes.Count == 0)
+        if (_preparedHosts.Count == 0)
         {
-            _logger.LogInformation("No scopes registered; live indexing is disabled. Tools will only see whatever's already in the database.");
+            if (_config.Scopes.Count == 0)
+            {
+                _logger.LogInformation("No scopes registered; live indexing is disabled. Tools will only see whatever's already in the database.");
+            }
             return;
         }
 
-        await _registry.EnsureSchemaAsync(stoppingToken).ConfigureAwait(false);
+        // Run the cold index for every prepared scope concurrently. Each call settles its own
+        // host status to "ok" or "degraded" and calls MarkReady so tools waiting on
+        // ScopeHost.Ready can proceed.
+        var indexTasks = _preparedHosts.Select(host => RunInitialIndexAsync(host, stoppingToken)).ToArray();
+        await Task.WhenAll(indexTasks).ConfigureAwait(false);
 
-        // Open every scope concurrently. A scope that fails initial-index marks itself degraded
-        // in the registry; the rest of the host stays up.
-        _logger.LogInformation("Opening {Count} scope(s) in parallel: {Ids}",
-            _config.Scopes.Count, string.Join(", ", _config.Scopes.Select(s => s.Id)));
-        var openTasks = _config.Scopes.Select(scope => OpenScopeAsync(scope, stoppingToken)).ToArray();
-        var hosts = await Task.WhenAll(openTasks).ConfigureAwait(false);
-
-        foreach (var host in hosts.Where(h => h is not null))
+        // Start watching every scope that finished cold-indexing cleanly.
+        foreach (var host in _preparedHosts.Where(h => h.Status == "ok"))
         {
-            _router.Register(host!);
-        }
-
-        // Start watching every scope that opened cleanly.
-        foreach (var host in hosts.Where(h => h is not null && h!.Status == "ok"))
-        {
-            StartWatcher(host!, stoppingToken);
+            StartWatcher(host, stoppingToken);
         }
 
         // Block until shutdown; watchers run on tasks they started themselves.
@@ -99,7 +129,16 @@ public sealed class LiveIndexService : BackgroundService
         catch (OperationCanceledException) { /* shutting down */ }
     }
 
-    private async Task<ScopeHost?> OpenScopeAsync(Scope scope, CancellationToken ct)
+    /// <summary>
+    /// Phase 1 of scope bring-up. Runs during <see cref="StartAsync"/> before MCP starts accepting
+    /// requests: opens the graph store, prepares the embeddings drain (if available), constructs
+    /// the indexer, builds the <see cref="ScopeHost"/>, and registers it with the router with
+    /// <c>status="indexing"</c>. No solution loading or cold-index work happens here — that's
+    /// phase 2 (<see cref="RunInitialIndexAsync"/>) which runs in <see cref="ExecuteAsync"/>.
+    /// </summary>
+    [SuppressMessage("Design", "CA1031:DoNotCatchGeneralExceptionTypes",
+        Justification = "Bring-up of any single scope must not crash the host: a per-scope failure (Roslyn workspace, plugin embeddings, malformed config, transient I/O) marks that scope `degraded` in the registry and lets every other scope and the MCP transport keep running. The exception is logged + persisted before the catch returns.")]
+    private async Task<ScopeHost?> PrepareScopeAsync(Scope scope, CancellationToken ct)
     {
         var solutionPath = ResolvePrimarySolution(scope);
         var dbPath = ScopeLayout.ScopeDbPath(scope.Root, scope.Id);
@@ -154,48 +193,16 @@ public sealed class LiveIndexService : BackgroundService
                 EmbeddingsSink = scopeSink,
                 EmbeddingsService = scopeEmbeddings,
             };
-            // Register with status=indexing first so list_scopes can show progress.
             host.Status = "indexing";
+            // Persist the registry row BEFORE registering with the router. If the registry
+            // upsert throws, the catch path disposes the host and never registers it, so we
+            // can't end up with a disposed ScopeHost stranded in the router with status
+            // "indexing" (which would hang any tool waiting on ScopeHost.Ready and trip a
+            // double-dispose during StopAsync). Once the upsert succeeds, registration is a
+            // pure dictionary insert under a lock and is the last fallible step here.
             await _registry.UpsertAsync(ToRow(scope, host.Status, null), ct).ConfigureAwait(false);
-
-            if (string.IsNullOrEmpty(solutionPath))
-            {
-                _logger.LogInformation("Scope `{Id}` has no resolvable solution; skipping cold index", scope.Id);
-                host.Status = "ok"; // empty graph but openable
-                await _registry.UpsertAsync(ToRow(scope, host.Status, null), ct).ConfigureAwait(false);
-                return host;
-            }
-
-            try
-            {
-                await indexer.OpenAsync(solutionPath, ct).ConfigureAwait(false);
-                var initial = await indexer.IndexAllAsync(ct).ConfigureAwait(false);
-                _logger.LogInformation("Scope `{Id}` initial index complete in {Elapsed}: {Files} files re-processed",
-                    scope.Id, initial.Elapsed, initial.FilesIndexed);
-
-                // Plugin analyzers: walk every indexed file and dispatch the registered analyzers.
-                // Done after the cold index so the per-scope graph already has the symbols /
-                // attributes the analyzers want to consume. Skipped silently when the plugin host
-                // has no analyzers, which is the v0.5.0 zero-config path.
-                if (_analyzerPipeline.HasAnalyzers)
-                {
-                    await DispatchAnalyzersForScopeAsync(host, ct).ConfigureAwait(false);
-                }
-
-                host.Status = "ok";
-                host.LastIndexedAt = DateTimeOffset.UtcNow;
-                await _registry.UpsertAsync(ToRow(scope, host.Status, null), ct).ConfigureAwait(false);
-                return host;
-            }
-            catch (OperationCanceledException) { throw; }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Scope `{Id}` initial indexing failed; marking degraded", scope.Id);
-                host.Status = "degraded";
-                host.StatusMessage = ex.Message;
-                await _registry.UpsertAsync(ToRow(scope, host.Status, host.StatusMessage), ct).ConfigureAwait(false);
-                return host;
-            }
+            _router.Register(host);
+            return host;
         }
         catch (OperationCanceledException) { throw; }
         catch (Exception ex)
@@ -209,13 +216,85 @@ public sealed class LiveIndexService : BackgroundService
                 scopeSink?.Complete();
                 using var stopCts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
                 try { await scopeEmbeddings.StopAsync(stopCts.Token).ConfigureAwait(false); }
-                catch { /* best-effort */ }
+                catch (Exception stopEx)
+                {
+                    _logger.LogDebug(stopEx, "Scope `{Id}` embeddings drain failed to stop cleanly", scope.Id);
+                }
                 scopeEmbeddings.Dispose();
             }
             if (indexer is not null) await indexer.DisposeAsync().ConfigureAwait(false);
             if (store is not null) await store.DisposeAsync().ConfigureAwait(false);
-            await _registry.UpsertAsync(ToRow(scope, "degraded", ex.Message), ct).ConfigureAwait(false);
+            // Best-effort registry write — if the original failure was a registry/storage issue
+            // this second call probably also throws. Logging the secondary failure is enough;
+            // the primary failure was already logged above and a missing degraded row in the
+            // registry is recoverable on next bring-up.
+            try
+            {
+                await _registry.UpsertAsync(ToRow(scope, "degraded", ex.Message), ct).ConfigureAwait(false);
+            }
+            catch (Exception upsertEx)
+            {
+                _logger.LogWarning(upsertEx, "Scope `{Id}` could not persist degraded row to registry", scope.Id);
+            }
             return null;
+        }
+    }
+
+    /// <summary>
+    /// Phase 2 of scope bring-up. Runs during <see cref="ExecuteAsync"/> after MCP is already
+    /// accepting requests against the prepared (status="indexing") host. Opens the solution,
+    /// runs the cold index, dispatches plugin analyzers, then settles <see cref="ScopeHost.Status"/>
+    /// to either <c>"ok"</c> or <c>"degraded"</c> and calls <see cref="ScopeHost.MarkReady"/> so
+    /// tools waiting on <see cref="ScopeHost.Ready"/> can proceed.
+    /// </summary>
+    [SuppressMessage("Design", "CA1031:DoNotCatchGeneralExceptionTypes",
+        Justification = "Cold-indexing surface area spans Roslyn workspace open, MSBuild project load, our own indexer, and arbitrary plugin analyzers — any of which can throw any exception type. The broad catch logs, marks the scope `degraded`, persists the message to the registry, and signals readiness via the finally so waiting tools see the failure rather than hang. The host stays up to serve healthy scopes.")]
+    private async Task RunInitialIndexAsync(ScopeHost host, CancellationToken ct)
+    {
+        var scope = host.Scope;
+        var solutionPath = host.SolutionPath;
+        if (string.IsNullOrEmpty(solutionPath))
+        {
+            _logger.LogInformation("Scope `{Id}` has no resolvable solution; skipping cold index", scope.Id);
+            host.Status = "ok"; // empty graph but openable
+            await _registry.UpsertAsync(ToRow(scope, host.Status, null), ct).ConfigureAwait(false);
+            host.MarkReady();
+            return;
+        }
+
+        try
+        {
+            await host.Indexer.OpenAsync(solutionPath, ct).ConfigureAwait(false);
+            var initial = await host.Indexer.IndexAllAsync(ct).ConfigureAwait(false);
+            _logger.LogInformation("Scope `{Id}` initial index complete in {Elapsed}: {Files} files re-processed",
+                scope.Id, initial.Elapsed, initial.FilesIndexed);
+
+            // Plugin analyzers: walk every indexed file and dispatch the registered analyzers.
+            // Done after the cold index so the per-scope graph already has the symbols /
+            // attributes the analyzers want to consume. Skipped silently when the plugin host
+            // has no analyzers, which is the v0.5.0 zero-config path.
+            if (_analyzerPipeline.HasAnalyzers)
+            {
+                await DispatchAnalyzersForScopeAsync(host, ct).ConfigureAwait(false);
+            }
+
+            host.Status = "ok";
+            host.LastIndexedAt = DateTimeOffset.UtcNow;
+            await _registry.UpsertAsync(ToRow(scope, host.Status, null), ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Scope `{Id}` initial indexing failed; marking degraded", scope.Id);
+            host.Status = "degraded";
+            host.StatusMessage = ex.Message;
+            await _registry.UpsertAsync(ToRow(scope, host.Status, host.StatusMessage), ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            // Always settle the readiness signal — both ok and degraded are valid post-bring-up
+            // terminal states for the per-scope Ready task.
+            host.MarkReady();
         }
     }
 
