@@ -11,7 +11,13 @@ namespace DevBitsLab.Mcp.SourceGraph.Tests;
 /// <c>ActivitySource</c> + <c>Meter</c>, and <see cref="ToolMetrics"/> emits well-formed signals
 /// for every tool call. Each test uses a unique tool name so it can filter out signals produced
 /// by other tests sharing the static <c>Telemetry</c> instances.
+///
+/// One test below reads <see cref="ToolMetrics.TrackAsync"/>'s return value, which the
+/// add-leaf-brand-mark chokepoint now decorates with a leaf prefix. Joins the
+/// <c>LeafFormatterState</c> collection so it doesn't race with tests that flip
+/// <c>LeafFormatter.Suppressed</c>.
 /// </summary>
+[Collection("LeafFormatterState")]
 public sealed class TelemetrySignalTests
 {
     [Fact]
@@ -121,8 +127,9 @@ public sealed class TelemetrySignalTests
     public async Task TrackAsync_withoutAnyListeners_runsAndReturnsBodyResult()
     {
         // Sanity: no ActivityListener, no MeterListener — Track* must not throw and must surface
-        // the body's return value unchanged. The cost path collapses to a null-Activity using-block
-        // plus instrument calls into unwatched Counter/Histogram instances.
+        // the body's return value (with the brand-mark prefix from the add-leaf-brand-mark
+        // chokepoint applied per design.md Decision 3). The cost path collapses to a null-Activity
+        // using-block plus instrument calls into unwatched Counter/Histogram instances.
         const string toolName = "test_otel_no_listener";
 
         var result = await ToolMetrics.TrackAsync(
@@ -130,8 +137,82 @@ public sealed class TelemetrySignalTests
             args: null,
             () => Task.FromResult("result-from-body"));
 
-        result.Should().Be("result-from-body");
+        result.Should().Be("\U0001F33F result-from-body");
     }
+
+    // ── Multi-content overloads (tool-output-content-blocks) ─────────────────────────────
+
+    [Fact]
+    public async Task TrackAsync_contentList_brandsFirstTextBlock_andReturnsList()
+    {
+        // The IReadOnlyList<ContentBlock> overload routes the body's content list through the leaf
+        // chokepoint, which prefixes the first user-visible text block. Audience-restricted blocks
+        // are skipped. Other items (resource links etc.) flow through unchanged.
+        var content = new ModelContextProtocol.Protocol.ContentBlock[]
+        {
+            new ModelContextProtocol.Protocol.TextContentBlock { Text = "found 3 things" },
+            new ModelContextProtocol.Protocol.ResourceLinkBlock { Uri = "graph://symbol/1", Name = "X" },
+        };
+        var result = await ToolMetrics.TrackAsync(
+            "test_content_overload",
+            args: null,
+            () => Task.FromResult<IReadOnlyList<ModelContextProtocol.Protocol.ContentBlock>>(content));
+
+        result.Count.Should().Be(2);
+        ((ModelContextProtocol.Protocol.TextContentBlock)result[0]).Text.Should().StartWith("\U0001F33F ");
+        result[1].Should().BeOfType<ModelContextProtocol.Protocol.ResourceLinkBlock>();
+    }
+
+    [Fact]
+    public async Task TrackAsync_callToolResult_brandsAndReturns_withStructuredContentIntact()
+    {
+        var dto = new TestStructuredDto("ok", 42);
+        var result = await ToolMetrics.TrackAsync(
+            "test_calltoolresult_overload",
+            args: null,
+            () => Task.FromResult(new ModelContextProtocol.Protocol.CallToolResult
+            {
+                Content = new List<ModelContextProtocol.Protocol.ContentBlock>
+                {
+                    new ModelContextProtocol.Protocol.TextContentBlock { Text = "1 hit" },
+                },
+                StructuredContent = System.Text.Json.JsonSerializer.SerializeToElement(dto),
+            }));
+
+        ((ModelContextProtocol.Protocol.TextContentBlock)result.Content![0]).Text.Should().StartWith("\U0001F33F ");
+        result.StructuredContent.Should().NotBeNull();
+    }
+
+    // Note: the change's design called for a runtime anonymous-type guard on
+    // CallToolResult.StructuredContent and Meta. On implementation the SDK was found to type
+    // those properties as JsonElement? and JsonObject? respectively — anonymous types fail at
+    // *compile* time, not runtime, so the guard would be unreachable. Test removed; the typed
+    // DTO discipline still applies (the JsonElement boxes only accept pre-serialized payloads).
+
+    [Fact]
+    public async Task TrackAsync_callToolResult_isErrorTrue_recordsAsErrorInTelemetry()
+    {
+        const string toolName = "test_calltoolresult_iserror";
+        var samples = new List<MeasurementSample>();
+        using var listener = SubscribeMeter(samples, toolName);
+
+        await ToolMetrics.TrackAsync(toolName, args: null, () => Task.FromResult(new ModelContextProtocol.Protocol.CallToolResult
+        {
+            Content = new List<ModelContextProtocol.Protocol.ContentBlock>
+            {
+                new ModelContextProtocol.Protocol.TextContentBlock { Text = "tool reported failure" },
+            },
+            IsError = true,
+        }));
+
+        // Cast Value to long to keep CodeQL's float-equality lint quiet — these are integer
+        // counters (Counter<long>.Add(1) on the metric instrument), so the read-back is exactly
+        // representable and the cast loses no information.
+        samples.Should().Contain(s => s.Instrument == "sourcegraph.tool.calls" && (long)s.Value == 1L);
+        samples.Should().Contain(s => s.Instrument == "sourcegraph.tool.errors" && (long)s.Value == 1L);
+    }
+
+    private sealed record TestStructuredDto(string Status, int Value);
 
     [Fact]
     public void Telemetry_exposesPublicNameMatchingTheSpec()

@@ -16,6 +16,9 @@ internal sealed class CommandLine
     /// <summary>True when <c>--no-instructions</c> was passed; suppresses the server-published
     /// usage guidance string in the MCP <c>initialize</c> response.</summary>
     public bool NoInstructions { get; private init; }
+    /// <summary>True when <c>--no-leaf</c> was passed; suppresses the green-leaf brand mark on
+    /// every built-in tool response and on the published <c>ServerInstructions</c> string.</summary>
+    public bool NoLeaf { get; private init; }
     /// <summary>True when <c>--strict</c> was passed; consumed by <c>vocabulary list</c> to exit
     /// non-zero when drift candidates are reported.</summary>
     public bool Strict { get; private init; }
@@ -38,6 +41,7 @@ internal sealed class CommandLine
         var noEmbeddings = false;
         var noHistory = false;
         var noInstructions = false;
+        var noLeaf = false;
         var strict = false;
         string? scopeId = null;
         var positional = new List<string>();
@@ -69,6 +73,9 @@ internal sealed class CommandLine
                     break;
                 case "--no-instructions":
                     noInstructions = true;
+                    break;
+                case "--no-leaf":
+                    noLeaf = true;
                     break;
                 case "--strict":
                     strict = true;
@@ -107,6 +114,7 @@ internal sealed class CommandLine
             NoEmbeddings = noEmbeddings,
             NoHistory = noHistory,
             NoInstructions = noInstructions,
+            NoLeaf = noLeaf,
             Strict = strict,
             ScopeId = scopeId,
             Positional = positional,
@@ -205,6 +213,9 @@ internal sealed class CommandLine
                             git on PATH or in CI runs where per-symbol history isn't needed.
           --no-instructions Don't publish server-side usage guidance in the MCP `initialize`
                             response. Equivalent to setting SOURCEGRAPH_NO_INSTRUCTIONS=1.
+          --no-leaf         Don't prefix tool responses (or the published `ServerInstructions`
+                            string) with the green-leaf brand mark. Equivalent to setting
+                            SOURCEGRAPH_NO_LEAF=1.
           --scope <id>      Restrict the operation to a single scope. Currently consumed by
                             `vocabulary list`; ignored elsewhere.
           --strict          Treat warnings as errors. Currently consumed by `vocabulary list`,

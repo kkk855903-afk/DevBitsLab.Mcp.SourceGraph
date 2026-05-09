@@ -1,5 +1,6 @@
 using System.Text;
 using DevBitsLab.Mcp.SourceGraph.Storage;
+using ModelContextProtocol.Protocol;
 
 namespace DevBitsLab.Mcp.SourceGraph.Server.Scoping;
 
@@ -32,7 +33,12 @@ public static class ScopedExecution
             return "No scopes matched.";
         }
 
-        // Common shortcut for single-host: no header dance, no merging.
+        // Common shortcut for single-host: no header dance, no merging. Implicit-scope
+        // annotation removed — it landed on response line 1 and competed with the leaf brand
+        // mark for visual real estate in chat clients (italic markdown chrome adjacent to the
+        // glyph). Agents that want to know which scope answered can call list_scopes / inspect
+        // graph_stats. ScopeResolution.IsImplicit is preserved on the record for future use
+        // (e.g. footer placement, telemetry tag).
         if (hosts.Count == 1)
         {
             var host = hosts[0];
@@ -40,10 +46,7 @@ public static class ScopedExecution
             {
                 return $"scope `{host.Scope.Id}` is degraded: {host.StatusMessage ?? "(no message)"}";
             }
-            var body = await onResolved(host).ConfigureAwait(false);
-            return resolution.IsImplicit
-                ? $"_(scope: `{host.Scope.Id}`)_\n\n{body}"
-                : body;
+            return await onResolved(host).ConfigureAwait(false);
         }
 
         // Multi-host: render each scope's response in turn, prefixed with the scope id. Tools that
@@ -77,6 +80,97 @@ public static class ScopedExecution
         }
         return sb.ToString();
     }
+
+    /// <summary>
+    /// Sibling of the legacy string-returning <see cref="RunAsync(ScopeRouter, object?, Func{ScopeHost, Task{string}}, CancellationToken)"/>
+    /// for tools that have evolved to <c>Task&lt;CallToolResult&gt;</c>. Resolves the scope and:
+    /// <list type="bullet">
+    ///   <item>On error / no hosts / degraded-with-explicit-target — returns a
+    ///     <see cref="CallToolResult"/> whose first <see cref="TextContentBlock"/> carries the
+    ///     diagnostic message (no <see cref="CallToolResult.IsError"/> flag — this matches the
+    ///     existing-string overload's "diagnostic-as-prose" convention so behaviour is invariant
+    ///     between the two paths).</item>
+    ///   <item>Single resolved host — invokes <paramref name="onResolved"/> and returns its result
+    ///     verbatim.</item>
+    ///   <item>Multi-host fan-out — runs <paramref name="onResolved"/> per host in parallel, then
+    ///     concatenates the resulting <see cref="CallToolResult.Content"/> lists with a
+    ///     per-scope <c>### scope: `id`</c> header text block, mirroring the legacy overload's
+    ///     prose merge. Per-call <see cref="CallToolResult.StructuredContent"/> values are dropped
+    ///     in this path — the wire shape of merged structured output is sweep-level work and not
+    ///     wired up by the vertical slice.</item>
+    /// </list>
+    /// </summary>
+    public static async Task<CallToolResult> RunAsync(
+        ScopeRouter router,
+        object? scope,
+        Func<ScopeHost, Task<CallToolResult>> onResolved,
+        CancellationToken ct)
+    {
+        var resolution = router.Resolve(scope);
+        if (resolution.IsError) return DiagnosticResult(resolution.ErrorMessage!);
+
+        var hosts = resolution.Hosts;
+        if (hosts.Count == 0) return DiagnosticResult("No scopes matched.");
+
+        if (hosts.Count == 1)
+        {
+            var host = hosts[0];
+            if (host.Status == "degraded")
+            {
+                return DiagnosticResult(
+                    $"scope `{host.Scope.Id}` is degraded: {host.StatusMessage ?? "(no message)"}");
+            }
+            return await onResolved(host).ConfigureAwait(false);
+        }
+
+        // Multi-host fan-out: parallel-run, then concatenate Content lists with a per-scope header.
+        // Structured content is dropped in the merge — we don't have a typed merge strategy yet.
+        var perHost = await Task.WhenAll(hosts.Select(async h =>
+        {
+            if (h.Status == "degraded")
+            {
+                return (h.Scope.Id, DiagnosticResult($"scope is degraded: {h.StatusMessage ?? "(no message)"}"));
+            }
+            try
+            {
+                var body = await onResolved(h).ConfigureAwait(false);
+                return (h.Scope.Id, body);
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex)
+            {
+                return (h.Scope.Id, DiagnosticResult($"scope query failed: {ex.Message}"));
+            }
+        })).ConfigureAwait(false);
+
+        var merged = new List<ContentBlock>();
+        var anyError = false;
+        foreach (var (id, body) in perHost)
+        {
+            merged.Add(new TextContentBlock { Text = $"### scope: `{id}`" });
+            if (body.Content is { Count: > 0 } blocks)
+            {
+                foreach (var b in blocks) merged.Add(b);
+            }
+            // OR per-scope IsError flags so a single failed scope marks the merged response as
+            // an error — keeps ToolMetrics' ok/err telemetry honest. StructuredContent merging
+            // is still deferred (sweep-level work), but error propagation is cheap and
+            // cross-cutting, so we land it here.
+            if (body.IsError == true) anyError = true;
+        }
+        return new CallToolResult { Content = merged, IsError = anyError ? true : null };
+    }
+
+    /// <summary>
+    /// Build a single-text <see cref="CallToolResult"/> carrying a diagnostic message. Used by the
+    /// scope-resolution short-circuits so the diagnostic reaches the leaf chokepoint as a
+    /// brand-able first text block.
+    /// </summary>
+    private static CallToolResult DiagnosticResult(string message) =>
+        new()
+        {
+            Content = new List<ContentBlock> { new TextContentBlock { Text = message } },
+        };
 
     /// <summary>
     /// Fan-out the typed <c>SymbolHit</c> query <paramref name="probe"/> across every resolved

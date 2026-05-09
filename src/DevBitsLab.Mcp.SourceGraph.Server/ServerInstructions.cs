@@ -1,3 +1,5 @@
+using DevBitsLab.Mcp.SourceGraph.Server.Tools;
+
 namespace DevBitsLab.Mcp.SourceGraph.Server;
 
 /// <summary>
@@ -6,7 +8,9 @@ namespace DevBitsLab.Mcp.SourceGraph.Server;
 /// tool's description in the catalog. This string carries only what doesn't fit there:
 /// (1) the rule to prefer source-graph tools over Grep+Read for symbol-level questions, and
 /// (2) the closing directive to call <c>usage_stats</c> at end-of-turn to verify the graph
-/// was actually queried.
+/// was actually queried. The leading <c>🌿 </c> teaches the connecting client the leaf-glyph-
+/// to-<c>sourcegraph</c> association from the initialize handshake (suppressed at publish time
+/// when <see cref="LeafFormatter.Suppressed"/> is true).
 /// </summary>
 internal static class ServerInstructions
 {
@@ -27,7 +31,7 @@ internal static class ServerInstructions
 
     public const string Template =
         """
-        This MCP server exposes a live code source graph for the connected .NET solution.
+        🌿 This MCP server exposes a live code source graph for the connected .NET solution.
         For symbol-level questions ("where is X defined?", "who calls X?", "what's in this
         file?", "what would change if I edit X?", and similar) prefer these tools before
         reaching for Grep + Read — the graph answers in one structured call instead of
@@ -42,4 +46,17 @@ internal static class ServerInstructions
         If the counts didn't move, you fell back to Grep + Read on a question a graph tool
         would have answered faster.
         """;
+
+    /// <summary>
+    /// Returns the value to publish into <c>McpServerOptions.ServerInstructions</c>. Honours
+    /// <see cref="LeafFormatter.Suppressed"/>: when set, strips the leading <c>🌿 </c> prefix
+    /// from <see cref="Template"/> before returning. The two suppression knobs
+    /// (<c>--no-instructions</c> and <c>--no-leaf</c>) compose independently — this helper
+    /// only handles leaf-suppression. The instructions-suppression check (skip publishing
+    /// entirely) lives at the call site in <c>Program.cs</c>.
+    /// </summary>
+    public static string ResolvePublished() =>
+        LeafFormatter.Suppressed && Template.StartsWith(LeafFormatter.Mark, System.StringComparison.Ordinal)
+            ? Template[LeafFormatter.Mark.Length..]
+            : Template;
 }

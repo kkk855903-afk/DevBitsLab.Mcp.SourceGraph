@@ -1,6 +1,9 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Text;
 using System.Text.Json;
+using DevBitsLab.Mcp.SourceGraph.Server.Tools;
+using ModelContextProtocol.Protocol;
 
 namespace DevBitsLab.Mcp.SourceGraph.Server.Observability;
 
@@ -40,7 +43,10 @@ public static class ToolMetrics
         try
         {
             result = await body().ConfigureAwait(false);
-            return result;
+            // The leaf is presentation, not payload — `result` (the local) stays unbranded so
+            // the `finally` block records true response size, while the caller gets the branded
+            // version. See openspec/changes/add-leaf-brand-mark/design.md (Decision 3).
+            return LeafFormatter.Brand(result);
         }
         catch (Exception ex)
         {
@@ -71,7 +77,7 @@ public static class ToolMetrics
         try
         {
             result = body();
-            return result;
+            return LeafFormatter.Brand(result);
         }
         catch (Exception ex)
         {
@@ -87,6 +93,151 @@ public static class ToolMetrics
             activity?.SetTag("mcp.tool.response_bytes", responseBytes);
             Record(toolName, args, result.Length, responseBytes, sw.Elapsed, ok);
         }
+    }
+
+    /// <summary>
+    /// Multi-content overload: tools that return <see cref="IReadOnlyList{ContentBlock}"/> route
+    /// here. The leaf brand mark is applied to the first user-visible <see cref="TextContentBlock"/>
+    /// (audience-restricted blocks are skipped). Telemetry counts the total text length across all
+    /// blocks so usage_stats / OTel response_size remain meaningful.
+    /// </summary>
+    public static async Task<IReadOnlyList<ContentBlock>> TrackAsync(
+        string toolName, object? args, Func<Task<IReadOnlyList<ContentBlock>>> body)
+    {
+        using var activity = Telemetry.ActivitySource.StartActivity(
+            $"mcp.tool {toolName}", ActivityKind.Server);
+        activity?.SetTag("mcp.tool.name", toolName);
+        activity?.SetTag("mcp.tool.scope", ExtractScope(args));
+
+        var sw = Stopwatch.StartNew();
+        var ok = true;
+        IReadOnlyList<ContentBlock> result = Array.Empty<ContentBlock>();
+        try
+        {
+            result = await body().ConfigureAwait(false);
+            return LeafFormatter.BrandFirstText(result);
+        }
+        catch (Exception ex)
+        {
+            ok = false;
+            activity?.SetStatus(ActivityStatusCode.Error, ex.Message);
+            activity?.SetTag("exception.type", ex.GetType().FullName);
+            throw;
+        }
+        finally
+        {
+            sw.Stop();
+            var (textLen, byteLen) = MeasureContent(result);
+            activity?.SetTag("mcp.tool.response_bytes", byteLen);
+            Record(toolName, args, textLen, byteLen, sw.Elapsed, ok);
+        }
+    }
+
+    /// <summary>
+    /// Rich-result overload: tools that need <see cref="CallToolResult.StructuredContent"/> or
+    /// <see cref="CallToolResult.IsError"/> route here. Same leaf-branding rule as the
+    /// content-list overload (the first user-visible <see cref="TextContentBlock"/> is prefixed
+    /// with the brand mark), and same telemetry — measured on the **unbranded** payload so the
+    /// recorded response size is comparable to the string and content-list overloads. When
+    /// <see cref="CallToolResult.IsError"/> is true the call records as ok=false so dashboards
+    /// surface tool-reported errors alongside thrown exceptions.
+    ///
+    /// No runtime guard against anonymous types — both <see cref="CallToolResult.StructuredContent"/>
+    /// (<see cref="System.Text.Json.JsonElement"/>?) and <see cref="CallToolResult.Meta"/>
+    /// (<see cref="System.Text.Json.Nodes.JsonObject"/>?) are typed strictly enough that the SDK's
+    /// source-gen <c>JsonContext</c> can't reject them at wire time; the C# compiler enforces the
+    /// shape at assignment instead.
+    /// </summary>
+    public static async Task<CallToolResult> TrackAsync(
+        string toolName, object? args, Func<Task<CallToolResult>> body)
+    {
+        using var activity = Telemetry.ActivitySource.StartActivity(
+            $"mcp.tool {toolName}", ActivityKind.Server);
+        activity?.SetTag("mcp.tool.name", toolName);
+        activity?.SetTag("mcp.tool.scope", ExtractScope(args));
+
+        var sw = Stopwatch.StartNew();
+        var ok = true;
+        CallToolResult result = new() { Content = Array.Empty<ContentBlock>() };
+        // Snapshots of the unbranded shape captured before LeafFormatter.BrandFirstText mutates
+        // result.Content in place. Telemetry measures these so the recorded byte count reflects
+        // payload size, not branded prose — consistent with the string and IReadOnlyList<ContentBlock>
+        // overloads which also measure unbranded.
+        IReadOnlyList<ContentBlock> unbrandedContent = Array.Empty<ContentBlock>();
+        JsonElement? unbrandedStructured = null;
+        try
+        {
+            result = await body().ConfigureAwait(false);
+            unbrandedContent = result.Content as IReadOnlyList<ContentBlock>
+                ?? (result.Content is null ? Array.Empty<ContentBlock>() : (IReadOnlyList<ContentBlock>)result.Content.ToArray());
+            unbrandedStructured = result.StructuredContent;
+            LeafFormatter.BrandFirstText(result);
+            return result;
+        }
+        catch (Exception ex)
+        {
+            ok = false;
+            activity?.SetStatus(ActivityStatusCode.Error, ex.Message);
+            activity?.SetTag("exception.type", ex.GetType().FullName);
+            throw;
+        }
+        finally
+        {
+            sw.Stop();
+            var (textLen, byteLen) = MeasureContent(unbrandedContent, unbrandedStructured);
+            activity?.SetTag("mcp.tool.response_bytes", byteLen);
+            // CallToolResult with IsError=true should still record as ok=false in telemetry so
+            // dashboards see tool-reported errors alongside thrown exceptions.
+            var effectiveOk = ok && (result.IsError != true);
+            Record(toolName, args, textLen, byteLen, sw.Elapsed, effectiveOk);
+        }
+    }
+
+    /// <summary>
+    /// Sum the size of the user-renderable surface of a tool result: text-block contents,
+    /// resource-link metadata (uri, name, title, description), and — when present — the raw JSON
+    /// of <see cref="CallToolResult.StructuredContent"/>. Captures the bulk of what the SDK
+    /// serialises for a real <c>tools/call</c> response, so <c>mcp.tool.response_bytes</c> stays
+    /// representative when tools emit multi-content blocks or structured payloads. Other
+    /// envelope-level fields (annotations, meta, isError) are small enough to skip.
+    /// </summary>
+    private static (int TextLen, int ByteCount) MeasureContent(
+        IReadOnlyList<ContentBlock> content,
+        JsonElement? structuredContent = null)
+    {
+        var len = 0;
+        var bytes = 0;
+        foreach (var block in content)
+        {
+            switch (block)
+            {
+                case TextContentBlock t when !string.IsNullOrEmpty(t.Text):
+                    len += t.Text.Length;
+                    bytes += Encoding.UTF8.GetByteCount(t.Text);
+                    break;
+                case ResourceLinkBlock r:
+                    // Sum every textual field a client renders for a resource link card.
+                    AddString(ref len, ref bytes, r.Uri);
+                    AddString(ref len, ref bytes, r.Name);
+                    AddString(ref len, ref bytes, r.Title);
+                    AddString(ref len, ref bytes, r.Description);
+                    break;
+            }
+        }
+        if (structuredContent.HasValue)
+        {
+            var raw = structuredContent.Value.GetRawText();
+            len += raw.Length;
+            bytes += Encoding.UTF8.GetByteCount(raw);
+        }
+        return (len, bytes);
+    }
+
+    private static void AddString(ref int len, ref int bytes, string? s)
+    {
+        if (string.IsNullOrEmpty(s)) return;
+        len += s.Length;
+        bytes += Encoding.UTF8.GetByteCount(s);
     }
 
     private static void Record(string toolName, object? args, int responseLen, int responseBytes, TimeSpan elapsed, bool ok)

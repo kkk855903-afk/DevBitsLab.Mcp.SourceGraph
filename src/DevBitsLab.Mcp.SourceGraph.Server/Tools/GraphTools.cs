@@ -5,8 +5,12 @@ using DevBitsLab.Mcp.SourceGraph.Core;
 using DevBitsLab.Mcp.SourceGraph.Embeddings;
 using DevBitsLab.Mcp.SourceGraph.Sdk;
 using DevBitsLab.Mcp.SourceGraph.Server.Observability;
+using DevBitsLab.Mcp.SourceGraph.Server.Resources;
 using DevBitsLab.Mcp.SourceGraph.Server.Scoping;
+using DevBitsLab.Mcp.SourceGraph.Server.Tools.Output;
 using DevBitsLab.Mcp.SourceGraph.Storage;
+using ModelContextProtocol;
+using ModelContextProtocol.Protocol;
 using ModelContextProtocol.Server;
 
 namespace DevBitsLab.Mcp.SourceGraph.Server.Tools;
@@ -18,10 +22,10 @@ public static class GraphTools
         "Optional scope id, the literal '*' for all non-isolated scopes, or a comma-separated list of ids " +
         "(e.g. 'frontend,backend'). Omit to use `default_scope` from .sourcegraph.json. Call `list_scopes` to discover.";
 
-    [McpServerTool]
+    [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(FindDefinitionResult))]
     [ToolTrigger("\"where is X defined?\"")]
     [Description("Find the definition of a symbol by name or fully-qualified name. Returns location, kind, signature, accessibility, modifiers, and one-line XML summary for each match.")]
-    public static Task<string> FindDefinitionAsync(
+    public static Task<CallToolResult> FindDefinitionAsync(
         ScopeRouter router,
         [Description("Symbol name (e.g. 'Calculator', 'Divide') or FQN suffix (e.g. 'Calculator.Add', 'Sample.Domain.Calculator')")] string symbol,
         [Description("Optional substring to narrow the search to specific file paths")] string? fileHint = null,
@@ -30,16 +34,29 @@ public static class GraphTools
         ToolMetrics.TrackAsync("find_definition", new { symbol, fileHint, scope }, () =>
             ScopedExecution.RunAsync(router, scope, async host =>
             {
+                var sw = System.Diagnostics.Stopwatch.StartNew();
                 var hits = await host.Store.FindSymbolsAsync(symbol, fileHint, limit: 25, ct).ConfigureAwait(false);
-                if (hits.Count == 0) return $"No definition found for '{symbol}'.";
+                if (hits.Count == 0)
+                {
+                    return BuildFindDefinitionResult(
+                        prose: $"No matches for '{symbol}'.",
+                        hits: Array.Empty<SymbolHit>(),
+                        structuredHits: Array.Empty<FindDefinitionHit>(),
+                        scopeId: host.Scope.Id,
+                        elapsedMs: sw.ElapsedMilliseconds);
+                }
 
                 // Pre-fetch history rows in one batch so we don't fire a query per hit.
                 var historyById = await host.Store.GetSymbolHistoryBatchAsync(hits.Select(h => h.Id).ToList(), ct).ConfigureAwait(false);
                 var multipleFlavors = await HasMultipleAnnotationFlavorsAsync(host.Store, ct).ConfigureAwait(false);
 
+                // Build prose and the structured DTO from the same enumeration so the two stay in
+                // lockstep — the spec scenario "structured array length equals prose row count"
+                // depends on this single source of truth.
                 var sb = new StringBuilder();
-                sb.AppendLine($"Found {hits.Count} match(es) for '{symbol}':");
+                sb.AppendLine($"{hits.Count} hits for '{symbol}':");
                 sb.AppendLine();
+                var structuredHits = new List<FindDefinitionHit>(hits.Count);
                 foreach (var h in hits)
                 {
                     sb.AppendLine($"- **{h.Fqn}** ({Format.KindWithAttrs(h)})");
@@ -55,9 +72,84 @@ public static class GraphTools
                         var line = Format.HistoryLine(hist);
                         if (line is not null) sb.AppendLine($"  - {line}");
                     }
+                    structuredHits.Add(new FindDefinitionHit(
+                        Fqn: h.Fqn,
+                        Kind: h.Kind,
+                        FilePath: h.FilePath,
+                        Line: h.StartLine,
+                        Column: h.StartCol,
+                        Signature: string.IsNullOrEmpty(h.Signature) ? null : h.Signature,
+                        XmlSummary: string.IsNullOrEmpty(h.XmlSummary) ? null : h.XmlSummary));
                 }
-                return sb.ToString();
+
+                return BuildFindDefinitionResult(
+                    prose: sb.ToString(),
+                    hits: hits,
+                    structuredHits: structuredHits,
+                    scopeId: host.Scope.Id,
+                    elapsedMs: sw.ElapsedMilliseconds);
             }, ct));
+
+    /// <summary>
+    /// Compose the multi-content <see cref="CallToolResult"/> for <c>find_definition</c>: the
+    /// leading user-visible prose <see cref="TextContentBlock"/>, one
+    /// <see cref="ResourceLinkBlock"/> per matched symbol pointing at the corresponding
+    /// <c>graph://symbol/&lt;id&gt;</c> resource, a trailing audience-restricted
+    /// <see cref="TextContentBlock"/> carrying scope id + latency + hit count for the model only,
+    /// and the typed <see cref="FindDefinitionResult"/> serialized into
+    /// <see cref="CallToolResult.StructuredContent"/>.
+    ///
+    /// The structured payload is serialised through the source-generated
+    /// <see cref="ToolOutputJsonContext"/> so we stay off reflection and the wire shape uses
+    /// snake_case property names (matching the SDK's tools/list outputSchema generator).
+    /// </summary>
+    private static CallToolResult BuildFindDefinitionResult(
+        string prose,
+        IReadOnlyList<SymbolHit> hits,
+        IReadOnlyList<FindDefinitionHit> structuredHits,
+        string scopeId,
+        long elapsedMs)
+    {
+        var content = new List<ContentBlock>(capacity: 2 + hits.Count)
+        {
+            new TextContentBlock { Text = prose },
+        };
+
+        foreach (var h in hits)
+        {
+            content.Add(new ResourceLinkBlock
+            {
+                Uri = GraphResourceUris.Symbol(h.Id),
+                Name = h.Fqn,
+                Title = h.Fqn,
+                Description = $"{Format.KindWithAttrs(h)} — {Format.Location(h.FilePath, h.StartLine, h.StartCol)}",
+                MimeType = "text/markdown",
+            });
+        }
+
+        // Audience-restricted metadata: scope id + latency + hit count are useful to the agent for
+        // chaining (e.g. "if I see latency_ms > 500 maybe drop this scope from a fan-out") but pure
+        // noise to the human reading the chat. Priority < 0.5 is the "informational, deprioritise"
+        // signal documented in the design.
+        content.Add(new TextContentBlock
+        {
+            Text = $"_meta: scope=`{scopeId}`, latency_ms={elapsedMs}, hits={hits.Count}_",
+            Annotations = new Annotations
+            {
+                Audience = new[] { Role.Assistant },
+                Priority = 0.2f,
+            },
+        });
+
+        var result = new CallToolResult
+        {
+            Content = content,
+            StructuredContent = JsonSerializer.SerializeToElement(
+                new FindDefinitionResult(structuredHits),
+                ToolOutputJsonContext.Default.FindDefinitionResult),
+        };
+        return result;
+    }
 
     [McpServerTool]
     [ToolTrigger("\"find every POST endpoint\", \"what's been deprecated?\", \"find all DI singletons\", \"every controller decorated with @Component\"")]
@@ -84,13 +176,38 @@ public static class GraphTools
                 }
                 var multipleFlavors = await HasMultipleAnnotationFlavorsAsync(host.Store, ct).ConfigureAwait(false);
                 var sb = new StringBuilder();
-                sb.AppendLine($"{hits.Count} symbol(s) carry [{name}]:");
-                foreach (var h in hits)
+                sb.AppendLine($"{hits.Count} symbols carry [{name}]:");
+                if (hits.Count >= 2)
                 {
-                    sb.AppendLine($"- **{h.Fqn}** ({Format.KindWithAttrs(h)}) at {Format.Location(h.FilePath, h.StartLine, h.StartCol)}");
-                    var anns = await host.Store.GetAnnotationsForSymbolAsync(h.Id, ct).ConfigureAwait(false);
-                    var line = AnnotationFormat.OneLine(anns, multipleFlavors);
-                    if (line is not null) sb.AppendLine($"  - {line}");
+                    var rows = new List<IReadOnlyList<string>>(hits.Count);
+                    foreach (var h in hits)
+                    {
+                        rows.Add(new[]
+                        {
+                            $"**{h.Fqn}**",
+                            Format.KindWithAttrs(h),
+                            Format.Location(h.FilePath, h.StartLine, h.StartCol),
+                        });
+                    }
+                    Format.AppendTable(sb, new[] { "Symbol", "Kind", "Location" }, rows);
+                    // Annotation detail still rendered as a follow-on bullet so the agent can read
+                    // each match's args without a per-cell wall-of-text in the table.
+                    foreach (var h in hits)
+                    {
+                        var anns = await host.Store.GetAnnotationsForSymbolAsync(h.Id, ct).ConfigureAwait(false);
+                        var line = AnnotationFormat.OneLine(anns, multipleFlavors);
+                        if (line is not null) sb.AppendLine($"- **{h.Fqn}**: {line}");
+                    }
+                }
+                else
+                {
+                    foreach (var h in hits)
+                    {
+                        sb.AppendLine($"- **{h.Fqn}** ({Format.KindWithAttrs(h)}) at {Format.Location(h.FilePath, h.StartLine, h.StartCol)}");
+                        var anns = await host.Store.GetAnnotationsForSymbolAsync(h.Id, ct).ConfigureAwait(false);
+                        var line = AnnotationFormat.OneLine(anns, multipleFlavors);
+                        if (line is not null) sb.AppendLine($"  - {line}");
+                    }
                 }
                 return sb.ToString();
             }, ct));
@@ -109,7 +226,7 @@ public static class GraphTools
             ScopedExecution.RunAsync(router, scope, async host =>
             {
                 var hits = await host.Store.FindSymbolsAsync(symbol, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
-                if (hits.Count == 0) return $"No symbol found for '{symbol}'.";
+                if (hits.Count == 0) return $"No matches for '{symbol}'.";
 
                 var sb = new StringBuilder();
                 if (hits.Count > 1)
@@ -129,10 +246,26 @@ public static class GraphTools
                     return sb.ToString();
                 }
                 sb.AppendLine();
-                sb.AppendLine($"{refs.Count} reference(s):");
-                foreach (var r in refs)
+                sb.AppendLine($"{refs.Count} references:");
+                if (refs.Count >= 2)
                 {
-                    sb.AppendLine($"- {RefKindLabel(r.Kind)} at {Format.Location(r.FilePath, r.Line, r.Col)}{GeneratedSuffix(r.IsGenerated)}");
+                    var rows = new List<IReadOnlyList<string>>(refs.Count);
+                    foreach (var r in refs)
+                    {
+                        rows.Add(new[]
+                        {
+                            RefKindLabel(r.Kind),
+                            Format.Location(r.FilePath, r.Line, r.Col) + GeneratedSuffix(r.IsGenerated),
+                        });
+                    }
+                    Format.AppendTable(sb, new[] { "Kind", "Location" }, rows);
+                }
+                else
+                {
+                    foreach (var r in refs)
+                    {
+                        sb.AppendLine($"- {RefKindLabel(r.Kind)} at {Format.Location(r.FilePath, r.Line, r.Col)}{GeneratedSuffix(r.IsGenerated)}");
+                    }
                 }
                 return sb.ToString();
             }, ct));
@@ -149,13 +282,13 @@ public static class GraphTools
             ScopedExecution.RunAsync(router, scope, async host =>
             {
                 var hits = await host.Store.ListSymbolsInFileAsync(path, ct).ConfigureAwait(false);
-                if (hits.Count == 0) return $"No indexed symbols found in '{path}'. The file may not be part of an indexed solution, or may not exist.";
+                if (hits.Count == 0) return $"No indexed symbols in '{path}'. The file may not be part of an indexed solution, or may not exist.";
 
                 var historyById = await host.Store.GetSymbolHistoryBatchAsync(hits.Select(h => h.Id).ToList(), ct).ConfigureAwait(false);
                 var multipleFlavors = await HasMultipleAnnotationFlavorsAsync(host.Store, ct).ConfigureAwait(false);
 
                 var sb = new StringBuilder();
-                sb.AppendLine($"{hits.Count} symbol(s) in {hits[0].FilePath}:");
+                sb.AppendLine($"{hits.Count} symbols in {hits[0].FilePath}:");
                 foreach (var h in hits)
                 {
                     sb.AppendLine($"- L{h.StartLine}: **{h.Name}** ({Format.KindWithAttrs(h)}) — {h.Fqn}");
@@ -195,17 +328,45 @@ public static class GraphTools
                 }
 
                 var hits = await host.Store.FindSymbolsAsync(symbol, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
-                if (hits.Count == 0) return $"No symbol found for '{symbol}'.";
+                if (hits.Count == 0) return $"No matches for '{symbol}'.";
                 var top = hits[0];
                 var callers = await host.Store.ListCallersAsync(top.Id, limit, edgeKind, ct).ConfigureAwait(false);
                 var sb = new StringBuilder();
                 sb.AppendLine($"Inbound `{label}` to **{top.Fqn}** ({KindLabel(top.Kind)}):");
                 if (callers.Count == 0) { sb.AppendLine("- (none)"); return sb.ToString(); }
-                foreach (var c in callers)
+                if (callers.Count >= 2)
                 {
-                    sb.AppendLine($"- **{c.Fqn}** ({KindLabel(c.Kind)}) at {Format.Location(c.FilePath, c.StartLine, c.StartCol)}");
-                    var payloadLine = Format.PayloadSubLine(c.PayloadJson);
-                    if (payloadLine is not null) sb.AppendLine(payloadLine);
+                    var rows = new List<IReadOnlyList<string>>(callers.Count);
+                    foreach (var c in callers)
+                    {
+                        rows.Add(new[]
+                        {
+                            $"**{c.Fqn}**",
+                            KindLabel(c.Kind),
+                            Format.Location(c.FilePath, c.StartLine, c.StartCol),
+                        });
+                    }
+                    Format.AppendTable(sb, new[] { "Symbol", "Kind", "Location" }, rows);
+                    // Per-edge payload (XAML binds-path, etc.) trails the table as bulleted sub-lines
+                    // for any rows that carry one. Most C# call edges have no payload and produce
+                    // nothing here; future edge kinds with metadata surface their detail without
+                    // bloating the table cells.
+                    foreach (var c in callers)
+                    {
+                        var payloadLine = Format.PayloadSubLine(c.PayloadJson);
+                        if (payloadLine is null) continue;
+                        sb.AppendLine($"- **{c.Fqn}**");
+                        sb.AppendLine(payloadLine);
+                    }
+                }
+                else
+                {
+                    foreach (var c in callers)
+                    {
+                        sb.AppendLine($"- **{c.Fqn}** ({KindLabel(c.Kind)}) at {Format.Location(c.FilePath, c.StartLine, c.StartCol)}");
+                        var payloadLine = Format.PayloadSubLine(c.PayloadJson);
+                        if (payloadLine is not null) sb.AppendLine(payloadLine);
+                    }
                 }
                 return sb.ToString();
             }, ct));
@@ -231,17 +392,41 @@ public static class GraphTools
                 }
 
                 var hits = await host.Store.FindSymbolsAsync(symbol, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
-                if (hits.Count == 0) return $"No symbol found for '{symbol}'.";
+                if (hits.Count == 0) return $"No matches for '{symbol}'.";
                 var top = hits[0];
                 var callees = await host.Store.ListCalleesAsync(top.Id, limit, edgeKind, ct).ConfigureAwait(false);
                 var sb = new StringBuilder();
                 sb.AppendLine($"Outbound `{label}` from **{top.Fqn}** ({KindLabel(top.Kind)}):");
                 if (callees.Count == 0) { sb.AppendLine("- (none)"); return sb.ToString(); }
-                foreach (var c in callees)
+                if (callees.Count >= 2)
                 {
-                    sb.AppendLine($"- **{c.Fqn}** ({KindLabel(c.Kind)}) at {Format.Location(c.FilePath, c.StartLine, c.StartCol)}");
-                    var payloadLine = Format.PayloadSubLine(c.PayloadJson);
-                    if (payloadLine is not null) sb.AppendLine(payloadLine);
+                    var rows = new List<IReadOnlyList<string>>(callees.Count);
+                    foreach (var c in callees)
+                    {
+                        rows.Add(new[]
+                        {
+                            $"**{c.Fqn}**",
+                            KindLabel(c.Kind),
+                            Format.Location(c.FilePath, c.StartLine, c.StartCol),
+                        });
+                    }
+                    Format.AppendTable(sb, new[] { "Symbol", "Kind", "Location" }, rows);
+                    foreach (var c in callees)
+                    {
+                        var payloadLine = Format.PayloadSubLine(c.PayloadJson);
+                        if (payloadLine is null) continue;
+                        sb.AppendLine($"- **{c.Fqn}**");
+                        sb.AppendLine(payloadLine);
+                    }
+                }
+                else
+                {
+                    foreach (var c in callees)
+                    {
+                        sb.AppendLine($"- **{c.Fqn}** ({KindLabel(c.Kind)}) at {Format.Location(c.FilePath, c.StartLine, c.StartCol)}");
+                        var payloadLine = Format.PayloadSubLine(c.PayloadJson);
+                        if (payloadLine is not null) sb.AppendLine(payloadLine);
+                    }
                 }
                 return sb.ToString();
             }, ct));
@@ -260,7 +445,7 @@ public static class GraphTools
             ScopedExecution.RunAsync(router, scope, async host =>
             {
                 var hits = await host.Store.FindSymbolsAsync(symbol, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
-                if (hits.Count == 0) return $"No symbol found for '{symbol}'.";
+                if (hits.Count == 0) return $"No matches for '{symbol}'.";
                 var top = hits[0];
                 var impls = await host.Store.ListImplementationsAsync(top.Id, limit, ct).ConfigureAwait(false);
                 var filtered = includeAbstract
@@ -269,9 +454,26 @@ public static class GraphTools
                 var sb = new StringBuilder();
                 sb.AppendLine($"Implementations of **{top.Fqn}** ({KindLabel(top.Kind)}):");
                 if (filtered.Count == 0) { sb.AppendLine("- (none)"); return sb.ToString(); }
-                foreach (var c in filtered)
+                if (filtered.Count >= 2)
                 {
-                    sb.AppendLine($"- **{c.Fqn}** ({KindLabel(c.Kind)}) at {Format.Location(c.FilePath, c.StartLine, c.StartCol)}");
+                    var rows = new List<IReadOnlyList<string>>(filtered.Count);
+                    foreach (var c in filtered)
+                    {
+                        rows.Add(new[]
+                        {
+                            $"**{c.Fqn}**",
+                            KindLabel(c.Kind),
+                            Format.Location(c.FilePath, c.StartLine, c.StartCol),
+                        });
+                    }
+                    Format.AppendTable(sb, new[] { "Symbol", "Kind", "Location" }, rows);
+                }
+                else
+                {
+                    foreach (var c in filtered)
+                    {
+                        sb.AppendLine($"- **{c.Fqn}** ({KindLabel(c.Kind)}) at {Format.Location(c.FilePath, c.StartLine, c.StartCol)}");
+                    }
                 }
                 return sb.ToString();
             }, ct));
@@ -294,10 +496,27 @@ public static class GraphTools
                 var hits = await host.Store.SearchSymbolsAsync(query, kindFilter, topK, ct).ConfigureAwait(false);
                 if (hits.Count == 0) return $"No symbols match '{query}'.";
                 var sb = new StringBuilder();
-                sb.AppendLine($"{hits.Count} match(es) for '{query}':");
-                foreach (var h in hits)
+                sb.AppendLine($"{hits.Count} hits for '{query}':");
+                if (hits.Count >= 2)
                 {
-                    sb.AppendLine($"- **{h.Fqn}** ({KindLabel(h.Kind)}) at {Format.Location(h.FilePath, h.StartLine, h.StartCol)}");
+                    var rows = new List<IReadOnlyList<string>>(hits.Count);
+                    foreach (var h in hits)
+                    {
+                        rows.Add(new[]
+                        {
+                            $"**{h.Fqn}**",
+                            KindLabel(h.Kind),
+                            Format.Location(h.FilePath, h.StartLine, h.StartCol),
+                        });
+                    }
+                    Format.AppendTable(sb, new[] { "Symbol", "Kind", "Location" }, rows);
+                }
+                else
+                {
+                    foreach (var h in hits)
+                    {
+                        sb.AppendLine($"- **{h.Fqn}** ({KindLabel(h.Kind)}) at {Format.Location(h.FilePath, h.StartLine, h.StartCol)}");
+                    }
                 }
                 return sb.ToString();
             }, ct));
@@ -323,7 +542,7 @@ public static class GraphTools
                 }
 
                 var hits = await host.Store.FindSymbolsAsync(symbol, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
-                if (hits.Count == 0) return $"No symbol found for '{symbol}'.";
+                if (hits.Count == 0) return $"No matches for '{symbol}'.";
                 var top = hits[0];
                 var callers = await host.Store.ListCallersAsync(top.Id, perCategory, edgeKind, ct).ConfigureAwait(false);
                 var callees = await host.Store.ListCalleesAsync(top.Id, perCategory, edgeKind, ct).ConfigureAwait(false);
@@ -339,36 +558,78 @@ public static class GraphTools
                 if (topAnnLine is not null) sb.AppendLine(topAnnLine);
                 sb.AppendLine();
                 sb.AppendLine($"### Inbound ({callers.Count})");
-                foreach (var c in callers)
-                {
-                    sb.Append($"- {c.Fqn} ({Format.KindWithAttrs(c)}) — {Format.Location(c.FilePath, c.StartLine, c.StartCol)}");
-                    var s = Format.OneLineSummary(c.XmlSummary);
-                    if (!string.IsNullOrEmpty(s)) sb.Append(" — _" + s + "_");
-                    sb.AppendLine();
-                    var ca = await host.Store.GetAnnotationsForSymbolAsync(c.Id, ct).ConfigureAwait(false);
-                    var caLine = AnnotationFormat.OneLine(ca, multipleFlavors);
-                    if (caLine is not null) sb.AppendLine($"  {caLine}");
-                    var payloadLine = Format.PayloadSubLine(c.PayloadJson);
-                    if (payloadLine is not null) sb.AppendLine(payloadLine);
-                }
-                if (callers.Count == 0) sb.AppendLine("- (none)");
+                await AppendNeighborhoodSectionAsync(sb, callers, host.Store, multipleFlavors, ct).ConfigureAwait(false);
                 sb.AppendLine();
                 sb.AppendLine($"### Outbound ({callees.Count})");
-                foreach (var c in callees)
-                {
-                    sb.Append($"- {c.Fqn} ({Format.KindWithAttrs(c)}) — {Format.Location(c.FilePath, c.StartLine, c.StartCol)}");
-                    var s = Format.OneLineSummary(c.XmlSummary);
-                    if (!string.IsNullOrEmpty(s)) sb.Append(" — _" + s + "_");
-                    sb.AppendLine();
-                    var ca = await host.Store.GetAnnotationsForSymbolAsync(c.Id, ct).ConfigureAwait(false);
-                    var caLine = AnnotationFormat.OneLine(ca, multipleFlavors);
-                    if (caLine is not null) sb.AppendLine($"  {caLine}");
-                    var payloadLine = Format.PayloadSubLine(c.PayloadJson);
-                    if (payloadLine is not null) sb.AppendLine(payloadLine);
-                }
-                if (callees.Count == 0) sb.AppendLine("- (none)");
+                await AppendNeighborhoodSectionAsync(sb, callees, host.Store, multipleFlavors, ct).ConfigureAwait(false);
                 return sb.ToString();
             }, ct));
+
+    /// <summary>
+    /// Render one of <c>neighborhood</c>'s Inbound / Outbound sections. When the row count is
+    /// at least two, the rows go into a `| Symbol | Kind | Location |` table — matching
+    /// `list_callers` / `list_callees` so the same edge data renders the same way across tools.
+    /// Per-row summary + annotation detail follows as bullets so it stays discoverable without
+    /// inflating the table cells. Empty / single-row sections retain the bulleted shape.
+    /// </summary>
+    private static async Task AppendNeighborhoodSectionAsync(
+        StringBuilder sb,
+        IReadOnlyList<SymbolHit> rows,
+        IGraphStore store,
+        bool multipleFlavors,
+        CancellationToken ct)
+    {
+        if (rows.Count == 0)
+        {
+            sb.AppendLine("- (none)");
+            return;
+        }
+        if (rows.Count >= 2)
+        {
+            var tableRows = new List<IReadOnlyList<string>>(rows.Count);
+            foreach (var c in rows)
+            {
+                tableRows.Add(new[]
+                {
+                    $"**{c.Fqn}**",
+                    Format.KindWithAttrs(c),
+                    Format.Location(c.FilePath, c.StartLine, c.StartCol),
+                });
+            }
+            Format.AppendTable(sb, new[] { "Symbol", "Kind", "Location" }, tableRows);
+            // Per-row detail (one-line summary + annotations + edge payload) trails the table as
+            // a bulleted section so each row's prose-shaped context stays discoverable without
+            // bloating the table cells.
+            foreach (var c in rows)
+            {
+                var summary = Format.OneLineSummary(c.XmlSummary);
+                var anns = await store.GetAnnotationsForSymbolAsync(c.Id, ct).ConfigureAwait(false);
+                var annLine = AnnotationFormat.OneLine(anns, multipleFlavors);
+                var payloadLine = Format.PayloadSubLine(c.PayloadJson);
+                if (string.IsNullOrEmpty(summary) && annLine is null && payloadLine is null) continue;
+                sb.Append($"- **{c.Fqn}**");
+                if (!string.IsNullOrEmpty(summary)) sb.Append(" — _" + summary + "_");
+                sb.AppendLine();
+                if (annLine is not null) sb.AppendLine($"  - {annLine}");
+                if (payloadLine is not null) sb.AppendLine(payloadLine);
+            }
+        }
+        else
+        {
+            foreach (var c in rows)
+            {
+                sb.Append($"- {c.Fqn} ({Format.KindWithAttrs(c)}) — {Format.Location(c.FilePath, c.StartLine, c.StartCol)}");
+                var s = Format.OneLineSummary(c.XmlSummary);
+                if (!string.IsNullOrEmpty(s)) sb.Append(" — _" + s + "_");
+                sb.AppendLine();
+                var ca = await store.GetAnnotationsForSymbolAsync(c.Id, ct).ConfigureAwait(false);
+                var caLine = AnnotationFormat.OneLine(ca, multipleFlavors);
+                if (caLine is not null) sb.AppendLine($"  {caLine}");
+                var payloadLine = Format.PayloadSubLine(c.PayloadJson);
+                if (payloadLine is not null) sb.AppendLine(payloadLine);
+            }
+        }
+    }
 
     [McpServerTool]
     [ToolTrigger("\"what's important in this namespace?\" or \"what's the entrypoint to module Y?\"")]
@@ -378,29 +639,66 @@ public static class GraphTools
         [Description("Namespace (e.g. 'Sample.Domain') or path-substring that identifies the module")] string namespaceOrPath,
         [Description("Top-K most-referenced symbols to return (default 25)")] int topK = 25,
         [Description(ScopeDescription)] string? scope = null,
+        IProgress<ProgressNotificationValue>? progress = null,
         CancellationToken ct = default) =>
         ToolMetrics.TrackAsync("module_summary", new { namespaceOrPath, topK, scope }, () =>
             ScopedExecution.RunAsync(router, scope, async host =>
             {
+                progress?.Report(Format.Progress(0.0, "querying"));
                 var rows = await host.Store.ModuleSummaryAsync(namespaceOrPath, topK, ct).ConfigureAwait(false);
                 if (rows.Count == 0) return $"No symbols matched module '{namespaceOrPath}'.";
                 var multipleFlavors = await HasMultipleAnnotationFlavorsAsync(host.Store, ct).ConfigureAwait(false);
                 var sb = new StringBuilder();
-                sb.AppendLine($"Top {rows.Count} symbol(s) in '{namespaceOrPath}' (by inbound calls):");
-                // Note: module_summary deliberately omits payload sub-lines per harden-sdk-pre-xaml
+                sb.AppendLine($"Top {rows.Count} symbols in '{namespaceOrPath}' (by inbound calls):");
+                // module_summary deliberately omits payload sub-lines per harden-sdk-pre-xaml
                 // design.md decision (renderer dense by design — top-K rows already carry FQN +
                 // kind + location + summary + annotations, plus an in-degree prefix; per-edge
                 // payload would push the row past readable). The dedicated edge-walking tools
                 // (list_callers, list_callees, neighborhood) surface payload instead.
-                foreach (var row in rows)
+                if (rows.Count >= 2)
                 {
-                    sb.Append($"- in-deg {row.InDegree,3} — **{row.Symbol.Fqn}** ({Format.KindWithAttrs(row.Symbol)}) at {Format.Location(row.Symbol.FilePath, row.Symbol.StartLine, row.Symbol.StartCol)}");
-                    var s = Format.OneLineSummary(row.Symbol.XmlSummary);
-                    if (!string.IsNullOrEmpty(s)) sb.Append(" — _" + s + "_");
-                    sb.AppendLine();
-                    var anns = await host.Store.GetAnnotationsForSymbolAsync(row.Symbol.Id, ct).ConfigureAwait(false);
-                    var line = AnnotationFormat.OneLine(anns, multipleFlavors);
-                    if (line is not null) sb.AppendLine($"  - {line}");
+                    var tableRows = new List<IReadOnlyList<string>>(rows.Count);
+                    foreach (var row in rows)
+                    {
+                        tableRows.Add(new[]
+                        {
+                            row.InDegree.ToString(),
+                            $"**{row.Symbol.Fqn}**",
+                            Format.KindWithAttrs(row.Symbol),
+                            Format.Location(row.Symbol.FilePath, row.Symbol.StartLine, row.Symbol.StartCol),
+                        });
+                    }
+                    Format.AppendTable(
+                        sb,
+                        new[] { "In-deg", "Symbol", "Kind", "Location" },
+                        tableRows,
+                        new[] { TableAlignment.Right, TableAlignment.Left, TableAlignment.Left, TableAlignment.Left });
+                    // Summary + annotation rendering kept as follow-on bullets so each per-row detail
+                    // remains discoverable without flooding the table cells.
+                    foreach (var row in rows)
+                    {
+                        var s = Format.OneLineSummary(row.Symbol.XmlSummary);
+                        var anns = await host.Store.GetAnnotationsForSymbolAsync(row.Symbol.Id, ct).ConfigureAwait(false);
+                        var annLine = AnnotationFormat.OneLine(anns, multipleFlavors);
+                        if (string.IsNullOrEmpty(s) && annLine is null) continue;
+                        sb.Append($"- **{row.Symbol.Fqn}**");
+                        if (!string.IsNullOrEmpty(s)) sb.Append(" — _" + s + "_");
+                        sb.AppendLine();
+                        if (annLine is not null) sb.AppendLine($"  - {annLine}");
+                    }
+                }
+                else
+                {
+                    foreach (var row in rows)
+                    {
+                        sb.Append($"- in-deg {row.InDegree,3} — **{row.Symbol.Fqn}** ({Format.KindWithAttrs(row.Symbol)}) at {Format.Location(row.Symbol.FilePath, row.Symbol.StartLine, row.Symbol.StartCol)}");
+                        var s = Format.OneLineSummary(row.Symbol.XmlSummary);
+                        if (!string.IsNullOrEmpty(s)) sb.Append(" — _" + s + "_");
+                        sb.AppendLine();
+                        var anns = await host.Store.GetAnnotationsForSymbolAsync(row.Symbol.Id, ct).ConfigureAwait(false);
+                        var line = AnnotationFormat.OneLine(anns, multipleFlavors);
+                        if (line is not null) sb.AppendLine($"  - {line}");
+                    }
                 }
                 return sb.ToString();
             }, ct));
@@ -415,6 +713,7 @@ public static class GraphTools
         [Description("Maximum results (default 100)")] int limit = 100,
         [Description("Edge kind to walk (kebab-case): calls (default) | uses-type | overrides-member | implements-member | instantiates | throws | tests | all. Plugin-defined kinds are accepted.")] string? kind = null,
         [Description(ScopeDescription)] string? scope = null,
+        IProgress<ProgressNotificationValue>? progress = null,
         CancellationToken ct = default) =>
         ToolMetrics.TrackAsync("impact_of_change", new { symbol, maxDepth, limit, kind, scope }, () =>
             ScopedExecution.RunAsync(router, scope, async host =>
@@ -427,15 +726,38 @@ public static class GraphTools
                 }
 
                 var hits = await host.Store.FindSymbolsAsync(symbol, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
-                if (hits.Count == 0) return $"No symbol found for '{symbol}'.";
+                if (hits.Count == 0) return $"No matches for '{symbol}'.";
                 var top = hits[0];
+                progress?.Report(Format.Progress(0.0, "querying"));
                 var rows = await host.Store.ImpactOfChangeAsync(top.Id, maxDepth, limit, edgeKind, ct).ConfigureAwait(false);
                 var sb = new StringBuilder();
                 sb.AppendLine($"Upstream impact of **{top.Fqn}** ({KindLabel(top.Kind)}) [kind={label}] up to depth {maxDepth}:");
                 if (rows.Count == 0) { sb.AppendLine("- (no upstream callers found in graph)"); return sb.ToString(); }
-                foreach (var r in rows)
+                if (rows.Count >= 2)
                 {
-                    sb.AppendLine($"- d{r.Depth}: **{r.Symbol.Fqn}** ({KindLabel(r.Symbol.Kind)}) at {Format.Location(r.Symbol.FilePath, r.Symbol.StartLine, r.Symbol.StartCol)}");
+                    var tableRows = new List<IReadOnlyList<string>>(rows.Count);
+                    foreach (var r in rows)
+                    {
+                        tableRows.Add(new[]
+                        {
+                            r.Depth.ToString(),
+                            $"**{r.Symbol.Fqn}**",
+                            KindLabel(r.Symbol.Kind),
+                            Format.Location(r.Symbol.FilePath, r.Symbol.StartLine, r.Symbol.StartCol),
+                        });
+                    }
+                    Format.AppendTable(
+                        sb,
+                        new[] { "Depth", "Symbol", "Kind", "Location" },
+                        tableRows,
+                        new[] { TableAlignment.Right, TableAlignment.Left, TableAlignment.Left, TableAlignment.Left });
+                }
+                else
+                {
+                    foreach (var r in rows)
+                    {
+                        sb.AppendLine($"- d{r.Depth}: **{r.Symbol.Fqn}** ({KindLabel(r.Symbol.Kind)}) at {Format.Location(r.Symbol.FilePath, r.Symbol.StartLine, r.Symbol.StartCol)}");
+                    }
                 }
                 return sb.ToString();
             }, ct));
@@ -455,7 +777,7 @@ public static class GraphTools
             ScopedExecution.RunAsync(router, scope, async host =>
             {
                 var hits = await host.Store.FindSymbolsAsync(container, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
-                if (hits.Count == 0) return $"No symbol found for container '{container}'.";
+                if (hits.Count == 0) return $"No matches for container '{container}'.";
                 var top = hits[0];
 
                 int? accFilter = ParseAccessibility(accessibility);
@@ -467,18 +789,35 @@ public static class GraphTools
                 var members = await host.Store.ListMembersAsync(top.Id, accFilter, limit, ct).ConfigureAwait(false);
                 var sb = new StringBuilder();
                 var filterNote = accFilter is null ? "" : $" (accessibility = {accessibility})";
-                sb.AppendLine($"{members.Count} member(s) of **{top.Fqn}** ({Format.KindWithAttrs(top)}){filterNote}:");
+                sb.AppendLine($"{members.Count} members of **{top.Fqn}** ({Format.KindWithAttrs(top)}){filterNote}:");
                 if (includeInherited)
                 {
                     sb.AppendLine("_(includeInherited is reserved for a future change; only direct members are returned.)_");
                 }
                 if (members.Count == 0) { sb.AppendLine("- (none)"); return sb.ToString(); }
-                foreach (var m in members)
+                if (members.Count >= 2)
                 {
-                    sb.Append($"- L{m.StartLine}: **{m.Name}** ({Format.KindWithAttrs(m)}) — `{m.Signature ?? m.Fqn}`");
-                    var s = Format.OneLineSummary(m.XmlSummary);
-                    if (!string.IsNullOrEmpty(s)) sb.Append(" — _" + s + "_");
-                    sb.AppendLine();
+                    var rows = new List<IReadOnlyList<string>>(members.Count);
+                    foreach (var m in members)
+                    {
+                        rows.Add(new[]
+                        {
+                            $"L{m.StartLine}: **{m.Name}**",
+                            Format.KindWithAttrs(m),
+                            $"`{m.Signature ?? m.Fqn}`",
+                        });
+                    }
+                    Format.AppendTable(sb, new[] { "Member", "Kind", "Signature" }, rows);
+                }
+                else
+                {
+                    foreach (var m in members)
+                    {
+                        sb.Append($"- L{m.StartLine}: **{m.Name}** ({Format.KindWithAttrs(m)}) — `{m.Signature ?? m.Fqn}`");
+                        var s = Format.OneLineSummary(m.XmlSummary);
+                        if (!string.IsNullOrEmpty(s)) sb.Append(" — _" + s + "_");
+                        sb.AppendLine();
+                    }
                 }
                 return sb.ToString();
             }, ct));
@@ -493,6 +832,7 @@ public static class GraphTools
         [Description("Top-K results to return (default 20)")] int k = 20,
         [Description("Optional kebab-case symbol kind filter: class|method|property|field|interface|namespace|...")] string? kind = null,
         [Description(ScopeDescription)] string? scope = null,
+        IProgress<ProgressNotificationValue>? progress = null,
         CancellationToken ct = default) =>
         ToolMetrics.TrackAsync("semantic_search", new { query, k, kind, scope }, () =>
             ScopedExecution.RunAsync(router, scope, async host =>
@@ -508,28 +848,58 @@ public static class GraphTools
 
                 var kindFilter = NormaliseKindFilter(kind);
 
+                // Cold-start: the JinaCodeEmbeddingGenerator singleton is lazy-instantiated by DI
+                // on first use, so the first `EmbedAsync` call after server start carries the ONNX
+                // model load (3-5s). Subsequent calls reuse the loaded model and are sub-second.
+                progress?.Report(Format.Progress(0.0, "encoding query"));
                 var queryEmbeddings = await generator.EmbedAsync(new[] { query }, ct).ConfigureAwait(false);
                 if (queryEmbeddings.Count == 0)
                 {
                     return "semantic_search: encoder produced no vector for the query.";
                 }
 
+                progress?.Report(Format.Progress(0.5, "searching"));
                 var hits = await host.EmbeddingsStore.SearchAsync(queryEmbeddings[0], k, kindFilter, ct).ConfigureAwait(false);
                 if (hits.Count == 0)
                 {
                     return $"No semantic matches for '{query}'. The graph may not have any embeddings yet — let the indexer's embedding pass complete after a fresh `index` and try again.";
                 }
 
+                progress?.Report(Format.Progress(0.9, "formatting results"));
                 var sb = new StringBuilder();
-                sb.AppendLine($"{hits.Count} semantic match(es) for '{query}':");
-                foreach (var h in hits)
+                sb.AppendLine($"{hits.Count} semantic hits for '{query}':");
+                if (hits.Count >= 2)
                 {
-                    var sym = await host.Store.GetSymbolByIdAsync(h.SymbolId, ct).ConfigureAwait(false);
-                    if (sym is null) continue;
-                    sb.Append($"- score {h.Score:F3} — **{sym.Fqn}** ({Format.KindWithAttrs(sym)}) at {Format.Location(sym.FilePath, sym.StartLine, sym.StartCol)}");
-                    var s = Format.OneLineSummary(sym.XmlSummary);
-                    if (!string.IsNullOrEmpty(s)) sb.Append(" — _" + s + "_");
-                    sb.AppendLine();
+                    var rows = new List<IReadOnlyList<string>>(hits.Count);
+                    foreach (var h in hits)
+                    {
+                        var sym = await host.Store.GetSymbolByIdAsync(h.SymbolId, ct).ConfigureAwait(false);
+                        if (sym is null) continue;
+                        rows.Add(new[]
+                        {
+                            h.Score.ToString("F3"),
+                            $"**{sym.Fqn}**",
+                            Format.KindWithAttrs(sym),
+                            Format.Location(sym.FilePath, sym.StartLine, sym.StartCol),
+                        });
+                    }
+                    Format.AppendTable(
+                        sb,
+                        new[] { "Score", "Symbol", "Kind", "Location" },
+                        rows,
+                        new[] { TableAlignment.Right, TableAlignment.Left, TableAlignment.Left, TableAlignment.Left });
+                }
+                else
+                {
+                    foreach (var h in hits)
+                    {
+                        var sym = await host.Store.GetSymbolByIdAsync(h.SymbolId, ct).ConfigureAwait(false);
+                        if (sym is null) continue;
+                        sb.Append($"- score {h.Score:F3} — **{sym.Fqn}** ({Format.KindWithAttrs(sym)}) at {Format.Location(sym.FilePath, sym.StartLine, sym.StartCol)}");
+                        var s = Format.OneLineSummary(sym.XmlSummary);
+                        if (!string.IsNullOrEmpty(s)) sb.Append(" — _" + s + "_");
+                        sb.AppendLine();
+                    }
                 }
                 return sb.ToString();
             }, ct));
@@ -572,7 +942,7 @@ public static class GraphTools
                 if (!string.IsNullOrWhiteSpace(symbol))
                 {
                     var hits = await host.Store.FindSymbolsAsync(symbol, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
-                    if (hits.Count == 0) return $"No symbol found for '{symbol}'.";
+                    if (hits.Count == 0) return $"No matches for '{symbol}'.";
                     symbolId = hits[0].Id;
                     symbolFqn = hits[0].Fqn;
                 }
@@ -584,9 +954,27 @@ public static class GraphTools
                 var symClause = symbolFqn is null ? "" : $", symbol={symbolFqn}";
                 sb.AppendLine($"Diagnostics (severity {sevLabel}{codeClause}{symClause}): {rows.Count}");
                 if (rows.Count == 0) return sb.ToString();
-                foreach (var d in rows)
+                if (rows.Count >= 2)
                 {
-                    sb.AppendLine($"- **{SeverityLabel(d.Severity)} {d.Code}** at {Format.Location(d.FilePath, d.Line, d.Col)} — {d.Message}");
+                    var tableRows = new List<IReadOnlyList<string>>(rows.Count);
+                    foreach (var d in rows)
+                    {
+                        tableRows.Add(new[]
+                        {
+                            SeverityLabel(d.Severity),
+                            d.Code,
+                            Format.Location(d.FilePath, d.Line, d.Col),
+                            d.Message,
+                        });
+                    }
+                    Format.AppendTable(sb, new[] { "Severity", "Code", "Location", "Message" }, tableRows);
+                }
+                else
+                {
+                    foreach (var d in rows)
+                    {
+                        sb.AppendLine($"- **{SeverityLabel(d.Severity)} {d.Code}** at {Format.Location(d.FilePath, d.Line, d.Col)} — {d.Message}");
+                    }
                 }
                 return sb.ToString();
             }, ct));
@@ -894,6 +1282,87 @@ internal static class Format
     }
 
     /// <summary>
+    /// Append a GitHub-Flavored-Markdown (GFM) table to <paramref name="sb"/>: a header row, an
+    /// alignment-cued separator row, and one data row per entry in <paramref name="rows"/>.
+    /// Cells are pipe-escaped (<c>|</c> → <c>\|</c>) so literal pipes in symbols / paths don't
+    /// split table cells in the consuming client. Throws when any row's column count differs from
+    /// the header's. Used by tools that emit list-shaped results once their row count reaches the
+    /// table threshold (>= 2).
+    /// </summary>
+    public static void AppendTable(
+        StringBuilder sb,
+        IReadOnlyList<string> headers,
+        IReadOnlyList<IReadOnlyList<string>> rows,
+        IReadOnlyList<TableAlignment>? alignments = null)
+    {
+        if (headers.Count == 0) throw new ArgumentException("Table requires at least one column.", nameof(headers));
+        if (alignments is not null && alignments.Count != headers.Count)
+        {
+            throw new ArgumentException(
+                $"Alignments length ({alignments.Count}) must match headers length ({headers.Count}).",
+                nameof(alignments));
+        }
+
+        // Header row.
+        sb.Append('|');
+        foreach (var h in headers)
+        {
+            sb.Append(' ');
+            sb.Append(EscapeCell(h));
+            sb.Append(" |");
+        }
+        sb.AppendLine();
+
+        // Separator row with optional alignment cues.
+        sb.Append('|');
+        for (var i = 0; i < headers.Count; i++)
+        {
+            var align = alignments is null ? TableAlignment.Left : alignments[i];
+            sb.Append(align switch
+            {
+                TableAlignment.Right => "---:",
+                TableAlignment.Center => ":---:",
+                _ => "---",
+            });
+            sb.Append('|');
+        }
+        sb.AppendLine();
+
+        // Data rows.
+        foreach (var row in rows)
+        {
+            if (row.Count != headers.Count)
+            {
+                throw new ArgumentException(
+                    $"Row column count ({row.Count}) must match headers length ({headers.Count}).",
+                    nameof(rows));
+            }
+            sb.Append('|');
+            foreach (var cell in row)
+            {
+                sb.Append(' ');
+                sb.Append(EscapeCell(cell));
+                sb.Append(" |");
+            }
+            sb.AppendLine();
+        }
+    }
+
+    /// <summary>Escape a literal <c>|</c> in cell content so it doesn't break GFM table parsing.</summary>
+    private static string EscapeCell(string s) =>
+        string.IsNullOrEmpty(s) ? string.Empty : s.Replace("|", "\\|", StringComparison.Ordinal);
+
+    /// <summary>
+    /// Build a <see cref="ProgressNotificationValue"/> for emission via an injected
+    /// <see cref="IProgress{T}"/>. Centralises the notification shape so every tool's checkpoints
+    /// share the same contract: <c>Total = 1.0</c>, <paramref name="fraction"/> in <c>[0.0, 1.0]</c>,
+    /// and a short imperative <paramref name="message"/> with no caller-supplied substrings (avoids
+    /// PII echo back to the chat UI).
+    /// </summary>
+    public static ProgressNotificationValue Progress(double fraction, string message) =>
+        new() { Progress = (float)fraction, Total = 1f, Message = message };
+
+    /// <summary>
     /// Render an indented <c>    payload: { key: "value", ... }</c> sub-line for an edge whose
     /// originating <c>edges.payload</c> column was non-null. Returns <c>null</c> when
     /// <paramref name="payloadJson"/> is null, empty, blank, or fails to deserialise as a JSON
@@ -948,6 +1417,18 @@ internal static class Format
     }
 
     private const int PayloadKeyLimit = 5;
+}
+
+/// <summary>
+/// Column alignment cue for <see cref="Format.AppendTable"/>. <see cref="Left"/> emits
+/// <c>---</c> (the GFM default), <see cref="Right"/> emits <c>---:</c> (used by numeric columns
+/// like <c>In-deg</c>, <c>Depth</c>, <c>Score</c>), and <see cref="Center"/> emits <c>:---:</c>.
+/// </summary>
+public enum TableAlignment
+{
+    Left,
+    Right,
+    Center,
 }
 
 internal static class AnnotationFormat

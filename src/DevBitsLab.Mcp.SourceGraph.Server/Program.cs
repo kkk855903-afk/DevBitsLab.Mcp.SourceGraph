@@ -214,6 +214,13 @@ static async Task<int> RunServeAsync(CommandLine cli)
     var noInstructions = ServerInstructions.ShouldSuppress(
         cli.NoInstructions,
         Environment.GetEnvironmentVariable(ServerInstructions.EnvVarName));
+
+    // Brand-mark suppression: same shape as --no-instructions. Set once, read by the
+    // LeafFormatter chokepoint inside ToolMetrics on every tool call (see Decision 6 in
+    // openspec/changes/add-leaf-brand-mark/design.md).
+    LeafFormatter.Suppressed = ServerInstructions.ShouldSuppress(
+        cli.NoLeaf,
+        Environment.GetEnvironmentVariable(LeafFormatter.EnvVarName));
     if (!noInstructions)
     {
         // Use Program as the logger category — ServerVocabulary is static so it can't be a
@@ -224,7 +231,7 @@ static async Task<int> RunServeAsync(CommandLine cli)
             .ConfigureAwait(false);
         builder.Services.Configure<McpServerOptions>(o =>
         {
-            o.ServerInstructions = ServerInstructions.Template;
+            o.ServerInstructions = ServerInstructions.ResolvePublished();
             // Capabilities.Experimental is the MCP spec's extension point for non-standard
             // server capabilities; we slot the vocabulary in under a namespaced key so unrelated
             // clients ignore it. The wire shape is `{ "edge_kinds": [...union...],

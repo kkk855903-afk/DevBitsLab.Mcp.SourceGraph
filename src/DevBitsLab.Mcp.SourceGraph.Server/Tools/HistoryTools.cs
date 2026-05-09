@@ -33,7 +33,7 @@ public static class HistoryTools
             ScopedExecution.RunAsync(router, scope, async host =>
             {
                 var hits = await host.Store.FindSymbolsAsync(symbol, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
-                if (hits.Count == 0) return $"No symbol found for '{symbol}'.";
+                if (hits.Count == 0) return $"No matches for '{symbol}'.";
                 var top = hits[0];
                 var tests = await host.Store.ListTestsForAsync(top.Id, limit, ct).ConfigureAwait(false);
                 var sb = new StringBuilder();
@@ -48,10 +48,28 @@ public static class HistoryTools
                     }
                     return sb.ToString();
                 }
-                foreach (var t in tests)
+                if (tests.Count >= 2)
                 {
-                    var fw = string.IsNullOrEmpty(t.Framework) ? "unknown" : t.Framework;
-                    sb.AppendLine($"- [{fw}] **{t.Test.Fqn}** at {Format.Location(t.Test.FilePath, t.Test.StartLine, t.Test.StartCol)}");
+                    var tableRows = new List<IReadOnlyList<string>>(tests.Count);
+                    foreach (var t in tests)
+                    {
+                        var fw = string.IsNullOrEmpty(t.Framework) ? "unknown" : t.Framework;
+                        tableRows.Add(new[]
+                        {
+                            fw,
+                            $"**{t.Test.Fqn}**",
+                            Format.Location(t.Test.FilePath, t.Test.StartLine, t.Test.StartCol),
+                        });
+                    }
+                    Format.AppendTable(sb, new[] { "Framework", "Test", "Location" }, tableRows);
+                }
+                else
+                {
+                    foreach (var t in tests)
+                    {
+                        var fw = string.IsNullOrEmpty(t.Framework) ? "unknown" : t.Framework;
+                        sb.AppendLine($"- [{fw}] **{t.Test.Fqn}** at {Format.Location(t.Test.FilePath, t.Test.StartLine, t.Test.StartCol)}");
+                    }
                 }
                 return sb.ToString();
             }, ct));
@@ -73,7 +91,7 @@ public static class HistoryTools
                     return "git history unavailable on this server (--no-history)";
                 }
                 var hits = await host.Store.FindSymbolsAsync(symbol, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
-                if (hits.Count == 0) return $"No symbol found for '{symbol}'.";
+                if (hits.Count == 0) return $"No matches for '{symbol}'.";
                 var top = hits[0];
                 var history = await host.Store.GetSymbolHistoryAsync(top.Id, ct).ConfigureAwait(false);
                 if (history is null || string.IsNullOrEmpty(history.LastCommitSha))
@@ -105,11 +123,33 @@ public static class HistoryTools
                 var rows = await host.Store.ListRecentChangesAsync(sinceMs, author, limit, ct).ConfigureAwait(false);
                 var sb = new StringBuilder();
                 var authorClause = string.IsNullOrEmpty(author) ? "" : $" by author~'{author}'";
-                sb.AppendLine($"{rows.Count} symbol(s) changed in the last {days} day(s){authorClause}:");
+                var symbolNoun = rows.Count == 1 ? "symbol" : "symbols";
+                sb.AppendLine($"{rows.Count} {symbolNoun} changed in the last {days} day(s){authorClause}:");
                 if (rows.Count == 0) return sb.ToString();
-                foreach (var r in rows)
+                if (rows.Count >= 2)
                 {
-                    sb.AppendLine($"- {Format.HistoryLine(r.History)} — **{r.Symbol.Fqn}** at {Format.Location(r.Symbol.FilePath, r.Symbol.StartLine, r.Symbol.StartCol)}");
+                    var tableRows = new List<IReadOnlyList<string>>(rows.Count);
+                    foreach (var r in rows)
+                    {
+                        var when = r.History.LastAuthoredAt is { } t ? t.ToString("yyyy-MM-dd") : "?";
+                        var who = r.History.LastAuthor ?? "(unknown)";
+                        var sha = r.History.LastCommitSha is { Length: > 0 } s ? s[..Math.Min(7, s.Length)] : "(none)";
+                        tableRows.Add(new[]
+                        {
+                            $"{when} ({sha})",
+                            who,
+                            $"**{r.Symbol.Fqn}**",
+                            Format.Location(r.Symbol.FilePath, r.Symbol.StartLine, r.Symbol.StartCol),
+                        });
+                    }
+                    Format.AppendTable(sb, new[] { "When", "Author", "Symbol", "Location" }, tableRows);
+                }
+                else
+                {
+                    foreach (var r in rows)
+                    {
+                        sb.AppendLine($"- {Format.HistoryLine(r.History)} — **{r.Symbol.Fqn}** at {Format.Location(r.Symbol.FilePath, r.Symbol.StartLine, r.Symbol.StartCol)}");
+                    }
                 }
                 return sb.ToString();
             }, ct));

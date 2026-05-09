@@ -296,6 +296,7 @@ Common flags:
 | `--no-embeddings` | Skip the embedding pipeline entirely (no model download, no `vec0` writes). `semantic_search` returns a disabled message; every other tool works as before. |
 | `--no-history` | Disable the git-blame history pipeline. Use in environments without `git` on `PATH` or in CI where per-symbol history isn't needed. |
 | `--no-instructions` | Don't publish server-side usage guidance in the MCP `initialize` response. By default the server tells the connected model to prefer source-graph tools over `Grep` + `Read` for symbol-level questions and to call `usage_stats` at end-of-turn to verify. Equivalent to setting `SOURCEGRAPH_NO_INSTRUCTIONS=1`. |
+| `--no-leaf` | Don't prefix tool responses (or the published `ServerInstructions` string) with the green-leaf brand mark `🌿`. By default every built-in tool's first line begins with `🌿 ` so the agent (and the human reading the chat) can tell at a glance that the answer came from this server. Use this knob if your terminal renders emoji as monospaced fallback boxes or if you simply prefer unbranded output. Equivalent to setting `SOURCEGRAPH_NO_LEAF=1`. Independent of `--no-instructions`. |
 
 Examples:
 
@@ -338,6 +339,28 @@ The server emits three signals you can hook into:
    `mcp.tool.scope`. Both signals are zero-cost when no listener is attached;
    pick them up with the OpenTelemetry SDK or `dotnet-counters monitor --name
    sourcegraph-mcp DevBitsLab.Mcp.SourceGraph`.
+4. **MCP `notifications/progress`** — three tools opt in to live progress
+   reporting on their slow paths: `semantic_search` (three checkpoints around
+   ONNX-model load + vector search + formatting), `impact_of_change`, and
+   `module_summary` (one starting checkpoint each). Clients opt in by sending
+   a `progressToken` field on the originating `tools/call` request:
+
+   ```json
+   {
+     "method": "tools/call",
+     "params": {
+       "name": "semantic_search",
+       "arguments": {"query": "retry on transient errors"},
+       "_meta": {"progressToken": "any-string-or-int"}
+     }
+   }
+   ```
+
+   When no `progressToken` is set, the server emits zero progress messages
+   — the wire fast-path is unchanged. When set, the server emits one
+   `notifications/progress` message per checkpoint with a normalised
+   `progress` value in `[0, 1]` and a short `message` (`encoding query`,
+   `searching`, `formatting results`, `querying`).
 
 ## Resource limits and tunables
 
@@ -354,6 +377,7 @@ database per scope. The current limits are:
 | Embedding model download | ~480 MB | Disable with `--no-embeddings`. |
 | Per-symbol `git blame` shellout | enabled | Disable with `--no-history`. |
 | MCP `initialize` instructions payload | enabled | Disable with `--no-instructions` or `SOURCEGRAPH_NO_INSTRUCTIONS=1`. |
+| Green-leaf brand mark on tool responses | enabled | Disable with `--no-leaf` or `SOURCEGRAPH_NO_LEAF=1`. |
 | SQLite database size per scope | unbounded | Use `clear` to wipe; databases live under `<root>/.sourcegraph/scopes/<id>.db`. |
 
 There is no built-in query timeout. If you need one, layer a `CancellationToken`

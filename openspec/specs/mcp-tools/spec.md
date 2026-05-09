@@ -6,9 +6,7 @@ Expose the code graph to MCP clients (Claude Code, Cursor, Continue, …) as a
 set of stdio-callable tools so that an LLM coding agent can answer
 symbol-level questions via one structured call instead of dozens of
 `Grep` + `Read` operations.
-
 ## Requirements
-
 ### Requirement: Definition lookup
 The server SHALL expose a `find_definition` tool that returns the location, kind, signature, accessibility, modifiers, and (when present) one-line XML summary for every symbol matching a name or fully-qualified name.
 
@@ -220,7 +218,7 @@ Every existing query tool (`find_definition`, `find_references`, `list_symbols_i
 
 #### Scenario: Default behaviour
 - **WHEN** any tool is invoked without a `scope` argument
-- **THEN** the query runs against the configured `default_scope` (or the single registered scope when none is configured), and the response notes the implicit scope it queried
+- **THEN** the query runs against the configured `default_scope` (or the single registered scope when none is configured), and the response carries no in-band scope annotation — the agent can call `list_scopes` if it needs to know which scope answered
 
 #### Scenario: Explicit single scope
 - **WHEN** a tool is invoked with `scope = "backend"`
@@ -242,11 +240,15 @@ Every result row from a scope-aware query SHALL include the originating scope (o
 - **THEN** each row's markdown includes `scope: <name>` (or `scope: [<a>, <b>]` for canonical_key dedup)
 
 ### Requirement: Server-published usage instructions
-The server SHALL publish a non-empty `ServerInstructions` string in the MCP `initialize` response by default. The string SHALL convey two things to a connected model: (1) a directive to prefer source-graph tools over `Grep` + `Read` for symbol-level questions, and (2) a closing directive to call `usage_stats` at end-of-turn to verify the graph was actually queried.
+The server SHALL publish a non-empty `ServerInstructions` string in the MCP `initialize` response by default. The string SHALL convey two things to a connected model: (1) a directive to prefer source-graph tools over `Grep` + `Read` for symbol-level questions, and (2) a closing directive to call `usage_stats` at end-of-turn to verify the graph was actually queried. When brand-mark suppression is not active (see *Brand-mark suppression*), the published string SHALL be prefixed with `🌿 ` (U+1F33F U+0020) so that a connecting client learns the leaf-glyph-to-`sourcegraph` association from the initialize handshake.
 
 #### Scenario: Client reads instructions on connect
 - **WHEN** an MCP client (`McpClient`) completes the initialize handshake against a freshly started `sourcegraph-mcp serve` process
 - **THEN** the client's `ServerInstructions` property contains both the preamble keyword (`prefer` or equivalent guidance against `Grep`+`Read`) and the epilogue keyword (`usage_stats`)
+
+#### Scenario: Instructions string starts with the leaf brand mark
+- **WHEN** an MCP client reads `ServerInstructions` from the initialize response with neither `--no-leaf` nor `SOURCEGRAPH_NO_LEAF` set
+- **THEN** the string starts with the byte sequence `🌿 ` (U+1F33F U+0020), and the cross-cutting guidance follows
 
 #### Scenario: Instructions suppressed via flag
 - **WHEN** the server is started with `--no-instructions`
@@ -288,3 +290,142 @@ The MCP `initialize` response SHALL include three top-level string arrays alongs
 #### Scenario: Polyglot scope vocabulary
 - **WHEN** the active scope additionally loads a plugin that emits `renders-component` and `binds-path` edges and a `xaml-element` symbol kind
 - **THEN** the `edge_kinds` array additionally contains `"binds-path"` and `"renders-component"`, and `symbol_kinds` additionally contains `"xaml-element"`, both still sorted lowercase
+
+### Requirement: Tool response brand mark
+The server SHALL prefix the first line of every built-in MCP tool's response text with the green-leaf glyph `🌿` (U+1F33F) followed by a single space character (U+0020), before that response is shipped to the MCP client. The prefix SHALL apply uniformly to success responses, empty-result responses, and any error-string responses (i.e. any response a tool body returns as a `string` or `Task<string>`). Plugin-registered tools (registered via `IToolRegistry.AddTool` in `Plugins/ToolRegistry.cs`) SHALL NOT receive the brand-mark prefix, so plugin-authored output preserves its own voice.
+
+#### Scenario: Built-in tool response leads with the leaf
+- **WHEN** an MCP client invokes `find_definition(symbol = "Calculator")` against an indexed solution that contains `Sample.Domain.Calculator`
+- **THEN** the response text starts with the byte sequence `🌿 ` (U+1F33F followed by U+0020), and the existing markdown content follows on the same line
+
+#### Scenario: Empty-result response also leads with the leaf
+- **WHEN** an MCP client invokes `find_definition(symbol = "Nonexistent")` against a graph with no matches
+- **THEN** the response text starts with `🌿 ` followed by the no-match message (e.g. `🌿 No matches for 'Nonexistent'.`)
+
+#### Scenario: Plugin tool response is not brand-marked
+- **WHEN** an MCP client invokes a tool registered through `IToolRegistry.AddTool` (e.g. a plugin-supplied `xaml.find_view`) and the plugin's handler returns a string
+- **THEN** the response text is the plugin's string verbatim, with no leading `🌿 ` prefix
+
+#### Scenario: Brand-mark prefix is idempotent
+- **WHEN** a built-in tool's body returns a string whose first characters are already `🌿 ` (e.g. due to internal pre-stamping)
+- **THEN** the shipped response contains exactly one `🌿 ` prefix, not two stacked leaves
+
+### Requirement: Brand-mark suppression
+The server SHALL accept `--no-leaf` as a CLI flag on `sourcegraph-mcp serve` and SHALL honour `SOURCEGRAPH_NO_LEAF` as an environment variable (truthy values: exact `1`, or `true` case-insensitive — same convention as `SOURCEGRAPH_NO_INSTRUCTIONS`). When either is set, the server SHALL omit the brand-mark prefix from every built-in tool response AND SHALL omit the brand-mark prefix from the published `ServerInstructions` string. The two suppression mechanisms (`--no-leaf` and `--no-instructions`) compose independently: turning off one SHALL NOT turn off the other.
+
+#### Scenario: Suppression via flag
+- **WHEN** the server is started with `--no-leaf`
+- **THEN** built-in tool responses contain no leading `🌿 ` and the published `ServerInstructions` string (if any) contains no leading `🌿 `
+
+#### Scenario: Suppression via env var
+- **WHEN** the server is started without `--no-leaf` but with `SOURCEGRAPH_NO_LEAF=1` in env
+- **THEN** built-in tool responses contain no leading `🌿 ` and the published `ServerInstructions` string (if any) contains no leading `🌿 `
+
+#### Scenario: Leaf suppression independent of instructions suppression
+- **WHEN** the server is started with `--no-leaf` but WITHOUT `--no-instructions`
+- **THEN** the `ServerInstructions` string is published, the rest of its cross-cutting guidance is intact, but it carries no leading `🌿 ` prefix
+
+#### Scenario: Suppression knobs compose
+- **WHEN** the server is started with both `--no-leaf` and `--no-instructions`
+- **THEN** the `initialize` response carries no `ServerInstructions` string at all, and built-in tool responses carry no `🌿 ` prefix
+
+### Requirement: Tabular rendering for list-shaped tool results
+Every built-in tool whose result is a list of homogeneous rows SHALL render those rows as a GitHub-Flavored-Markdown (GFM) table when the row count is two or greater. The table SHALL begin with a header row enumerating the columns, followed by a separator row carrying alignment cues for any numeric column, followed by one data row per result. Single-result responses (one row) MAY remain bulleted prose so the table-chrome overhead is not paid for one-row data.
+
+The first line of every tool response SHALL remain a substantive prose summary so the leaf brand-mark prefix from `add-leaf-brand-mark` lands on prose rather than on table chrome.
+
+Cells containing the pipe character (`|`) — file paths, symbol identifiers — SHALL escape it to `\|` so a literal pipe in the data does not break table parsing in the consuming client.
+
+Tools whose result is hierarchical (each row carries nested signature, summary, annotations, or history) — `find_definition`, `list_symbols_in_file` — SHALL retain their existing bulleted prose rendering. Tools that already render tables — `usage_stats`, `list_scopes`, `list_generated_files`, `graph_stats` — are unchanged.
+
+#### Scenario: find_references with multiple references
+- **WHEN** the agent invokes `find_references(symbol = "X")` against a graph that has 4 references to `X`
+- **THEN** the response begins with a leaf-prefixed summary line (e.g. `🌿 4 references to **X** (class):`), followed by the definition line, followed by a GFM table with header `| Kind | Location |` and four data rows, one per reference
+
+#### Scenario: find_references with a single reference falls back to prose
+- **WHEN** `find_references(symbol = "Y")` returns one reference
+- **THEN** the response renders the single reference as a bulleted line (no table)
+
+#### Scenario: search_symbols with multiple hits
+- **WHEN** `search_symbols(query = "Calc")` returns 6 hits
+- **THEN** the response renders a `| Symbol | Kind | Location |` table with six data rows
+
+#### Scenario: list_callers / list_callees / find_implementations table shape
+- **WHEN** any of `list_callers`, `list_callees`, `find_implementations` returns two or more rows
+- **THEN** the response renders a `| Symbol | Kind | Location |` table
+
+#### Scenario: list_members table shape
+- **WHEN** `list_members(container = "X")` returns two or more members
+- **THEN** the response renders a `| Member | Kind | Signature |` table
+
+#### Scenario: semantic_search table shape with right-aligned score column
+- **WHEN** `semantic_search(query = "...")` returns two or more semantic hits
+- **THEN** the response renders a `| Score | Symbol | Kind | Location |` table whose `Score` column header separator carries right-alignment (`---:`)
+
+#### Scenario: find_diagnostics table shape
+- **WHEN** `find_diagnostics(...)` returns two or more diagnostics
+- **THEN** the response renders a `| Severity | Code | Location | Message |` table
+
+#### Scenario: recent_changes table shape
+- **WHEN** `recent_changes(...)` returns two or more rows
+- **THEN** the response renders a `| When | Author | Symbol | Location |` table
+
+#### Scenario: list_tests_for table shape
+- **WHEN** `list_tests_for(symbol = "...")` returns two or more tests
+- **THEN** the response renders a `| Framework | Test | Location |` table
+
+#### Scenario: impact_of_change table shape with right-aligned depth column
+- **WHEN** `impact_of_change(symbol = "...")` returns two or more upstream callers
+- **THEN** the response renders a `| Depth | Symbol | Kind | Location |` table whose `Depth` column header separator carries right-alignment (`---:`)
+
+#### Scenario: module_summary table shape with right-aligned in-degree column
+- **WHEN** `module_summary(namespaceOrPath = "...")` returns two or more rows
+- **THEN** the response renders a `| In-deg | Symbol | Kind | Location |` table whose `In-deg` column header separator carries right-alignment (`---:`)
+
+#### Scenario: find_by_annotation table shape
+- **WHEN** `find_by_annotation(name = "...")` returns two or more symbols
+- **THEN** the response renders a `| Symbol | Kind | Location |` table
+
+#### Scenario: neighborhood Inbound and Outbound sections render as tables
+- **WHEN** `neighborhood(symbol = "X")` returns at least two inbound or outbound rows in a category
+- **THEN** that category's `### Inbound (N)` / `### Outbound (N)` header is followed by a `| Symbol | Kind | Location |` table; categories with one or zero rows render as today's bulleted shape
+
+#### Scenario: Cell pipe escaping
+- **WHEN** a result row's symbol or file path contains a literal `|` character (rare but legal in arbitrary FQNs / paths)
+- **THEN** the rendered table cell escapes that character as `\|` so the pipe is rendered literally and does not split the cell
+
+#### Scenario: Fan-out scope tag in tabular rendering
+- **WHEN** `find_references(symbol = "X", scope = "*")` produces a multi-scope merged table
+- **THEN** each row's `Symbol` cell carries the inline scope annotation (`\`Symbol.Name\` — scope: \`<id>\``) so the existing per-row scope contract from "Scope identity in result rows" is preserved
+
+### Requirement: Progress notifications on slow tools
+Tools whose work has multi-second tails on representative inputs SHALL accept an `IProgress<ProgressNotificationValue>` parameter and emit progress at coarse, named checkpoints during the call. Each emitted `ProgressNotificationValue` SHALL set `Total = 1.0`, a `Progress` value in the inclusive range `[0.0, 1.0]` that is monotonically increasing across the call, and a short imperative `Message` (e.g. `"encoding query"`, `"searching"`, `"querying"`) that contains no user-controlled substrings.
+
+The set of tools opted in by this requirement is `semantic_search`, `impact_of_change`, and `module_summary`. Other tools MAY add the parameter in future changes when their measured latency justifies it.
+
+When an MCP client did not include a `progressToken` on the originating `tools/call` request, the SDK SHALL inject a no-op `IProgress<ProgressNotificationValue>` instance so tool bodies that call `Report(...)` unconditionally incur no wire-level overhead.
+
+#### Scenario: semantic_search emits encoding, searching, and formatting checkpoints
+- **WHEN** an MCP client invokes `semantic_search(query = "...")` and includes a `progressToken` on the request
+- **THEN** the server emits three `notifications/progress` messages over the call's lifetime, in order: `Progress = 0.0` with `Message = "encoding query"`, `Progress = 0.5` with `Message = "searching"`, and `Progress = 0.9` with `Message = "formatting results"`; the request's final `tools/call` response carries the search results as today
+
+#### Scenario: impact_of_change emits a starting checkpoint
+- **WHEN** an MCP client invokes `impact_of_change(symbol = "...", maxDepth = 6)` with a `progressToken` on the request
+- **THEN** the server emits a single `notifications/progress` message with `Progress = 0.0` and `Message = "querying"` shortly after the request begins; the final response carries the impact set as today
+
+#### Scenario: module_summary emits a starting checkpoint
+- **WHEN** an MCP client invokes `module_summary(namespaceOrPath = "...")` with a `progressToken` on the request
+- **THEN** the server emits a single `notifications/progress` message with `Progress = 0.0` and `Message = "querying"` shortly after the request begins
+
+#### Scenario: No progress emitted when client did not opt in
+- **WHEN** an MCP client invokes any of `semantic_search`, `impact_of_change`, `module_summary` WITHOUT a `progressToken` on the request
+- **THEN** the server emits zero `notifications/progress` messages for the call; the tool result returns identically to today's behaviour
+
+#### Scenario: Progress values are monotonically increasing
+- **WHEN** any opted-in tool emits two or more progress notifications during a single call
+- **THEN** each successive notification's `Progress` value is strictly greater than the previous notification's `Progress`, with all values in the closed interval `[0.0, 1.0]`
+
+#### Scenario: Progress messages carry no user input
+- **WHEN** any progress notification is emitted by an opted-in tool
+- **THEN** its `Message` string is one of the documented short imperatives (`"encoding query"`, `"searching"`, `"formatting results"`, `"querying"`) and does not interpolate any caller-supplied argument value (symbol name, query text, file path, etc.) into the message
+

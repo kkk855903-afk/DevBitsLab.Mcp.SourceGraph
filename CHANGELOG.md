@@ -11,6 +11,31 @@ below note which package the change applies to.
 ## [Unreleased]
 
 ### Added
+- 🌿 Green-leaf brand mark on every built-in MCP tool response so the agent
+  (and reading human) can tell at a glance the answer came from sourcegraph
+  vs. `Grep` + `Read`. Suppress with `--no-leaf` or `SOURCEGRAPH_NO_LEAF=1`.
+  Also leafs the published `ServerInstructions` string. (`add-leaf-brand-mark`)
+- Markdown tables for list-shaped tool results when the row count is ≥ 2:
+  `find_references`, `find_by_annotation`, `search_symbols`, `list_callers`,
+  `list_callees`, `find_implementations`, `list_members`, `semantic_search`,
+  `find_diagnostics`, `recent_changes`, `list_tests_for`, `impact_of_change`,
+  `module_summary`, plus the inbound/outbound sections of `neighborhood`.
+  Single-result responses keep their existing bulleted form. Hierarchical
+  tools (`find_definition`, `list_symbols_in_file`) stay bulleted because
+  per-row nesting (xml summary, annotations, history) doesn't fit a table
+  cleanly. (`polish-tool-output-markdown`)
+- MCP `notifications/progress` on three slow tools — `semantic_search`
+  (cold-start ONNX model load), `impact_of_change`, `module_summary`. Clients
+  opt in by sending a `progressToken` on the originating `tools/call` request;
+  no-op otherwise. (`report-progress-on-slow-tools`)
+- `find_definition` now ships typed `structuredContent` (`FindDefinitionResult`
+  with snake_case JSON properties) alongside renderable prose, plus one
+  `resource_link` per hit pointing at `graph://symbol/<id>` for clients with
+  richer UI, plus an audience-restricted (`Audience = [Assistant]`) metadata
+  block carrying scope id and per-call latency. The remaining tools migrate
+  in follow-up commits. (`tool-output-content-blocks` foundation + vertical
+  slice; the bulk sweep across the other 17 tools is queued for a future
+  `/opsx:apply` session.)
 - **Sdk 2.1.0** — `PayloadKeys` static class with kebab-case constants
   for the well-known keys plugins put in `EdgeEmitted.Metadata` (`path`,
   `mode`, `converter`, `converter-parameter`, `event`, `handler`,
@@ -71,12 +96,47 @@ below note which package the change applies to.
 - README sections covering the platform support matrix and configurable
   resource limits.
 
+### Changed
+- Tool response lead-in lines tightened for token economy:
+  `Found N match(es) for 'X':` → `🌿 N hits for 'X':`,
+  `No definition found for 'X'.` → `🌿 No matches for 'X'.`,
+  collective `(s)` plurals dropped (`5 symbol(s) carry [Foo]:` →
+  `🌿 5 symbols carry [Foo]:`). Net-positive across a typical session even
+  after the leaf glyph is added. (Lands with `add-leaf-brand-mark`.)
+- Single-host implicit-default scope responses no longer prefix with an
+  italic `_(scope: \`default\`)_` line. Removing it gives the brand mark
+  prime first-line real estate, adjacent to substantive content rather
+  than chrome. Agents that need to know which scope answered can still
+  call `list_scopes`, read the `mcp.tool.scope` OTel tag, or inspect the
+  per-call `usage.jsonl` log entry. Multi-scope explicit fan-out is
+  unchanged (per-scope `### scope: <id>` headers still appear).
+  (`drop-implicit-scope-annotation`)
+- Indexer now wraps the `Ping` tool through `ToolMetrics.TrackSync`. It
+  was bypassing the chokepoint entirely — no leaf, no telemetry. Same
+  `pong @ <iso-time>` payload, just with the standard observability
+  surfaces around it.
+
 ### Fixed
 - `Capabilities.Experimental["sourcegraph.vocabulary"]` no longer crashes
   the `initialize` handler under MCP SDK 1.2.0's source-generated JSON
   context. The payload was an anonymous type rejected by
   `McpJsonUtilities+JsonContext`; replaced with a `JsonObject` graph
   that the SDK's context handles natively. Wire shape unchanged.
+  (`fix-initialize-vocabulary-serialization` — landed independently from
+  main's `harden-sdk-pre-xaml` change, which carries the same fix.)
+
+### Documentation
+- New OpenSpec proposals drafted but not yet applied:
+  - `tool-output-content-blocks` Groups 3-8 — bulk sweep of the remaining
+    17 tools to the multi-content + structuredContent + resource_link
+    protocol; foundation and `find_definition` vertical slice are already
+    shipped (this PR).
+  - `fix-stranded-reference-edges` — defensive recovery for the incremental
+    indexer's "zombie file" state (file's outgoing references cleared in
+    pass 1 but never repopulated; SHA-skip preserves the empty state
+    indefinitely). Reproduced today against `HistoryTools.cs`. Fix proposal
+    adds an `IGraphStore.HasOutgoingReferencesAsync` integrity check at the
+    skip boundary plus a try/catch around pass 2's per-file walk.
 
 ## [0.7.0] - 2026-05-06
 

@@ -1,11 +1,12 @@
 {
   "mcpServers": {
-    "sourcegraph": {
+    "SourceGraph": {
+      "name": "SourceGraph",
       "command": "dotnet",
       "args": [
         "run",
         "--project",
-        "${workspaceFolder}/src/DevBitsLab.Mcp.SourceGraph.Server",
+        "src/DevBitsLab.Mcp.SourceGraph.Server",
         "--no-build",
         "--no-launch-profile",
         "--verbosity",
@@ -13,7 +14,7 @@
         "--",
         "serve",
         "--solution",
-        "${workspaceFolder}/DevBitsLab.Mcp.SourceGraph.slnx"
+        "DevBitsLab.Mcp.SourceGraph.slnx"
       ]
     }
   }
