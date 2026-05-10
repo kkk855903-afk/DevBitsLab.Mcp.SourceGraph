@@ -52,6 +52,14 @@ below note which package the change applies to.
   (and reading human) can tell at a glance the answer came from sourcegraph
   vs. `Grep` + `Read`. Suppress with `--no-leaf` or `SOURCEGRAPH_NO_LEAF=1`.
   Also leafs the published `ServerInstructions` string. (`add-leaf-brand-mark`)
+- 🌿 Per-tool brand mark on every built-in MCP tool's catalog identity in
+  `tools/list`: `Tool.Title` is set to `🌿 <name>` (e.g. `🌿 find_definition`)
+  and `Tool.Description` is `🌿 `-prefixed. Surfaces the brand in MCP clients
+  that render tool selectors / hover cards / structured detail rather than
+  per-call prose, where the existing `add-leaf-brand-mark` head prefix can be
+  hidden. Plugin-registered tools are skipped (first-party voice only).
+  Suppression covered by the same `--no-leaf` / `SOURCEGRAPH_NO_LEAF=1` knob.
+  (`add-leaf-to-tool-identity`)
 - Markdown tables for list-shaped tool results when the row count is ≥ 2:
   `find_references`, `find_by_annotation`, `search_symbols`, `list_callers`,
   `list_callees`, `find_implementations`, `list_members`, `semantic_search`,

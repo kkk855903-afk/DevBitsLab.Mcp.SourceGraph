@@ -348,6 +348,13 @@ static async Task<int> RunServeAsync(CommandLine cli)
     // both built-in tools (registered via WithToolsFromAssembly) and any tools added by plugins.
     ToolDescriptionFormatter.ApplyTriggersFromAttributes(host.Services.GetServices<McpServerTool>());
 
+    // Stamp the brand mark on every built-in tool's catalog identity (Title + Description). Same
+    // post-build mutation pattern as ApplyTriggersFromAttributes; reads LeafFormatter.Suppressed
+    // (set above ~line 255) to short-circuit when --no-leaf is in effect. Plugin tools are skipped
+    // structurally — their declaring type lacks [McpServerToolType]. See
+    // openspec/changes/add-leaf-to-tool-identity/design.md for the chokepoint design.
+    ToolIdentityFormatter.ApplyBrandMark(host.Services.GetServices<McpServerTool>());
+
     await host.RunAsync().ConfigureAwait(false);
     return 0;
 }

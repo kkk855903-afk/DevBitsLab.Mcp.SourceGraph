@@ -15,7 +15,12 @@ prefer to drive guidance from your own `CLAUDE.md`.
 
 Every built-in tool's response begins with a green-leaf glyph `🌿` — that's
 the at-a-glance signal that the answer came from this server (and not from
-`Grep` + `Read` or another MCP server). Suppress with `--no-leaf` or
+`Grep` + `Read` or another MCP server). The same `🌿` also rides on each
+built-in tool's catalog identity in `tools/list`: `Tool.Title` is set to
+`🌿 <name>` and `Tool.Description` is `🌿 `-prefixed, so the brand surfaces
+in client UIs that render tool selectors and hover cards rather than the
+prose response. Suppress all three (per-call response, `ServerInstructions`
+head, and per-tool `Title`/`Description`) with `--no-leaf` or
 `SOURCEGRAPH_NO_LEAF=1` if your terminal doesn't render emoji well or you
 prefer unbranded output.
 
