@@ -25,7 +25,8 @@ public sealed record EmbeddingModelInfo(string ModelId, int Dimension)
 
 /// <summary>
 /// Default embedding model identity used when no <c>--model</c> override is supplied.
-/// 768-dim, code-trained, ~280 MB INT8-quantised ONNX from Hugging Face.
+/// 768-dim, code-trained, ~640 MB FP32 ONNX (the upstream `onnx/model.onnx` file at HF) —
+/// not the smaller INT8-quantised variant. Subsequent runs hit the local cache.
 /// </summary>
 public static class DefaultEmbeddingModel
 {
@@ -33,4 +34,23 @@ public static class DefaultEmbeddingModel
     public const int Dimension = 768;
 
     public static EmbeddingModelInfo Info { get; } = new(ModelId, Dimension);
+
+    /// <summary>
+    /// Files the auto-downloader fetches on first run for this model. The ONNX graph lives
+    /// at <c>onnx/model.onnx</c> on Hugging Face but is flattened to <c>model.onnx</c> in the
+    /// cache so the generator's path resolution stays simple.
+    ///
+    /// <para>
+    /// SHA-256s captured 2026-05-10 against the live HF release (these are the bytes shipped
+    /// at <c>https://huggingface.co/jinaai/jina-embeddings-v2-base-code/resolve/main/</c> at
+    /// the time of capture). The downloader rejects partial / tampered downloads against
+    /// these hashes; if HF re-uploads the model with new bytes the next pull will fail loudly
+    /// with a SHA-256 mismatch — capture the new hashes and ship a patch release.
+    /// </para>
+    /// </summary>
+    public static IReadOnlyList<ModelFile> Manifest { get; } = new[]
+    {
+        new ModelFile("onnx/model.onnx", "model.onnx", "63363fc178428b74620c6f3780cbc7191883fa5c7f84c0945c45eb5c4256733b"),
+        new ModelFile("tokenizer.json", null, "b01c78a902aa4facb2f47f95449f48e2f7bbfea5d2472ee2f6ce92323c6f86e5"),
+    };
 }

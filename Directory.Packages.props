@@ -32,12 +32,16 @@
     <!-- CLI -->
     <PackageVersion Include="System.CommandLine" Version="2.0.7" />
 
-    <!-- Embeddings: ONNX Runtime + Microsoft.Extensions.AI abstraction + BERT tokenizer.
+    <!-- Embeddings: ONNX Runtime + Microsoft.Extensions.AI abstraction + tokenizer library.
+         Microsoft.ML.Tokenizers covers BPE (RoBERTa-style, used by Jina v2 base code and most
+         modern code-aware embedding models) and WordPiece (BERT) from one API surface — the
+         original FastBertTokenizer choice was BERT-only and quietly excluded the entire
+         RoBERTa tier; see openspec/changes/migrate-to-ml-tokenizers/ for the swap rationale.
          The vector store native binding ships native vec0.{dylib,dll,so} via a runtimes/
          payload that flows into bin/.../runtimes/{rid}/native via the SDK. -->
     <PackageVersion Include="Microsoft.ML.OnnxRuntime" Version="1.25.1" />
     <PackageVersion Include="Microsoft.Extensions.AI.Abstractions" Version="10.5.2" />
-    <PackageVersion Include="FastBertTokenizer" Version="1.0.28" />
+    <PackageVersion Include="Microsoft.ML.Tokenizers" Version="2.0.0" />
     <PackageVersion Include="sqlite-vec" Version="0.1.7-alpha.2.1" />
 
     <!-- Tree-sitter native bindings + bundled grammars. TreeSitter.DotNet ships libtree-sitter
@@ -51,6 +55,7 @@
     <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="18.5.1" />
     <PackageVersion Include="xunit" Version="2.9.3" />
     <PackageVersion Include="xunit.runner.visualstudio" Version="3.1.5" />
+    <PackageVersion Include="Xunit.SkippableFact" Version="1.5.23" />
     <PackageVersion Include="FluentAssertions" Version="8.9.0" />
     <PackageVersion Include="coverlet.collector" Version="10.0.0" />
 

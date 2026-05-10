@@ -1,4 +1,5 @@
 using System.Reflection;
+using ModelContextProtocol.Protocol;
 using ModelContextProtocol.Server;
 
 namespace DevBitsLab.Mcp.SourceGraph.Server.Tools;
@@ -45,6 +46,27 @@ internal static class ToolDescriptionFormatter
             if (current.EndsWith(line, StringComparison.Ordinal)) continue;
 
             tool.ProtocolTool.Description = AppendTrigger(current, trigger);
+        }
+    }
+
+    /// <summary>
+    /// Apply every <see cref="ToolAnnotationAttribute"/> declared on the methods backing
+    /// <paramref name="tools"/> by mutating each tool's <see cref="ModelContextProtocol.Protocol.Tool.Annotations"/>
+    /// in place. Spec-aware MCP clients use these hints to require explicit user confirmation
+    /// before invoking destructive tools (e.g. <c>embeddings_remove</c>).
+    /// </summary>
+    public static void ApplyAnnotationsFromAttributes(IEnumerable<McpServerTool> tools)
+    {
+        foreach (var tool in tools)
+        {
+            var method = tool.Metadata?.OfType<MethodInfo>().FirstOrDefault();
+            var attr = method?.GetCustomAttribute<ToolAnnotationAttribute>();
+            if (attr is null) continue;
+
+            tool.ProtocolTool.Annotations ??= new ToolAnnotations();
+            tool.ProtocolTool.Annotations.DestructiveHint = attr.DestructiveHint;
+            tool.ProtocolTool.Annotations.IdempotentHint = attr.IdempotentHint;
+            tool.ProtocolTool.Annotations.ReadOnlyHint = attr.ReadOnlyHint;
         }
     }
 }

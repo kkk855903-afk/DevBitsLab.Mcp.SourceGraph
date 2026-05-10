@@ -66,6 +66,10 @@ public sealed class FindDefinitionStructuredOutputTests : IAsyncLifetime, IDispo
         _router = new ScopeRouter();
         _router.Register(_host);
         _router.SetDefaultScope("default");
+        // The fixture bypasses LiveIndexService, which is what normally calls MarkReady after
+        // settling. Without it, every tool call through ScopedExecution.WaitUntilReadyAsync waits
+        // forever. Surfaced post-merge of `improve-first-run-progress`.
+        _host.MarkReady();
     }
 
     public async Task DisposeAsync()

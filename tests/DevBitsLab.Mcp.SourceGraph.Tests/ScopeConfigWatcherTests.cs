@@ -82,10 +82,11 @@ public sealed class ScopeConfigWatcherTests
 
             // The watcher emits a synthetic Reverted on its first poll (file didn't exist when
             // the watcher started); we look past that for the post-write Updated event.
+            // 5s tolerates Windows CI's slower FileSystemWatcher event delivery.
             var change = await ReadUntilAsync(
                 watcher,
                 c => c is ScopeConfigChange.Updated,
-                TimeSpan.FromSeconds(2));
+                TimeSpan.FromSeconds(5));
             change.Should().NotBeNull();
             change!.Config.Scopes.Should().ContainSingle().Which.Id.Should().Be("foo");
         }
@@ -103,7 +104,8 @@ public sealed class ScopeConfigWatcherTests
         {
             await using var watcher = new ScopeConfigWatcher(root, debounce: ShortDebounce);
             // Drain the synthetic-init Reverted (the file didn't exist when the watcher started).
-            var initial = await ReadOneWithTimeoutAsync(watcher, TimeSpan.FromSeconds(2));
+            // 5s tolerates Windows CI's slower FileSystemWatcher event delivery.
+            var initial = await ReadOneWithTimeoutAsync(watcher, TimeSpan.FromSeconds(5));
             initial.Should().BeOfType<ScopeConfigChange.Reverted>();
 
             File.WriteAllText(Path.Join(root, ScopeConfigLoader.FileName), "{ this is not json");
@@ -134,12 +136,14 @@ public sealed class ScopeConfigWatcherTests
 
             // The watcher polls on each tick and emits a synthetic event on the first iteration
             // (an Updated, since the file is present at startup). We drain past that and look
-            // specifically for the post-deletion Reverted event.
+            // specifically for the post-deletion Reverted event. 8s tolerates Windows CI's
+            // slower FileSystemWatcher event delivery (the previous 3s timed out at the slow
+            // end of variance).
             File.Delete(Path.Join(root, ScopeConfigLoader.FileName));
             var change = await ReadUntilAsync(
                 watcher,
                 c => c is ScopeConfigChange.Reverted,
-                TimeSpan.FromSeconds(3));
+                TimeSpan.FromSeconds(8));
             change.Should().NotBeNull();
             change!.Config.Scopes.Should().ContainSingle().Which.Id.Should().Be("default");
         }
@@ -159,8 +163,10 @@ public sealed class ScopeConfigWatcherTests
             var sw = System.Diagnostics.Stopwatch.StartNew();
             await watcher.DisposeAsync();
             sw.Stop();
-            sw.Elapsed.Should().BeLessThan(TimeSpan.FromSeconds(2),
-                "dispose should not hang waiting for events that won't come");
+            sw.Elapsed.Should().BeLessThan(TimeSpan.FromSeconds(5),
+                "dispose should not hang waiting for events that won't come; "
+                + "the threshold is generous enough to absorb Windows CI cold-start variance "
+                + "(observed 3.1s on a slow runner) without masking a true hang");
         }
         finally
         {

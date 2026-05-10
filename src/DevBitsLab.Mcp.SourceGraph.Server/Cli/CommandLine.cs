@@ -11,6 +11,10 @@ internal sealed class CommandLine
     public string? Model { get; private init; }
     /// <summary>Disable the embedding pipeline (no model download, no vec0 writes, semantic_search returns disabled-message).</summary>
     public bool NoEmbeddings { get; private init; }
+    /// <summary>True when <c>--no-model-download</c> was passed (or <c>SOURCEGRAPH_NO_MODEL_DOWNLOAD=1</c>);
+    /// disables auto-fetching the embedding model. With this flag the pipeline runs only if the cache is
+    /// already populated; otherwise it degrades to the same shape as <c>--no-embeddings</c>.</summary>
+    public bool NoModelDownload { get; private init; }
     /// <summary>True when <c>--no-history</c> was passed; disables the git-blame pipeline.</summary>
     public bool NoHistory { get; private init; }
     /// <summary>True when <c>--no-instructions</c> was passed; suppresses the server-published
@@ -22,6 +26,9 @@ internal sealed class CommandLine
     /// <summary>True when <c>--strict</c> was passed; consumed by <c>vocabulary list</c> to exit
     /// non-zero when drift candidates are reported.</summary>
     public bool Strict { get; private init; }
+    /// <summary>True when <c>--all</c> was passed; consumed by <c>embeddings remove</c> to wipe
+    /// every cached model directory rather than just the active one.</summary>
+    public bool All { get; private init; }
     /// <summary>The scope id passed via <c>--scope &lt;id&gt;</c>; consumed by <c>vocabulary list</c>
     /// to filter the output to a single scope. Null means every scope.</summary>
     public string? ScopeId { get; private init; }
@@ -69,10 +76,13 @@ internal sealed class CommandLine
         string? model = null;
         string? root = null;
         var noEmbeddings = false;
+        var noModelDownload = string.Equals(
+            Environment.GetEnvironmentVariable("SOURCEGRAPH_NO_MODEL_DOWNLOAD"), "1", StringComparison.Ordinal);
         var noHistory = false;
         var noInstructions = false;
         var noLeaf = false;
         var strict = false;
+        var all = false;
         string? scopeId = null;
         int? queryTimeoutSeconds = null;
         int? queryRowLimit = null;
@@ -113,6 +123,9 @@ internal sealed class CommandLine
                 case "--no-embeddings":
                     noEmbeddings = true;
                     break;
+                case "--no-model-download":
+                    noModelDownload = true;
+                    break;
                 case "--no-history":
                     noHistory = true;
                     break;
@@ -124,6 +137,9 @@ internal sealed class CommandLine
                     break;
                 case "--strict":
                     strict = true;
+                    break;
+                case "--all":
+                    all = true;
                     break;
                 case "--scope":
                     scopeId = RequireArg(args, ref i, a);
@@ -201,10 +217,12 @@ internal sealed class CommandLine
             RepoRoot = root,
             Model = model,
             NoEmbeddings = noEmbeddings,
+            NoModelDownload = noModelDownload,
             NoHistory = noHistory,
             NoInstructions = noInstructions,
             NoLeaf = noLeaf,
             Strict = strict,
+            All = all,
             ScopeId = scopeId,
             QueryTimeoutSeconds = queryTimeoutSeconds,
             QueryRowLimit = queryRowLimit,
@@ -279,12 +297,12 @@ internal sealed class CommandLine
         sourcegraph-mcp — live code source graph MCP server for .NET
 
         Usage:
-          sourcegraph-mcp serve [--solution <path>] [--db <path>] [--root <repo>] [--model <id>] [--no-embeddings] [--no-history]
+          sourcegraph-mcp serve [--solution <path>] [--db <path>] [--root <repo>] [--model <id>] [--no-embeddings] [--no-model-download] [--no-history]
               Run the MCP stdio server. With --solution given, registers an implicit single-scope
               `default` mapped to that solution. Otherwise reads `.sourcegraph.json` from --root
               (or CWD) for multi-scope configuration.
 
-          sourcegraph-mcp index <solution-path> [--db <path>] [--model <id>] [--no-embeddings] [--no-history]
+          sourcegraph-mcp index <solution-path> [--db <path>] [--model <id>] [--no-embeddings] [--no-model-download] [--no-history]
               Build/refresh the graph database from the given .sln file, then exit.
 
           sourcegraph-mcp stats [--db <path>]
@@ -340,6 +358,25 @@ internal sealed class CommandLine
               indexers emitting near-duplicate identifiers (e.g. `bind-path` vs `binds-path`).
               Exits 0 by default; with --strict, exits 2 when any drift candidate is reported.
 
+          sourcegraph-mcp embeddings status [--model <id>]
+              Print the cache directory, active model id and dimension, per-file presence/size/
+              SHA-256, and the free disk on the cache volume. Useful as a first stop when
+              `--no-model-download` warned the cache was empty.
+
+          sourcegraph-mcp embeddings pull [--model <id>]
+              Synchronously download the active (or --model) manifest into the cache. Idempotent:
+              a populated cache is a no-op.
+
+          sourcegraph-mcp embeddings remove [--model <id>] [--all]
+              Clear the cache for the active model (default), one specific --model, or every
+              cached model with --all. Combining --model with --all is rejected.
+
+          sourcegraph-mcp embeddings verify [--model <id>]
+              Recompute SHAs of every cached file. The default model ships with pinned SHAs —
+              exits 2 on mismatch. Override `--model <id>` paths use a best-effort manifest with
+              no pinned SHAs; in that case prints the computed SHA with an "informational only"
+              note and exits 0.
+
         Common flags:
           --root <path>     Repository root used for `.sourcegraph.json` discovery and scope DBs.
                             Defaults to the directory holding `--solution`, then CWD.
@@ -347,6 +384,12 @@ internal sealed class CommandLine
                             jinaai/jina-embeddings-v2-base-code). Applies to serve/index.
           --no-embeddings   Skip the embedding pipeline entirely. semantic_search returns the
                             disabled-message; every other tool works as before.
+          --no-model-download
+                            Disable auto-fetching the embedding model from Hugging Face. With this
+                            flag the pipeline runs only when the cache is already populated;
+                            otherwise it degrades to the same shape as --no-embeddings. Use in
+                            air-gapped environments where outbound network is denied. Equivalent
+                            to setting SOURCEGRAPH_NO_MODEL_DOWNLOAD=1.
           --no-history      Disable the git-blame history pipeline. Use in environments without
                             git on PATH or in CI runs where per-symbol history isn't needed.
           --no-instructions Don't publish server-side usage guidance in the MCP `initialize`

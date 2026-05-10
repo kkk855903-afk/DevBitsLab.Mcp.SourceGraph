@@ -316,6 +316,10 @@ public sealed class PayloadToolingFixtureTests : IAsyncLifetime, IDisposable
         var router = new ScopeRouter();
         router.Register(host);
         router.SetDefaultScope(scopeId);
+        // The fixture bypasses LiveIndexService, which is what normally calls MarkReady after
+        // settling. Without it, every tool call through ScopedExecution.WaitUntilReadyAsync waits
+        // forever. Surfaced post-merge of `improve-first-run-progress`.
+        host.MarkReady();
         return (host, router);
     }
 

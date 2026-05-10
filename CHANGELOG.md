@@ -10,7 +10,45 @@ below note which package the change applies to.
 
 ## [Unreleased]
 
+### Fixed
+- **Semantic search now actually works on a fresh checkout.** Three coordinated
+  changes that together close the gap between "documented as available" and
+  "actually loads":
+  - `wire-model-autodownload` — `ModelStore.EnsureAsync` is now invoked at
+    server startup so the embedding model is fetched from Hugging Face on
+    first run (the downloader had been written in the v0.4 semantic-search
+    change but never wired into `Program.cs`). Indexing runs concurrently
+    with the download via a `ModelDownloadGate` singleton; the embed worker
+    awaits the gate before probing `IsAvailable` (sticky), closing the race
+    that previously disabled embeddings permanently for the session. New
+    `--no-model-download` flag (and `SOURCEGRAPH_NO_MODEL_DOWNLOAD=1` env
+    var) lets air-gapped operators run against a pre-populated cache without
+    enabling the auto-fetch.
+  - `migrate-to-ml-tokenizers` — replaced the BERT-only `FastBertTokenizer`
+    with `Microsoft.ML.Tokenizers` 2.0 so the documented default model
+    `jinaai/jina-embeddings-v2-base-code` (RoBERTa-tokenized BPE) actually
+    loads. Previous library threw a `JsonException` on the upstream
+    `tokenizer.json`, silently disabling semantic search even when the model
+    file was on disk. New library handles both BPE (RoBERTa, Jina, BGE-M3)
+    and WordPiece (BERT) from one API surface — dispatch keys off the
+    `model.type` field of `tokenizer.json` at load time.
+  - Pinned SHA-256 hashes for the default model's `model.onnx` and
+    `tokenizer.json` so corrupted / tampered downloads fail loudly instead
+    of poisoning the cache. Override-model paths (`--model <id>`) remain
+    best-effort with no SHA verification.
+
 ### Added
+- **Embedding cache management surface.** New CLI subcommand group
+  `sourcegraph-mcp embeddings <status|pull|remove|verify>` and matching MCP
+  tools `embeddings_status` / `embeddings_pull` / `embeddings_remove` /
+  `embeddings_verify`. `status` reports the cache directory, model id +
+  dimension, per-file presence/size/SHA, and free disk on the cache volume
+  — first stop when the new `--no-model-download` warning fires. `remove`
+  defaults to the active model; `--all` wipes every cached model directory;
+  combining `--model X --all` is rejected. Mutating MCP tools carry MCP-spec
+  `destructiveHint` / `idempotentHint` annotations via a new `[ToolAnnotation]`
+  attribute + post-build walker so spec-aware hosts (Claude Code) prompt
+  before invocation. (`add-embeddings-cli-and-tools`)
 - **Cold-start progress visibility.** When a progress-aware tool
   (`find_definition`, `semantic_search`, `impact_of_change`, `module_summary`)
   is invoked with a `progressToken` against a scope whose initial indexing

@@ -495,3 +495,6 @@ $RECYCLE.BIN/
 
 # Per-session scheduled-tasks lock (Claude Code runtime)
 .claude/scheduled_tasks.lock
+
+# Lazily-fetched test fixtures (e.g. tokenizer.json downloaded once per dev/CI box)
+tests/fixtures/.cache/

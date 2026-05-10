@@ -82,7 +82,7 @@ priority: `--db` if given, then `<solution-dir>/.sourcegraph/graph.db` if
 - **THEN** the DB lands at the per-user cache path; CWD is never used
 
 ### Requirement: Embedding-related CLI flags
-The CLI SHALL accept `--model <id>` to override the embedding model and `--no-embeddings` to disable the embedding pipeline entirely; both apply to `serve` and `index`.
+The CLI SHALL accept `--model <id>` to override the embedding model, `--no-embeddings` to disable the embedding pipeline entirely, and `--no-model-download` to disable the auto-download step while still using a pre-populated cache. All three flags apply to `serve` and `index`. The `--no-model-download` flag SHALL also be settable via the `SOURCEGRAPH_NO_MODEL_DOWNLOAD` environment variable.
 
 #### Scenario: Disable embeddings
 - **WHEN** `sourcegraph-mcp serve --solution <sln> --no-embeddings` is invoked
@@ -90,7 +90,19 @@ The CLI SHALL accept `--model <id>` to override the embedding model and `--no-em
 
 #### Scenario: Override model
 - **WHEN** the user passes `--model nomic-ai/CodeRankEmbed`
-- **THEN** the server resolves and (if needed) downloads that model, ignores any cached embeddings whose `model_version` is different, and re-embeds on next index
+- **THEN** the server resolves and (if needed) downloads that model best-effort (no SHA-256 verification, atomic rename still in place), ignores any cached embeddings whose `model_version` is different, and re-embeds on next index
+
+#### Scenario: Disable auto-download with empty cache
+- **WHEN** the user passes `--no-model-download` and the cache directory has no `model.onnx` or `tokenizer.json`
+- **THEN** no HTTP request is issued, the embedding pipeline is disabled for this session (same payload as `--no-embeddings`), and the warning text names the cache path so the operator can pre-populate it
+
+#### Scenario: Disable auto-download with populated cache
+- **WHEN** the user passes `--no-model-download` and the cache directory already contains valid `model.onnx` + `tokenizer.json`
+- **THEN** the cached model is loaded and embeddings run normally; no HTTP request is issued
+
+#### Scenario: Disable auto-download via environment variable
+- **WHEN** the user starts the server with `SOURCEGRAPH_NO_MODEL_DOWNLOAD=1` and no `--no-model-download` flag
+- **THEN** the server behaves identically to the `--no-model-download` flag form
 
 ### Requirement: Scope-management subcommands
 The CLI SHALL accept `sourcegraph-mcp scopes list`, `sourcegraph-mcp scopes add <name> ...`, and `sourcegraph-mcp scopes remove <name>` to inspect and edit `.sourcegraph.json`.
@@ -164,6 +176,49 @@ The `vocabulary list` subcommand SHALL accept an optional `--scope <id>` flag th
 #### Scenario: Filter to one scope
 - **WHEN** `vocabulary list --scope backend` is invoked in a repo whose `.sourcegraph.json` declares scopes `backend`, `frontend`, and `vendor`
 - **THEN** only the `backend` section is printed; `frontend` and `vendor` are not visited
+
+### Requirement: Embeddings subcommand group
+The CLI SHALL accept a `sourcegraph-mcp embeddings <verb>` top-level subcommand group that exposes inspection and management of the embedding model cache. At v1 the supported verbs are `status`, `pull`, `remove`, and `verify`. An unknown nested verb SHALL exit with code `2` and an error message naming the supported verbs.
+
+#### Scenario: Default model status
+- **WHEN** `sourcegraph-mcp embeddings status` is invoked with no `--model` override
+- **THEN** the command prints the cache directory path, the active model id and dimension, one row per manifest file (`localName`, presence flag, size in bytes when present, computed SHA-256 when present, pinned SHA when the manifest specifies one and a `match` indicator), and the free-disk bytes on the cache volume; the exit code is `0`
+
+#### Scenario: Explicit pull
+- **WHEN** `sourcegraph-mcp embeddings pull` is invoked with no `--model` override and an empty cache
+- **THEN** the command synchronously downloads the active model's manifest files into the cache directory, prints a final status snapshot identical to the `status` verb's output, and exits `0`
+
+#### Scenario: Pull is idempotent
+- **WHEN** `sourcegraph-mcp embeddings pull` is invoked against a populated cache
+- **THEN** no HTTP request is issued, the existing files are left untouched, the status snapshot is printed, and the command exits `0`
+
+#### Scenario: Remove the active model
+- **WHEN** `sourcegraph-mcp embeddings remove` is invoked with no flags and the active model's cache directory is populated
+- **THEN** the command deletes the active model's per-id directory under `models/`, prints `{ "modelId": "<active>", "removedDirs": [...], "freedBytes": N }` (or the equivalent prose), and exits `0`
+
+#### Scenario: Remove all cached models
+- **WHEN** `sourcegraph-mcp embeddings remove --all` is invoked
+- **THEN** every per-id directory under `models/` is deleted (the `models/` parent itself is preserved), the printed report names every removed directory and the total bytes freed, and the command exits `0`
+
+#### Scenario: Conflicting --model and --all rejected
+- **WHEN** `sourcegraph-mcp embeddings remove --model jinaai/foo --all` is invoked
+- **THEN** the command prints an `ArgumentException` message naming both flags, prints the `embeddings remove` usage line, and exits `2` without touching disk
+
+#### Scenario: Verify, no pinned SHA in manifest
+- **WHEN** `sourcegraph-mcp embeddings verify --model someorg/custom-model` is invoked against a populated cache for a non-default model whose manifest has no pinned SHA-256 strings (the override-model path uses a best-effort manifest)
+- **THEN** the command prints the computed SHA of every cached file alongside a `(no pinned SHA — informational only)` note and exits `0`
+
+#### Scenario: Verify, pinned SHA matches
+- **WHEN** `sourcegraph-mcp embeddings verify` is invoked against a populated cache and every cached file's computed SHA matches its manifest pinned SHA
+- **THEN** every row carries `match: true` and the command exits `0`
+
+#### Scenario: Verify, pinned SHA mismatch
+- **WHEN** `sourcegraph-mcp embeddings verify` is invoked against a populated cache where at least one cached file's computed SHA does not match its manifest pinned SHA
+- **THEN** the affected rows carry `match: false`, the prose names the failing files, and the command exits `2`
+
+#### Scenario: Inspect a non-active cached model
+- **WHEN** the user passes `sourcegraph-mcp embeddings status --model someorg/other-model` against a cache containing both the active model and `someorg/other-model`
+- **THEN** the printed status reflects the `someorg/other-model` directory only; the active model's data is not included in the report
 
 ### Requirement: init subcommand
 The CLI SHALL accept `sourcegraph-mcp init` that runs an interactive (default) or flag-driven (`--yes`) onboarding flow producing per-client MCP configuration files, optionally pre-warming the index, and printing a closing report. Default writes SHALL be project-scoped (under `--root`, default CWD); user-scope writes SHALL require an explicit per-client opt-in flag.

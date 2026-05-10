@@ -107,6 +107,13 @@ workspace` → `indexing` → `ready`) for the duration of the wait, so first-
 call latency narrates itself instead of presenting as a silent spinner.
 Clients that don't opt in see today's silent-then-result behaviour.
 
+The embedding model cache is inspectable from both surfaces: the CLI verbs
+`sourcegraph-mcp embeddings status / pull / remove / verify` (operator-facing,
+human-readable) and the matching MCP tools `embeddings_status` / `embeddings_pull`
+/ `embeddings_remove` / `embeddings_verify` (agent-facing, structured output).
+Mutating tools carry MCP `destructiveHint` annotations so spec-aware hosts can
+require explicit confirmation before invocation.
+
 ## Scopes (multi-solution monorepos)
 
 A `.sourcegraph.json` at the repo root opts a project into multi-scope mode:
