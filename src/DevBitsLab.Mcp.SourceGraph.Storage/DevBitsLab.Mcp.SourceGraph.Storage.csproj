@@ -10,6 +10,8 @@
     <PackageReference Include="sqlite-vec" />
 
     <ProjectReference Include="..\DevBitsLab.Mcp.SourceGraph.Core\DevBitsLab.Mcp.SourceGraph.Core.csproj" />
+    <!-- For KebabCaseValidator (used by ScopeConfigLoader's `language` field validation). -->
+    <ProjectReference Include="..\DevBitsLab.Mcp.SourceGraph.Sdk\DevBitsLab.Mcp.SourceGraph.Sdk.csproj" />
   </ItemGroup>
 
   <ItemGroup>

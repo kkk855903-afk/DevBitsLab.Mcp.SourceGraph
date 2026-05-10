@@ -52,6 +52,15 @@ calls with a single structured tool call:
   Five XAML symbol kinds, eight cross-language edge kinds, plus
   `xaml-attached-property` annotations for `Grid.Row` / `DockPanel.Dock` /
   etc.
+- **TypeScript / JavaScript / TSX / JSX indexing.** Built-in tree-sitter-backed
+  indexer for `.ts` / `.tsx` / `.js` / `.jsx`, covering function / class /
+  interface / type-alias / enum / namespace / const / let declarations, call-site
+  references, and JSX `instantiates` edges (with prop-list payload) for
+  PascalCase components. Default excludes (`node_modules`, `dist`, `.next`,
+  `build`, `coverage`, `.cache`, `.parcel-cache`, `out`) keep a fresh
+  install from indexing dependency trees. Cross-file ref resolution is
+  intra-file at this version; tsconfig `paths`-aware module resolution +
+  optional `typescript-language-server` enrichment ship as follow-ups.
 - **FTS5 name search.** Trigram fragment matching for cases where you only
   remember "`…Greet…Async`".
 - **Optional code-aware semantic search.** ONNX embeddings (default model:
@@ -89,7 +98,7 @@ cheap structural queries against a stable solution.
 | **Initial indexing** | `MSBuildWorkspace` load (10–60 s on a real solution), paid in every consumer process | Scope open + full indexing on host start (and after `clear` or workspace reloads); tool calls await `ScopeHost.Ready` until the pass completes. Borne once by the host, shared across every connected client. |
 | **Steady-state query** | Fast in-memory queries against the loaded workspace | Milliseconds — SQLite query against the warm DB; incremental re-indexing handled by the watcher (see *Freshness* below) |
 | **Search shape** | Exact-identity lookups (`SymbolFinder.FindReferencesAsync`) | Same exact lookups *plus* FTS5 fragment search and ONNX semantic search |
-| **Languages** | C# / VB only | C# + XAML today, with cross-language joins; plugin SDK for more |
+| **Languages** | C# / VB only | C# + XAML + TypeScript / JavaScript / TSX / JSX today, with cross-language joins; plugin SDK for more |
 | **Multi-solution** | One workspace per solution | Native scope router with isolation flags for vendored / generated code |
 | **Freshness** | Caller's problem | File watcher + `.git/HEAD` watcher with 200 ms debounce |
 | **Semantic accuracy** | 100% live | Snapshot-accurate, refreshed on file changes |
@@ -555,6 +564,14 @@ A `.sourcegraph.json` at the repo root opts a project into multi-scope mode:
 - `isolated: true` excludes a scope from `scope = "*"` fan-out — useful for
   vendored or generated code that shouldn't pollute references on production
   symbols.
+- `language` (string, optional, kebab-case) declares the primary language
+  for scopes whose project-set is glob-based; hint to indexer dispatch when
+  the same file extension could plausibly be claimed by multiple plugins.
+  No closed-list enforcement (soft-registry posture).
+- `enrichment` (object, optional) is a forward-declared block carrying one
+  nested `lsp: { command, args }` field. Loaded and surfaced via
+  `scopes info`, but no first-party plugin consumes it at this version —
+  the first runtime use lands with the TypeScript indexer.
 - Without a `.sourcegraph.json` and without `--solution`, a synthesised
   `default` scope keeps single-solution users working unchanged.
 - The legacy single-database layout (`.sourcegraph/graph.db`) is migrated to
@@ -622,6 +639,7 @@ sourcegraph-mcp <subcommand> [options]
 | `demo [--scope <id>] [--no-color]` | Run four canned operations (`ping`, `graph_stats`, `search_symbols`, `find_definition`) against the active scope and print leaf-stamped markdown — the same shape an MCP client would see. Provides the "ah, it works" confidence moment without an agent loop. Exits `2` if the scope has zero symbols indexed. |
 | `init-scopes` | Discover `.slnx`/`.sln` files at `--root` (default: CWD) and write a starter `.sourcegraph.json`. Continues to work standalone; `init` invokes the same scaffolding internally when multi-solution is detected. |
 | `scopes list [--root <path>]` | List the scopes declared in `.sourcegraph.json`. |
+| `scopes info <name> [--root <path>] [--json]` | Detailed view of one scope: identity, project set, optional `language` field, optional `enrichment` block. With `--json`, emits a stable JSON shape. |
 | `scopes add <name> --solution <path> [--root <path>] [--isolated]` | Add a scope. The file is created on first use. |
 | `scopes remove <name> [--root <path>]` | Remove a scope. |
 | `plugins list [--root <path>]` | List plugins declared in `.sourcegraph.json` with their version, status, registered contracts, and source path. |

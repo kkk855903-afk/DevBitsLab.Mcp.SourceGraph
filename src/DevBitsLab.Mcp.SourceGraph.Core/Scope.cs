@@ -29,7 +29,42 @@ public sealed record Scope(
     string Root,
     ScopeProjectSet ProjectSet,
     bool Isolated,
-    DateTimeOffset LastIndexedAt);
+    DateTimeOffset LastIndexedAt)
+{
+    /// <summary>
+    /// Optional kebab-case language identifier (<c>"typescript"</c>, <c>"python"</c>, …).
+    /// Forward-declared at this version: the loader validates the shape (kebab-case if
+    /// present) and surfaces the value via <c>scopes info</c>, but indexer dispatch still
+    /// runs purely off file extensions today. A future change will read this hint to
+    /// disambiguate when a single extension could plausibly be claimed by multiple plugins.
+    /// </summary>
+    public string? Language { get; init; }
+
+    /// <summary>
+    /// Optional enrichment configuration block. Forward-declared at this version: the loader
+    /// parses and validates the shape, the host surfaces it via <c>scopes info</c>, but no
+    /// first-party indexer consumes <see cref="ScopeEnrichmentConfig.Lsp"/> yet. The first
+    /// runtime consumer will be a follow-up <c>add-typescript-lsp-enrichment</c> change that
+    /// wires <c>typescript-language-server</c> against TS scopes; this field locks the
+    /// on-disk shape so the follow-up doesn't need to retouch the loader.
+    /// </summary>
+    public ScopeEnrichmentConfig? Enrichment { get; init; }
+}
+
+/// <summary>
+/// Optional per-scope enrichment configuration. Currently carries one nested <see cref="Lsp"/>
+/// block; future enrichment kinds (<c>embeddings</c>, <c>static-analysis</c>) hang off the
+/// same root when their indexers ship.
+/// </summary>
+public sealed record ScopeEnrichmentConfig(LspEnrichmentConfig? Lsp);
+
+/// <summary>
+/// LSP-server configuration for enrichment-aware language indexers. <see cref="Command"/> is the
+/// executable to launch (resolved against PATH); <see cref="Args"/> is the argument list.
+/// Loader validates that <see cref="Command"/> is non-empty when the block is present;
+/// <see cref="Args"/> defaults to an empty array.
+/// </summary>
+public sealed record LspEnrichmentConfig(string Command, IReadOnlyList<string> Args);
 
 /// <summary>
 /// Discriminated union over the three ways a scope can describe its source set: a list of

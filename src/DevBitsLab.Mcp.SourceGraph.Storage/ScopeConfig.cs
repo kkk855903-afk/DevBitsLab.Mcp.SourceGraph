@@ -1,6 +1,7 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using DevBitsLab.Mcp.SourceGraph.Core;
+using DevBitsLab.Mcp.SourceGraph.Sdk.Validation;
 
 namespace DevBitsLab.Mcp.SourceGraph.Storage;
 
@@ -139,13 +140,34 @@ public static class ScopeConfigLoader
                 : hasProjects
                     ? new ScopeProjectSet.Projects(entry.Projects!, entry.Exclude ?? Array.Empty<string>())
                     : new ScopeProjectSet.Paths(entry.Paths ?? entry.Include ?? Array.Empty<string>(), entry.Exclude ?? Array.Empty<string>());
+
+            // Optional `language` field — kebab-case if present.
+            if (entry.Language is not null && !KebabCaseValidator.IsValid(entry.Language))
+            {
+                throw new ScopeConfigException(
+                    $"{FileName} scope `{entry.Name}` has invalid `language` value `{entry.Language}`. Must be a non-empty kebab-case identifier (lowercase letters / digits, single hyphens between segments).");
+            }
+
+            // Optional `enrichment` block — currently only `lsp` is recognised; unknown keys are
+            // rejected so a misspelled future-enrichment key surfaces as an error rather than
+            // silent drop.
+            ScopeEnrichmentConfig? enrichment = null;
+            if (entry.Enrichment is not null)
+            {
+                enrichment = ParseEnrichment(entry.Name, entry.Enrichment);
+            }
+
             scopes.Add(new Scope(
                 Id: entry.Name,
                 Name: entry.Name,
                 Root: repoRoot,
                 ProjectSet: projectSet,
                 Isolated: entry.Isolated ?? false,
-                LastIndexedAt: DateTimeOffset.MinValue));
+                LastIndexedAt: DateTimeOffset.MinValue)
+            {
+                Language = entry.Language,
+                Enrichment = enrichment,
+            });
         }
 
         if (!string.IsNullOrEmpty(dto.DefaultScope) && !seen.Contains(dto.DefaultScope!))
@@ -156,6 +178,44 @@ public static class ScopeConfigLoader
 
         var plugins = ParsePlugins(dto.Plugins);
         return new ScopeConfig(scopes, dto.DefaultScope, plugins);
+    }
+
+    /// <summary>
+    /// Validate and convert a <see cref="ScopeEnrichmentJson"/> into the in-memory
+    /// <see cref="ScopeEnrichmentConfig"/>. Rejects unknown nested keys, empty
+    /// <c>command</c> strings, and missing <c>lsp</c> blocks. The enrichment is forward-declared
+    /// at this SDK version — the loader still validates the shape so a misspelled future-
+    /// enrichment key surfaces as a precise startup error rather than silent acceptance.
+    /// </summary>
+    private static ScopeEnrichmentConfig ParseEnrichment(string scopeName, ScopeEnrichmentJson dto)
+    {
+        // `JsonExtensionData` captures any keys we don't recognise (e.g. a typo of `lsp` or a
+        // future-enrichment block this SDK doesn't enforce yet). Reject up front so the
+        // operator sees a precise error at startup rather than discovering hours later that
+        // their `embeddings: { ... }` block was silently dropped.
+        if (dto.Extra is { Count: > 0 })
+        {
+            var unknownKey = dto.Extra.Keys.First();
+            throw new ScopeConfigException(
+                $"{FileName} scope `{scopeName}`: unknown key `{unknownKey}` in `enrichment` block. At this SDK version the only recognised key is `lsp` ({{ command, args }}); future enrichment kinds (embeddings, static-analysis, …) are reserved-but-rejected until their indexers ship.");
+        }
+        if (dto.Lsp is null)
+        {
+            throw new ScopeConfigException(
+                $"{FileName} scope `{scopeName}`: `enrichment` block is empty. At this SDK version the only recognised key is `lsp` ({{ command, args }}); future enrichment kinds will be reserved when their indexers ship.");
+        }
+        if (string.IsNullOrWhiteSpace(dto.Lsp.Command))
+        {
+            // IsNullOrWhiteSpace (vs IsNullOrEmpty) catches whitespace-only commands like
+            // "   " that would parse cleanly but fail at process-launch time with a useless
+            // FileNotFoundException — the loader is the right place to reject these.
+            throw new ScopeConfigException(
+                $"{FileName} scope `{scopeName}`: `enrichment.lsp.command` is missing, empty, or whitespace-only. Specify the LSP-server executable name (resolved against PATH).");
+        }
+        var args = dto.Lsp.Args ?? Array.Empty<string>();
+        // Trim the command to defend against trailing-newline-from-yaml-paste shapes; args
+        // are passed to the process verbatim so we don't trim them.
+        return new ScopeEnrichmentConfig(new LspEnrichmentConfig(dto.Lsp.Command.Trim(), args));
     }
 
     /// <summary>
@@ -234,6 +294,17 @@ public static class ScopeConfigLoader
                 Paths = s.ProjectSet is ScopeProjectSet.Paths g ? g.Globs : null,
                 Exclude = s.ProjectSet.Exclude.Count > 0 ? s.ProjectSet.Exclude : null,
                 Isolated = s.Isolated ? true : null,
+                Language = s.Language,
+                Enrichment = s.Enrichment is { Lsp: { } lsp }
+                    ? new ScopeEnrichmentJson
+                    {
+                        Lsp = new LspEnrichmentJson
+                        {
+                            Command = lsp.Command,
+                            Args = lsp.Args.Count > 0 ? lsp.Args : null,
+                        },
+                    }
+                    : null,
             }).ToList(),
             DefaultScope = config.DefaultScope,
             Plugins = config.Plugins.Count > 0
@@ -303,4 +374,36 @@ internal sealed record ScopeEntryJson
     [JsonPropertyName("include")] public IReadOnlyList<string>? Include { get; init; }
     [JsonPropertyName("exclude")] public IReadOnlyList<string>? Exclude { get; init; }
     [JsonPropertyName("isolated")] public bool? Isolated { get; init; }
+    [JsonPropertyName("language")] public string? Language { get; init; }
+    [JsonPropertyName("enrichment")] public ScopeEnrichmentJson? Enrichment { get; init; }
+}
+
+/// <summary>
+/// JSON wire-shape for the per-scope <c>enrichment</c> block. Currently carries one nested
+/// <see cref="Lsp"/> field; future enrichment kinds (<c>embeddings</c>, <c>static-analysis</c>)
+/// will hang off the same root when their indexers ship.
+/// </summary>
+internal sealed record ScopeEnrichmentJson
+{
+    [JsonPropertyName("lsp")] public LspEnrichmentJson? Lsp { get; init; }
+
+    /// <summary>
+    /// Captures any JSON keys not declared above (e.g. a future <c>embeddings</c> or
+    /// <c>static-analysis</c> block that this SDK version doesn't recognise yet). The loader
+    /// inspects this dictionary at parse time and rejects with <see cref="ScopeConfigException"/>
+    /// when it's non-empty so a misspelled future-enrichment key surfaces as a precise startup
+    /// error rather than silent acceptance.
+    /// </summary>
+    [JsonExtensionData] public Dictionary<string, JsonElement>? Extra { get; init; }
+}
+
+/// <summary>
+/// JSON wire-shape for the <c>enrichment.lsp</c> block. <see cref="Command"/> is the executable
+/// name (resolved against PATH at launch time); <see cref="Args"/> defaults to an empty array
+/// when omitted.
+/// </summary>
+internal sealed record LspEnrichmentJson
+{
+    [JsonPropertyName("command")] public string? Command { get; init; }
+    [JsonPropertyName("args")] public IReadOnlyList<string>? Args { get; init; }
 }

@@ -1,8 +1,34 @@
 # Roadmap
 
-All proposed changes have shipped and archived. New proposals can be drafted
-under `openspec/changes/<slug>/` and validated with
+New proposals are drafted under `openspec/changes/<slug>/` and validated with
 `openspec validate --all --strict`.
+
+## Phase 5 — Open language hosts (in flight)
+
+Generalising the per-language indexer slot beyond `.cs` (Roslyn) and `.xaml`
+(custom parser) so the marginal cost of adding language N+1 collapses to
+"bind a tree-sitter grammar + write a node-kind map".
+
+| Change | Adds | Depends on |
+|---|---|---|
+| **`add-tree-sitter-language-indexer-host`** | New `Indexing.TreeSitter` project; abstract `TreeSitterLanguageIndexer<T>` base; SDK `INodeKindMapper` / `IModuleResolver` / `LanguageIndexerOptions` / `ITreeSitterGrammarConfig` contracts; scope-config `language` + `enrichment` fields; `scopes info` CLI; `TreeSitter.DotNet` runtime + 28 grammar binaries shipped transitively. No language emits rows yet. | — |
+| **`add-typescript-language-indexer`** (MVP shipping) | First concrete language on the host: `.ts` / `.tsx` / `.js` / `.jsx` indexer using bundled grammars; PascalCase JSX `instantiates` edges with prop payload; default scope excludes (`node_modules`, `dist`, `.next`, …); lifts `js` / `ts` / `jsx` / `tsx` canonical-key schemes. **Cross-file ref resolution + LSP enrichment ship as follow-ups** (see below). | `add-tree-sitter-language-indexer-host` |
+
+**Deferred follow-ups for the TypeScript stack** (factored out so the MVP can ship):
+
+- `add-typescript-module-resolver` — hand-rolled cross-file resolver covering
+  relative imports + tsconfig `paths` aliases + extension probing + re-export
+  chase. Adds `tsconfig` field on scope-config.
+- `add-typescript-lsp-enrichment` — LSP client wiring under
+  `Indexing.TreeSitter/Lsp/`; spawns `typescript-language-server` post-pass when
+  `enrichment.lsp.command` is set; merges results as `refs` rows tagged
+  `enrichment_source = 'lsp'`. Carries the additive schema bump V11→V12 for the
+  new column. `find_references` rendering gains a `(via lsp)` annotation.
+
+After these land, future per-language changes (Python, Go, Rust, Ruby) reduce
+to: subclass `TreeSitterLanguageIndexer<T>`, write the `INodeKindMapper`,
+implement language-specific `IModuleResolver`, lift the relevant canonical-key
+scheme.
 
 ## Shipped (archived)
 

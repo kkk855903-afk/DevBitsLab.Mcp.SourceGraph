@@ -11,12 +11,12 @@ namespace DevBitsLab.Mcp.SourceGraph.Sdk.Validation;
 /// MUST NOT contain backslash characters (paths embedded in keys are repo-relative with forward
 /// slashes regardless of OS, so cross-platform identity is preserved).</para>
 ///
-/// <para>Reserved-and-enforced schemes at v1: <c>csharp</c>, <c>xaml</c>.</para>
+/// <para>Reserved-and-enforced schemes at this SDK version: <c>csharp</c>, <c>xaml</c>,
+/// <c>js</c>, <c>ts</c>, <c>jsx</c>, <c>tsx</c>.</para>
 ///
 /// <para>Reserved-but-not-yet-enforced (documented for cross-language joins; emissions using these
 /// schemes are rejected by the host until the corresponding language indexer ships): <c>vbnet</c>,
-/// <c>fsharp</c>, <c>razor</c>, <c>js</c>, <c>ts</c>, <c>jsx</c>, <c>tsx</c>, <c>vue</c>,
-/// <c>svelte</c>.</para>
+/// <c>fsharp</c>, <c>razor</c>, <c>vue</c>, <c>svelte</c>, <c>python</c>, <c>go</c>, <c>rust</c>.</para>
 /// </summary>
 public static class CanonicalKeyValidator
 {
@@ -24,6 +24,12 @@ public static class CanonicalKeyValidator
     {
         "csharp",
         "xaml",
+        // Lifted by add-typescript-language-indexer (SDK 2.2.0): the TypeScript indexer emits
+        // these. The four cover .ts, .tsx, .js, .jsx file extensions respectively.
+        "js",
+        "ts",
+        "jsx",
+        "tsx",
     };
 
     private static readonly HashSet<string> _reservedFutureSchemes = new(StringComparer.Ordinal)
@@ -31,12 +37,14 @@ public static class CanonicalKeyValidator
         "vbnet",
         "fsharp",
         "razor",
-        "js",
-        "ts",
-        "jsx",
-        "tsx",
         "vue",
         "svelte",
+        // Documented across the live extensibility/spec.md as reserved-for-future-use; listed
+        // here so the validator's error hint mentions "reserved for a future language" rather
+        // than a generic "unknown scheme" when a plugin emits one of these too early.
+        "python",
+        "go",
+        "rust",
     };
 
     /// <summary>

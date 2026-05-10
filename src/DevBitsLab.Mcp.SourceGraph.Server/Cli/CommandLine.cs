@@ -53,7 +53,7 @@ internal sealed class CommandLine
     public bool ClaudeDesktop { get; private init; }
     /// <summary>Every <c>--solution</c> value, in order. <see cref="SolutionPath"/> mirrors the last entry for back-compat with single-valued consumers.</summary>
     public IReadOnlyList<string> Solutions { get; private init; } = Array.Empty<string>();
-    /// <summary>True when <c>--json</c> was passed; consumed by <c>doctor</c> to emit a machine-readable structured document instead of glyph output.</summary>
+    /// <summary>True when <c>--json</c> was passed; consumed by <c>doctor</c> to emit a machine-readable structured document instead of glyph output, and by <c>scopes info</c> to emit a stable JSON shape mirroring the markdown sections.</summary>
     public bool Json { get; private init; }
     /// <summary>True when <c>--no-color</c> was passed; consumed by <c>demo</c> to suppress the green-leaf glyph on per-line output. Independent of <see cref="NoLeaf"/>, which is the server-wide opt-out.</summary>
     public bool NoColor { get; private init; }
@@ -319,6 +319,11 @@ internal sealed class CommandLine
 
           sourcegraph-mcp scopes list [--root <path>]
               List the scopes declared in the repo's .sourcegraph.json (or the synthesised default).
+
+          sourcegraph-mcp scopes info <name> [--root <path>] [--json]
+              Detailed view of one scope: identity, project set, optional `language` field,
+              optional `enrichment` block. With --json, emits a stable shape mirroring the markdown
+              sections.
 
           sourcegraph-mcp scopes add <name> --solution <path> [--root <path>] [--isolated]
               Add a scope to .sourcegraph.json. <name> is the kebab-case id; --solution gives the

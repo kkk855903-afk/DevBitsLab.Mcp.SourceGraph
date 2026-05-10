@@ -1,8 +1,9 @@
 # 🌿 DevBitsLab.Mcp.SourceGraph
 
-Live code source graph MCP server for .NET solutions. Indexes C# via Roslyn into
-SQLite + FTS5 and exposes graph queries to MCP clients (Claude Code, Cursor) over
-stdio.
+Live code source graph MCP server. Indexes C# via Roslyn, XAML via a custom
+profile-aware parser, and TypeScript / JavaScript / TSX / JSX via tree-sitter
+into SQLite + FTS5 and exposes graph queries to MCP clients (Claude Code,
+Cursor) over stdio.
 
 ## Onboarding CLI: `init`, `doctor`, `demo`
 
@@ -101,11 +102,21 @@ list, or `"*"`). Call `list_scopes` to discover the configured scopes. Without a
 `.sourcegraph.json` and without `--solution`, a synthesised `default` scope keeps
 single-solution users working unchanged.
 
+Two optional fields beyond the project-set declaration:
+
+- `language` (kebab-case string) — primary language for glob-based scopes;
+  hint to indexer dispatch when an extension could plausibly be claimed by
+  multiple plugins. Soft-registry: any kebab-case value loads, unknown
+  values mis-route silently.
+- `enrichment` (object) — forward-declared block carrying `lsp: { command, args }`.
+  Surfaced via `scopes info` but no first-party plugin consumes it at this
+  version; the first runtime use lands with the TypeScript indexer.
+
 CLI helpers:
 
 - `sourcegraph-mcp init-scopes` — scaffold a `.sourcegraph.json` from the .slnx
   files at the repo root.
-- `sourcegraph-mcp scopes list` / `add <name> --solution <path>` / `remove <name>`.
+- `sourcegraph-mcp scopes list` / `info <name> [--json]` / `add <name> --solution <path>` / `remove <name>`.
 
 A running server picks up `.sourcegraph.json` edits live — no restart required.
 The four delta kinds are: **add scope** (new per-scope DB + cold index), **remove
@@ -183,9 +194,12 @@ the client is also resolved by the server against the process env, so paths like
 
 ## Project layout
 
-- `src/DevBitsLab.Mcp.SourceGraph.Core/` — domain types (Scope, ScopeProjectSet, ScopeIdValidator)
+- `src/DevBitsLab.Mcp.SourceGraph.Core/` — domain types (Scope, ScopeProjectSet, ScopeIdValidator, ScopeEnrichmentConfig, LspEnrichmentConfig)
 - `src/DevBitsLab.Mcp.SourceGraph.Storage/` — SQLite graph store + FTS5; per-scope `IGraphStore` factory + `IScopeRegistry`; `ScopeConfigLoader`
 - `src/DevBitsLab.Mcp.SourceGraph.Indexing/` — Roslyn workspace + indexer
+- `src/DevBitsLab.Mcp.SourceGraph.Indexing.Xaml/` — XAML profile-aware parser indexer (WPF/WinUI/UWP/Avalonia/Uno)
+- `src/DevBitsLab.Mcp.SourceGraph.Indexing.TreeSitter/` — generic tree-sitter host (`TreeSitterLanguageIndexer<TGrammarConfig>` abstract base, `TreeSitterAdapter`); transitively brings `TreeSitter.DotNet` + bundled grammars
+- `src/DevBitsLab.Mcp.SourceGraph.Indexing.TypeScript/` — TS/JS/JSX/TSX indexer subclass of the tree-sitter host
 - `src/DevBitsLab.Mcp.SourceGraph.Watcher/` — file + git HEAD watcher
 - `src/DevBitsLab.Mcp.SourceGraph.Server/` — stdio MCP host + CLI; `Scoping/` (router + per-scope hosts)
 - `tests/fixtures/Sample.sln` — single-scope fixture for smoke tests

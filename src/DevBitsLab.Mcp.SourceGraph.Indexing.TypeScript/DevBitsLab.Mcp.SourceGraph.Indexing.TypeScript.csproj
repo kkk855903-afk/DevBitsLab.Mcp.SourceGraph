@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!-- TypeScript / JavaScript / TSX / JSX language indexer. Subclasses TreeSitterLanguageIndexer
+         from the host project; no direct TreeSitter.DotNet PackageReference here — the dependency
+         flows transitively from Indexing.TreeSitter. -->
+    <RootNamespace>DevBitsLab.Mcp.SourceGraph.Indexing.TypeScript</RootNamespace>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="DevBitsLab.Mcp.SourceGraph.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
+    <ProjectReference Include="..\DevBitsLab.Mcp.SourceGraph.Sdk\DevBitsLab.Mcp.SourceGraph.Sdk.csproj" />
+    <ProjectReference Include="..\DevBitsLab.Mcp.SourceGraph.Indexing.TreeSitter\DevBitsLab.Mcp.SourceGraph.Indexing.TreeSitter.csproj" />
+  </ItemGroup>
+
+</Project>

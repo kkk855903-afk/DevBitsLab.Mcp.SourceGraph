@@ -91,6 +91,29 @@ The server SHALL also honour `SOURCEGRAPH_NO_INSTRUCTIONS` as a process environm
 - **WHEN** the server is started with `--no-instructions` and no env var is set
 - **THEN** the initialize response carries no instructions string
 
+### Requirement: `.sourcegraph.json` scope shape
+The documented `.sourcegraph.json` schema for a scope entry SHALL be extended with two optional fields: `language` (kebab-case string) and `enrichment` (object with one `lsp` sub-key carrying `command` + optional `args`). Both fields are absent by default; existing single-solution and multi-scope configs continue to load unchanged. The shipped schema documentation in the README SHALL include the new fields with one-line semantics.
+
+#### Scenario: Pre-existing config loads unchanged
+- **WHEN** a `.sourcegraph.json` file authored against the previous schema (no `language`, no `enrichment` on any scope) is loaded by the new host version
+- **THEN** the loader produces the same `ScopeConfig` it produced before, with no additional warnings or errors
+
+#### Scenario: New config with both fields populated
+- **WHEN** a `.sourcegraph.json` declares
+  ```jsonc
+  { "scopes": [{ "name": "frontend", "paths": ["src/web/**/*.ts"],
+                  "language": "typescript",
+                  "enrichment": { "lsp": { "command": "typescript-language-server", "args": ["--stdio"] } } }] }
+  ```
+- **THEN** the loader succeeds, the `Scope` (or sister runtime record) exposes both values, and the README's documented shape matches what was loaded
+
+### Requirement: `init-scopes` does not emit the new fields
+The `sourcegraph-mcp init-scopes` CLI subcommand SHALL not emit `language` or `enrichment` keys for the synthesised default config — those are operator-authored, not auto-discoverable. Editing them into an existing `.sourcegraph.json` is the operator's responsibility at this SDK version; CLI helpers for adding them via flags on `scopes add` are deferred to a follow-up change.
+
+#### Scenario: `init-scopes` produces a minimal config
+- **WHEN** the user runs `sourcegraph-mcp init-scopes` in a repo with a single .slnx and no `.sourcegraph.json`
+- **THEN** the scaffolder writes a config containing only `name` + `solutions` for the default scope; no `language` or `enrichment` keys appear
+
 ### Requirement: First-class per-client config writers
 The CLI SHALL ship a dedicated configuration writer for each first-class MCP client (`Claude Code`, `GitHub Copilot`, `Cursor`, `Continue`, `Claude Desktop`). Each writer SHALL emit the schema documented by its target client verbatim — schemas are not normalised across writers. The writers SHALL be invokable from the `init` subcommand and SHALL share an `IClientConfigWriter` contract so future clients can be added by adding a new writer file.
 
@@ -159,4 +182,3 @@ When a writer detects that its target file contains JavaScript-style line commen
 #### Scenario: Hand-commented .mcp.json triggers degraded mode
 - **WHEN** `<root>/.mcp.json` contains lines like `// only enable in dev` above an `mcpServers` object, and `init --yes --client claude-code` runs
 - **THEN** the file is not modified, stdout includes the snippet that would have been written to it preceded by the warning line, and the process exits `0` (degrade is informational, not an error)
-
