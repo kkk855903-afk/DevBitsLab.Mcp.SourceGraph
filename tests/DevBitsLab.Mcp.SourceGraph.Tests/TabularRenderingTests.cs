@@ -13,6 +13,7 @@ using DevBitsLab.Mcp.SourceGraph.Server.Scoping;
 using DevBitsLab.Mcp.SourceGraph.Server.Tools;
 using DevBitsLab.Mcp.SourceGraph.Storage;
 using FluentAssertions;
+using ModelContextProtocol.Protocol;
 using Xunit;
 
 namespace DevBitsLab.Mcp.SourceGraph.Tests;
@@ -90,12 +91,17 @@ public sealed class TabularRenderingTests : IAsyncLifetime, IDisposable
         throw new FileNotFoundException("Could not locate tests/fixtures/Sample.sln from " + dir);
     }
 
+    // ProseText / IsUserVisible live on the shared CallToolResultHelpers static helper so the
+    // "user-visible" predicate doesn't drift across test classes that exercise the same wire
+    // shape from different angles (TabularRenderingTests, StructuredContentInvariantTests,
+    // FindDefinitionStructuredOutputTests, LeafChokepointInvariantTests).
+
     [Fact]
     public async Task FindReferences_multipleHits_rendersTable()
     {
         // Calculator.Add has at least two reference sites in the fixture: the call from
         // Multiply (`result = Add(result, a)`) and the call from Sample.App's Program.cs.
-        var output = await GraphTools.FindReferencesAsync(_router!, "Calculator.Add");
+        var output = CallToolResultHelpers.ProseText(await GraphTools.FindReferencesAsync(_router!, "Calculator.Add"));
         output.Should().Contain("References to **");
         output.Should().Contain("| Kind | Location |");
         // Separator row.
@@ -109,7 +115,7 @@ public sealed class TabularRenderingTests : IAsyncLifetime, IDisposable
     public async Task SearchSymbols_multipleHits_rendersTable()
     {
         // "Add" should match Calculator.Add (and likely several test methods that mention Add).
-        var output = await GraphTools.SearchSymbolsAsync(_router!, "Add");
+        var output = CallToolResultHelpers.ProseText(await GraphTools.SearchSymbolsAsync(_router!, "Add"));
         output.Should().Contain("hits for 'Add':");
         output.Should().Contain("| Symbol | Kind | Location |");
         var firstLine = output.Split('\n')[0];
@@ -120,7 +126,7 @@ public sealed class TabularRenderingTests : IAsyncLifetime, IDisposable
     public async Task FindByAnnotation_multipleHits_rendersTable()
     {
         // [Obsolete] is on Calculator.LegacyAdd and Greeter.LegacyGreet — at least 2 hits.
-        var output = await GraphTools.FindByAnnotationAsync(_router!, "Obsolete");
+        var output = CallToolResultHelpers.ProseText(await GraphTools.FindByAnnotationAsync(_router!, "Obsolete"));
         output.Should().Contain("symbols carry [Obsolete]");
         output.Should().Contain("| Symbol | Kind | Location |");
         var firstLine = output.Split('\n')[0];
@@ -131,7 +137,7 @@ public sealed class TabularRenderingTests : IAsyncLifetime, IDisposable
     public async Task ListCallers_multipleHits_rendersTable()
     {
         // Calculator.Add is called from Multiply, Program.cs, and the xunit/nunit test cases.
-        var output = await GraphTools.ListCallersAsync(_router!, "Calculator.Add");
+        var output = CallToolResultHelpers.ProseText(await GraphTools.ListCallersAsync(_router!, "Calculator.Add"));
         output.Should().Contain("Inbound `calls` to **");
         output.Should().Contain("| Symbol | Kind | Location |");
         var firstLine = output.Split('\n')[0];
@@ -144,7 +150,7 @@ public sealed class TabularRenderingTests : IAsyncLifetime, IDisposable
         // Greeter.Greet's body calls Bump and TrySet — at least 2 outbound `calls` edges. We
         // pin to the full FQN to avoid the name-resolver picking up the Greeter constructor
         // (whose name shares the "Greet" prefix).
-        var output = await GraphTools.ListCalleesAsync(_router!, "Sample.Domain.Greeter.Greet");
+        var output = CallToolResultHelpers.ProseText(await GraphTools.ListCalleesAsync(_router!, "Sample.Domain.Greeter.Greet"));
         output.Should().Contain("Outbound `calls` from **");
         var firstLine = output.Split('\n')[0];
         firstLine.Should().NotStartWith("|");
@@ -159,7 +165,7 @@ public sealed class TabularRenderingTests : IAsyncLifetime, IDisposable
     {
         // IGreeter.Greet has at least one implementation (Greeter.Greet). If only one impl
         // exists, the response stays bulleted; either way the lead-in is prose.
-        var output = await GraphTools.FindImplementationsAsync(_router!, "IGreeter.Greet");
+        var output = CallToolResultHelpers.ProseText(await GraphTools.FindImplementationsAsync(_router!, "IGreeter.Greet"));
         output.Should().Contain("Implementations of **");
         var firstLine = output.Split('\n')[0];
         firstLine.Should().NotStartWith("|");
@@ -169,7 +175,7 @@ public sealed class TabularRenderingTests : IAsyncLifetime, IDisposable
     public async Task ListMembers_multipleHits_rendersTable()
     {
         // Calculator has Add, Subtract, Multiply, MakeGreeter, Divide, LegacyAdd — 6+ members.
-        var output = await GraphTools.ListMembersAsync(_router!, "Sample.Domain.Calculator");
+        var output = CallToolResultHelpers.ProseText(await GraphTools.ListMembersAsync(_router!, "Sample.Domain.Calculator"));
         output.Should().Contain("members of **");
         output.Should().Contain("| Member | Kind | Signature |");
         var firstLine = output.Split('\n')[0];
@@ -183,7 +189,7 @@ public sealed class TabularRenderingTests : IAsyncLifetime, IDisposable
         // and there's an Obsolete attribute on Greeter.LegacyGreet too — so multiple sites
         // get the warning. We assert tolerantly: the prose lead-in is always there, and if
         // there are 2+ rows we expect the table header.
-        var output = await GraphTools.FindDiagnosticsAsync(_router!);
+        var output = CallToolResultHelpers.ProseText(await GraphTools.FindDiagnosticsAsync(_router!));
         output.Should().Contain("Diagnostics (severity");
         var firstLine = output.Split('\n')[0];
         firstLine.Should().NotStartWith("|");
@@ -199,7 +205,7 @@ public sealed class TabularRenderingTests : IAsyncLifetime, IDisposable
     {
         // Calculator.Add has at least the xunit AddTwoNumbers + AddManyNumbers tests, plus
         // the nunit Add_isAssociative — so >= 2 inbound Tests edges.
-        var output = await HistoryTools.ListTestsForAsync(_router!, "Calculator.Add");
+        var output = CallToolResultHelpers.ProseText(await HistoryTools.ListTestsForAsync(_router!, "Calculator.Add"));
         output.Should().Contain("Tests targeting **");
         // If the fixture produced multiple test edges we expect the table header; otherwise
         // tolerate the bulleted single-row fallback.
@@ -215,7 +221,7 @@ public sealed class TabularRenderingTests : IAsyncLifetime, IDisposable
     public async Task ImpactOfChange_multipleHits_rendersTableWithRightAlignedDepth()
     {
         // Calculator.Add has multiple upstream callers across direct + transitive depth.
-        var output = await GraphTools.ImpactOfChangeAsync(_router!, "Calculator.Add");
+        var output = CallToolResultHelpers.ProseText(await GraphTools.ImpactOfChangeAsync(_router!, "Calculator.Add"));
         output.Should().Contain("Upstream impact of **");
         var firstLine = output.Split('\n')[0];
         firstLine.Should().NotStartWith("|");
@@ -231,7 +237,7 @@ public sealed class TabularRenderingTests : IAsyncLifetime, IDisposable
     public async Task ModuleSummary_multipleHits_rendersTableWithRightAlignedInDeg()
     {
         // Sample.Domain has multiple symbols (Calculator + members + Greeter + IGreeter + LegacyAttribute).
-        var output = await GraphTools.ModuleSummaryAsync(_router!, "Sample.Domain");
+        var output = CallToolResultHelpers.ProseText(await GraphTools.ModuleSummaryAsync(_router!, "Sample.Domain"));
         output.Should().Contain("Top ");
         output.Should().Contain("symbols in 'Sample.Domain'");
         var firstLine = output.Split('\n')[0];
@@ -247,7 +253,7 @@ public sealed class TabularRenderingTests : IAsyncLifetime, IDisposable
     public async Task Neighborhood_multipleInbound_rendersTable()
     {
         // Calculator.Add has multiple inbound callers (Multiply, Program.cs, the unit tests).
-        var output = await GraphTools.NeighborhoodAsync(_router!, "Calculator.Add");
+        var output = CallToolResultHelpers.ProseText(await GraphTools.NeighborhoodAsync(_router!, "Calculator.Add"));
         output.Should().Contain("Neighborhood of **");
         output.Should().Contain("### Inbound (");
         var firstLine = output.Split('\n')[0];
@@ -263,7 +269,7 @@ public sealed class TabularRenderingTests : IAsyncLifetime, IDisposable
         // semantic_search tool returns a single-line "disabled" message in that case. Either
         // way, the response leads with prose so the leaf chokepoint can prefix it.
         var generator = new DeterministicMockEmbeddingGenerator(new EmbeddingModelInfo("test/mock", 384));
-        var output = await GraphTools.SemanticSearchAsync(_router!, generator, "calculator add");
+        var output = CallToolResultHelpers.ProseText(await GraphTools.SemanticSearchAsync(_router!, generator, "calculator add"));
         var firstLine = output.Split('\n')[0];
         firstLine.Should().NotStartWith("|", "first line must be prose so the leaf prefix lands on substantive content");
         // If the embedding pipeline produced enough rows (>= 2) the table must be the documented shape.
@@ -301,7 +307,7 @@ public sealed class TabularRenderingTests : IAsyncLifetime, IDisposable
             BlamedContentSha: null));
 
         var options = new HistoryOptions(Disabled: false);
-        var output = await HistoryTools.RecentChangesAsync(_router!, options, days: 7);
+        var output = CallToolResultHelpers.ProseText(await HistoryTools.RecentChangesAsync(_router!, options, days: 7));
         output.Should().Contain("symbols changed in the last 7 day(s)");
         output.Should().Contain("| When | Author | Symbol | Location |");
         var firstLine = output.Split('\n')[0];

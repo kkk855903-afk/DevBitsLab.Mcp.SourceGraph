@@ -335,23 +335,31 @@ The MCP `initialize` response SHALL include three top-level string arrays alongs
 - **THEN** the `edge_kinds` array additionally contains `"binds-path"` and `"renders-component"`, and `symbol_kinds` additionally contains `"xaml-element"`, both still sorted lowercase
 
 ### Requirement: Tool response brand mark
-The server SHALL prefix the first line of every built-in MCP tool's response text with the green-leaf glyph `🌿` (U+1F33F) followed by a single space character (U+0020), before that response is shipped to the MCP client. The prefix SHALL apply uniformly to success responses, empty-result responses, and any error-string responses (i.e. any response a tool body returns as a `string` or `Task<string>`). Plugin-registered tools (registered via `IToolRegistry.AddTool` in `Plugins/ToolRegistry.cs`) SHALL NOT receive the brand-mark prefix, so plugin-authored output preserves its own voice.
+The server SHALL prefix the first user-visible `TextContentBlock` of every built-in MCP tool's response with the green-leaf glyph `🌿` (U+1F33F) followed by a single space character (U+0020), before the response is shipped to the MCP client. The chokepoint SHALL search the content list for the first text block whose `annotations.audience` is null, empty, or contains `Role.User` (skipping audience-restricted blocks); the brand mark attaches to the first match regardless of position relative to non-text blocks. The prefix SHALL apply uniformly to success responses, empty-result responses, and any error-string responses. When a tool returns a single-string body (legacy path, plus `PingTool` and any plugin-style return), the prefix applies to that string verbatim. When a content list contains zero user-visible text blocks (only resource links, only audience-restricted text, etc.), no prefix is applied. When the leaf chokepoint is suppressed (`--no-leaf` / `SOURCEGRAPH_NO_LEAF=1`), no prefix is applied regardless of return type. Plugin-registered tools (registered via `IToolRegistry.AddTool`) SHALL NOT receive the brand-mark prefix.
 
 #### Scenario: Built-in tool response leads with the leaf
 - **WHEN** an MCP client invokes `find_definition(symbol = "Calculator")` against an indexed solution that contains `Sample.Domain.Calculator`
-- **THEN** the response text starts with the byte sequence `🌿 ` (U+1F33F followed by U+0020), and the existing markdown content follows on the same line
+- **THEN** the response's first `TextContentBlock.text` starts with the byte sequence `🌿 ` (U+1F33F followed by U+0020), and the existing markdown content follows on the same line
 
 #### Scenario: Empty-result response also leads with the leaf
 - **WHEN** an MCP client invokes `find_definition(symbol = "Nonexistent")` against a graph with no matches
-- **THEN** the response text starts with `🌿 ` followed by the no-match message (e.g. `🌿 No matches for 'Nonexistent'.`)
+- **THEN** the response's first `TextContentBlock.text` starts with `🌿 ` followed by the no-match message (e.g. `🌿 No matches for 'Nonexistent'.`)
 
 #### Scenario: Plugin tool response is not brand-marked
-- **WHEN** an MCP client invokes a tool registered through `IToolRegistry.AddTool` (e.g. a plugin-supplied `xaml.find_view`) and the plugin's handler returns a string
-- **THEN** the response text is the plugin's string verbatim, with no leading `🌿 ` prefix
+- **WHEN** an MCP client invokes a tool registered through `IToolRegistry.AddTool` (e.g. a plugin-supplied `xaml.find_view`) and the plugin's handler returns a string or content list
+- **THEN** the response is shipped verbatim, with no leading `🌿 ` on any block
 
-#### Scenario: Brand-mark prefix is idempotent
-- **WHEN** a built-in tool's body returns a string whose first characters are already `🌿 ` (e.g. due to internal pre-stamping)
+#### Scenario: Brand-mark prefix is idempotent on text bodies
+- **WHEN** a built-in tool's body returns a string (or first text block) whose first characters are already `🌿 ` (e.g. due to internal pre-stamping)
 - **THEN** the shipped response contains exactly one `🌿 ` prefix, not two stacked leaves
+
+#### Scenario: Audience-restricted block is not brand-marked
+- **WHEN** a tool's content list contains a `TextContentBlock` with `annotations.audience = ["assistant"]`
+- **THEN** the chokepoint never stamps the brand mark on that block; the prefix applies only to the first user-visible (non-audience-restricted) `TextContentBlock`
+
+#### Scenario: First block is not text
+- **WHEN** a tool returns a content list whose first item is a `ResourceLinkBlock` (or other non-text block) followed later by a user-visible `TextContentBlock`
+- **THEN** the chokepoint walks the list and prefixes the user-visible text block with `🌿 ` regardless of its position; the non-text item earlier in the list is unchanged. Chokepoint behaviour is documented in `LeafFormatter.BrandFirstText`.
 
 ### Requirement: Brand-mark suppression
 The server SHALL accept `--no-leaf` as a CLI flag on `sourcegraph-mcp serve` and SHALL honour `SOURCEGRAPH_NO_LEAF` as an environment variable (truthy values: exact `1`, or `true` case-insensitive — same convention as `SOURCEGRAPH_NO_INSTRUCTIONS`). When either is set, the server SHALL omit the brand-mark prefix from every built-in tool response AND SHALL omit the brand-mark prefix from the published `ServerInstructions` string. The two suppression mechanisms (`--no-leaf` and `--no-instructions`) compose independently: turning off one SHALL NOT turn off the other.
@@ -478,4 +486,90 @@ Any MCP tool that renders per-edge result rows SHALL use the same indented `payl
 #### Scenario: Future tool emits per-edge rows
 - **WHEN** a new MCP tool that walks edges (e.g. an `inspect_edge` follow-up) renders results
 - **THEN** its row format includes the same `payload:` sub-line shape with the same truncation rule, by reusing the shared rendering helper rather than implementing a parallel format
+
+### Requirement: Multi-content tool responses
+Every built-in MCP tool's response SHALL be representable as an ordered list of `ContentBlock` items rather than a single concatenated text blob. The list MAY include `TextContentBlock`, `ResourceLinkBlock`, and other protocol-defined content types in any order. The wire-level encoding (`CallToolResult.content`) follows the MCP spec verbatim — clients that recognise the richer block types render them; clients that don't fall back to rendering only `TextContentBlock` items.
+
+The brand-mark chokepoint SHALL find the **first user-visible** `TextContentBlock` (i.e. the first text block whose `annotations.audience` is null, empty, or contains `Role.User`) anywhere in the list — regardless of position relative to non-text blocks — and prefix its `Text` with `🌿 ` (when leaf suppression is not active). Audience-restricted blocks (`audience = ["assistant"]` only) SHALL be skipped over while searching for the user-visible target. Lists containing zero user-visible text blocks SHALL ship unchanged.
+
+#### Scenario: Tool returns a list of content blocks
+- **WHEN** an MCP client invokes `find_references(symbol = "X")` and the server has matching results
+- **THEN** the response's `content` array contains one leading `TextContentBlock` with the prose summary + body, zero or more `ResourceLinkBlock` items (one per result row), and at most one trailing `TextContentBlock` with `annotations.audience = ["assistant"]` carrying agent-only metadata
+
+#### Scenario: Brand mark applies to first user-visible text block
+- **WHEN** a built-in tool returns a content list whose first item is a user-visible `TextContentBlock`
+- **THEN** the shipped response's `content[0].text` starts with `🌿 ` (or the unprefixed body text when leaf suppression is active), with subsequent content items unchanged
+
+#### Scenario: Leaf attaches to a text block that isn't first in the list
+- **WHEN** a built-in tool returns a content list whose first item is a `ResourceLinkBlock` (or any other non-text block) followed later by a user-visible `TextContentBlock`
+- **THEN** the chokepoint walks the list, locates the first user-visible text block, and prefixes its `Text` with `🌿 `; the non-text items earlier in the list are passed through unchanged
+
+#### Scenario: List with no user-visible text blocks ships unchanged
+- **WHEN** a built-in tool returns a content list containing only non-text items (resource links, audio, etc.) or only audience-restricted text blocks
+- **THEN** no `🌿 ` prefix is added anywhere; the response ships exactly as the tool body produced it
+
+#### Scenario: Older clients ignore unfamiliar block types
+- **WHEN** an MCP client that doesn't recognise `resource_link` content blocks reads a response from a built-in tool that emitted them
+- **THEN** the client renders only the `TextContentBlock` items and skips the unrecognised ones; the user sees a complete prose answer because the prose is self-sufficient
+
+### Requirement: Structured content output
+Every built-in tool whose result is naturally typed (a list of hits, a typed singleton record, a counts summary) SHALL ship its successful result as both renderable `content` and a typed `structuredContent` object. The tool's MCP catalog entry SHALL declare an `outputSchema` matching the structured-content shape, with the top-level schema being `{"type":"object", ...}` (the MCP SDK rejects non-object root schemas at registration time).
+
+`structuredContent` payloads SHALL use named DTO types — never anonymous types. The compile-time typing of `CallToolResult.StructuredContent` (`JsonElement?`) and `CallToolResult.Meta` (`JsonObject?`) enforces this at assignment: anonymous types simply do not satisfy either type, so the C# compiler rejects them before the code can even be built. No runtime guard is needed; the SDK's typed properties are the contract.
+
+Property names on the wire SHALL use `snake_case` to match the tool catalog's published `outputSchema`. C# DTOs use PascalCase records with `[property: JsonPropertyName("snake_name")]` overrides on multi-word fields, so both the source-gen-derived `structuredContent` payload and the SDK's `JsonSchemaExporter`-derived `outputSchema` publish the same wire names.
+
+The pair (`content`, `structuredContent`) SHALL describe the same result. The number of items in any structured array SHALL equal the number of corresponding rows in the rendered prose.
+
+Diagnostic short-circuits — input validation failures (unknown severity / accessibility / edge kind), disabled subsystems (`--no-history`, `--no-embeddings`), scope-routing failures (no scopes registered, scope degraded, exception thrown inside the scope query) — MAY omit `structuredContent` and SHALL set `isError = true` on the wire. Successful zero-row responses (the query ran cleanly but produced no rows) SHALL still ship the typed structured shape with the empty collection populated.
+
+#### Scenario: find_definition publishes structured hits
+- **WHEN** the agent invokes `find_definition(symbol = "Calculator")` and the graph returns 3 hits
+- **THEN** the response's `structuredContent` is a `{"hits": [...]}` object whose `hits` array has 3 typed entries with at least the fields `fqn`, `kind`, `file_path`, `line`, `column`, `signature`, `xml_summary`; and the rendered prose lists the same 3 hits in the same order
+
+#### Scenario: Output schema declared at tools/list time
+- **WHEN** an MCP client calls `tools/list`
+- **THEN** every tool that ships `structuredContent` carries an `outputSchema` field with `{"type":"object", "properties": ...}` matching the tool's structured-content payload, with `snake_case` property names matching the wire shape of `structuredContent`
+
+#### Scenario: Empty result populates structured content
+- **WHEN** a tool that ships structured output returns no rows for a successful query (e.g. `find_definition(symbol = "Nonexistent")`)
+- **THEN** the response's `structuredContent` is the typed object with an empty array (e.g. `{"hits": []}`), not omitted; `isError` is unset; the prose carries the existing "No matches for 'X'." line
+
+#### Scenario: Diagnostic responses may omit structuredContent
+- **WHEN** a tool short-circuits before producing a structured result — input validation failure, disabled subsystem, scope-routing failure, or caught exception
+- **THEN** the response MAY omit `structuredContent` entirely; the prose carries the diagnostic message branded by the leaf chokepoint; `isError` is set to `true` so telemetry and strict-validating clients can distinguish the diagnostic from a successful zero-row response
+
+#### Scenario: Successful no-resolve targets short-circuit without structuredContent
+- **WHEN** a target-shaped tool (`find_references`, `list_callers`, `list_callees`, `find_implementations`, `list_members`, `neighborhood`, `impact_of_change`, `list_tests_for`, `who_authored`) is invoked with a symbol or container the graph doesn't resolve
+- **THEN** the response ships the prose `"No matches for '<symbol>'."` line as a single text block, omits `structuredContent` (no resolved target descriptor exists to populate it), and leaves `isError` unset — telemetry counts the call as ok=true, symmetric with the historical `Task<string>` "no matches" behaviour
+
+### Requirement: Resource-link content items
+Tools whose result rows correspond to individual symbols or files SHALL emit a `ResourceLinkBlock` per row alongside the rendered prose. Each `ResourceLinkBlock` SHALL carry a URI in the project's defined `graph://` scheme — `graph://symbol/<id>` for symbols, `graph://file/<path>` for files — pointing at a resource the project's `Resources/GraphResources.cs` subsystem can serve.
+
+URIs SHALL be constructed via the centralised `GraphResourceUris` helper so the URI shape stays consistent between tools and resource handlers. Tools SHALL emit links only for entities they have just queried out of the graph; speculative or synthesised URIs are not allowed.
+
+#### Scenario: find_references emits a link per reference row
+- **WHEN** `find_references(symbol = "X")` returns 5 reference rows
+- **THEN** the response's `content` includes 5 `ResourceLinkBlock` items, each with `uri = "graph://symbol/<id>"` matching the reference's symbol id, plus `name`, `description`, and `mimeType` populated for renderer cards
+
+#### Scenario: Tool-emitted resource links resolve via the resource handler
+- **WHEN** an MCP client follows a `ResourceLinkBlock.uri` from a tool response by calling `resources/read` against that URI
+- **THEN** the resource handler in `Resources/GraphResources.cs` returns the typed resource card without "URI not found" — every emitted URI is dereferenceable
+
+#### Scenario: Centralised URI helper
+- **WHEN** any built-in tool needs to emit a graph resource URI
+- **THEN** the URI is constructed via `GraphResourceUris.Symbol(id)` or `GraphResourceUris.File(path)` (not by hand-formatted string interpolation), so the URI shape stays consistent across all tools and any future change to the URI scheme lands in one place
+
+### Requirement: Audience-restricted metadata content blocks
+Tools MAY emit a trailing `TextContentBlock` carrying agent-only metadata — resolved scope, latency, edge-kind defaults, "X of N rows omitted due to limit" notices, cache hit info — with `annotations.audience = ["assistant"]` and `annotations.priority` set to a low value (typically 0.2). Such blocks reach the connected model but SHALL NOT be rendered to the human user by clients that respect the `audience` annotation.
+
+The brand mark SHALL NOT be stamped on audience-restricted blocks. Multiple audience-restricted blocks per response are allowed but discouraged for compactness.
+
+#### Scenario: Tool ships scope and latency metadata to the model
+- **WHEN** a built-in tool runs to completion and produces metadata about scope resolution, query timing, or row truncation
+- **THEN** that metadata may be emitted as a `TextContentBlock` whose `annotations.audience` array equals `["assistant"]`; the model receives the block in its tool-result payload, but a client honoring the `audience` annotation does not render the block to the human user
+
+#### Scenario: Audience-restricted content is not brand-marked
+- **WHEN** a tool's content list contains an audience-restricted `TextContentBlock`
+- **THEN** the chokepoint does NOT prepend `🌿 ` to that block; the brand mark applies only to the first user-visible `TextContentBlock`
 

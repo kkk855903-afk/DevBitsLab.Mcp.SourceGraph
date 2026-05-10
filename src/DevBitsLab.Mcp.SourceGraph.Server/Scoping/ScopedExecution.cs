@@ -1,4 +1,5 @@
 using System.Text;
+using DevBitsLab.Mcp.SourceGraph.Server.Tools.Output;
 using DevBitsLab.Mcp.SourceGraph.Storage;
 using ModelContextProtocol.Protocol;
 
@@ -109,10 +110,10 @@ public static class ScopedExecution
         CancellationToken ct)
     {
         var resolution = router.Resolve(scope);
-        if (resolution.IsError) return DiagnosticResult(resolution.ErrorMessage!);
+        if (resolution.IsError) return DiagnosticResult.Error(resolution.ErrorMessage!);
 
         var hosts = resolution.Hosts;
-        if (hosts.Count == 0) return DiagnosticResult("No scopes matched.");
+        if (hosts.Count == 0) return DiagnosticResult.Error("No scopes matched.");
 
         if (hosts.Count == 1)
         {
@@ -120,7 +121,7 @@ public static class ScopedExecution
             await WaitUntilReadyAsync(host, ct).ConfigureAwait(false);
             if (host.Status == "degraded")
             {
-                return DiagnosticResult(
+                return DiagnosticResult.Error(
                     $"scope `{host.Scope.Id}` is degraded: {host.StatusMessage ?? "(no message)"}");
             }
             return await onResolved(host).ConfigureAwait(false);
@@ -133,7 +134,7 @@ public static class ScopedExecution
             await WaitUntilReadyAsync(h, ct).ConfigureAwait(false);
             if (h.Status == "degraded")
             {
-                return (h.Scope.Id, DiagnosticResult($"scope is degraded: {h.StatusMessage ?? "(no message)"}"));
+                return (h.Scope.Id, DiagnosticResult.Error($"scope is degraded: {h.StatusMessage ?? "(no message)"}"));
             }
             try
             {
@@ -143,7 +144,7 @@ public static class ScopedExecution
             catch (OperationCanceledException) { throw; }
             catch (Exception ex)
             {
-                return (h.Scope.Id, DiagnosticResult($"scope query failed: {ex.Message}"));
+                return (h.Scope.Id, DiagnosticResult.Error($"scope query failed: {ex.Message}"));
             }
         })).ConfigureAwait(false);
 
@@ -165,16 +166,9 @@ public static class ScopedExecution
         return new CallToolResult { Content = merged, IsError = anyError ? true : null };
     }
 
-    /// <summary>
-    /// Build a single-text <see cref="CallToolResult"/> carrying a diagnostic message. Used by the
-    /// scope-resolution short-circuits so the diagnostic reaches the leaf chokepoint as a
-    /// brand-able first text block.
-    /// </summary>
-    private static CallToolResult DiagnosticResult(string message) =>
-        new()
-        {
-            Content = new List<ContentBlock> { new TextContentBlock { Text = message } },
-        };
+    // Diagnostic short-circuits route through DevBitsLab.Mcp.SourceGraph.Server.Tools.Output.DiagnosticResult.Build
+    // so the same wire shape ships from every tool body — keeps the leaf chokepoint's branding
+    // contract identical regardless of where the short-circuit originates.
 
     /// <summary>
     /// When a scope is mid-cold-index (registered with <c>status="indexing"</c>) the lazy-index-

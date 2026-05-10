@@ -52,14 +52,19 @@ below note which package the change applies to.
   (cold-start ONNX model load), `impact_of_change`, `module_summary`. Clients
   opt in by sending a `progressToken` on the originating `tools/call` request;
   no-op otherwise. (`report-progress-on-slow-tools`)
-- `find_definition` now ships typed `structuredContent` (`FindDefinitionResult`
-  with snake_case JSON properties) alongside renderable prose, plus one
-  `resource_link` per hit pointing at `graph://symbol/<id>` for clients with
-  richer UI, plus an audience-restricted (`Audience = [Assistant]`) metadata
-  block carrying scope id and per-call latency. The remaining tools migrate
-  in follow-up commits. (`tool-output-content-blocks` foundation + vertical
-  slice; the bulk sweep across the other 17 tools is queued for a future
-  `/opsx:apply` session.)
+- All 20 built-in MCP tools now ship typed `structuredContent` alongside
+  renderable prose, with `outputSchema` declared on `tools/list`. Each tool
+  emits one `resource_link` per result row pointing at the corresponding
+  `graph://symbol/<id>`, `graph://file/<path>`, or `graph://namespace/<name>`
+  resource, plus a trailing audience-restricted (`Audience = [Assistant]`,
+  `Priority = 0.2`) metadata block carrying scope id, latency, and per-tool
+  row counts. Field names use snake_case on the wire, with
+  `[JsonPropertyName]` overrides on every multi-word DTO field so the
+  exporter-derived `outputSchema` and the source-gen-derived
+  `structuredContent` payload converge on the same casing. Older clients that
+  ignore `structuredContent` / `resource_link` see a complete prose answer;
+  clients that respect `audience` annotations filter the metadata block out
+  of the user view. (`tool-output-content-blocks`)
 - **Sdk 2.1.0** — `PayloadKeys` static class with kebab-case constants
   for the well-known keys plugins put in `EdgeEmitted.Metadata` (`path`,
   `mode`, `converter`, `converter-parameter`, `event`, `handler`,
@@ -151,10 +156,6 @@ below note which package the change applies to.
 
 ### Documentation
 - New OpenSpec proposals drafted but not yet applied:
-  - `tool-output-content-blocks` Groups 3-8 — bulk sweep of the remaining
-    17 tools to the multi-content + structuredContent + resource_link
-    protocol; foundation and `find_definition` vertical slice are already
-    shipped (this PR).
   - `fix-stranded-reference-edges` — defensive recovery for the incremental
     indexer's "zombie file" state (file's outgoing references cleared in
     pass 1 but never repopulated; SHA-skip preserves the empty state

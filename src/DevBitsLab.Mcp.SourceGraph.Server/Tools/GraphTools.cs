@@ -22,6 +22,12 @@ public static class GraphTools
         "Optional scope id, the literal '*' for all non-isolated scopes, or a comma-separated list of ids " +
         "(e.g. 'frontend,backend'). Omit to use `default_scope` from .sourcegraph.json. Call `list_scopes` to discover.";
 
+    // Diagnostic short-circuits route through DevBitsLab.Mcp.SourceGraph.Server.Tools.Output.DiagnosticResult.Build
+    // so the same wire shape is shared with HistoryTools, ScopeTools, and the multi-host fan-out
+    // path in ScopedExecution. Use it for symbol-not-found, unknown-flag, and disabled-subsystem
+    // short-circuits — anywhere a tool body returning Task<CallToolResult> needs to ship plain
+    // prose without a structured payload while still feeding the leaf chokepoint.
+
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(FindDefinitionResult))]
     [ToolTrigger("\"where is X defined?\"")]
     [Description("Find the definition of a symbol by name or fully-qualified name. Returns location, kind, signature, accessibility, modifiers, and one-line XML summary for each match.")]
@@ -129,17 +135,12 @@ public static class GraphTools
 
         // Audience-restricted metadata: scope id + latency + hit count are useful to the agent for
         // chaining (e.g. "if I see latency_ms > 500 maybe drop this scope from a fan-out") but pure
-        // noise to the human reading the chat. Priority < 0.5 is the "informational, deprioritise"
-        // signal documented in the design.
-        content.Add(new TextContentBlock
-        {
-            Text = $"_meta: scope=`{scopeId}`, latency_ms={elapsedMs}, hits={hits.Count}_",
-            Annotations = new Annotations
-            {
-                Audience = new[] { Role.Assistant },
-                Priority = 0.2f,
-            },
-        });
+        // noise to the human reading the chat. Routed through AudienceMetadata so every converted
+        // tool emits the same wire shape and Audience/Priority annotations.
+        content.Add(AudienceMetadata.Build(
+            scopeId,
+            elapsedMs,
+            ("hits", hits.Count.ToString())));
 
         var result = new CallToolResult
         {
@@ -151,10 +152,10 @@ public static class GraphTools
         return result;
     }
 
-    [McpServerTool]
+    [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(FindByAnnotationResult))]
     [ToolTrigger("\"find every POST endpoint\", \"what's been deprecated?\", \"find all DI singletons\", \"every controller decorated with @Component\"")]
     [Description("Find every symbol that carries an annotation by short name (e.g. 'HttpGet', 'Obsolete', 'Authorize', 'Component'). Annotations span .NET attributes, TS decorators, Vue directives, etc. — `flavor` filters to one annotation pattern (e.g. 'csharp-attribute'), null matches across all flavors. Optional argValue does a trigram match against the annotation's serialised arguments (e.g. argValue='/api/v2' to find route attributes whose path contains that substring).")]
-    public static Task<string> FindByAnnotationAsync(
+    public static Task<CallToolResult> FindByAnnotationAsync(
         ScopeRouter router,
         [Description("Annotation short name (e.g. 'HttpGet', 'Obsolete', 'Authorize'). Trailing 'Attribute' is implied; use the form you'd type in source.")] string name,
         [Description("Optional flavor filter (kebab-case, e.g. 'csharp-attribute', 'xaml-attached-property', 'ts-decorator'). Null matches across all flavors. Call `list_scopes` and inspect `annotation_flavors` from the initialize response to discover what's available on the active scope.")] string? flavor = null,
@@ -166,17 +167,24 @@ public static class GraphTools
         ToolMetrics.TrackAsync("find_by_annotation", new { name, flavor, argValue, kind, limit, scope }, () =>
             ScopedExecution.RunAsync(router, scope, async host =>
             {
+                var sw = System.Diagnostics.Stopwatch.StartNew();
                 var kindFilter = NormaliseKindFilter(kind);
                 var hits = await host.Store.FindByAnnotationAsync(name, flavor, argValue, kindFilter, limit, ct).ConfigureAwait(false);
                 if (hits.Count == 0)
                 {
                     var argsClause = string.IsNullOrEmpty(argValue) ? "" : $" with argValue ~ '{argValue}'";
                     var flavorClause = string.IsNullOrEmpty(flavor) ? "" : $" (flavor='{flavor}')";
-                    return $"No symbols carry [{name}]{flavorClause}{argsClause}.";
+                    return BuildFindByAnnotationResult(
+                        prose: $"No symbols carry [{name}]{flavorClause}{argsClause}.",
+                        hits: Array.Empty<SymbolHit>(),
+                        annotationsBySymbolId: new Dictionary<long, IReadOnlyList<AnnotationRecord>>(),
+                        scopeId: host.Scope.Id,
+                        elapsedMs: sw.ElapsedMilliseconds);
                 }
                 var multipleFlavors = await HasMultipleAnnotationFlavorsAsync(host.Store, ct).ConfigureAwait(false);
                 var sb = new StringBuilder();
                 sb.AppendLine($"{hits.Count} symbols carry [{name}]:");
+                var annotationsBySymbolId = new Dictionary<long, IReadOnlyList<AnnotationRecord>>(hits.Count);
                 if (hits.Count >= 2)
                 {
                     var rows = new List<IReadOnlyList<string>>(hits.Count);
@@ -195,6 +203,7 @@ public static class GraphTools
                     foreach (var h in hits)
                     {
                         var anns = await host.Store.GetAnnotationsForSymbolAsync(h.Id, ct).ConfigureAwait(false);
+                        annotationsBySymbolId[h.Id] = anns;
                         var line = AnnotationFormat.OneLine(anns, multipleFlavors);
                         if (line is not null) sb.AppendLine($"- **{h.Fqn}**: {line}");
                     }
@@ -205,17 +214,85 @@ public static class GraphTools
                     {
                         sb.AppendLine($"- **{h.Fqn}** ({Format.KindWithAttrs(h)}) at {Format.Location(h.FilePath, h.StartLine, h.StartCol)}");
                         var anns = await host.Store.GetAnnotationsForSymbolAsync(h.Id, ct).ConfigureAwait(false);
+                        annotationsBySymbolId[h.Id] = anns;
                         var line = AnnotationFormat.OneLine(anns, multipleFlavors);
                         if (line is not null) sb.AppendLine($"  - {line}");
                     }
                 }
-                return sb.ToString();
+                return BuildFindByAnnotationResult(
+                    prose: sb.ToString(),
+                    hits: hits,
+                    annotationsBySymbolId: annotationsBySymbolId,
+                    scopeId: host.Scope.Id,
+                    elapsedMs: sw.ElapsedMilliseconds);
             }, ct));
 
-    [McpServerTool]
+    private static CallToolResult BuildFindByAnnotationResult(
+        string prose,
+        IReadOnlyList<SymbolHit> hits,
+        IReadOnlyDictionary<long, IReadOnlyList<AnnotationRecord>> annotationsBySymbolId,
+        string scopeId,
+        long elapsedMs)
+    {
+        var content = new List<ContentBlock>(capacity: 2 + hits.Count)
+        {
+            new TextContentBlock { Text = prose },
+        };
+
+        foreach (var h in hits)
+        {
+            content.Add(new ResourceLinkBlock
+            {
+                Uri = GraphResourceUris.Symbol(h.Id),
+                Name = h.Fqn,
+                Title = h.Fqn,
+                Description = $"{Format.KindWithAttrs(h)} — {Format.Location(h.FilePath, h.StartLine, h.StartCol)}",
+                MimeType = "text/markdown",
+            });
+        }
+
+        content.Add(AudienceMetadata.Build(
+            scopeId,
+            elapsedMs,
+            ("hits", hits.Count.ToString())));
+
+        var structuredHits = hits
+            .Select(h =>
+            {
+                var anns = annotationsBySymbolId.TryGetValue(h.Id, out var a)
+                    ? a
+                    : (IReadOnlyList<AnnotationRecord>)Array.Empty<AnnotationRecord>();
+                var entries = anns
+                    .Select(a => new FindByAnnotationEntry(
+                        Name: a.Name,
+                        FullName: a.FullName,
+                        Flavor: a.Flavor,
+                        ArgsJson: string.IsNullOrEmpty(a.ArgsJson) ? null : a.ArgsJson))
+                    .ToList();
+                return new FindByAnnotationHit(
+                    SymbolId: h.Id,
+                    Fqn: h.Fqn,
+                    Kind: h.Kind,
+                    FilePath: h.FilePath,
+                    Line: h.StartLine,
+                    Column: h.StartCol,
+                    Annotations: entries);
+            })
+            .ToList();
+
+        return new CallToolResult
+        {
+            Content = content,
+            StructuredContent = JsonSerializer.SerializeToElement(
+                new FindByAnnotationResult(structuredHits),
+                ToolOutputJsonContext.Default.FindByAnnotationResult),
+        };
+    }
+
+    [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(FindReferencesResult))]
     [ToolTrigger("\"who uses X?\" or \"who calls X?\"")]
     [Description("Find every place that references a symbol. Resolves the symbol by name/FQN, then lists each call site or type-use as file:line. By default skips refs from source-generated files; pass includeGenerated=true to surface them.")]
-    public static Task<string> FindReferencesAsync(
+    public static Task<CallToolResult> FindReferencesAsync(
         ScopeRouter router,
         [Description("Symbol name or FQN, same matching rules as find_definition")] string symbol,
         [Description("Maximum number of references to return (default 200)")] int limit = 200,
@@ -225,8 +302,18 @@ public static class GraphTools
         ToolMetrics.TrackAsync("find_references", new { symbol, limit, includeGenerated, scope }, () =>
             ScopedExecution.RunAsync(router, scope, async host =>
             {
+                var sw = System.Diagnostics.Stopwatch.StartNew();
                 var hits = await host.Store.FindSymbolsAsync(symbol, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
-                if (hits.Count == 0) return $"No matches for '{symbol}'.";
+                if (hits.Count == 0)
+                {
+                    // No symbol resolved — short-circuit through DiagnosticResult.Build instead of
+                    // BuildFindReferencesResult. Without a resolved target we can't construct a
+                    // meaningful FindReferencesResult (Target* fields would be sentinel placeholders,
+                    // ambiguous to consumers). Matches every other target-shaped tool's no-resolve
+                    // path. Telemetry counts as ok=true (success-with-empty), symmetric with the
+                    // pre-conversion `Task<string>` "No matches for 'X'." behaviour.
+                    return DiagnosticResult.Build($"No matches for '{symbol}'.");
+                }
 
                 var sb = new StringBuilder();
                 if (hits.Count > 1)
@@ -243,7 +330,12 @@ public static class GraphTools
                     sb.AppendLine(includeGenerated
                         ? "- no other references in the graph"
                         : "- no other references in the graph (pass includeGenerated=true to include source-generated files)");
-                    return sb.ToString();
+                    return BuildFindReferencesResult(
+                        prose: sb.ToString(),
+                        target: top,
+                        refs: Array.Empty<ReferenceHit>(),
+                        scopeId: host.Scope.Id,
+                        elapsedMs: sw.ElapsedMilliseconds);
                 }
                 sb.AppendLine();
                 sb.AppendLine($"{refs.Count} references:");
@@ -267,13 +359,87 @@ public static class GraphTools
                         sb.AppendLine($"- {RefKindLabel(r.Kind)} at {Format.Location(r.FilePath, r.Line, r.Col)}{GeneratedSuffix(r.IsGenerated)}");
                     }
                 }
-                return sb.ToString();
+                return BuildFindReferencesResult(
+                    prose: sb.ToString(),
+                    target: top,
+                    refs: refs,
+                    scopeId: host.Scope.Id,
+                    elapsedMs: sw.ElapsedMilliseconds);
             }, ct));
 
-    [McpServerTool]
+    /// <summary>
+    /// Compose the multi-content <see cref="CallToolResult"/> for <c>find_references</c>: leading
+    /// user-visible prose, one <see cref="ResourceLinkBlock"/> per reference row pointing at the
+    /// resolved target's <c>graph://symbol/&lt;id&gt;</c> resource (per spec scenario "find_references
+    /// emits a link per reference row" — each row's link targets the reference's symbol id, which
+    /// in our schema is the resolved target shared across all rows), a trailing audience-restricted
+    /// metadata block with scope + latency + reference count, and the typed
+    /// <see cref="FindReferencesResult"/> in <see cref="CallToolResult.StructuredContent"/>.
+    /// </summary>
+    private static CallToolResult BuildFindReferencesResult(
+        string prose,
+        SymbolHit target,
+        IReadOnlyList<ReferenceHit> refs,
+        string scopeId,
+        long elapsedMs)
+    {
+        var content = new List<ContentBlock>(capacity: 2 + refs.Count)
+        {
+            new TextContentBlock { Text = prose },
+        };
+
+        // Per spec scenario "find_references emits a link per reference row": each row's URI
+        // is `graph://symbol/<id>` where the id is the *reference's symbol id*. In our schema
+        // ReferenceHit.SymbolId is the *target* symbol's id (the thing being referenced),
+        // shared across every row, so all emitted links carry the same Uri value. The Title
+        // varies per row (kind + location of this specific reference) so card-rendering UIs
+        // can distinguish individual occurrences. Wasteful in serialized bytes — N copies of
+        // the same Uri — but matches the literal spec wording. Revisit (e.g. switch to
+        // `graph://file/<path>` per row) if usage telemetry shows agents care.
+        foreach (var r in refs)
+        {
+            content.Add(new ResourceLinkBlock
+            {
+                Uri = GraphResourceUris.Symbol(target.Id),
+                Name = target.Fqn,
+                Title = $"{RefKindLabel(r.Kind)} at {Format.Location(r.FilePath, r.Line, r.Col)}",
+                Description = $"{KindLabel(target.Kind)} — {Format.Location(target.FilePath, target.StartLine, target.StartCol)}",
+                MimeType = "text/markdown",
+            });
+        }
+
+        content.Add(AudienceMetadata.Build(
+            scopeId,
+            elapsedMs,
+            ("references", refs.Count.ToString())));
+
+        var structuredReferences = refs
+            .Select(r => new FindReferenceHit(
+                Kind: RefKindLabel(r.Kind),
+                FilePath: r.FilePath,
+                Line: r.Line,
+                Column: r.Col,
+                IsGenerated: r.IsGenerated))
+            .ToList();
+        var dto = new FindReferencesResult(
+            TargetFqn: target.Fqn,
+            TargetKind: target.Kind,
+            TargetSymbolId: target.Id,
+            References: structuredReferences);
+
+        return new CallToolResult
+        {
+            Content = content,
+            StructuredContent = JsonSerializer.SerializeToElement(
+                dto,
+                ToolOutputJsonContext.Default.FindReferencesResult),
+        };
+    }
+
+    [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(ListSymbolsInFileResult))]
     [ToolTrigger("\"what's in this file?\" — faster than reading the whole file")]
     [Description("List every symbol declared in a file (classes, methods, properties, etc.). Each row carries kind, accessibility, modifiers, and one-line XML summary.")]
-    public static Task<string> ListSymbolsInFileAsync(
+    public static Task<CallToolResult> ListSymbolsInFileAsync(
         ScopeRouter router,
         [Description("Absolute path or path suffix that uniquely identifies the file")] string path,
         [Description(ScopeDescription)] string? scope = null,
@@ -281,8 +447,13 @@ public static class GraphTools
         ToolMetrics.TrackAsync("list_symbols_in_file", new { path, scope }, () =>
             ScopedExecution.RunAsync(router, scope, async host =>
             {
+                var sw = System.Diagnostics.Stopwatch.StartNew();
                 var hits = await host.Store.ListSymbolsInFileAsync(path, ct).ConfigureAwait(false);
-                if (hits.Count == 0) return $"No indexed symbols in '{path}'. The file may not be part of an indexed solution, or may not exist.";
+                if (hits.Count == 0)
+                {
+                    return DiagnosticResult.Build(
+                        $"No indexed symbols in '{path}'. The file may not be part of an indexed solution, or may not exist.");
+                }
 
                 var historyById = await host.Store.GetSymbolHistoryBatchAsync(hits.Select(h => h.Id).ToList(), ct).ConfigureAwait(false);
                 var multipleFlavors = await HasMultipleAnnotationFlavorsAsync(host.Store, ct).ConfigureAwait(false);
@@ -304,13 +475,71 @@ public static class GraphTools
                         if (hline is not null) sb.AppendLine($"    {hline}");
                     }
                 }
-                return sb.ToString();
+                return BuildListSymbolsInFileResult(
+                    prose: sb.ToString(),
+                    filePath: hits[0].FilePath,
+                    symbols: hits,
+                    scopeId: host.Scope.Id,
+                    elapsedMs: sw.ElapsedMilliseconds);
             }, ct));
 
-    [McpServerTool]
+    private static CallToolResult BuildListSymbolsInFileResult(
+        string prose,
+        string filePath,
+        IReadOnlyList<SymbolHit> symbols,
+        string scopeId,
+        long elapsedMs)
+    {
+        var content = new List<ContentBlock>(capacity: 2 + symbols.Count)
+        {
+            new TextContentBlock { Text = prose },
+        };
+
+        foreach (var s in symbols)
+        {
+            content.Add(new ResourceLinkBlock
+            {
+                Uri = GraphResourceUris.Symbol(s.Id),
+                Name = s.Fqn,
+                Title = s.Name,
+                Description = $"{Format.KindWithAttrs(s)} — line {s.StartLine}",
+                MimeType = "text/markdown",
+            });
+        }
+
+        content.Add(AudienceMetadata.Build(
+            scopeId,
+            elapsedMs,
+            ("symbols", symbols.Count.ToString()),
+            ("file", $"`{filePath}`")));
+
+        var structuredSymbols = symbols
+            .Select(s => new ListSymbolsInFileRow(
+                SymbolId: s.Id,
+                Name: s.Name,
+                Fqn: s.Fqn,
+                Kind: s.Kind,
+                Line: s.StartLine,
+                Column: s.StartCol,
+                Signature: string.IsNullOrEmpty(s.Signature) ? null : s.Signature,
+                XmlSummary: string.IsNullOrEmpty(s.XmlSummary) ? null : s.XmlSummary))
+            .ToList();
+        var dto = new ListSymbolsInFileResult(
+            FilePath: filePath,
+            Symbols: structuredSymbols);
+        return new CallToolResult
+        {
+            Content = content,
+            StructuredContent = JsonSerializer.SerializeToElement(
+                dto,
+                ToolOutputJsonContext.Default.ListSymbolsInFileResult),
+        };
+    }
+
+    [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(ListCallersResult))]
     [ToolTrigger("\"who calls X?\" or \"who consumes type X?\"")]
     [Description("List inbound edges into a target symbol. Default kind=calls (i.e. callers). Use kind=uses-type to find consumers of a type, kind=overrides-member for derived implementations, kind=implements-member for members satisfying an interface, kind=instantiates for `new T()` sites, kind=throws for throw sites, kind=tests for inbound test edges, or any XAML kind (code-behind, binds-path, binds-element, handles-event, uses-resource, instantiates-type, merges, applies-style) on a scope that loaded the XAML indexer; kind=all walks every edge kind. Plugin-defined kinds (any kebab-case identifier) are accepted as-is.")]
-    public static Task<string> ListCallersAsync(
+    public static Task<CallToolResult> ListCallersAsync(
         ScopeRouter router,
         [Description("Target symbol name or FQN")] string symbol,
         [Description("Maximum number of results to return (default 50)")] int limit = 50,
@@ -320,20 +549,31 @@ public static class GraphTools
         ToolMetrics.TrackAsync("list_callers", new { symbol, limit, kind, scope }, () =>
             ScopedExecution.RunAsync(router, scope, async host =>
             {
+                var sw = System.Diagnostics.Stopwatch.StartNew();
                 var (edgeKind, label, isAll) = NormaliseEdgeKindParam(kind);
                 if (!isAll && edgeKind is not null)
                 {
                     var unknownNote = await CheckUnknownEdgeKindAsync(host.Store, edgeKind, ct).ConfigureAwait(false);
-                    if (unknownNote is not null) return unknownNote;
+                    if (unknownNote is not null) return DiagnosticResult.Error(unknownNote);
                 }
 
                 var hits = await host.Store.FindSymbolsAsync(symbol, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
-                if (hits.Count == 0) return $"No matches for '{symbol}'.";
+                if (hits.Count == 0) return DiagnosticResult.Build($"No matches for '{symbol}'.");
                 var top = hits[0];
                 var callers = await host.Store.ListCallersAsync(top.Id, limit, edgeKind, ct).ConfigureAwait(false);
                 var sb = new StringBuilder();
                 sb.AppendLine($"Inbound `{label}` to **{top.Fqn}** ({KindLabel(top.Kind)}):");
-                if (callers.Count == 0) { sb.AppendLine("- (none)"); return sb.ToString(); }
+                if (callers.Count == 0)
+                {
+                    sb.AppendLine("- (none)");
+                    return BuildListCallersResult(
+                        prose: sb.ToString(),
+                        target: top,
+                        callers: Array.Empty<SymbolHit>(),
+                        edgeKindLabel: label,
+                        scopeId: host.Scope.Id,
+                        elapsedMs: sw.ElapsedMilliseconds);
+                }
                 if (callers.Count >= 2)
                 {
                     var rows = new List<IReadOnlyList<string>>(callers.Count);
@@ -368,13 +608,75 @@ public static class GraphTools
                         if (payloadLine is not null) sb.AppendLine(payloadLine);
                     }
                 }
-                return sb.ToString();
+                return BuildListCallersResult(
+                    prose: sb.ToString(),
+                    target: top,
+                    callers: callers,
+                    edgeKindLabel: label,
+                    scopeId: host.Scope.Id,
+                    elapsedMs: sw.ElapsedMilliseconds);
             }, ct));
 
-    [McpServerTool]
+    private static CallToolResult BuildListCallersResult(
+        string prose,
+        SymbolHit target,
+        IReadOnlyList<SymbolHit> callers,
+        string edgeKindLabel,
+        string scopeId,
+        long elapsedMs)
+    {
+        var content = new List<ContentBlock>(capacity: 2 + callers.Count)
+        {
+            new TextContentBlock { Text = prose },
+        };
+
+        foreach (var c in callers)
+        {
+            content.Add(new ResourceLinkBlock
+            {
+                Uri = GraphResourceUris.Symbol(c.Id),
+                Name = c.Fqn,
+                Title = c.Fqn,
+                Description = $"{KindLabel(c.Kind)} — {Format.Location(c.FilePath, c.StartLine, c.StartCol)}",
+                MimeType = "text/markdown",
+            });
+        }
+
+        content.Add(AudienceMetadata.Build(
+            scopeId,
+            elapsedMs,
+            ("edge_kind", edgeKindLabel),
+            ("callers", callers.Count.ToString())));
+
+        var structuredCallers = callers
+            .Select(c => new ListCallersRow(
+                SymbolId: c.Id,
+                Fqn: c.Fqn,
+                Kind: c.Kind,
+                FilePath: c.FilePath,
+                Line: c.StartLine,
+                Column: c.StartCol,
+                PayloadJson: string.IsNullOrEmpty(c.PayloadJson) ? null : c.PayloadJson))
+            .ToList();
+        var dto = new ListCallersResult(
+            TargetFqn: target.Fqn,
+            TargetKind: target.Kind,
+            TargetSymbolId: target.Id,
+            EdgeKind: edgeKindLabel,
+            Callers: structuredCallers);
+        return new CallToolResult
+        {
+            Content = content,
+            StructuredContent = JsonSerializer.SerializeToElement(
+                dto,
+                ToolOutputJsonContext.Default.ListCallersResult),
+        };
+    }
+
+    [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(ListCalleesResult))]
     [ToolTrigger("\"what does X call?\" or \"what types does X use?\"")]
     [Description("List outbound edges from the target symbol. Default kind=calls (callees). Use kind=uses-type for types touched in this member's signature/body, kind=overrides-member for the base it overrides, kind=implements-member for the interface member it satisfies, kind=instantiates for types it constructs, kind=throws for exception types it throws, kind=tests for outbound test edges, or any XAML kind (code-behind, binds-path, binds-element, handles-event, uses-resource, instantiates-type, merges, applies-style) on a scope that loaded the XAML indexer; kind=all walks every edge kind. Plugin-defined kinds (any kebab-case identifier) are accepted as-is.")]
-    public static Task<string> ListCalleesAsync(
+    public static Task<CallToolResult> ListCalleesAsync(
         ScopeRouter router,
         [Description("Source symbol name or FQN")] string symbol,
         [Description("Maximum number of results to return (default 50)")] int limit = 50,
@@ -384,20 +686,31 @@ public static class GraphTools
         ToolMetrics.TrackAsync("list_callees", new { symbol, limit, kind, scope }, () =>
             ScopedExecution.RunAsync(router, scope, async host =>
             {
+                var sw = System.Diagnostics.Stopwatch.StartNew();
                 var (edgeKind, label, isAll) = NormaliseEdgeKindParam(kind);
                 if (!isAll && edgeKind is not null)
                 {
                     var unknownNote = await CheckUnknownEdgeKindAsync(host.Store, edgeKind, ct).ConfigureAwait(false);
-                    if (unknownNote is not null) return unknownNote;
+                    if (unknownNote is not null) return DiagnosticResult.Error(unknownNote);
                 }
 
                 var hits = await host.Store.FindSymbolsAsync(symbol, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
-                if (hits.Count == 0) return $"No matches for '{symbol}'.";
+                if (hits.Count == 0) return DiagnosticResult.Build($"No matches for '{symbol}'.");
                 var top = hits[0];
                 var callees = await host.Store.ListCalleesAsync(top.Id, limit, edgeKind, ct).ConfigureAwait(false);
                 var sb = new StringBuilder();
                 sb.AppendLine($"Outbound `{label}` from **{top.Fqn}** ({KindLabel(top.Kind)}):");
-                if (callees.Count == 0) { sb.AppendLine("- (none)"); return sb.ToString(); }
+                if (callees.Count == 0)
+                {
+                    sb.AppendLine("- (none)");
+                    return BuildListCalleesResult(
+                        prose: sb.ToString(),
+                        target: top,
+                        callees: Array.Empty<SymbolHit>(),
+                        edgeKindLabel: label,
+                        scopeId: host.Scope.Id,
+                        elapsedMs: sw.ElapsedMilliseconds);
+                }
                 if (callees.Count >= 2)
                 {
                     var rows = new List<IReadOnlyList<string>>(callees.Count);
@@ -428,13 +741,75 @@ public static class GraphTools
                         if (payloadLine is not null) sb.AppendLine(payloadLine);
                     }
                 }
-                return sb.ToString();
+                return BuildListCalleesResult(
+                    prose: sb.ToString(),
+                    target: top,
+                    callees: callees,
+                    edgeKindLabel: label,
+                    scopeId: host.Scope.Id,
+                    elapsedMs: sw.ElapsedMilliseconds);
             }, ct));
 
-    [McpServerTool]
+    private static CallToolResult BuildListCalleesResult(
+        string prose,
+        SymbolHit target,
+        IReadOnlyList<SymbolHit> callees,
+        string edgeKindLabel,
+        string scopeId,
+        long elapsedMs)
+    {
+        var content = new List<ContentBlock>(capacity: 2 + callees.Count)
+        {
+            new TextContentBlock { Text = prose },
+        };
+
+        foreach (var c in callees)
+        {
+            content.Add(new ResourceLinkBlock
+            {
+                Uri = GraphResourceUris.Symbol(c.Id),
+                Name = c.Fqn,
+                Title = c.Fqn,
+                Description = $"{KindLabel(c.Kind)} — {Format.Location(c.FilePath, c.StartLine, c.StartCol)}",
+                MimeType = "text/markdown",
+            });
+        }
+
+        content.Add(AudienceMetadata.Build(
+            scopeId,
+            elapsedMs,
+            ("edge_kind", edgeKindLabel),
+            ("callees", callees.Count.ToString())));
+
+        var structuredCallees = callees
+            .Select(c => new ListCalleesRow(
+                SymbolId: c.Id,
+                Fqn: c.Fqn,
+                Kind: c.Kind,
+                FilePath: c.FilePath,
+                Line: c.StartLine,
+                Column: c.StartCol,
+                PayloadJson: string.IsNullOrEmpty(c.PayloadJson) ? null : c.PayloadJson))
+            .ToList();
+        var dto = new ListCalleesResult(
+            TargetFqn: target.Fqn,
+            TargetKind: target.Kind,
+            TargetSymbolId: target.Id,
+            EdgeKind: edgeKindLabel,
+            Callees: structuredCallees);
+        return new CallToolResult
+        {
+            Content = content,
+            StructuredContent = JsonSerializer.SerializeToElement(
+                dto,
+                ToolOutputJsonContext.Default.ListCalleesResult),
+        };
+    }
+
+    [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(FindImplementationsResult))]
     [ToolTrigger("\"who implements IGreeter.Greet?\"")]
     [Description("Find every concrete member that implements an interface member (uses implements-member edges).")]
-    public static Task<string> FindImplementationsAsync(
+    public static Task<CallToolResult> FindImplementationsAsync(
         ScopeRouter router,
         [Description("Interface member name or FQN, e.g. 'IGreeter.Greet'")] string symbol,
         [Description("Include abstract base members in the result (default false)")] bool includeAbstract = false,
@@ -444,8 +819,9 @@ public static class GraphTools
         ToolMetrics.TrackAsync("find_implementations", new { symbol, includeAbstract, limit, scope }, () =>
             ScopedExecution.RunAsync(router, scope, async host =>
             {
+                var sw = System.Diagnostics.Stopwatch.StartNew();
                 var hits = await host.Store.FindSymbolsAsync(symbol, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
-                if (hits.Count == 0) return $"No matches for '{symbol}'.";
+                if (hits.Count == 0) return DiagnosticResult.Build($"No matches for '{symbol}'.");
                 var top = hits[0];
                 var impls = await host.Store.ListImplementationsAsync(top.Id, limit, ct).ConfigureAwait(false);
                 var filtered = includeAbstract
@@ -453,7 +829,16 @@ public static class GraphTools
                     : impls.Where(h => !(h.Signature?.Contains("abstract", StringComparison.Ordinal) ?? false)).ToList();
                 var sb = new StringBuilder();
                 sb.AppendLine($"Implementations of **{top.Fqn}** ({KindLabel(top.Kind)}):");
-                if (filtered.Count == 0) { sb.AppendLine("- (none)"); return sb.ToString(); }
+                if (filtered.Count == 0)
+                {
+                    sb.AppendLine("- (none)");
+                    return BuildFindImplementationsResult(
+                        prose: sb.ToString(),
+                        target: top,
+                        impls: Array.Empty<SymbolHit>(),
+                        scopeId: host.Scope.Id,
+                        elapsedMs: sw.ElapsedMilliseconds);
+                }
                 if (filtered.Count >= 2)
                 {
                     var rows = new List<IReadOnlyList<string>>(filtered.Count);
@@ -475,13 +860,71 @@ public static class GraphTools
                         sb.AppendLine($"- **{c.Fqn}** ({KindLabel(c.Kind)}) at {Format.Location(c.FilePath, c.StartLine, c.StartCol)}");
                     }
                 }
-                return sb.ToString();
+                return BuildFindImplementationsResult(
+                    prose: sb.ToString(),
+                    target: top,
+                    impls: filtered,
+                    scopeId: host.Scope.Id,
+                    elapsedMs: sw.ElapsedMilliseconds);
             }, ct));
 
-    [McpServerTool]
+    private static CallToolResult BuildFindImplementationsResult(
+        string prose,
+        SymbolHit target,
+        IReadOnlyList<SymbolHit> impls,
+        string scopeId,
+        long elapsedMs)
+    {
+        var content = new List<ContentBlock>(capacity: 2 + impls.Count)
+        {
+            new TextContentBlock { Text = prose },
+        };
+
+        foreach (var c in impls)
+        {
+            content.Add(new ResourceLinkBlock
+            {
+                Uri = GraphResourceUris.Symbol(c.Id),
+                Name = c.Fqn,
+                Title = c.Fqn,
+                Description = $"{KindLabel(c.Kind)} — {Format.Location(c.FilePath, c.StartLine, c.StartCol)}",
+                MimeType = "text/markdown",
+            });
+        }
+
+        content.Add(AudienceMetadata.Build(
+            scopeId,
+            elapsedMs,
+            ("implementations", impls.Count.ToString())));
+
+        var structuredImpls = impls
+            .Select(c => new FindImplementationsRow(
+                SymbolId: c.Id,
+                Fqn: c.Fqn,
+                Kind: c.Kind,
+                FilePath: c.FilePath,
+                Line: c.StartLine,
+                Column: c.StartCol,
+                Signature: string.IsNullOrEmpty(c.Signature) ? null : c.Signature))
+            .ToList();
+        var dto = new FindImplementationsResult(
+            TargetFqn: target.Fqn,
+            TargetKind: target.Kind,
+            TargetSymbolId: target.Id,
+            Implementations: structuredImpls);
+        return new CallToolResult
+        {
+            Content = content,
+            StructuredContent = JsonSerializer.SerializeToElement(
+                dto,
+                ToolOutputJsonContext.Default.FindImplementationsResult),
+        };
+    }
+
+    [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(SearchSymbolsResult))]
     [ToolTrigger("\"I only have a fragment of the name (e.g. 'Calc', 'Greet', 'Async')\"")]
     [Description("Free-text search for symbols by partial name, FQN, or signature using FTS5.")]
-    public static Task<string> SearchSymbolsAsync(
+    public static Task<CallToolResult> SearchSymbolsAsync(
         ScopeRouter router,
         [Description("Search query (a few characters, words, or substring of name/FQN/signature)")] string query,
         [Description("Optional kebab-case symbol kind filter: class|method|property|field|interface|namespace|enum|enum-member|operator|record|delegate|struct|event|xaml-view|xaml-element|xaml-resource|xaml-style|xaml-template|... (any plugin-defined kebab-case kind also accepted).")] string? kind = null,
@@ -491,10 +934,18 @@ public static class GraphTools
         ToolMetrics.TrackAsync("search_symbols", new { query, kind, topK, scope }, () =>
             ScopedExecution.RunAsync(router, scope, async host =>
             {
+                var sw = System.Diagnostics.Stopwatch.StartNew();
                 var kindFilter = NormaliseKindFilter(kind);
 
                 var hits = await host.Store.SearchSymbolsAsync(query, kindFilter, topK, ct).ConfigureAwait(false);
-                if (hits.Count == 0) return $"No symbols match '{query}'.";
+                if (hits.Count == 0)
+                {
+                    return BuildSearchSymbolsResult(
+                        prose: $"No symbols match '{query}'.",
+                        hits: Array.Empty<SymbolHit>(),
+                        scopeId: host.Scope.Id,
+                        elapsedMs: sw.ElapsedMilliseconds);
+                }
                 var sb = new StringBuilder();
                 sb.AppendLine($"{hits.Count} hits for '{query}':");
                 if (hits.Count >= 2)
@@ -518,13 +969,64 @@ public static class GraphTools
                         sb.AppendLine($"- **{h.Fqn}** ({KindLabel(h.Kind)}) at {Format.Location(h.FilePath, h.StartLine, h.StartCol)}");
                     }
                 }
-                return sb.ToString();
+                return BuildSearchSymbolsResult(
+                    prose: sb.ToString(),
+                    hits: hits,
+                    scopeId: host.Scope.Id,
+                    elapsedMs: sw.ElapsedMilliseconds);
             }, ct));
 
-    [McpServerTool]
+    private static CallToolResult BuildSearchSymbolsResult(
+        string prose,
+        IReadOnlyList<SymbolHit> hits,
+        string scopeId,
+        long elapsedMs)
+    {
+        var content = new List<ContentBlock>(capacity: 2 + hits.Count)
+        {
+            new TextContentBlock { Text = prose },
+        };
+
+        foreach (var h in hits)
+        {
+            content.Add(new ResourceLinkBlock
+            {
+                Uri = GraphResourceUris.Symbol(h.Id),
+                Name = h.Fqn,
+                Title = h.Fqn,
+                Description = $"{KindLabel(h.Kind)} — {Format.Location(h.FilePath, h.StartLine, h.StartCol)}",
+                MimeType = "text/markdown",
+            });
+        }
+
+        content.Add(AudienceMetadata.Build(
+            scopeId,
+            elapsedMs,
+            ("hits", hits.Count.ToString())));
+
+        var structuredHits = hits
+            .Select(h => new SearchSymbolHit(
+                Fqn: h.Fqn,
+                Kind: h.Kind,
+                FilePath: h.FilePath,
+                Line: h.StartLine,
+                Column: h.StartCol,
+                Signature: string.IsNullOrEmpty(h.Signature) ? null : h.Signature,
+                XmlSummary: string.IsNullOrEmpty(h.XmlSummary) ? null : h.XmlSummary))
+            .ToList();
+        return new CallToolResult
+        {
+            Content = content,
+            StructuredContent = JsonSerializer.SerializeToElement(
+                new SearchSymbolsResult(structuredHits),
+                ToolOutputJsonContext.Default.SearchSymbolsResult),
+        };
+    }
+
+    [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(NeighborhoodResult))]
     [ToolTrigger("\"give me a quick overview around X\" — orient before diving in")]
     [Description("Get the immediate graph neighborhood of a symbol: callers, callees, and inheritance/implements edges. Default kind=calls; pass kind=uses-type, overrides-member, implements-member, instantiates, throws, tests, all, any XAML edge kind (code-behind, binds-path, binds-element, handles-event, uses-resource, instantiates-type, merges, applies-style) on a scope that loaded the XAML indexer, or any plugin-defined kebab-case kind to inspect other edge layers.")]
-    public static Task<string> NeighborhoodAsync(
+    public static Task<CallToolResult> NeighborhoodAsync(
         ScopeRouter router,
         [Description("Symbol name or FQN")] string symbol,
         [Description("Max items per category (default 20)")] int perCategory = 20,
@@ -534,15 +1036,16 @@ public static class GraphTools
         ToolMetrics.TrackAsync("neighborhood", new { symbol, perCategory, kind, scope }, () =>
             ScopedExecution.RunAsync(router, scope, async host =>
             {
+                var sw = System.Diagnostics.Stopwatch.StartNew();
                 var (edgeKind, label, isAll) = NormaliseEdgeKindParam(kind);
                 if (!isAll && edgeKind is not null)
                 {
                     var unknownNote = await CheckUnknownEdgeKindAsync(host.Store, edgeKind, ct).ConfigureAwait(false);
-                    if (unknownNote is not null) return unknownNote;
+                    if (unknownNote is not null) return DiagnosticResult.Error(unknownNote);
                 }
 
                 var hits = await host.Store.FindSymbolsAsync(symbol, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
-                if (hits.Count == 0) return $"No matches for '{symbol}'.";
+                if (hits.Count == 0) return DiagnosticResult.Build($"No matches for '{symbol}'.");
                 var top = hits[0];
                 var callers = await host.Store.ListCallersAsync(top.Id, perCategory, edgeKind, ct).ConfigureAwait(false);
                 var callees = await host.Store.ListCalleesAsync(top.Id, perCategory, edgeKind, ct).ConfigureAwait(false);
@@ -562,8 +1065,86 @@ public static class GraphTools
                 sb.AppendLine();
                 sb.AppendLine($"### Outbound ({callees.Count})");
                 await AppendNeighborhoodSectionAsync(sb, callees, host.Store, multipleFlavors, ct).ConfigureAwait(false);
-                return sb.ToString();
+                return BuildNeighborhoodResult(
+                    prose: sb.ToString(),
+                    target: top,
+                    inbound: callers,
+                    outbound: callees,
+                    edgeKindLabel: label,
+                    scopeId: host.Scope.Id,
+                    elapsedMs: sw.ElapsedMilliseconds);
             }, ct));
+
+    private static CallToolResult BuildNeighborhoodResult(
+        string prose,
+        SymbolHit target,
+        IReadOnlyList<SymbolHit> inbound,
+        IReadOnlyList<SymbolHit> outbound,
+        string edgeKindLabel,
+        string scopeId,
+        long elapsedMs)
+    {
+        var content = new List<ContentBlock>(capacity: 2 + inbound.Count + outbound.Count)
+        {
+            new TextContentBlock { Text = prose },
+        };
+
+        foreach (var c in inbound)
+        {
+            content.Add(new ResourceLinkBlock
+            {
+                Uri = GraphResourceUris.Symbol(c.Id),
+                Name = c.Fqn,
+                Title = $"inbound: {c.Fqn}",
+                Description = $"{Format.KindWithAttrs(c)} — {Format.Location(c.FilePath, c.StartLine, c.StartCol)}",
+                MimeType = "text/markdown",
+            });
+        }
+        foreach (var c in outbound)
+        {
+            content.Add(new ResourceLinkBlock
+            {
+                Uri = GraphResourceUris.Symbol(c.Id),
+                Name = c.Fqn,
+                Title = $"outbound: {c.Fqn}",
+                Description = $"{Format.KindWithAttrs(c)} — {Format.Location(c.FilePath, c.StartLine, c.StartCol)}",
+                MimeType = "text/markdown",
+            });
+        }
+
+        content.Add(AudienceMetadata.Build(
+            scopeId,
+            elapsedMs,
+            ("edge_kind", edgeKindLabel),
+            ("inbound", inbound.Count.ToString()),
+            ("outbound", outbound.Count.ToString())));
+
+        static NeighborhoodRow Project(SymbolHit s) => new(
+            SymbolId: s.Id,
+            Fqn: s.Fqn,
+            Kind: s.Kind,
+            FilePath: s.FilePath,
+            Line: s.StartLine,
+            Column: s.StartCol,
+            PayloadJson: string.IsNullOrEmpty(s.PayloadJson) ? null : s.PayloadJson);
+        var dto = new NeighborhoodResult(
+            SymbolId: target.Id,
+            Fqn: target.Fqn,
+            Kind: target.Kind,
+            FilePath: target.FilePath,
+            Line: target.StartLine,
+            Column: target.StartCol,
+            EdgeKind: edgeKindLabel,
+            Inbound: inbound.Select(Project).ToList(),
+            Outbound: outbound.Select(Project).ToList());
+        return new CallToolResult
+        {
+            Content = content,
+            StructuredContent = JsonSerializer.SerializeToElement(
+                dto,
+                ToolOutputJsonContext.Default.NeighborhoodResult),
+        };
+    }
 
     /// <summary>
     /// Render one of <c>neighborhood</c>'s Inbound / Outbound sections. When the row count is
@@ -631,10 +1212,10 @@ public static class GraphTools
         }
     }
 
-    [McpServerTool]
+    [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(ModuleSummaryResult))]
     [ToolTrigger("\"what's important in this namespace?\" or \"what's the entrypoint to module Y?\"")]
     [Description("Summarize a namespace or directory: lists the most-referenced symbols (highest in-degree) so you know what to read first. Pass 'Sample.Domain' or a path fragment.")]
-    public static Task<string> ModuleSummaryAsync(
+    public static Task<CallToolResult> ModuleSummaryAsync(
         ScopeRouter router,
         [Description("Namespace (e.g. 'Sample.Domain') or path-substring that identifies the module")] string namespaceOrPath,
         [Description("Top-K most-referenced symbols to return (default 25)")] int topK = 25,
@@ -644,9 +1225,18 @@ public static class GraphTools
         ToolMetrics.TrackAsync("module_summary", new { namespaceOrPath, topK, scope }, () =>
             ScopedExecution.RunAsync(router, scope, async host =>
             {
+                var sw = System.Diagnostics.Stopwatch.StartNew();
                 progress?.Report(Format.Progress(0.0, "querying"));
                 var rows = await host.Store.ModuleSummaryAsync(namespaceOrPath, topK, ct).ConfigureAwait(false);
-                if (rows.Count == 0) return $"No symbols matched module '{namespaceOrPath}'.";
+                if (rows.Count == 0)
+                {
+                    return BuildModuleSummaryResult(
+                        prose: $"No symbols matched module '{namespaceOrPath}'.",
+                        module: namespaceOrPath,
+                        rows: Array.Empty<ModuleSymbol>(),
+                        scopeId: host.Scope.Id,
+                        elapsedMs: sw.ElapsedMilliseconds);
+                }
                 var multipleFlavors = await HasMultipleAnnotationFlavorsAsync(host.Store, ct).ConfigureAwait(false);
                 var sb = new StringBuilder();
                 sb.AppendLine($"Top {rows.Count} symbols in '{namespaceOrPath}' (by inbound calls):");
@@ -700,13 +1290,68 @@ public static class GraphTools
                         if (line is not null) sb.AppendLine($"  - {line}");
                     }
                 }
-                return sb.ToString();
+                return BuildModuleSummaryResult(
+                    prose: sb.ToString(),
+                    module: namespaceOrPath,
+                    rows: rows,
+                    scopeId: host.Scope.Id,
+                    elapsedMs: sw.ElapsedMilliseconds);
             }, ct));
 
-    [McpServerTool]
+    private static CallToolResult BuildModuleSummaryResult(
+        string prose,
+        string module,
+        IReadOnlyList<ModuleSymbol> rows,
+        string scopeId,
+        long elapsedMs)
+    {
+        var content = new List<ContentBlock>(capacity: 2 + rows.Count)
+        {
+            new TextContentBlock { Text = prose },
+        };
+
+        foreach (var row in rows)
+        {
+            content.Add(new ResourceLinkBlock
+            {
+                Uri = GraphResourceUris.Symbol(row.Symbol.Id),
+                Name = row.Symbol.Fqn,
+                Title = $"in-deg {row.InDegree}: {row.Symbol.Fqn}",
+                Description = $"{Format.KindWithAttrs(row.Symbol)} — {Format.Location(row.Symbol.FilePath, row.Symbol.StartLine, row.Symbol.StartCol)}",
+                MimeType = "text/markdown",
+            });
+        }
+
+        content.Add(AudienceMetadata.Build(
+            scopeId,
+            elapsedMs,
+            ("module", $"`{module}`"),
+            ("rows", rows.Count.ToString())));
+
+        var structuredRows = rows
+            .Select(row => new ModuleSummaryRow(
+                InDegree: row.InDegree,
+                SymbolId: row.Symbol.Id,
+                Fqn: row.Symbol.Fqn,
+                Kind: row.Symbol.Kind,
+                FilePath: row.Symbol.FilePath,
+                Line: row.Symbol.StartLine,
+                Column: row.Symbol.StartCol))
+            .ToList();
+        var dto = new ModuleSummaryResult(Module: module, Top: structuredRows);
+        return new CallToolResult
+        {
+            Content = content,
+            StructuredContent = JsonSerializer.SerializeToElement(
+                dto,
+                ToolOutputJsonContext.Default.ModuleSummaryResult),
+        };
+    }
+
+    [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(ImpactOfChangeResult))]
     [ToolTrigger("\"what would change if I edit X?\" — transitive callers")]
     [Description("Compute the transitive set of upstream callers for a symbol (impact of changing it). Walks the call graph backward up to maxDepth. Default kind=calls; pass kind=uses-type, overrides-member, implements-member, instantiates, throws, tests, all, or any plugin-defined kebab-case kind to traverse other edge layers.")]
-    public static Task<string> ImpactOfChangeAsync(
+    public static Task<CallToolResult> ImpactOfChangeAsync(
         ScopeRouter router,
         [Description("Symbol name or FQN")] string symbol,
         [Description("Maximum traversal depth (default 4)")] int maxDepth = 4,
@@ -718,21 +1363,33 @@ public static class GraphTools
         ToolMetrics.TrackAsync("impact_of_change", new { symbol, maxDepth, limit, kind, scope }, () =>
             ScopedExecution.RunAsync(router, scope, async host =>
             {
+                var sw = System.Diagnostics.Stopwatch.StartNew();
                 var (edgeKind, label, isAll) = NormaliseEdgeKindParam(kind);
                 if (!isAll && edgeKind is not null)
                 {
                     var unknownNote = await CheckUnknownEdgeKindAsync(host.Store, edgeKind, ct).ConfigureAwait(false);
-                    if (unknownNote is not null) return unknownNote;
+                    if (unknownNote is not null) return DiagnosticResult.Error(unknownNote);
                 }
 
                 var hits = await host.Store.FindSymbolsAsync(symbol, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
-                if (hits.Count == 0) return $"No matches for '{symbol}'.";
+                if (hits.Count == 0) return DiagnosticResult.Build($"No matches for '{symbol}'.");
                 var top = hits[0];
                 progress?.Report(Format.Progress(0.0, "querying"));
                 var rows = await host.Store.ImpactOfChangeAsync(top.Id, maxDepth, limit, edgeKind, ct).ConfigureAwait(false);
                 var sb = new StringBuilder();
                 sb.AppendLine($"Upstream impact of **{top.Fqn}** ({KindLabel(top.Kind)}) [kind={label}] up to depth {maxDepth}:");
-                if (rows.Count == 0) { sb.AppendLine("- (no upstream callers found in graph)"); return sb.ToString(); }
+                if (rows.Count == 0)
+                {
+                    sb.AppendLine("- (no upstream callers found in graph)");
+                    return BuildImpactOfChangeResult(
+                        prose: sb.ToString(),
+                        target: top,
+                        rows: Array.Empty<ImpactedSymbol>(),
+                        edgeKindLabel: label,
+                        maxDepth: maxDepth,
+                        scopeId: host.Scope.Id,
+                        elapsedMs: sw.ElapsedMilliseconds);
+                }
                 if (rows.Count >= 2)
                 {
                     var tableRows = new List<IReadOnlyList<string>>(rows.Count);
@@ -759,13 +1416,79 @@ public static class GraphTools
                         sb.AppendLine($"- d{r.Depth}: **{r.Symbol.Fqn}** ({KindLabel(r.Symbol.Kind)}) at {Format.Location(r.Symbol.FilePath, r.Symbol.StartLine, r.Symbol.StartCol)}");
                     }
                 }
-                return sb.ToString();
+                return BuildImpactOfChangeResult(
+                    prose: sb.ToString(),
+                    target: top,
+                    rows: rows,
+                    edgeKindLabel: label,
+                    maxDepth: maxDepth,
+                    scopeId: host.Scope.Id,
+                    elapsedMs: sw.ElapsedMilliseconds);
             }, ct));
 
-    [McpServerTool]
+    private static CallToolResult BuildImpactOfChangeResult(
+        string prose,
+        SymbolHit target,
+        IReadOnlyList<ImpactedSymbol> rows,
+        string edgeKindLabel,
+        int maxDepth,
+        string scopeId,
+        long elapsedMs)
+    {
+        var content = new List<ContentBlock>(capacity: 2 + rows.Count)
+        {
+            new TextContentBlock { Text = prose },
+        };
+
+        foreach (var r in rows)
+        {
+            content.Add(new ResourceLinkBlock
+            {
+                Uri = GraphResourceUris.Symbol(r.Symbol.Id),
+                Name = r.Symbol.Fqn,
+                Title = $"d{r.Depth}: {r.Symbol.Fqn}",
+                Description = $"{KindLabel(r.Symbol.Kind)} — {Format.Location(r.Symbol.FilePath, r.Symbol.StartLine, r.Symbol.StartCol)}",
+                MimeType = "text/markdown",
+            });
+        }
+
+        content.Add(AudienceMetadata.Build(
+            scopeId,
+            elapsedMs,
+            ("edge_kind", edgeKindLabel),
+            ("max_depth", maxDepth.ToString()),
+            ("upstream", rows.Count.ToString())));
+
+        var structuredRows = rows
+            .Select(r => new ImpactOfChangeRow(
+                Depth: r.Depth,
+                SymbolId: r.Symbol.Id,
+                Fqn: r.Symbol.Fqn,
+                Kind: r.Symbol.Kind,
+                FilePath: r.Symbol.FilePath,
+                Line: r.Symbol.StartLine,
+                Column: r.Symbol.StartCol))
+            .ToList();
+        var dto = new ImpactOfChangeResult(
+            TargetFqn: target.Fqn,
+            TargetKind: target.Kind,
+            TargetSymbolId: target.Id,
+            EdgeKind: edgeKindLabel,
+            MaxDepth: maxDepth,
+            Upstream: structuredRows);
+        return new CallToolResult
+        {
+            Content = content,
+            StructuredContent = JsonSerializer.SerializeToElement(
+                dto,
+                ToolOutputJsonContext.Default.ImpactOfChangeResult),
+        };
+    }
+
+    [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(ListMembersResult))]
     [ToolTrigger("\"what members does X have?\" or \"list members of namespace Y\"")]
     [Description("List the direct members of a container (class, struct, interface, namespace) by FQN, optionally filtered by accessibility. Walks the populated container_id chain — replaces 'list_symbols_in_file then filter'.")]
-    public static Task<string> ListMembersAsync(
+    public static Task<CallToolResult> ListMembersAsync(
         ScopeRouter router,
         [Description("Container FQN (e.g. 'Sample.Domain.Calculator', 'Sample.Domain'). Resolved with the same matching rules as find_definition; the top match is used.")] string container,
         [Description("Reserved for a future change that follows inherits/implements edges; currently ignored.")] bool includeInherited = false,
@@ -776,14 +1499,16 @@ public static class GraphTools
         ToolMetrics.TrackAsync("list_members", new { container, includeInherited, accessibility, limit, scope }, () =>
             ScopedExecution.RunAsync(router, scope, async host =>
             {
+                var sw = System.Diagnostics.Stopwatch.StartNew();
                 var hits = await host.Store.FindSymbolsAsync(container, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
-                if (hits.Count == 0) return $"No matches for container '{container}'.";
+                if (hits.Count == 0) return DiagnosticResult.Build($"No matches for container '{container}'.");
                 var top = hits[0];
 
                 int? accFilter = ParseAccessibility(accessibility);
                 if (!string.IsNullOrEmpty(accessibility) && accFilter is null)
                 {
-                    return $"Unknown accessibility '{accessibility}'. Valid: public, internal, private, protected, protected internal, private protected.";
+                    return DiagnosticResult.Error(
+                        $"Unknown accessibility '{accessibility}'. Valid: public, internal, private, protected, protected internal, private protected.");
                 }
 
                 var members = await host.Store.ListMembersAsync(top.Id, accFilter, limit, ct).ConfigureAwait(false);
@@ -794,7 +1519,16 @@ public static class GraphTools
                 {
                     sb.AppendLine("_(includeInherited is reserved for a future change; only direct members are returned.)_");
                 }
-                if (members.Count == 0) { sb.AppendLine("- (none)"); return sb.ToString(); }
+                if (members.Count == 0)
+                {
+                    sb.AppendLine("- (none)");
+                    return BuildListMembersResult(
+                        prose: sb.ToString(),
+                        container: top,
+                        members: Array.Empty<SymbolHit>(),
+                        scopeId: host.Scope.Id,
+                        elapsedMs: sw.ElapsedMilliseconds);
+                }
                 if (members.Count >= 2)
                 {
                     var rows = new List<IReadOnlyList<string>>(members.Count);
@@ -819,13 +1553,73 @@ public static class GraphTools
                         sb.AppendLine();
                     }
                 }
-                return sb.ToString();
+                return BuildListMembersResult(
+                    prose: sb.ToString(),
+                    container: top,
+                    members: members,
+                    scopeId: host.Scope.Id,
+                    elapsedMs: sw.ElapsedMilliseconds);
             }, ct));
 
-    [McpServerTool]
+    private static CallToolResult BuildListMembersResult(
+        string prose,
+        SymbolHit container,
+        IReadOnlyList<SymbolHit> members,
+        string scopeId,
+        long elapsedMs)
+    {
+        var content = new List<ContentBlock>(capacity: 2 + members.Count)
+        {
+            new TextContentBlock { Text = prose },
+        };
+
+        foreach (var m in members)
+        {
+            content.Add(new ResourceLinkBlock
+            {
+                Uri = GraphResourceUris.Symbol(m.Id),
+                Name = m.Fqn,
+                Title = m.Name,
+                Description = $"{Format.KindWithAttrs(m)} — {Format.Location(m.FilePath, m.StartLine, m.StartCol)}",
+                MimeType = "text/markdown",
+            });
+        }
+
+        content.Add(AudienceMetadata.Build(
+            scopeId,
+            elapsedMs,
+            ("members", members.Count.ToString())));
+
+        var structuredMembers = members
+            .Select(m => new ListMembersRow(
+                SymbolId: m.Id,
+                Name: m.Name,
+                Fqn: m.Fqn,
+                Kind: m.Kind,
+                FilePath: m.FilePath,
+                Line: m.StartLine,
+                Column: m.StartCol,
+                Signature: string.IsNullOrEmpty(m.Signature) ? null : m.Signature,
+                XmlSummary: string.IsNullOrEmpty(m.XmlSummary) ? null : m.XmlSummary))
+            .ToList();
+        var dto = new ListMembersResult(
+            ContainerSymbolId: container.Id,
+            ContainerFqn: container.Fqn,
+            ContainerKind: container.Kind,
+            Members: structuredMembers);
+        return new CallToolResult
+        {
+            Content = content,
+            StructuredContent = JsonSerializer.SerializeToElement(
+                dto,
+                ToolOutputJsonContext.Default.ListMembersResult),
+        };
+    }
+
+    [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(SemanticSearchResult))]
     [ToolTrigger("\"find code that does retry logic\", \"how does this codebase handle authentication\", \"show me the rate-limiting code\"")]
     [Description("Semantic / intent search: encode a natural-language query, find symbols whose code embeddings are nearest by cosine similarity. Complements (not replaces) search_symbols, which does name-fragment FTS5 trigram matching. Returns a top-k list with location, kind, and a similarity score in [-1, 1].")]
-    public static Task<string> SemanticSearchAsync(
+    public static Task<CallToolResult> SemanticSearchAsync(
         ScopeRouter router,
         ICodeEmbeddingGenerator generator,
         [Description("Free-text intent query, e.g. 'retry on transient errors', 'masks PII in logs'")] string query,
@@ -837,13 +1631,22 @@ public static class GraphTools
         ToolMetrics.TrackAsync("semantic_search", new { query, k, kind, scope }, () =>
             ScopedExecution.RunAsync(router, scope, async host =>
             {
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                // The next three short-circuits ship as plain prose (no structuredContent) — by
+                // design. They're config-/input-/encoder-failure diagnostics, NOT zero-row query
+                // results. The "Empty result populates structured content" spec scenario applies
+                // only when the search ran cleanly and produced zero matches (handled below by
+                // BuildSemanticSearchResult with hits=[]). Distinguishing the two lets agents
+                // detect "search was attempted, found nothing" vs. "search couldn't run" without
+                // string-matching the prose.
                 if (!host.EmbeddingsStore.IsAvailable || !generator.IsAvailable)
                 {
-                    return "semantic_search disabled: install the embedding model (run with the network on for first start) or remove `--no-embeddings`. The graph itself is fully indexed; other tools (`find_definition`, `search_symbols`, `list_callers`, …) work as normal.";
+                    return DiagnosticResult.Error(
+                        "semantic_search disabled: install the embedding model (run with the network on for first start) or remove `--no-embeddings`. The graph itself is fully indexed; other tools (`find_definition`, `search_symbols`, `list_callers`, …) work as normal.");
                 }
                 if (string.IsNullOrWhiteSpace(query))
                 {
-                    return "semantic_search: provide a non-empty query.";
+                    return DiagnosticResult.Error("semantic_search: provide a non-empty query.");
                 }
 
                 var kindFilter = NormaliseKindFilter(kind);
@@ -855,26 +1658,37 @@ public static class GraphTools
                 var queryEmbeddings = await generator.EmbedAsync(new[] { query }, ct).ConfigureAwait(false);
                 if (queryEmbeddings.Count == 0)
                 {
-                    return "semantic_search: encoder produced no vector for the query.";
+                    return DiagnosticResult.Error("semantic_search: encoder produced no vector for the query.");
                 }
 
                 progress?.Report(Format.Progress(0.5, "searching"));
                 var hits = await host.EmbeddingsStore.SearchAsync(queryEmbeddings[0], k, kindFilter, ct).ConfigureAwait(false);
                 if (hits.Count == 0)
                 {
-                    return $"No semantic matches for '{query}'. The graph may not have any embeddings yet — let the indexer's embedding pass complete after a fresh `index` and try again.";
+                    return BuildSemanticSearchResult(
+                        prose: $"No semantic matches for '{query}'. The graph may not have any embeddings yet — let the indexer's embedding pass complete after a fresh `index` and try again.",
+                        query: query,
+                        rows: Array.Empty<(EmbeddingHit Hit, SymbolHit Symbol)>(),
+                        scopeId: host.Scope.Id,
+                        elapsedMs: sw.ElapsedMilliseconds);
                 }
 
                 progress?.Report(Format.Progress(0.9, "formatting results"));
-                var sb = new StringBuilder();
-                sb.AppendLine($"{hits.Count} semantic hits for '{query}':");
-                if (hits.Count >= 2)
+                // Resolve every hit into its SymbolHit once; downstream prose render and structured
+                // output share this list so prose-row count and structured-array length stay in lockstep.
+                var resolved = new List<(EmbeddingHit Hit, SymbolHit Symbol)>(hits.Count);
+                foreach (var h in hits)
                 {
-                    var rows = new List<IReadOnlyList<string>>(hits.Count);
-                    foreach (var h in hits)
+                    var sym = await host.Store.GetSymbolByIdAsync(h.SymbolId, ct).ConfigureAwait(false);
+                    if (sym is not null) resolved.Add((h, sym));
+                }
+                var sb = new StringBuilder();
+                sb.AppendLine($"{resolved.Count} semantic hits for '{query}':");
+                if (resolved.Count >= 2)
+                {
+                    var rows = new List<IReadOnlyList<string>>(resolved.Count);
+                    foreach (var (h, sym) in resolved)
                     {
-                        var sym = await host.Store.GetSymbolByIdAsync(h.SymbolId, ct).ConfigureAwait(false);
-                        if (sym is null) continue;
                         rows.Add(new[]
                         {
                             h.Score.ToString("F3"),
@@ -891,36 +1705,122 @@ public static class GraphTools
                 }
                 else
                 {
-                    foreach (var h in hits)
+                    foreach (var (h, sym) in resolved)
                     {
-                        var sym = await host.Store.GetSymbolByIdAsync(h.SymbolId, ct).ConfigureAwait(false);
-                        if (sym is null) continue;
                         sb.Append($"- score {h.Score:F3} — **{sym.Fqn}** ({Format.KindWithAttrs(sym)}) at {Format.Location(sym.FilePath, sym.StartLine, sym.StartCol)}");
                         var s = Format.OneLineSummary(sym.XmlSummary);
                         if (!string.IsNullOrEmpty(s)) sb.Append(" — _" + s + "_");
                         sb.AppendLine();
                     }
                 }
-                return sb.ToString();
+                return BuildSemanticSearchResult(
+                    prose: sb.ToString(),
+                    query: query,
+                    rows: resolved,
+                    scopeId: host.Scope.Id,
+                    elapsedMs: sw.ElapsedMilliseconds);
             }, ct));
 
-    [McpServerTool]
+    private static CallToolResult BuildSemanticSearchResult(
+        string prose,
+        string query,
+        IReadOnlyList<(EmbeddingHit Hit, SymbolHit Symbol)> rows,
+        string scopeId,
+        long elapsedMs)
+    {
+        var content = new List<ContentBlock>(capacity: 2 + rows.Count)
+        {
+            new TextContentBlock { Text = prose },
+        };
+
+        foreach (var (h, sym) in rows)
+        {
+            content.Add(new ResourceLinkBlock
+            {
+                Uri = GraphResourceUris.Symbol(sym.Id),
+                Name = sym.Fqn,
+                Title = $"score {h.Score:F3}: {sym.Fqn}",
+                Description = $"{Format.KindWithAttrs(sym)} — {Format.Location(sym.FilePath, sym.StartLine, sym.StartCol)}",
+                MimeType = "text/markdown",
+            });
+        }
+
+        content.Add(AudienceMetadata.Build(
+            scopeId,
+            elapsedMs,
+            ("hits", rows.Count.ToString())));
+
+        var structuredHits = rows
+            .Select(r => new SemanticSearchHit(
+                Score: r.Hit.Score,
+                SymbolId: r.Symbol.Id,
+                Fqn: r.Symbol.Fqn,
+                Kind: r.Symbol.Kind,
+                FilePath: r.Symbol.FilePath,
+                Line: r.Symbol.StartLine,
+                Column: r.Symbol.StartCol,
+                XmlSummary: string.IsNullOrEmpty(r.Symbol.XmlSummary) ? null : r.Symbol.XmlSummary))
+            .ToList();
+        var dto = new SemanticSearchResult(Query: query, Hits: structuredHits);
+        return new CallToolResult
+        {
+            Content = content,
+            StructuredContent = JsonSerializer.SerializeToElement(
+                dto,
+                ToolOutputJsonContext.Default.SemanticSearchResult),
+        };
+    }
+
+    [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(GraphStatsResult))]
     [Description("Print summary counts (files, symbols, references, edges) for the current graph database. Use to confirm the index is populated.")]
-    public static Task<string> GraphStatsAsync(
+    public static Task<CallToolResult> GraphStatsAsync(
         ScopeRouter router,
         [Description(ScopeDescription)] string? scope = null,
         CancellationToken ct = default) =>
         ToolMetrics.TrackAsync("graph_stats", new { scope }, () =>
             ScopedExecution.RunAsync(router, scope, async host =>
             {
+                var sw = System.Diagnostics.Stopwatch.StartNew();
                 var s = await host.Store.GetStatsAsync(ct).ConfigureAwait(false);
-                return $"files={s.FileCount} symbols={s.SymbolCount} references={s.ReferenceCount} edges={s.EdgeCount}";
+                var prose = $"files={s.FileCount} symbols={s.SymbolCount} references={s.ReferenceCount} edges={s.EdgeCount}";
+                return BuildGraphStatsResult(
+                    prose: prose,
+                    stats: s,
+                    scopeId: host.Scope.Id,
+                    elapsedMs: sw.ElapsedMilliseconds);
             }, ct));
 
-    [McpServerTool]
+    private static CallToolResult BuildGraphStatsResult(
+        string prose,
+        GraphStats stats,
+        string scopeId,
+        long elapsedMs)
+    {
+        // Per spec: no resource link — graph_stats is a singleton summary, not a list.
+        var content = new List<ContentBlock>(capacity: 2)
+        {
+            new TextContentBlock { Text = prose },
+            AudienceMetadata.Build(scopeId, elapsedMs),
+        };
+
+        var dto = new GraphStatsResult(
+            Files: stats.FileCount,
+            Symbols: stats.SymbolCount,
+            References: stats.ReferenceCount,
+            Edges: stats.EdgeCount);
+        return new CallToolResult
+        {
+            Content = content,
+            StructuredContent = JsonSerializer.SerializeToElement(
+                dto,
+                ToolOutputJsonContext.Default.GraphStatsResult),
+        };
+    }
+
+    [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(FindDiagnosticsResult))]
     [ToolTrigger("\"what does this codebase warn about?\" or \"is X being warned on?\"")]
     [Description("Find Roslyn diagnostics (analyzer warnings, compiler errors, etc.) captured during indexing. Filter by severity (default 'warning' = severity >= 2), diagnostic code (e.g. 'CS0618'), and/or symbol.")]
-    public static Task<string> FindDiagnosticsAsync(
+    public static Task<CallToolResult> FindDiagnosticsAsync(
         ScopeRouter router,
         [Description("Severity floor: hidden | info | warning (default) | error | all. Numeric values 0-3 also accepted.")] string? severity = "warning",
         [Description("Optional diagnostic code filter, e.g. 'CS0618' for [Obsolete] usage")] string? code = null,
@@ -931,10 +1831,12 @@ public static class GraphTools
         ToolMetrics.TrackAsync("find_diagnostics", new { severity, code, symbol, limit, scope }, () =>
             ScopedExecution.RunAsync(router, scope, async host =>
             {
+                var sw = System.Diagnostics.Stopwatch.StartNew();
                 var sev = ParseSeverity(severity);
                 if (sev == -1)
                 {
-                    return $"Unknown severity '{severity}'. Expected one of: hidden | info | warning | error | all.";
+                    return DiagnosticResult.Error(
+                        $"Unknown severity '{severity}'. Expected one of: hidden | info | warning | error | all.");
                 }
 
                 long? symbolId = null;
@@ -942,7 +1844,7 @@ public static class GraphTools
                 if (!string.IsNullOrWhiteSpace(symbol))
                 {
                     var hits = await host.Store.FindSymbolsAsync(symbol, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
-                    if (hits.Count == 0) return $"No matches for '{symbol}'.";
+                    if (hits.Count == 0) return DiagnosticResult.Build($"No matches for '{symbol}'.");
                     symbolId = hits[0].Id;
                     symbolFqn = hits[0].Fqn;
                 }
@@ -953,7 +1855,6 @@ public static class GraphTools
                 var codeClause = string.IsNullOrEmpty(code) ? "" : $", code={code}";
                 var symClause = symbolFqn is null ? "" : $", symbol={symbolFqn}";
                 sb.AppendLine($"Diagnostics (severity {sevLabel}{codeClause}{symClause}): {rows.Count}");
-                if (rows.Count == 0) return sb.ToString();
                 if (rows.Count >= 2)
                 {
                     var tableRows = new List<IReadOnlyList<string>>(rows.Count);
@@ -969,20 +1870,74 @@ public static class GraphTools
                     }
                     Format.AppendTable(sb, new[] { "Severity", "Code", "Location", "Message" }, tableRows);
                 }
-                else
+                else if (rows.Count == 1)
                 {
                     foreach (var d in rows)
                     {
                         sb.AppendLine($"- **{SeverityLabel(d.Severity)} {d.Code}** at {Format.Location(d.FilePath, d.Line, d.Col)} — {d.Message}");
                     }
                 }
-                return sb.ToString();
+                return BuildFindDiagnosticsResult(
+                    prose: sb.ToString(),
+                    severityFloor: sevLabel,
+                    code: code,
+                    symbolFqn: symbolFqn,
+                    symbolId: symbolId,
+                    rows: rows,
+                    scopeId: host.Scope.Id,
+                    elapsedMs: sw.ElapsedMilliseconds);
             }, ct));
 
-    [McpServerTool]
+    private static CallToolResult BuildFindDiagnosticsResult(
+        string prose,
+        string severityFloor,
+        string? code,
+        string? symbolFqn,
+        long? symbolId,
+        IReadOnlyList<DiagnosticHit> rows,
+        string scopeId,
+        long elapsedMs)
+    {
+        // Per spec: no resource link per row — diagnostics aren't first-class graph entities yet.
+        // Just the leading prose + trailing audience-restricted metadata + structured payload.
+        var content = new List<ContentBlock>(capacity: 2)
+        {
+            new TextContentBlock { Text = prose },
+        };
+
+        content.Add(AudienceMetadata.Build(
+            scopeId,
+            elapsedMs,
+            ("diagnostics", rows.Count.ToString())));
+
+        var structuredRows = rows
+            .Select(d => new FindDiagnosticsRow(
+                Severity: SeverityLabel(d.Severity),
+                Code: d.Code,
+                Message: d.Message,
+                FilePath: d.FilePath,
+                Line: d.Line,
+                Column: d.Col))
+            .ToList();
+        var dto = new FindDiagnosticsResult(
+            SeverityFloor: severityFloor,
+            Code: string.IsNullOrEmpty(code) ? null : code,
+            Symbol: symbolFqn,
+            SymbolId: symbolId,
+            Diagnostics: structuredRows);
+        return new CallToolResult
+        {
+            Content = content,
+            StructuredContent = JsonSerializer.SerializeToElement(
+                dto,
+                ToolOutputJsonContext.Default.FindDiagnosticsResult),
+        };
+    }
+
+    [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(ListGeneratedFilesResult))]
     [ToolTrigger("\"what's source-generated in this codebase?\"")]
     [Description("List every source-generated file (Roslyn IIncrementalGenerator output: regex source-gen, MVVM Toolkit, ASP.NET routing, JSON source-gen, etc.) tracked by the index. Each row shows the path and the count of symbols emitted from that file.")]
-    public static Task<string> ListGeneratedFilesAsync(
+    public static Task<CallToolResult> ListGeneratedFilesAsync(
         ScopeRouter router,
         [Description("Maximum rows (default 100)")] int limit = 100,
         [Description(ScopeDescription)] string? scope = null,
@@ -990,13 +1945,18 @@ public static class GraphTools
         ToolMetrics.TrackAsync("list_generated_files", new { limit, scope }, () =>
             ScopedExecution.RunAsync(router, scope, async host =>
             {
+                var sw = System.Diagnostics.Stopwatch.StartNew();
                 var rows = await host.Store.ListGeneratedFilesAsync(limit, ct).ConfigureAwait(false);
                 var sb = new StringBuilder();
                 sb.AppendLine($"Generated files: {rows.Count}");
                 if (rows.Count == 0)
                 {
                     sb.AppendLine("_(no source-generated documents in this solution)_");
-                    return sb.ToString();
+                    return BuildListGeneratedFilesResult(
+                        prose: sb.ToString(),
+                        rows: Array.Empty<GeneratedFileRow>(),
+                        scopeId: host.Scope.Id,
+                        elapsedMs: sw.ElapsedMilliseconds);
                 }
                 sb.AppendLine();
                 sb.AppendLine("| Symbols | Path |");
@@ -1005,8 +1965,55 @@ public static class GraphTools
                 {
                     sb.AppendLine($"| {r.SymbolCount} | `{r.FilePath}` |");
                 }
-                return sb.ToString();
+                return BuildListGeneratedFilesResult(
+                    prose: sb.ToString(),
+                    rows: rows,
+                    scopeId: host.Scope.Id,
+                    elapsedMs: sw.ElapsedMilliseconds);
             }, ct));
+
+    private static CallToolResult BuildListGeneratedFilesResult(
+        string prose,
+        IReadOnlyList<GeneratedFileRow> rows,
+        string scopeId,
+        long elapsedMs)
+    {
+        var content = new List<ContentBlock>(capacity: 2 + rows.Count)
+        {
+            new TextContentBlock { Text = prose },
+        };
+
+        foreach (var r in rows)
+        {
+            content.Add(new ResourceLinkBlock
+            {
+                Uri = GraphResourceUris.File(r.FilePath),
+                Name = r.FilePath,
+                Title = r.FilePath,
+                Description = $"{r.SymbolCount} symbol(s) emitted",
+                MimeType = "text/markdown",
+            });
+        }
+
+        content.Add(AudienceMetadata.Build(
+            scopeId,
+            elapsedMs,
+            ("files", rows.Count.ToString())));
+
+        var structuredRows = rows
+            .Select(r => new ListGeneratedFilesRow(
+                FilePath: r.FilePath,
+                SymbolCount: r.SymbolCount))
+            .ToList();
+        var dto = new ListGeneratedFilesResult(Files: structuredRows);
+        return new CallToolResult
+        {
+            Content = content,
+            StructuredContent = JsonSerializer.SerializeToElement(
+                dto,
+                ToolOutputJsonContext.Default.ListGeneratedFilesResult),
+        };
+    }
 
     [McpServerTool]
     [Description("Show how often each MCP tool was called this server-process session: count, errors, avg/max latency, avg response size, last-called time. Use this to verify the agent is actually using the source-graph tools (vs grep+read fallback). Persistent log of every call is at usage.jsonl next to graph.db.")]

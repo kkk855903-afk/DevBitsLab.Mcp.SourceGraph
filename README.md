@@ -24,6 +24,7 @@ calls with a single structured tool call:
 - [Installation](#installation)
 - [Wiring it into an MCP client](#wiring-it-into-an-mcp-client)
 - [MCP tools](#mcp-tools)
+- [Structured output and resource links](#structured-output-and-resource-links)
 - [Resource templates](#resource-templates)
 - [Scopes (multi-solution monorepos)](#scopes-multi-solution-monorepos)
 - [Command-line interface](#command-line-interface)
@@ -251,6 +252,94 @@ to the client at handshake time.
 { "tool": "find_by_annotation",
   "args": { "name": "Grid.Row", "flavor": "xaml-attached-property" } }
 ```
+
+## Structured output and resource links
+
+Every tool whose result is naturally typed — the symbol-list, edge,
+diagnostics, history, and singleton tools above — ships two parallel views
+in each `tools/call` response:
+
+1. **Renderable prose** in `content` — the markdown the human reads in chat. A
+   leading text block carries the substantive answer; per-row `resource_link`
+   items point at the corresponding graph resources (see the URI table below);
+   a trailing `audience: ["assistant"]` text block carries diagnostic metadata
+   (resolved scope, query latency, edge-kind defaults, row counts) for the
+   model only.
+2. **Typed `structuredContent`** — the same data as a JSON object with
+   snake-case field names matching the `outputSchema` declared on
+   `tools/list`. Agents that want to chain calls or post-process results can
+   `JSON.parse(...)` the structured payload directly without re-parsing prose.
+
+The `outputSchema` for each tool is derived from the C# DTO at registration
+time, so the wire-level schema stays in lockstep with the implementation.
+Older MCP clients that don't recognise `structuredContent` see a complete
+prose answer; clients that don't recognise `resource_link` items skip them;
+clients that respect `audience` annotations filter the metadata block out
+of the user view.
+
+### `graph://` URI scheme
+
+Each `resource_link.uri` follows one of three shapes:
+
+| URI | What it serves |
+|---|---|
+| `graph://symbol/<id>` | Markdown card for one symbol — signature, summary, location, attributes, top neighbours |
+| `graph://file/<url-encoded-path>` | Symbol outline for a file — every class/method/property declared, with line numbers |
+| `graph://namespace/<name>` | Namespace summary — top symbols by inbound call count |
+
+A client that supports `resources/read` can dereference any emitted URI for
+an expanded card; the server resolves it against the active scope. See
+[Resource templates](#resource-templates) for the underlying MCP templates.
+
+### Sample `find_definition` payload
+
+A `find_definition({"symbol": "Calculator"})` call against the Sample fixture
+returns:
+
+```jsonc
+{
+  "content": [
+    {
+      "type": "text",
+      "text": "🌿 6 hits for 'Calculator':\n- **Sample.Domain.Calculator** (public class)\n  - /abs/path/Calculator.cs:12:18\n  - …"
+    },
+    {
+      "type": "resource_link",
+      "uri": "graph://symbol/12",
+      "name": "Sample.Domain.Calculator",
+      "title": "Sample.Domain.Calculator",
+      "description": "public class — /abs/path/Calculator.cs:12:18",
+      "mimeType": "text/markdown"
+    },
+    // … one resource_link per hit, in the same order as the prose rows …
+    {
+      "type": "text",
+      "text": "_meta: scope=`default`, latency_ms=12, hits=6_",
+      "annotations": { "audience": ["assistant"], "priority": 0.2 }
+    }
+  ],
+  "structuredContent": {
+    "hits": [
+      {
+        "fqn": "Sample.Domain.Calculator",
+        "kind": "class",
+        "file_path": "/abs/path/Calculator.cs",
+        "line": 12,
+        "column": 18,
+        "signature": "public class Calculator",
+        "xml_summary": "Multiply, divide, add — the four basics."
+      }
+      // … one entry per resource_link, same order …
+    ]
+  }
+}
+```
+
+A downstream tool that chains on this result reads
+`result.structuredContent.hits[i]` directly — the typed array length always
+equals the number of `resource_link` items and the number of prose rows.
+Plugin tools that opt into the same shape return a `CallToolResult` from
+their handler; the SDK marshals the wire shape identically to the built-ins.
 
 ## Resource templates
 

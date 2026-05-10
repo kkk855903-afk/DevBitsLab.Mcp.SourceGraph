@@ -3,6 +3,7 @@ using DevBitsLab.Mcp.SourceGraph.Server.Observability;
 using DevBitsLab.Mcp.SourceGraph.Server.Plugins;
 using DevBitsLab.Mcp.SourceGraph.Server.Tools;
 using FluentAssertions;
+using ModelContextProtocol.Protocol;
 using ModelContextProtocol.Server;
 using Xunit;
 
@@ -83,6 +84,112 @@ public sealed class LeafChokepointInvariantTests
             LeafFormatter.Suppressed = false;
         }
     }
+
+    [Fact]
+    public async Task TrackAsync_brandsFirstUserVisibleTextBlock_inContentList()
+    {
+        // Multi-content path: tool body returns IReadOnlyList<ContentBlock>. The chokepoint must
+        // brand the first user-visible text block in place, leaving non-text and audience-restricted
+        // blocks untouched.
+        var content = new List<ContentBlock>
+        {
+            new TextContentBlock { Text = "leading prose row 1" },
+            new ResourceLinkBlock { Uri = "graph://symbol/1", Name = "Sample.X", MimeType = "text/markdown" },
+            new TextContentBlock
+            {
+                Text = "trailing meta line",
+                Annotations = new Annotations { Audience = new[] { Role.Assistant }, Priority = 0.2f },
+            },
+        };
+
+        var result = await ToolMetrics.TrackAsync(
+            "test_chokepoint_brands_content_list",
+            args: null,
+            () => Task.FromResult<IReadOnlyList<ContentBlock>>(content));
+
+        // First user-visible text block is branded.
+        var first = result.OfType<TextContentBlock>().First(IsUserVisible);
+        first.Text.Should().StartWith("\U0001F33F ");
+        first.Text.Should().EndWith("leading prose row 1");
+
+        // Resource link is unchanged.
+        var link = result.OfType<ResourceLinkBlock>().Single();
+        link.Uri.Should().Be("graph://symbol/1");
+
+        // Audience-restricted block must NOT be brand-marked.
+        var meta = result.OfType<TextContentBlock>().Single(b => !IsUserVisible(b));
+        meta.Text.Should().Be("trailing meta line", "audience-restricted blocks are skipped by the chokepoint");
+        meta.Text.Should().NotStartWith("\U0001F33F ");
+    }
+
+    [Fact]
+    public async Task TrackAsync_brandsFirstUserVisibleTextBlock_inCallToolResult()
+    {
+        // CallToolResult path: tool body returns Task<CallToolResult>. Same branding rule as the
+        // content-list overload, plus the StructuredContent payload must ride through unchanged.
+        var input = new CallToolResult
+        {
+            Content = new List<ContentBlock>
+            {
+                new TextContentBlock { Text = "user-visible body" },
+                new TextContentBlock
+                {
+                    Text = "agent-only meta",
+                    Annotations = new Annotations { Audience = new[] { Role.Assistant }, Priority = 0.2f },
+                },
+            },
+            StructuredContent = System.Text.Json.JsonDocument.Parse("{\"hits\":[]}").RootElement,
+        };
+
+        var result = await ToolMetrics.TrackAsync(
+            "test_chokepoint_brands_call_tool_result",
+            args: null,
+            () => Task.FromResult(input));
+
+        // First user-visible text block branded.
+        var first = result.Content!.OfType<TextContentBlock>().First(IsUserVisible);
+        first.Text.Should().StartWith("\U0001F33F user-visible body");
+
+        // Audience-restricted block unchanged.
+        var meta = result.Content!.OfType<TextContentBlock>().Single(b => !IsUserVisible(b));
+        meta.Text.Should().Be("agent-only meta");
+        meta.Text.Should().NotStartWith("\U0001F33F ");
+
+        // StructuredContent rides through unchanged so agents that consume it directly aren't
+        // affected by the leaf chokepoint mutating Content.
+        result.StructuredContent.Should().NotBeNull();
+        result.StructuredContent!.Value.GetRawText().Should().Be("{\"hits\":[]}");
+    }
+
+    [Fact]
+    public async Task TrackAsync_contentList_doesNotBrand_whenSuppressed()
+    {
+        // Suppression invariant on the content-list path: when the leaf is silenced, no block is
+        // mutated — the input list ships verbatim.
+        try
+        {
+            LeafFormatter.Suppressed = true;
+            var content = new List<ContentBlock>
+            {
+                new TextContentBlock { Text = "verbatim prose" },
+            };
+            var result = await ToolMetrics.TrackAsync(
+                "test_chokepoint_content_list_suppressed",
+                args: null,
+                () => Task.FromResult<IReadOnlyList<ContentBlock>>(content));
+
+            var first = result.OfType<TextContentBlock>().First();
+            first.Text.Should().Be("verbatim prose");
+        }
+        finally
+        {
+            LeafFormatter.Suppressed = false;
+        }
+    }
+
+    // IsUserVisible lives on the shared CallToolResultHelpers helper so the predicate is
+    // consistent across every test class that exercises the multi-content shape.
+    private static bool IsUserVisible(TextContentBlock b) => CallToolResultHelpers.IsUserVisible(b);
 
     [Fact]
     public void PluginRegisteredTool_handlerOutput_bypassesChokepoint()

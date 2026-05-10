@@ -19,6 +19,12 @@ the at-a-glance signal that the answer came from this server (and not from
 `SOURCEGRAPH_NO_LEAF=1` if your terminal doesn't render emoji well or you
 prefer unbranded output.
 
+Built-in `find_*` / `list_*` / `search_*` tools ship typed `structuredContent`
+(snake-case fields, `outputSchema` declared on `tools/list`) alongside the
+prose, so agents chaining tool calls can consume `result.structuredContent`
+directly without re-parsing markdown — see README's "Structured output and
+resource links" for the shape and a worked example.
+
 A persistent JSONL log of every tool call lives at
 `<solution>/.sourcegraph/usage.jsonl` for offline analysis.
 

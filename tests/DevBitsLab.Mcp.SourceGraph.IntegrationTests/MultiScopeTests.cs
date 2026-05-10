@@ -43,7 +43,7 @@ public sealed class MultiScopeTests
 
         // Real MCP wire round-trip: ask the server to invoke its `list_scopes` tool. The result
         // is a CallToolResult whose Content carries the markdown the tool produced. The
-        // production tool (ScopeTools.ListScopes) renders a markdown table with one row per
+        // production tool (ScopeTools.ListScopesAsync) renders a markdown table with one row per
         // scope — we assert the row text contains both `frontend` and `backend` (the scope ids
         // declared in tests/fixtures/MultiScope/.sourcegraph.json).
         var result = await harness.Client.CallToolAsync(

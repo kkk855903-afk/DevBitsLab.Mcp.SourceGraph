@@ -15,6 +15,25 @@ namespace DevBitsLab.Mcp.SourceGraph.Server.Tools.Output;
 /// </summary>
 [JsonSourceGenerationOptions(PropertyNamingPolicy = JsonKnownNamingPolicy.SnakeCaseLower)]
 [JsonSerializable(typeof(FindDefinitionResult))]
+[JsonSerializable(typeof(FindReferencesResult))]
+[JsonSerializable(typeof(SearchSymbolsResult))]
+[JsonSerializable(typeof(FindByAnnotationResult))]
+[JsonSerializable(typeof(ListCallersResult))]
+[JsonSerializable(typeof(ListCalleesResult))]
+[JsonSerializable(typeof(FindImplementationsResult))]
+[JsonSerializable(typeof(ListMembersResult))]
+[JsonSerializable(typeof(ListSymbolsInFileResult))]
+[JsonSerializable(typeof(NeighborhoodResult))]
+[JsonSerializable(typeof(ModuleSummaryResult))]
+[JsonSerializable(typeof(ImpactOfChangeResult))]
+[JsonSerializable(typeof(SemanticSearchResult))]
+[JsonSerializable(typeof(FindDiagnosticsResult))]
+[JsonSerializable(typeof(RecentChangesResult))]
+[JsonSerializable(typeof(ListTestsForResult))]
+[JsonSerializable(typeof(WhoAuthoredResult))]
+[JsonSerializable(typeof(ListGeneratedFilesResult))]
+[JsonSerializable(typeof(ListScopesResult))]
+[JsonSerializable(typeof(GraphStatsResult))]
 internal partial class ToolOutputJsonContext : JsonSerializerContext
 {
 }

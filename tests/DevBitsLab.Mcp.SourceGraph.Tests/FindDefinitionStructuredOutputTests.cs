@@ -237,9 +237,6 @@ public sealed class FindDefinitionStructuredOutputTests : IAsyncLifetime, IDispo
         return dto!;
     }
 
-    private static bool IsUserVisible(TextContentBlock b)
-    {
-        var aud = b.Annotations?.Audience;
-        return aud is null || aud.Count == 0 || aud.Contains(Role.User);
-    }
+    // IsUserVisible delegates to the shared CallToolResultHelpers helper.
+    private static bool IsUserVisible(TextContentBlock b) => CallToolResultHelpers.IsUserVisible(b);
 }

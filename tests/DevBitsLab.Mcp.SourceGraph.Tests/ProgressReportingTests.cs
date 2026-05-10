@@ -131,15 +131,15 @@ public sealed class ProgressReportingTests : IAsyncLifetime, IDisposable
     {
         // No-op path: no `progress` argument. The default null parameter means `progress?.Report`
         // is a noop. Tool body must run identically and return a non-empty response.
-        var output = await GraphTools.ImpactOfChangeAsync(_router!, "Calculator.Add");
-        output.Should().NotBeNullOrEmpty();
+        var result = await GraphTools.ImpactOfChangeAsync(_router!, "Calculator.Add");
+        result.Content.Should().NotBeNullOrEmpty();
     }
 
     [Fact]
     public async Task ModuleSummary_noProgressArg_runsToCompletion()
     {
-        var output = await GraphTools.ModuleSummaryAsync(_router!, "Sample.Domain");
-        output.Should().NotBeNullOrEmpty();
+        var result = await GraphTools.ModuleSummaryAsync(_router!, "Sample.Domain");
+        result.Content.Should().NotBeNullOrEmpty();
     }
 
     [Fact]
