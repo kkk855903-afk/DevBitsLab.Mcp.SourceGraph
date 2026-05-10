@@ -160,6 +160,13 @@ static async Task<int> RunServeAsync(CommandLine cli)
     var historyDisabled = await ResolveHistoryDisabledForScopesAsync(cli, scopeConfig).ConfigureAwait(false);
     builder.Services.AddSingleton(new HistoryOptions(historyDisabled));
 
+    // Tunables for the query_graph tool: CLI flag → env var → built-in default. Singleton so the
+    // tool method can resolve it via DI without re-parsing every call.
+    builder.Services.AddSingleton(GraphQueryOptions.Resolve(cli.QueryTimeoutSeconds, cli.QueryRowLimit));
+    // Repo root surfaced for tools (query_graph / describe_schema) that need it to locate
+    // per-scope DB files via ScopeLayout.
+    builder.Services.AddSingleton(new RepoRootInfo(repoRoot));
+
     builder.Services.AddSingleton(new LiveIndexConfig(scopeConfig.Scopes));
     builder.Services.AddHostedService<HistoryHostedService>(sp => new HistoryHostedService(
         sp.GetRequiredService<HistoryQueue>(),

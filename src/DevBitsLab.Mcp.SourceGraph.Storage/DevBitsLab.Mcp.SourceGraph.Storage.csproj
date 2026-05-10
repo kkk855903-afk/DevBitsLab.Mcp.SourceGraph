@@ -12,4 +12,11 @@
     <ProjectReference Include="..\DevBitsLab.Mcp.SourceGraph.Core\DevBitsLab.Mcp.SourceGraph.Core.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- Views.sql is the parametrised view-layer DDL loaded by Views.cs at static-init time.
+         Resource id is "DevBitsLab.Mcp.SourceGraph.Storage.Views.sql" (default namespace +
+         filename). See openspec/changes/add-graph-query/design.md Decision 2. -->
+    <EmbeddedResource Include="Views.sql" />
+  </ItemGroup>
+
 </Project>

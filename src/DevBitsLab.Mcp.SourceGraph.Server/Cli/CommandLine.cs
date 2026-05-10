@@ -25,6 +25,12 @@ internal sealed class CommandLine
     /// <summary>The scope id passed via <c>--scope &lt;id&gt;</c>; consumed by <c>vocabulary list</c>
     /// to filter the output to a single scope. Null means every scope.</summary>
     public string? ScopeId { get; private init; }
+    /// <summary>Statement timeout (seconds) for the <c>query_graph</c> tool. Null when not set;
+    /// resolution falls back to <c>SOURCEGRAPH_QUERY_TIMEOUT_SECONDS</c> then the built-in default.</summary>
+    public int? QueryTimeoutSeconds { get; private init; }
+    /// <summary>Maximum row count returned per <c>query_graph</c> call. Null when not set; resolution
+    /// falls back to <c>SOURCEGRAPH_QUERY_ROW_LIMIT</c> then the built-in default.</summary>
+    public int? QueryRowLimit { get; private init; }
     /// <summary>Positional rest args (used by `scopes add`, `scopes remove`, etc.).</summary>
     public IReadOnlyList<string> Positional { get; private init; } = Array.Empty<string>();
 
@@ -44,6 +50,8 @@ internal sealed class CommandLine
         var noLeaf = false;
         var strict = false;
         string? scopeId = null;
+        int? queryTimeoutSeconds = null;
+        int? queryRowLimit = null;
         var positional = new List<string>();
 
         for (var i = 1; i < args.Length; i++)
@@ -83,6 +91,12 @@ internal sealed class CommandLine
                 case "--scope":
                     scopeId = RequireArg(args, ref i, a);
                     break;
+                case "--query-timeout-seconds":
+                    queryTimeoutSeconds = RequirePositiveInt(args, ref i, a);
+                    break;
+                case "--query-row-limit":
+                    queryRowLimit = RequirePositiveInt(args, ref i, a);
+                    break;
                 default:
                     if (subcommand == "index" && solution is null && !a.StartsWith('-'))
                     {
@@ -117,6 +131,8 @@ internal sealed class CommandLine
             NoLeaf = noLeaf,
             Strict = strict,
             ScopeId = scopeId,
+            QueryTimeoutSeconds = queryTimeoutSeconds,
+            QueryRowLimit = queryRowLimit,
             Positional = positional,
         };
     }
@@ -125,6 +141,16 @@ internal sealed class CommandLine
     {
         if (++i >= args.Length) throw new ArgumentException($"{flag} requires a value");
         return args[i];
+    }
+
+    private static int RequirePositiveInt(string[] args, ref int i, string flag)
+    {
+        var raw = RequireArg(args, ref i, flag);
+        if (!int.TryParse(raw, out var n) || n <= 0)
+        {
+            throw new ArgumentException($"{flag} requires a positive integer; got '{raw}'");
+        }
+        return n;
     }
 
     /// <summary>
@@ -220,6 +246,13 @@ internal sealed class CommandLine
                             `vocabulary list`; ignored elsewhere.
           --strict          Treat warnings as errors. Currently consumed by `vocabulary list`,
                             which exits 2 on drift candidates when set.
+          --query-timeout-seconds <int>
+                            Statement timeout (seconds) for the `query_graph` MCP tool. Default 5.
+                            Equivalent to setting SOURCEGRAPH_QUERY_TIMEOUT_SECONDS=<int>.
+          --query-row-limit <int>
+                            Maximum rows returned by a `query_graph` call. Default 5000. The tool
+                            returns up to <int> rows and reports `truncated: true` if more matched.
+                            Equivalent to setting SOURCEGRAPH_QUERY_ROW_LIMIT=<int>.
 
         Defaults:
           --db   ./.sourcegraph/scopes/default.db   (created if missing; legacy graph.db is migrated)

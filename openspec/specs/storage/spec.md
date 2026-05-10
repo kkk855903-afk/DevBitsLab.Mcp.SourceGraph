@@ -5,9 +5,7 @@
 Persist the code graph (files, symbols, refs, edges) in a single SQLite file
 with FTS5 full-text search, and expose query and write operations to the rest
 of the system through `IGraphStore`.
-
 ## Requirements
-
 ### Requirement: Self-applying schema migrations
 `SqliteGraphStore` SHALL apply the bundled schema on connect; if the on-disk
 version is below `Schema.Version`, all data tables and triggers SHALL be
@@ -182,3 +180,141 @@ The `edges` table SHALL include a `payload TEXT NULL` column that stores the JSO
 #### Scenario: Edge written with metadata
 - **WHEN** an edge is emitted with `Metadata = { ["path"] = "User.Name" }`
 - **THEN** the resulting `edges` row has `payload = '{"path":"User.Name"}'` (JSON object form), and `json_extract(payload, '$.path')` returns `'User.Name'`
+
+### Requirement: Stable view layer over the underlying tables
+The storage layer SHALL ship a versioned set of read-only SQL views (`v_symbols`, `v_files`, `v_edges`, `v_references`, `v_scopes`, `v_annotations`, `v_diagnostics`, `v_history`) that present a denormalised, agent-facing contract over the underlying `symbols` / `edges` / `symbol_references` / `files` / `annotations` / `diagnostics` / `symbol_history` tables and the `_meta.db` scope-registry tables. The views SHALL be the public contract for any consumer that runs ad-hoc SQL via the MCP `query_graph` tool; the underlying tables remain implementation details and may evolve without bumping `Views.SchemaVersion`.
+
+`Views.SchemaVersion` SHALL be a compile-time integer constant exposed on the storage assembly (current value `2`); it SHALL bump on **any view-set change** — addition, removal, column rename, or column-type change — so clients that cache `describe_schema` by version always re-introspect after a server upgrade. The original "backwards-incompatible only" wording is superseded: cache-aware clients need a signal even for additive changes (a new view added without a version bump would otherwise be invisible to a client still serving cached schema).
+
+The view definitions SHALL live in an embedded SQL resource (`Views.sql`) with `{{SCOPE_UNION_BLOCK_<view>}}` placeholder tokens for the per-scope `UNION ALL` branches that the connection helper inlines at attach time. Each view (except `v_scopes`) SHALL include a `scope TEXT NOT NULL` column carrying the scope id, populated by the per-scope branch's `SELECT '<scope_id>' AS scope, …` clause; cross-scope joins SHALL use the composite `(scope, id)` tuple.
+
+The view definitions of the original five views (`v_symbols` / `v_files` / `v_edges` / `v_references` / `v_scopes`) are unchanged from the prior version of this requirement (their column shapes do not change in this revision); only the view-set extension and the version-bump-policy clarification differ.
+
+#### Scenario: View definitions execute against a single-scope DB
+- **GIVEN** a temp SQLite DB containing one row each in `symbols`, `edges`, `files`, `symbol_references`, `annotations`, `diagnostics`, `symbol_history` (mimicking a single attached scope)
+- **WHEN** the test inlines `Views.Sql` with one branch per per-view template and applies it as TEMP views
+- **THEN** every view from the set executes without syntax error and returns the expected column shapes; `v_symbols.is_public` is `1` for the symbol whose `accessibility = 6`; `v_symbols.is_type` is `1` for the symbol whose `kind_name = 'class'`; `v_diagnostics.severity_name` reflects the documented CASE mapping; `v_history` returns the seeded blame row with all six columns
+
+#### Scenario: View columns match describe_schema's response
+- **WHEN** `describe_schema` returns the `views` array
+- **THEN** every column listed in the `Views.All` descriptor for each of the eight views is present (and only those columns) when the view is queried via `SELECT * FROM <view> LIMIT 0`; the SQLite `name` and `type` for each column matches the descriptor
+
+#### Scenario: View schema version bumps with the view-set change
+- **WHEN** a consumer reads `Views.SchemaVersion` (or the `view_schema_version` field returned by `describe_schema`)
+- **THEN** the value is `2` for this revision; was `1` for the prior revision (which shipped only the five core views); a future change adding or removing a view SHALL increment the version again
+
+#### Scenario: Underlying table schema evolution does not bump view version
+- **GIVEN** a hypothetical future storage change that adds an internal column `symbols.cyclomatic_complexity INTEGER` without exposing it via `v_symbols`
+- **WHEN** that change ships
+- **THEN** `Views.SchemaVersion` remains unchanged; agent queries against `v_symbols` return the same columns as before; `Schema.Version` (the storage on-disk version) bumps independently
+
+#### Scenario: Cache-aware client re-introspects after additive view change
+- **GIVEN** a client that called `describe_schema` against a server reporting `view_schema_version = 1` and cached the resulting schema
+- **WHEN** the client reconnects to a server reporting `view_schema_version = 2` after this change ships
+- **THEN** the client SHOULD discard its cached schema and re-call `describe_schema`; `v_annotations`, `v_diagnostics`, and `v_history` appear in the refreshed view list with their columns
+
+### Requirement: Read-only multi-scope attached connection helper
+The storage layer SHALL expose `MultiScopeReadOnlyConnection.OpenAsync(IScopeRegistry registry, string repoRoot, string scopeFilter, int maxAttached, CancellationToken ct)` returning an open `SqliteConnection` configured for read-only access to a resolved set of scope DBs plus the `_meta.db` registry, with the view layer (per the `Stable view layer over the underlying tables` requirement) created as TEMP views ready for query. The `repoRoot` parameter resolves the per-scope DB locations via `ScopeLayout.ScopeDbPath(repoRoot, id)` and the registry DB via `ScopeLayout.MetaDbPath(repoRoot)`.
+
+The helper SHALL:
+- Open an in-memory SQLite connection (`Data Source=:memory:`).
+- Raise the runtime ATTACH limit to `maxAttached` (default `64`, hard-bounded by SQLite's compile-time ceiling of `125`) via `sqlite3_limit(SQLITE_LIMIT_ATTACHED, …)`. Note: the bundled `e_sqlite3` ships with `SQLITE_MAX_ATTACHED = 10`, silently clamping any higher limit; the practical ceiling is therefore 9 scope DBs (one ATTACH slot is reserved for `meta`).
+- Resolve `scopeFilter` against `IScopeRegistry`:
+  - `"*"` → all scopes whose `isolated` flag is `false`.
+  - Comma-separated list → those scopes by id (isolated permitted when explicitly named).
+  - Single id → just that scope.
+- Throw `ArgumentException(paramName: "scopeFilter")` with a diagnostic message **before** opening any ATTACH when the resolved scope set is empty (e.g. `*` against a registry with no non-isolated scopes, or a comma-list that filters everything out). The message SHALL distinguish "registry has no scopes" from "every scope is isolated" so callers can render an actionable hint.
+- For each ATTACH (meta + per-scope), validate `File.Exists(absolutePath)` first and throw `FileNotFoundException` with the alias and absolute path if the file is missing. SQLite's `ATTACH DATABASE` materialises an empty file at the given path when the file doesn't exist (the connection isn't read-only at this point — `query_only` fires later); the explicit existence check prevents accidentally creating phantom empty scope DBs that would later fail with cryptic "no such table" errors.
+- ATTACH `_meta.db` AS `meta` with a literal absolute path (no URI), once per connection regardless of scope filter.
+- ATTACH each per-scope DB AS `<scope_id>` (double-quoted in the DDL so kebab-case ids parse cleanly) with a literal absolute path.
+- Expand `Views.Sql`'s `{{SCOPE_UNION_BLOCK_<view>}}` tokens into one `SELECT '<scope_id>' AS scope, … FROM "<scope_id>".<table>` branch per attached scope, joined by `UNION ALL`, then execute the resulting DDL.
+- After the TEMP VIEW DDL is applied, set `PRAGMA query_only = 1` on the connection so any subsequent `INSERT` / `UPDATE` / `DELETE` / `DROP` / `CREATE` / `REPLACE` against any attached DB returns `SQLITE_READONLY` (8). `query_only` is per-connection state — it does not require a global `SQLITE_CONFIG_URI` flip and never races with other `SqliteConnection`s in the process. (An earlier revision used `ATTACH 'file:…?mode=ro'` URIs; the URI form needed a process-global `sqlite3_shutdown / config / initialize` dance that raced with parallel `SqliteConnection`s under xUnit's collection runner.)
+- If the resolved scope set's count exceeds `maxAttached` (or the SQLite-imposed ceiling, whichever is lower), throw `ScopeAttachLimitExceededException` carrying the resolved scope-id list and the configured ceiling, **before** opening any per-scope ATTACH.
+
+#### Scenario: Default filter resolves to non-isolated scopes
+- **GIVEN** a scope registry with `frontend` (not isolated), `backend` (not isolated), and `vendor` (isolated)
+- **WHEN** `OpenAsync(registry, repoRoot, "*", maxAttached: 64, ct)` runs
+- **THEN** the returned connection has `meta`, `frontend`, and `backend` attached; `vendor` is NOT attached; `v_symbols` enumerates rows from `frontend` and `backend` only
+
+#### Scenario: Explicit naming includes isolated scopes
+- **WHEN** `OpenAsync(registry, repoRoot, "vendor", maxAttached: 64, ct)` runs
+- **THEN** the returned connection has `meta` and `vendor` attached; `v_symbols` enumerates rows from `vendor` only
+
+#### Scenario: Comma-list filter is honoured exactly
+- **WHEN** `OpenAsync(registry, repoRoot, "frontend,vendor", maxAttached: 64, ct)` runs
+- **THEN** the returned connection has `meta`, `frontend`, and `vendor` attached; `backend` is NOT attached even though it's not isolated
+
+#### Scenario: Read-only enforcement via PRAGMA query_only
+- **GIVEN** an open multi-scope connection
+- **WHEN** the caller executes `INSERT INTO frontend.symbols(name) VALUES ('evil')`
+- **THEN** SQLite returns error code `SQLITE_READONLY` (8); no row is inserted; the on-disk `frontend.db` is untouched. The same applies to writes against the `meta` ATTACH and to schema mutations (`CREATE`, `DROP`, `ALTER`).
+
+#### Scenario: Empty scope set throws ArgumentException
+- **GIVEN** a registry containing only isolated scopes (or no scopes at all)
+- **WHEN** `OpenAsync(registry, repoRoot, "*", maxAttached: 64, ct)` runs
+- **THEN** the helper throws `ArgumentException` with `ParamName == "scopeFilter"` and a diagnostic message naming the cause; no SQLite connection is leaked; tool bodies (`describe_schema`, `query_graph`) catch this and surface a structured `no_scopes` error to the agent
+
+#### Scenario: Missing scope DB file throws FileNotFoundException
+- **GIVEN** a scope registered in `_meta.db` whose per-scope DB file (`scopes/<id>.db`) has been deleted from disk
+- **WHEN** the resolved scope set includes that id and `OpenAsync` reaches the corresponding ATTACH
+- **THEN** the helper throws `FileNotFoundException` with the alias and absolute path; the SQLite ATTACH is never issued, so no phantom empty file is created on disk; tool bodies catch this and surface a structured `scope_db_missing` error
+
+#### Scenario: ATTACH ceiling enforced
+- **GIVEN** a registry containing 70 non-isolated scopes
+- **WHEN** `OpenAsync(registry, repoRoot, "*", maxAttached: 64, ct)` runs
+- **THEN** the helper throws `ScopeAttachLimitExceededException`; the exception's `ResolvedScopes` property lists all 70 scope ids; `Limit` is the lower of `maxAttached` and the SQLite-imposed ceiling; no SQLite connection is leaked
+
+#### Scenario: Connection is per-call and disposable
+- **WHEN** `query_graph` opens a multi-scope connection, executes one query, and disposes it
+- **THEN** the in-memory main DB and every ATTACH are released; subsequent calls do not see leftover TEMP views from a prior call; opening two connections concurrently does not interfere with each other (no shared state and no global SQLite engine reconfigure)
+
+### Requirement: Extended view coverage for annotations, diagnostics, and per-symbol git history
+The storage layer SHALL extend the view layer (per the existing `Stable view layer over the underlying tables` requirement) with three additional views — `v_annotations`, `v_diagnostics`, `v_history` — covering the corresponding underlying tables (`annotations`, `diagnostics`, `symbol_history`). The new views SHALL follow the same per-scope `UNION ALL` pattern, the same `(scope, id)` composite-uniqueness convention, and the same `Views.PerScopeBlockTemplates` registration that the existing five views use.
+
+The view shapes:
+
+- `v_annotations(scope, id, symbol_id, name, full_name, flavor, args_json, attribute_symbol_id)` — one row per indexed annotation (C# attribute, XAML attached property, future plugin-defined flavor). `flavor` discriminates the source language / framework. `args_json` is raw TEXT; agents who need substring search over arguments SHOULD prefer the `find_by_annotation` curated tool (FTS5-indexed) and use this view for compositional queries (joins / aggregations) instead.
+- `v_diagnostics(scope, id, symbol_id, file_id, severity, severity_name, code, message, line, column_number)` — one row per Roslyn diagnostic. `severity` is the raw integer (matching `Microsoft.CodeAnalysis.DiagnosticSeverity`: 0=Hidden, 1=Info, 2=Warning, 3=Error). `severity_name` is the convenience text mapping (`hidden` / `info` / `warning` / `error`) computed via CASE. `symbol_id` is nullable (some diagnostics — e.g. unused-using directives — don't fall inside any indexed declaration). `column_number` renames the underlying `col` to avoid the SQL-reserved bare `column`.
+- `v_history(scope, symbol_id, last_commit_sha, last_author, last_authored_at, line_count, blamed_content_sha)` — one row per symbol with cached git-blame metadata. `last_authored_at` is Unix-millis (matches `v_files.last_indexed_at` and `v_scopes.last_indexed_at`); agents needing ISO-8601 use `datetime(last_authored_at / 1000, 'unixepoch')`. Empty when the server runs with `--no-history` or against an environment without git on PATH.
+
+The new views SHALL appear in `Views.All` (the curated descriptor list returned by `describe_schema`) with the same column-by-column documentation depth as the existing five.
+
+#### Scenario: v_annotations exposes the indexed annotation set
+- **GIVEN** an indexed scope containing one C# class decorated with `[Obsolete("use Foo")]` and one XAML element with `Grid.Row="2"`
+- **WHEN** the agent invokes `query_graph` with `sql = "SELECT name, flavor, args_json FROM v_annotations ORDER BY name"`
+- **THEN** the result contains two rows: one with `name = 'Obsolete'`, `flavor = 'csharp-attribute'`, `args_json` containing the literal `"use Foo"`; one with `name = 'Grid.Row'`, `flavor = 'xaml-attached-property'`, `args_json` containing `2`
+
+#### Scenario: v_annotations joins to v_symbols
+- **WHEN** the agent invokes `query_graph` with
+  ```sql
+  SELECT s.fqn FROM v_annotations a
+  JOIN v_symbols s ON s.id = a.symbol_id AND s.scope = a.scope
+  WHERE a.name = 'Obsolete' AND s.is_type = 1
+  ```
+- **THEN** the result lists the FQN of every type-kind symbol decorated with `[Obsolete]`, joined via the `(scope, id)` composite key
+
+#### Scenario: v_diagnostics maps severity integer to text
+- **GIVEN** a scope where a public class symbol has one diagnostic stored at `severity = 2`
+- **WHEN** the agent invokes `query_graph` with `sql = "SELECT severity, severity_name FROM v_diagnostics WHERE code = 'CS0612'"`
+- **THEN** the row reads `severity = 2`, `severity_name = 'warning'`
+
+#### Scenario: v_diagnostics with nullable symbol_id
+- **GIVEN** a diagnostic whose source span doesn't fall inside any indexed declaration (e.g. an unused-using on a using directive at file scope)
+- **WHEN** the agent invokes `query_graph` with `sql = "SELECT code, symbol_id FROM v_diagnostics WHERE symbol_id IS NULL"`
+- **THEN** the result includes that row with `symbol_id = NULL`; an INNER JOIN against `v_symbols` would silently drop it (LEFT JOIN preserves it)
+
+#### Scenario: v_history shape against an empty history table
+- **GIVEN** a scope whose `symbol_history` table is empty (e.g. test fixture, `--no-history` mode)
+- **WHEN** the agent invokes `query_graph` with `sql = "SELECT scope, symbol_id, last_commit_sha, last_authored_at FROM v_history LIMIT 5"`
+- **THEN** the call succeeds with `row_count = 0`; the response's `columns` array carries the four named columns with the documented types
+
+#### Scenario: v_history joins to v_symbols when populated
+- **GIVEN** a scope with at least one populated `symbol_history` row referencing a symbol whose `fqn` is `Sample.Foo.Bar`
+- **WHEN** the agent invokes `query_graph` with
+  ```sql
+  SELECT s.fqn, h.last_author, h.last_authored_at FROM v_history h
+  JOIN v_symbols s ON s.id = h.symbol_id AND s.scope = h.scope
+  WHERE s.fqn = @fqn
+  ```
+- **THEN** the result row joins the history record to the symbol via `(scope, symbol_id)`, returning the author + Unix-millis timestamp
+

@@ -1,4 +1,5 @@
 using System.ComponentModel;
+using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
 using DevBitsLab.Mcp.SourceGraph.Core;
@@ -10,6 +11,7 @@ using DevBitsLab.Mcp.SourceGraph.Server.Resources;
 using DevBitsLab.Mcp.SourceGraph.Server.Scoping;
 using DevBitsLab.Mcp.SourceGraph.Server.Tools.Output;
 using DevBitsLab.Mcp.SourceGraph.Storage;
+using Microsoft.Data.Sqlite;
 using ModelContextProtocol;
 using ModelContextProtocol.Protocol;
 using ModelContextProtocol.Server;
@@ -2642,6 +2644,827 @@ public static class GraphTools
     {
         var flavors = await store.GetDistinctAnnotationFlavorsAsync(ct).ConfigureAwait(false);
         return flavors.Count > 1;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────────────
+    // describe_schema + query_graph (add-graph-query change). These tools intentionally do
+    // NOT route through ScopeRouter / ScopedExecution.RunAsync — they're "not per-scope
+    // dispatch" tools that fan out across the resolved scope set via
+    // MultiScopeReadOnlyConnection. The connection helper resolves the scope filter, opens
+    // the per-call connection, ATTACHes meta + each per-scope DB read-only, and creates the
+    // TEMP view layer ready for query.
+    // ─────────────────────────────────────────────────────────────────────────────────────
+
+    [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(DescribeSchemaResult))]
+    [ToolTrigger("\"what tables/columns can I query?\" or before writing query_graph SQL")]
+    [Description("Returns the stable view layer (v_symbols, v_files, v_edges, v_references, v_scopes, v_annotations, v_diagnostics, v_history) that query_graph runs SQL against, plus the live symbol_kinds, edge_kinds, and annotation_flavors vocabularies present in the resolved scope set. Call this before composing query_graph SQL when you don't yet know the column shapes — the `Use when` line below (auto-appended from the ToolTrigger attribute) is the canonical guidance.")]
+    public static Task<CallToolResult> DescribeSchemaAsync(
+        IScopeRegistry registry,
+        RepoRootInfo repoInfo,
+        [Description(ScopeDescription)] string? scope = null,
+        CancellationToken ct = default) =>
+        ToolMetrics.TrackAsync("describe_schema", new { scope }, () =>
+            DescribeSchemaImpl(registry, repoInfo, scope ?? "*", ct));
+
+    private static async Task<CallToolResult> DescribeSchemaImpl(
+        IScopeRegistry registry,
+        RepoRootInfo repoInfo,
+        string scope,
+        CancellationToken ct)
+    {
+        var sw = Stopwatch.StartNew();
+
+        // Mirror QueryGraphImpl's connection-open error handling so describe_schema returns
+        // structured errors instead of bubbling raw exceptions.
+        SqliteConnection connection;
+        try
+        {
+            connection = await MultiScopeReadOnlyConnection.OpenAsync(registry, repoInfo.Path, scope, maxAttached: 64, ct).ConfigureAwait(false);
+        }
+        catch (ScopeAttachLimitExceededException ex)
+        {
+            return BuildToolErrorResult(
+                toolName: "describe_schema",
+                error: "scope_overflow",
+                message: ex.Message,
+                hint: "narrow the scope filter (e.g. `scope='backend,frontend'`)",
+                scope: scope,
+                elapsedMs: sw.ElapsedMilliseconds,
+                extras: new Dictionary<string, object?>
+                {
+                    ["resolved_scopes"] = ex.ResolvedScopes,
+                    ["limit"] = ex.Limit,
+                });
+        }
+        catch (ArgumentException ex) when (ex.ParamName == "scopeFilter")
+        {
+            return BuildToolErrorResult(
+                toolName: "describe_schema",
+                error: "no_scopes",
+                message: ex.Message,
+                hint: "register a scope (or name an isolated one explicitly) before calling describe_schema",
+                scope: scope,
+                elapsedMs: sw.ElapsedMilliseconds);
+        }
+        catch (FileNotFoundException ex)
+        {
+            return BuildToolErrorResult(
+                toolName: "describe_schema",
+                error: "scope_db_missing",
+                message: ex.Message,
+                hint: "re-index the scope, remove its registry entry, or restore the file",
+                scope: scope,
+                elapsedMs: sw.ElapsedMilliseconds,
+                extras: new Dictionary<string, object?> { ["missing_path"] = ex.FileName ?? "" });
+        }
+
+        try
+        {
+            var symbolKinds = await ReadDistinctValuesAsync(connection, "v_symbols", "kind", ct).ConfigureAwait(false);
+            var edgeKinds = await ReadDistinctValuesAsync(connection, "v_edges", "kind", ct).ConfigureAwait(false);
+            var annotationFlavors = await ReadDistinctValuesAsync(connection, "v_annotations", "flavor", ct).ConfigureAwait(false);
+
+            // Map storage's hand-curated descriptors to the wire DTO. The descriptor list IS the
+            // contract — agents read this to learn the queryable surface in one round-trip.
+            var views = Views.All
+                .Select(v => new DescribeSchemaView(
+                    Name: v.Name,
+                    Description: v.Description,
+                    Columns: v.Columns
+                        .Select(c => new DescribeSchemaColumn(
+                            Name: c.Name,
+                            Type: c.SqliteType,
+                            Nullable: c.Nullable,
+                            Description: c.Description))
+                        .ToList()))
+                .ToList();
+
+            var dto = new DescribeSchemaResult(
+                ViewSchemaVersion: Views.SchemaVersion,
+                Views: views,
+                SymbolKinds: symbolKinds,
+                EdgeKinds: edgeKinds,
+                AnnotationFlavors: annotationFlavors);
+
+            sw.Stop();
+
+            // Brand-aware prose summary. The leaf chokepoint won't double-stamp because the
+            // body itself emits the brand mark when not suppressed (matches the convention used
+            // throughout this file for tools that own their own summary line).
+            var leaf = LeafFormatter.Suppressed ? "" : LeafFormatter.Mark;
+            var sb = new StringBuilder();
+            sb.Append(leaf)
+              .Append("describe_schema (view_schema_version=")
+              .Append(Views.SchemaVersion)
+              .Append(", ")
+              .Append(views.Count)
+              .Append(" views, ")
+              .Append(symbolKinds.Count)
+              .Append(" symbol_kinds, ")
+              .Append(edgeKinds.Count)
+              .Append(" edge_kinds, ")
+              .Append(annotationFlavors.Count)
+              .AppendLine(" annotation_flavors)");
+            sb.AppendLine();
+            sb.Append("Views: ");
+            sb.AppendLine(string.Join(", ", views.Select(v => v.Name)));
+            if (symbolKinds.Count > 0)
+            {
+                sb.Append("symbol_kinds: ");
+                sb.AppendLine(string.Join(", ", symbolKinds));
+            }
+            if (edgeKinds.Count > 0)
+            {
+                sb.Append("edge_kinds: ");
+                sb.AppendLine(string.Join(", ", edgeKinds));
+            }
+            if (annotationFlavors.Count > 0)
+            {
+                sb.Append("annotation_flavors: ");
+                sb.AppendLine(string.Join(", ", annotationFlavors));
+            }
+
+            var content = new List<ContentBlock>(capacity: 2)
+            {
+                new TextContentBlock { Text = sb.ToString().TrimEnd() },
+                AudienceMetadata.Build(
+                    scopeId: scope,
+                    latencyMs: sw.ElapsedMilliseconds,
+                    ("symbol_kinds", symbolKinds.Count.ToString()),
+                    ("edge_kinds", edgeKinds.Count.ToString()),
+                    ("annotation_flavors", annotationFlavors.Count.ToString())),
+            };
+
+            return new CallToolResult
+            {
+                Content = content,
+                StructuredContent = JsonSerializer.SerializeToElement(
+                    dto,
+                    ToolOutputJsonContext.Default.DescribeSchemaResult),
+            };
+        }
+        finally
+        {
+            await connection.DisposeAsync().ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// Read distinct values from <paramref name="columnName"/> on <paramref name="viewName"/>.
+    /// Used by <c>describe_schema</c> to populate the live <c>symbol_kinds</c> /
+    /// <c>edge_kinds</c> / <c>annotation_flavors</c> vocabularies. Returned sorted ordinally so
+    /// the agent sees a stable vocabulary list across calls.
+    /// </summary>
+    private static async Task<List<string>> ReadDistinctValuesAsync(SqliteConnection connection, string viewName, string columnName, CancellationToken ct)
+    {
+        // viewName + columnName are hard-coded by the caller (never user input), so inlining them
+        // into the SQL is safe — no parameter binding needed.
+        await using var cmd = connection.CreateCommand();
+        cmd.CommandText = $"SELECT DISTINCT {columnName} FROM {viewName} WHERE {columnName} IS NOT NULL ORDER BY {columnName};";
+        var values = new List<string>();
+        await using var reader = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+        while (await reader.ReadAsync(ct).ConfigureAwait(false))
+        {
+            if (!reader.IsDBNull(0))
+            {
+                values.Add(reader.GetString(0));
+            }
+        }
+        return values;
+    }
+
+    [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(QueryGraphResult))]
+    [ToolTrigger("\"how many public types use this type?\", \"which classes implement IDisposable but lack Dispose?\", \"which types have > 50 methods?\" — anything that needs aggregation/join/grouping over the graph that no curated tool exposes")]
+    [Description("Run a read-only SQL SELECT or WITH statement against the stable view layer (v_symbols, v_edges, v_files, v_references, v_scopes, v_annotations, v_diagnostics, v_history). Call describe_schema first to learn the view shapes. Parameters bind via @name placeholders; scope filter follows the standard convention. Returns tabular {columns, rows} structured content. The `Use when` line below (auto-appended from the ToolTrigger attribute) is the canonical guidance.")]
+    public static Task<CallToolResult> QueryGraphAsync(
+        IScopeRegistry registry,
+        RepoRootInfo repoInfo,
+        GraphQueryOptions queryOptions,
+        [Description("Read-only SQL — single SELECT or WITH statement against v_* views. See describe_schema for the schema.")] string sql,
+        [Description("Named bindings for @name placeholders in the SQL. Values are bound by Microsoft.Data.Sqlite.")] IReadOnlyDictionary<string, JsonElement>? parameters = null,
+        [Description(ScopeDescription)] string? scope = null,
+        CancellationToken ct = default) =>
+        ToolMetrics.TrackAsync(
+            "query_graph",
+            new { sql, scope, paramCount = parameters?.Count ?? 0 },
+            () => QueryGraphImpl(registry, repoInfo, queryOptions, sql, parameters, scope ?? "*", ct));
+
+    private static async Task<CallToolResult> QueryGraphImpl(
+        IScopeRegistry registry,
+        RepoRootInfo repoInfo,
+        GraphQueryOptions queryOptions,
+        string sql,
+        IReadOnlyDictionary<string, JsonElement>? parameters,
+        string scope,
+        CancellationToken ct)
+    {
+        var sw = Stopwatch.StartNew();
+
+        // Step 1 — open the multi-scope connection. Three OpenAsync errors surface before we
+        // even build the SqliteCommand; everything else falls into the SQL execute try/catch
+        // below.
+        SqliteConnection connection;
+        try
+        {
+            connection = await MultiScopeReadOnlyConnection.OpenAsync(registry, repoInfo.Path, scope, maxAttached: 64, ct).ConfigureAwait(false);
+        }
+        catch (ScopeAttachLimitExceededException ex)
+        {
+            return BuildToolErrorResult(
+                toolName: "query_graph",
+                error: "scope_overflow",
+                message: ex.Message,
+                hint: "narrow the scope filter (e.g. `scope='backend,frontend'`)",
+                scope: scope,
+                elapsedMs: sw.ElapsedMilliseconds,
+                extras: new Dictionary<string, object?>
+                {
+                    ["resolved_scopes"] = ex.ResolvedScopes,
+                    ["limit"] = ex.Limit,
+                });
+        }
+        catch (ArgumentException ex) when (ex.ParamName == "scopeFilter")
+        {
+            // Empty scope set — `*` against an all-isolated registry, or a comma-list that
+            // resolved to nothing. The MultiScopeReadOnlyConnection message carries the
+            // diagnosis (zero scopes vs all-isolated); pass it through verbatim as the hint.
+            return BuildToolErrorResult(
+                toolName: "query_graph",
+                error: "no_scopes",
+                message: ex.Message,
+                hint: "register a scope (or name an isolated one explicitly) before calling query_graph",
+                scope: scope,
+                elapsedMs: sw.ElapsedMilliseconds);
+        }
+        catch (FileNotFoundException ex)
+        {
+            // A scope is registered but its DB file is missing — re-index, remove the registry
+            // entry, or restore from backup. The exception message names the scope and path.
+            return BuildToolErrorResult(
+                toolName: "query_graph",
+                error: "scope_db_missing",
+                message: ex.Message,
+                hint: "re-index the scope, remove its registry entry, or restore the file",
+                scope: scope,
+                elapsedMs: sw.ElapsedMilliseconds,
+                extras: new Dictionary<string, object?> { ["missing_path"] = ex.FileName ?? "" });
+        }
+
+        try
+        {
+            // Step 2a — statement-type enforcement. The contract says SELECT or WITH; reject
+            // PRAGMA / EXPLAIN / VACUUM / ATTACH / DETACH / etc. before they reach SQLite even
+            // though PRAGMA query_only would let read-only ones pass at the engine level. The
+            // structured `read_only` error is the closest match in the existing error vocabulary
+            // — agents that hit it learn "this tool only runs queries, not statements".
+            var firstKeyword = SingleStatementCheck.GetFirstKeyword(sql);
+            if (firstKeyword is null)
+            {
+                return BuildToolErrorResult(
+                    toolName: "query_graph",
+                    error: "read_only",
+                    message: "Empty SQL statement (only whitespace and/or comments).",
+                    hint: "query_graph is read-only; use a SELECT or WITH statement",
+                    scope: scope,
+                    elapsedMs: sw.ElapsedMilliseconds);
+            }
+            if (firstKeyword is not "SELECT" and not "WITH")
+            {
+                return BuildToolErrorResult(
+                    toolName: "query_graph",
+                    error: "read_only",
+                    message: $"query_graph only accepts SELECT and WITH statements; got `{firstKeyword}`. PRAGMA / EXPLAIN / VACUUM / ATTACH and write statements are not supported.",
+                    hint: "query_graph is read-only; use a SELECT or WITH statement",
+                    scope: scope,
+                    elapsedMs: sw.ElapsedMilliseconds,
+                    extras: new Dictionary<string, object?> { ["first_keyword"] = firstKeyword });
+            }
+
+            // Step 2b — single-statement enforcement. Split on top-level `;` (string-literal +
+            // line-comment aware) and reject if any non-whitespace remains after the first
+            // statement. See SingleStatementCheck for the rationale.
+            var leftover = SingleStatementCheck.GetLeftoverAfterFirstStatement(sql);
+            if (leftover is not null)
+            {
+                throw new MultiStatementRejectedException(leftover);
+            }
+
+            // Step 3 — build & configure the command.
+            await using var cmd = connection.CreateCommand();
+            cmd.CommandText = sql;
+            cmd.CommandTimeout = queryOptions.TimeoutSeconds;
+
+            // Step 4 — bind parameters from the JsonElement values supplied by the MCP framework.
+            // The MCP serialiser hands tool methods deserialised JSON values as JsonElement; we
+            // unwrap each element to its CLR equivalent so SqliteParameter sees a typed value
+            // (string / long / double / bool / DBNull) rather than a JsonElement opaque blob.
+            if (parameters is { Count: > 0 })
+            {
+                foreach (var (name, valueElement) in parameters)
+                {
+                    var p = cmd.CreateParameter();
+                    p.ParameterName = name.StartsWith('@') ? name : "@" + name;
+                    p.Value = JsonElementToSqliteValue(valueElement);
+                    cmd.Parameters.Add(p);
+                }
+            }
+
+            // Step 5 — execute and read up to RowLimit + 1 rows. The +1 row is the truncation
+            // sentinel; we drop it before returning.
+            await using var reader = await cmd.ExecuteReaderAsync(ct).ConfigureAwait(false);
+
+            var columns = new List<QueryGraphColumn>(reader.FieldCount);
+            for (var i = 0; i < reader.FieldCount; i++)
+            {
+                var name = reader.GetName(i);
+                var typeName = SqliteAffinityFromFieldType(reader.GetFieldType(i));
+                columns.Add(new QueryGraphColumn(name, typeName));
+            }
+
+            var rows = new List<JsonElement>();
+            var rowCap = queryOptions.RowLimit;
+            var rowsRead = 0;
+            while (await reader.ReadAsync(ct).ConfigureAwait(false))
+            {
+                rowsRead++;
+                if (rowsRead > rowCap)
+                {
+                    // We read the cap-plus-one sentinel so we know we should set truncated; stop
+                    // here, do NOT emit this row.
+                    break;
+                }
+                var values = new object?[reader.FieldCount];
+                for (var i = 0; i < reader.FieldCount; i++)
+                {
+                    values[i] = reader.IsDBNull(i) ? null : reader.GetValue(i);
+                }
+                // Pre-serialize each row to a JsonElement (a JSON array). The reflection-based
+                // serializer is acceptable here because (a) it's the only path that handles the
+                // heterogeneous mix cleanly and (b) the row-by-row cost is dominated by SQLite's
+                // own decoding work, not the serializer. The outer envelope (QueryGraphResult)
+                // still rides the source-gen context.
+                rows.Add(JsonSerializer.SerializeToElement(values));
+            }
+
+            var truncated = rowsRead > rowCap;
+            var rowCount = truncated ? rowCap : rowsRead;
+            sw.Stop();
+
+            var dto = new QueryGraphResult(
+                RowCount: rowCount,
+                Truncated: truncated,
+                RowCap: rowCap,
+                ElapsedMs: sw.ElapsedMilliseconds,
+                Columns: columns,
+                Rows: rows);
+
+            // Render markdown table.
+            var leaf = LeafFormatter.Suppressed ? "" : LeafFormatter.Mark;
+            var sb = new StringBuilder();
+            sb.Append(leaf)
+              .Append("query_graph (")
+              .Append(rowCount)
+              .Append(rowCount == 1 ? " row, " : " rows, ")
+              .Append(sw.ElapsedMilliseconds)
+              .AppendLine(" ms)");
+            sb.AppendLine();
+
+            if (rowCount == 0)
+            {
+                sb.AppendLine("_(no rows)_");
+            }
+            else
+            {
+                AppendQueryGraphMarkdownTable(sb, columns, rows);
+            }
+
+            if (truncated)
+            {
+                sb.AppendLine();
+                sb.Append("_(truncated at ").Append(rowCap).AppendLine(" rows; add a tighter LIMIT or WHERE)_");
+            }
+
+            return new CallToolResult
+            {
+                Content = new List<ContentBlock>
+                {
+                    new TextContentBlock { Text = sb.ToString().TrimEnd() },
+                    AudienceMetadata.Build(
+                        scopeId: scope,
+                        latencyMs: sw.ElapsedMilliseconds,
+                        ("rows", rowCount.ToString()),
+                        ("truncated", truncated ? "true" : "false")),
+                },
+                StructuredContent = JsonSerializer.SerializeToElement(
+                    dto,
+                    ToolOutputJsonContext.Default.QueryGraphResult),
+            };
+        }
+        catch (MultiStatementRejectedException ex)
+        {
+            return BuildToolErrorResult(
+                toolName: "query_graph",
+                error: "multi_statement",
+                message: ex.Message,
+                hint: "send one SELECT/WITH statement per call",
+                scope: scope,
+                elapsedMs: sw.ElapsedMilliseconds,
+                extras: new Dictionary<string, object?> { ["leftover"] = ex.LeftoverSql });
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            // User-initiated cancellation — bubble out so the MCP host can record the cancel.
+            throw;
+        }
+        catch (SqliteException ex) when (IsReadOnlyError(ex))
+        {
+            return BuildToolErrorResult(
+                toolName: "query_graph",
+                error: "read_only",
+                message: ex.Message,
+                hint: "query_graph is read-only; use a SELECT or WITH statement",
+                scope: scope,
+                elapsedMs: sw.ElapsedMilliseconds);
+        }
+        catch (SqliteException ex) when (
+            ex.SqliteErrorCode == 9 /* SQLITE_INTERRUPT */
+            || ex.Message.Contains("interrupted", StringComparison.OrdinalIgnoreCase))
+        {
+            // Statement timeout — Microsoft.Data.Sqlite's CommandTimeout calls sqlite3_interrupt
+            // on timer expiry, which surfaces as SQLITE_INTERRUPT (9) on the next progress callback.
+            return BuildToolErrorResult(
+                toolName: "query_graph",
+                error: "timeout",
+                message: ex.Message,
+                hint: "narrow your WHERE clause or raise --query-timeout-seconds",
+                scope: scope,
+                elapsedMs: sw.ElapsedMilliseconds);
+        }
+        catch (SqliteException ex)
+        {
+            return BuildToolErrorResult(
+                toolName: "query_graph",
+                error: "sqlite",
+                message: ex.Message,
+                hint: "check your SQL against describe_schema",
+                scope: scope,
+                elapsedMs: sw.ElapsedMilliseconds,
+                extras: new Dictionary<string, object?> { ["code"] = ex.SqliteErrorCode });
+        }
+        finally
+        {
+            await connection.DisposeAsync().ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// Classify a SQLite exception as a "write attempted on read-only surface". Two cases land
+    /// here: (1) <c>SQLITE_READONLY</c> (8) on an attempt to write any attached DB or the
+    /// in-memory main — the connection has <c>PRAGMA query_only = 1</c> set after the TEMP
+    /// VIEW DDL is applied (see <see cref="DevBitsLab.Mcp.SourceGraph.Storage.MultiScopeReadOnlyConnection.OpenAsync"/>),
+    /// so any INSERT/UPDATE/DELETE/DROP/CREATE/REPLACE against any attached DB returns this
+    /// code; (2) <c>SQLITE_ERROR</c> (1) with a "cannot modify ... because it is a view"
+    /// message when the agent tries to INSERT/UPDATE/DELETE against one of the <c>v_*</c>
+    /// TEMP views (SQLite's parser rejects these before even consulting query_only). The spec
+    /// promises every write attempt surfaces as <c>read_only</c>, regardless of which gate fired.
+    /// </summary>
+    private static bool IsReadOnlyError(SqliteException ex)
+    {
+        if (ex.SqliteErrorCode == 8 /* SQLITE_READONLY */) return true;
+        // SQLite's view-immutability message is stable across versions.
+        var msg = ex.Message;
+        if (string.IsNullOrEmpty(msg)) return false;
+        return msg.Contains("because it is a view", StringComparison.OrdinalIgnoreCase)
+            || msg.Contains("cannot modify", StringComparison.OrdinalIgnoreCase) && msg.Contains("view", StringComparison.OrdinalIgnoreCase)
+            || msg.Contains("readonly", StringComparison.OrdinalIgnoreCase)
+            || msg.Contains("read-only", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Convert a JSON value supplied by the MCP framework into the CLR object accepted by
+    /// <see cref="SqliteParameter.Value"/>: null → DBNull; string / number / bool → matching
+    /// primitive; object / array → its raw JSON text (so the agent can still bind structured
+    /// blobs as text). Numbers prefer <see cref="long"/> when they fit, else <see cref="double"/>.
+    /// </summary>
+    private static object JsonElementToSqliteValue(JsonElement element) => element.ValueKind switch
+    {
+        JsonValueKind.Null or JsonValueKind.Undefined => DBNull.Value,
+        JsonValueKind.True => true,
+        JsonValueKind.False => false,
+        JsonValueKind.String => element.GetString() ?? (object)DBNull.Value,
+        JsonValueKind.Number => element.TryGetInt64(out var l) ? l : element.GetDouble(),
+        // Object / Array: pass through as raw JSON text so the agent can bind structured payloads
+        // as text and `WHERE payload LIKE '%foo%'` style queries still work.
+        _ => element.GetRawText(),
+    };
+
+    /// <summary>
+    /// Map the .NET CLR type returned by <see cref="System.Data.Common.DbDataReader.GetFieldType"/>
+    /// to the SQLite affinity name (TEXT / INTEGER / REAL / BLOB). Returns empty for unknown
+    /// types — that's the documented "no recognisable affinity" case.
+    /// </summary>
+    private static string SqliteAffinityFromFieldType(Type clrType)
+    {
+        if (clrType == typeof(string)) return "TEXT";
+        if (clrType == typeof(long) || clrType == typeof(int) || clrType == typeof(short) ||
+            clrType == typeof(byte) || clrType == typeof(bool))
+        {
+            return "INTEGER";
+        }
+        if (clrType == typeof(double) || clrType == typeof(float) || clrType == typeof(decimal))
+        {
+            return "REAL";
+        }
+        if (clrType == typeof(byte[])) return "BLOB";
+        return "";
+    }
+
+    /// <summary>
+    /// Build a structured-error <see cref="CallToolResult"/> for either <c>query_graph</c> or
+    /// <c>describe_schema</c>. Wraps the inline JSON shape
+    /// <c>{ "error": "...", "hint": "...", ... }</c> in a JsonElement via the reflection-based
+    /// serializer (cold path; only on error). The prose carries
+    /// <c>🌿 &lt;tool_name&gt; error: type: message</c> so the agent reads a clear failure
+    /// reason — naming the tool that errored — even before parsing structured content.
+    ///
+    /// Note that on error <c>StructuredContent</c> intentionally carries the error envelope
+    /// rather than the tool's declared <c>OutputSchemaType</c>; the MCP convention is that
+    /// <c>IsError = true</c> signals a different shape, so strict-schema clients gate
+    /// validation on <c>IsError</c>.
+    /// </summary>
+    private static CallToolResult BuildToolErrorResult(
+        string toolName,
+        string error,
+        string message,
+        string hint,
+        string scope,
+        long elapsedMs,
+        IReadOnlyDictionary<string, object?>? extras = null)
+    {
+        var leaf = LeafFormatter.Suppressed ? "" : LeafFormatter.Mark;
+
+        // Build the structured payload. Inline anonymous-object serialisation via the reflection
+        // serializer is fine on the cold error path; the success path uses the source-gen context.
+        var payload = new Dictionary<string, object?>
+        {
+            ["error"] = error,
+            ["message"] = message,
+            ["hint"] = hint,
+            ["elapsed_ms"] = elapsedMs,
+        };
+        if (extras is not null)
+        {
+            foreach (var (k, v) in extras)
+            {
+                payload[k] = v;
+            }
+        }
+        var structured = JsonSerializer.SerializeToElement(payload);
+
+        return new CallToolResult
+        {
+            IsError = true,
+            Content = new List<ContentBlock>
+            {
+                new TextContentBlock { Text = $"{leaf}{toolName} error: {error}: {message}" },
+                AudienceMetadata.Build(
+                    scopeId: scope,
+                    latencyMs: elapsedMs,
+                    ("error", error)),
+            },
+            StructuredContent = structured,
+        };
+    }
+
+    /// <summary>
+    /// Append a GitHub-flavoured markdown table for the <c>query_graph</c> result. Numeric
+    /// columns (INTEGER / REAL) are right-aligned; long string cells are NOT truncated (the
+    /// agent needs the data; truncation is a UI concern). Cells are pipe-escaped via
+    /// <see cref="Format.AppendTable"/>.
+    /// </summary>
+    private static void AppendQueryGraphMarkdownTable(StringBuilder sb, IReadOnlyList<QueryGraphColumn> columns, IReadOnlyList<JsonElement> rows)
+    {
+        var headers = columns.Select(c => c.Name).ToList();
+        var alignments = columns
+            .Select(c => c.Type is "INTEGER" or "REAL" ? TableAlignment.Right : TableAlignment.Left)
+            .ToList();
+
+        var renderedRows = new List<IReadOnlyList<string>>(rows.Count);
+        foreach (var row in rows)
+        {
+            // Each `row` is a JSON array (built by the executor); enumerate its elements and
+            // render each as a markdown cell. `null` JsonValueKind renders as the literal `(null)`
+            // so the agent can tell empty-string apart from NULL at a glance.
+            var cells = new List<string>(headers.Count);
+            foreach (var v in row.EnumerateArray())
+            {
+                cells.Add(RenderCell(v));
+            }
+            // Defensive: if the row had fewer values than headers (shouldn't happen — built from
+            // the same FieldCount), pad with empty cells so the table doesn't throw.
+            while (cells.Count < headers.Count) cells.Add(string.Empty);
+            renderedRows.Add(cells);
+        }
+
+        Format.AppendTable(sb, headers, renderedRows, alignments);
+    }
+
+    private static string RenderCell(JsonElement value) => value.ValueKind switch
+    {
+        JsonValueKind.Null or JsonValueKind.Undefined => "(null)",
+        JsonValueKind.String => value.GetString() ?? "",
+        JsonValueKind.True => "true",
+        JsonValueKind.False => "false",
+        JsonValueKind.Number => value.GetRawText(),
+        // Object / Array: render the raw JSON text so the agent can read structured cells.
+        _ => value.GetRawText(),
+    };
+}
+
+/// <summary>
+/// Static helper that detects whether a SQL string contains more than one top-level statement.
+/// Returns the leftover SQL after the first statement (with leading whitespace stripped) when
+/// extra non-whitespace remains, or <c>null</c> when the input is a single statement.
+///
+/// <para>Why we don't lean on <see cref="Microsoft.Data.Sqlite.SqliteCommand.Prepare"/>: the
+/// Microsoft.Data.Sqlite wrapper does not expose the SQLite C API's <c>pzTail</c> outparam,
+/// so we can't read "what wasn't consumed by the first prepare". This helper does the minimal
+/// lex needed to find the first top-level <c>;</c>: it tracks single-quoted strings,
+/// double-quoted identifiers, line comments (<c>--…</c>), and block comments (<c>/* … */</c>)
+/// so a semicolon inside a string literal or comment doesn't count as a statement boundary.
+/// SQLite's own parser handles trailing-whitespace and comment-only tails as a "single statement"
+/// — we mirror that semantics here.</para>
+/// </summary>
+internal static class SingleStatementCheck
+{
+    /// <summary>
+    /// Return the first SQL keyword (uppercased ASCII) after skipping leading whitespace,
+    /// <c>--</c> line comments, and <c>/* … */</c> block comments. Returns <c>null</c> when
+    /// the input is empty or contains only whitespace / comments. Used by <c>query_graph</c>
+    /// to enforce the contract that the statement begins with <c>SELECT</c> or <c>WITH</c>
+    /// (rather than <c>PRAGMA</c>, <c>EXPLAIN</c>, <c>VACUUM</c>, or any other read-only-ish
+    /// statement that the connection's <c>PRAGMA query_only = 1</c> would let through but
+    /// the spec doesn't promise to support).
+    /// </summary>
+    public static string? GetFirstKeyword(string sql)
+    {
+        if (string.IsNullOrEmpty(sql)) return null;
+
+        var i = 0;
+        var len = sql.Length;
+        while (i < len)
+        {
+            var c = sql[i];
+
+            // Skip whitespace.
+            if (char.IsWhiteSpace(c)) { i++; continue; }
+
+            // Skip line comments: -- … to EOL.
+            if (c == '-' && i + 1 < len && sql[i + 1] == '-')
+            {
+                i += 2;
+                while (i < len && sql[i] != '\n') i++;
+                continue;
+            }
+
+            // Skip block comments: /* … */
+            if (c == '/' && i + 1 < len && sql[i + 1] == '*')
+            {
+                i += 2;
+                while (i + 1 < len && !(sql[i] == '*' && sql[i + 1] == '/')) i++;
+                i = Math.Min(i + 2, len);
+                continue;
+            }
+
+            // First non-whitespace, non-comment character — start of a keyword. Walk the
+            // contiguous identifier characters. SQL keywords are ASCII letters; we collect
+            // until we hit whitespace, punctuation, or end-of-input, then uppercase.
+            var start = i;
+            while (i < len && (char.IsAsciiLetter(sql[i]) || sql[i] == '_')) i++;
+            if (i == start) return null;
+            return sql[start..i].ToUpperInvariant();
+        }
+        return null;
+    }
+
+    public static string? GetLeftoverAfterFirstStatement(string sql)
+    {
+        if (string.IsNullOrEmpty(sql)) return null;
+
+        var i = 0;
+        var len = sql.Length;
+        while (i < len)
+        {
+            var c = sql[i];
+
+            // Single-quoted string literal: 'a''b' — doubled '' is the SQL escape.
+            if (c == '\'')
+            {
+                i++;
+                while (i < len)
+                {
+                    if (sql[i] == '\'')
+                    {
+                        if (i + 1 < len && sql[i + 1] == '\'')
+                        {
+                            i += 2; // doubled quote = escaped, stay in string
+                            continue;
+                        }
+                        i++; // closing quote
+                        break;
+                    }
+                    i++;
+                }
+                continue;
+            }
+
+            // Double-quoted identifier: "scope_id" — same escape rule.
+            if (c == '"')
+            {
+                i++;
+                while (i < len)
+                {
+                    if (sql[i] == '"')
+                    {
+                        if (i + 1 < len && sql[i + 1] == '"')
+                        {
+                            i += 2;
+                            continue;
+                        }
+                        i++;
+                        break;
+                    }
+                    i++;
+                }
+                continue;
+            }
+
+            // Line comment: -- … to EOL.
+            if (c == '-' && i + 1 < len && sql[i + 1] == '-')
+            {
+                i += 2;
+                while (i < len && sql[i] != '\n') i++;
+                continue;
+            }
+
+            // Block comment: /* … */
+            if (c == '/' && i + 1 < len && sql[i + 1] == '*')
+            {
+                i += 2;
+                while (i + 1 < len && !(sql[i] == '*' && sql[i + 1] == '/')) i++;
+                i = Math.Min(i + 2, len); // skip the closing */
+                continue;
+            }
+
+            // Top-level statement terminator.
+            if (c == ';')
+            {
+                // Anything non-whitespace / non-comment after this point is a second statement.
+                var rest = sql[(i + 1)..];
+                var trimmedTail = StripTrailingNoise(rest);
+                if (trimmedTail.Length > 0)
+                {
+                    return trimmedTail;
+                }
+                return null;
+            }
+
+            i++;
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Strip leading whitespace and comment runs from <paramref name="rest"/>; return what
+    /// remains. An "empty" result (everything was whitespace + comments) means the trailing
+    /// content is harmless — the input is effectively a single statement.
+    /// </summary>
+    private static string StripTrailingNoise(string rest)
+    {
+        var i = 0;
+        var len = rest.Length;
+        while (i < len)
+        {
+            var c = rest[i];
+            if (char.IsWhiteSpace(c)) { i++; continue; }
+            if (c == '-' && i + 1 < len && rest[i + 1] == '-')
+            {
+                i += 2;
+                while (i < len && rest[i] != '\n') i++;
+                continue;
+            }
+            if (c == '/' && i + 1 < len && rest[i + 1] == '*')
+            {
+                i += 2;
+                while (i + 1 < len && !(rest[i] == '*' && rest[i + 1] == '/')) i++;
+                i = Math.Min(i + 2, len);
+                continue;
+            }
+            // Bare semicolon after the first statement is harmless (empty trailing statement).
+            if (c == ';') { i++; continue; }
+            return rest[i..];
+        }
+        return string.Empty;
     }
 }
 

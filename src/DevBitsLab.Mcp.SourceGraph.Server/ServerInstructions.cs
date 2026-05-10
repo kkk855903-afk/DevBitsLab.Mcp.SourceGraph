@@ -42,6 +42,12 @@ internal static class ServerInstructions
         genuinely doesn't cover the question (config files, plain text, comments, PR
         descriptions, etc.) or when a tool returns nothing relevant.
 
+        For ad-hoc questions that don't fit a curated tool — aggregations, joins, "how many
+        public types use X", "which classes implement IDisposable but lack Dispose", etc. —
+        call `describe_schema` to learn the view layer, then `query_graph` to run read-only
+        SQL against it. The view layer (v_symbols, v_edges, v_files, v_references, v_scopes)
+        is a stable contract; the underlying tables remain implementation details.
+
         Call usage_stats at the end of a turn to verify the graph was actually queried.
         If the counts didn't move, you fell back to Grep + Read on a question a graph tool
         would have answered faster.
