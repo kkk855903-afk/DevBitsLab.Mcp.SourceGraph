@@ -1,8 +1,9 @@
 # 🌿 DevBitsLab.Mcp.SourceGraph
 
+[![CI](https://github.com/Jak3b0/DevBitsLab.Mcp.SourceGraph/actions/workflows/ci.yml/badge.svg)](https://github.com/Jak3b0/DevBitsLab.Mcp.SourceGraph/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/Jak3b0/DevBitsLab.Mcp.SourceGraph/actions/workflows/codeql.yml/badge.svg)](https://github.com/Jak3b0/DevBitsLab.Mcp.SourceGraph/actions/workflows/codeql.yml)
 [![Release](https://github.com/Jak3b0/DevBitsLab.Mcp.SourceGraph/actions/workflows/publish-nuget.yml/badge.svg?event=push)](https://github.com/Jak3b0/DevBitsLab.Mcp.SourceGraph/releases)
 [![NuGet](https://img.shields.io/nuget/v/DevBitsLab.Mcp.SourceGraph.Tool.svg)](https://www.nuget.org/packages/DevBitsLab.Mcp.SourceGraph.Tool/)
-[![CodeQL](https://github.com/Jak3b0/DevBitsLab.Mcp.SourceGraph/actions/workflows/github-code-scanning/codeql/badge.svg)](https://github.com/Jak3b0/DevBitsLab.Mcp.SourceGraph/actions/workflows/github-code-scanning/codeql)
 
 A live code source graph [Model Context Protocol](https://modelcontextprotocol.io)
 server for .NET solutions. It indexes your C# code with Roslyn into a SQLite +
