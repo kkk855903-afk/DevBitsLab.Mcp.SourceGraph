@@ -24,6 +24,7 @@ calls with a single structured tool call:
 - [Why not just use Roslyn directly?](#why-not-just-use-roslyn-directly)
 - [Requirements](#requirements)
 - [Installation](#installation)
+- [Quickstart (60 seconds)](#quickstart-60-seconds)
 - [Wiring it into an MCP client](#wiring-it-into-an-mcp-client)
 - [MCP tools](#mcp-tools)
 - [Structured output and resource links](#structured-output-and-resource-links)
@@ -115,7 +116,36 @@ Make sure `~/.dotnet/tools` is on your `PATH`. The installed command is
 `sourcegraph-mcp`. You can also pin a version per repository — see
 [Pin a version per repo](#pin-a-version-per-repo) below.
 
+## Quickstart (60 seconds)
+
+From a fresh clone of any .NET solution:
+
+```bash
+dotnet tool install -g DevBitsLab.Mcp.SourceGraph.Tool
+sourcegraph-mcp init        # interactive: detects clients, writes .mcp.json / .vscode/mcp.json / etc.
+sourcegraph-mcp demo        # canned probe: ping → graph_stats → search_symbols → find_definition
+```
+
+`init` writes only **project-scoped** files by default (`.mcp.json`,
+`.vscode/mcp.json`, `.cursor/mcp.json`, `.continue/mcp/sourcegraph.yaml`).
+User-scope writes (or Claude Desktop) require explicit per-client flags.
+`demo` reads the indexed scope and prints the same leaf-stamped markdown
+your agent will see — instant verification.
+
+Other useful first-run commands:
+
+```bash
+sourcegraph-mcp init --yes --client copilot,claude-code --print-only   # CI-friendly preview
+sourcegraph-mcp doctor                                                  # environment diagnostic
+sourcegraph-mcp init --prewarm                                          # also pre-build the index
+```
+
 ## Wiring it into an MCP client
+
+`sourcegraph-mcp init` writes the right config for each client below
+automatically. The snippets here document what each writer produces — useful
+if you'd rather paste manually, or if you want to understand the schema delta
+between clients.
 
 ### Claude Code (project-scoped, committed to the repo)
 
@@ -139,6 +169,86 @@ server falls back to the `WORKSPACE_FOLDER`, `CLAUDE_PROJECT_DIR`, or
 expanded against the process environment, so paths like
 `${HOME}/repos/my.slnx` work too.
 
+### GitHub Copilot (`.vscode/mcp.json`)
+
+Copilot's VS Code MCP integration uses a **distinct schema** from Claude Code's
+— top-level key is `servers` (not `mcpServers`), and each server entry carries
+an explicit `type: "stdio"` field:
+
+```json
+{
+  "servers": {
+    "sourcegraph": {
+      "type": "stdio",
+      "command": "sourcegraph-mcp",
+      "args": ["serve", "--solution", "${workspaceFolder}/MySolution.slnx"]
+    }
+  }
+}
+```
+
+Place this at `.vscode/mcp.json` at the repo root. Pasting the Claude Code
+snippet here would not work — Copilot silently ignores files that don't match
+its schema.
+
+### Cursor
+
+Cursor uses Claude Code's `mcpServers` shape. Place at `.cursor/mcp.json`
+(project-scope) or `~/.cursor/mcp.json` (user-scope):
+
+```json
+{
+  "mcpServers": {
+    "sourcegraph": {
+      "command": "sourcegraph-mcp",
+      "args": ["serve", "--solution", "${workspaceFolder}/MySolution.slnx"]
+    }
+  }
+}
+```
+
+### Continue
+
+Continue uses YAML, one server per file. Place at
+`.continue/mcp/sourcegraph.yaml`:
+
+```yaml
+name: sourcegraph
+command: sourcegraph-mcp
+args:
+  - serve
+  - --solution
+  - ${workspaceFolder}/MySolution.slnx
+```
+
+### Claude Desktop
+
+Claude Desktop has no project-scoped config — all MCP servers live in the
+platform-specific user config:
+
+| OS | Path |
+|---|---|
+| macOS | `~/Library/Application Support/Claude/claude_desktop_config.json` |
+| Windows | `%APPDATA%\Claude\claude_desktop_config.json` |
+| Linux | `~/.config/Claude/claude_desktop_config.json` |
+
+The shape matches Claude Code:
+
+```json
+{
+  "mcpServers": {
+    "sourcegraph": {
+      "command": "sourcegraph-mcp",
+      "args": ["serve", "--solution", "/abs/path/to/MySolution.slnx"]
+    }
+  }
+}
+```
+
+Note: `${workspaceFolder}` doesn't apply at the user-scope; use absolute paths
+or set `MCP_WORKSPACE_FOLDER` in your shell init. `init --claude-desktop`
+generates the correct file for you.
+
 ### Pin a version per repo
 
 ```bash
@@ -147,14 +257,9 @@ dotnet tool install DevBitsLab.Mcp.SourceGraph.Tool
 git add .config/dotnet-tools.json
 ```
 
-Collaborators run `dotnet tool restore` once. Your `.mcp.json` then invokes
-`dotnet sourcegraph-mcp serve …` — no global install required.
-
-### Cursor / Claude Desktop / Continue
-
-Use the same `command` + `args` shape inside each client's configuration file
-(for example `~/.cursor/mcp.json`, `claude_desktop_config.json`, or
-Continue's MCP block).
+Collaborators run `dotnet tool restore` once. Pass `--install-mode local-tool`
+to `init` to have the writers emit `command: "dotnet"` + `args: ["sourcegraph-mcp", ...]`
+instead of the global-install shape.
 
 ### Multi-scope monorepo
 
@@ -508,7 +613,10 @@ sourcegraph-mcp <subcommand> [options]
 | `index <solution>` | Build/refresh the database for a single solution, then exit. Useful in CI. |
 | `stats` | Print counts of files / symbols / references / edges in the database. |
 | `clear` | Delete all rows from the database (schema preserved). |
-| `init-scopes` | Discover `.slnx`/`.sln` files at `--root` (default: CWD) and write a starter `.sourcegraph.json`. |
+| `init [--yes] [--client <id>] [--no-<client>] [--user-<client>] [--claude-desktop] [--print-only] [--force] [--prewarm] [--install-mode <mode>]` | Interactive (default) or flag-driven onboarding flow. Detects environment, picks MCP clients, writes per-client config files (project-scoped by default), and optionally pre-warms the index. First-class clients: `claude-code`, `copilot`, `cursor`, `continue`, `claude-desktop`. Use `--print-only` for a CI-friendly preview that writes nothing. |
+| `doctor [--json]` | Read-only environment diagnostic. Reports SDK / git / solution / config / per-client status. Exit `0` = all-pass; `2` = at least one warning; `1` = hard failure. `--json` emits a machine-readable `{checks, exit_code}` document. |
+| `demo [--scope <id>] [--no-color]` | Run four canned operations (`ping`, `graph_stats`, `search_symbols`, `find_definition`) against the active scope and print leaf-stamped markdown — the same shape an MCP client would see. Provides the "ah, it works" confidence moment without an agent loop. Exits `2` if the scope has zero symbols indexed. |
+| `init-scopes` | Discover `.slnx`/`.sln` files at `--root` (default: CWD) and write a starter `.sourcegraph.json`. Continues to work standalone; `init` invokes the same scaffolding internally when multi-solution is detected. |
 | `scopes list [--root <path>]` | List the scopes declared in `.sourcegraph.json`. |
 | `scopes add <name> --solution <path> [--root <path>] [--isolated]` | Add a scope. The file is created on first use. |
 | `scopes remove <name> [--root <path>]` | Remove a scope. |
@@ -586,10 +694,16 @@ The server emits three signals you can hook into:
    `mcp.tool.scope`. Both signals are zero-cost when no listener is attached;
    pick them up with the OpenTelemetry SDK or `dotnet-counters monitor --name
    sourcegraph-mcp DevBitsLab.Mcp.SourceGraph`.
-4. **MCP `notifications/progress`** — three tools opt in to live progress
-   reporting on their slow paths: `semantic_search` (three checkpoints around
-   ONNX-model load + vector search + formatting), `impact_of_change`, and
-   `module_summary` (one starting checkpoint each). Clients opt in by sending
+4. **MCP `notifications/progress`** — four tools opt in to live progress
+   reporting: `semantic_search` (three checkpoints around ONNX-model load +
+   vector search + formatting), `impact_of_change`, `module_summary` (one
+   starting checkpoint each), and `find_definition` (cold-start phase
+   progress only — see below). **Cold-start visibility**: when one of the
+   progress-aware tools is invoked against a scope whose initial indexing
+   isn't finished, the server forwards per-scope `IIndexingProgressSource`
+   events as `notifications/progress` for the duration of the wait — three
+   coarse phases (`opening workspace` → `indexing` → `ready`) so the chat
+   panel sees motion instead of a silent spinner. Clients opt in by sending
    a `progressToken` field on the originating `tools/call` request:
 
    ```json

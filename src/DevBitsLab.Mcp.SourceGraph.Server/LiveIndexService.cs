@@ -266,13 +266,28 @@ public sealed class LiveIndexService : BackgroundService
             _logger.LogInformation("Scope `{Id}` has no resolvable solution; skipping cold index", scope.Id);
             host.Status = "ok"; // empty graph but openable
             await _registry.UpsertAsync(ToRow(scope, host.Status, null), ct).ConfigureAwait(false);
+            host.ProgressSource.MarkReady();
             host.MarkReady();
             return;
         }
 
         try
         {
+            // Phase 1: workspace open. The MSBuildWorkspace pass dominates this section for real
+            // solutions (10s+ on a 1000-doc tree). Emit the coarse phase event so any tool waiting
+            // on Ready (and forwarding our progress) sees motion.
+            host.ProgressSource.Emit(new ModelContextProtocol.ProgressNotificationValue
+            {
+                Progress = 0.0f, Total = 1.0f, Message = "opening workspace",
+            });
             await host.Indexer.OpenAsync(solutionPath, ct).ConfigureAwait(false);
+            // Phase 2: cold index. The IndexAllAsync call walks every document, writes symbols /
+            // refs / edges. We can't see per-document progress from outside the indexer; emit the
+            // single phase marker here so progress monotonically increases.
+            host.ProgressSource.Emit(new ModelContextProtocol.ProgressNotificationValue
+            {
+                Progress = 0.5f, Total = 1.0f, Message = "indexing",
+            });
             var initial = await host.Indexer.IndexAllAsync(ct).ConfigureAwait(false);
             _logger.LogInformation("Scope `{Id}` initial index complete in {Elapsed}: {Files} files re-processed",
                 scope.Id, initial.Elapsed, initial.FilesIndexed);
@@ -377,7 +392,10 @@ public sealed class LiveIndexService : BackgroundService
         finally
         {
             // Always settle the readiness signal — both ok and degraded are valid post-bring-up
-            // terminal states for the per-scope Ready task.
+            // terminal states for the per-scope Ready task. Emit the terminal `ready` progress
+            // event before flipping the host's TCS so any subscriber that's about to unsubscribe
+            // (because the Ready task completed) sees the final 1.0 first.
+            host.ProgressSource.MarkReady();
             host.MarkReady();
         }
     }

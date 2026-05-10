@@ -30,7 +30,15 @@ public sealed class ScopeHost : IAsyncDisposable
         Indexer = indexer;
         SolutionPath = solutionPath;
         Status = "ok";
+        ProgressSource = new IndexingProgressSource();
     }
+
+    /// <summary>
+    /// Per-scope cold-start progress broadcaster. <c>LiveIndexService</c> emits coarse phase
+    /// events through this during initial indexing; tools that block on <see cref="Ready"/>
+    /// subscribe to forward those events as MCP <c>notifications/progress</c>.
+    /// </summary>
+    internal IndexingProgressSource ProgressSource { get; }
 
     /// <summary>
     /// Completes the first time this scope's initial bring-up settles into either <c>"ok"</c> or

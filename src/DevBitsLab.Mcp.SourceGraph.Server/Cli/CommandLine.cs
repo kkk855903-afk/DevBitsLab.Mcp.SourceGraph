@@ -33,6 +33,30 @@ internal sealed class CommandLine
     public int? QueryRowLimit { get; private init; }
     /// <summary>Positional rest args (used by `scopes add`, `scopes remove`, etc.).</summary>
     public IReadOnlyList<string> Positional { get; private init; } = Array.Empty<string>();
+    /// <summary>True when <c>--yes</c>/<c>-y</c> was passed; consumed by <c>init</c> to skip every interactive prompt.</summary>
+    public bool Yes { get; private init; }
+    /// <summary>True when <c>--force</c> was passed; consumed by <c>init</c> to overwrite an existing differing <c>sourcegraph</c> server entry without prompting.</summary>
+    public bool Force { get; private init; }
+    /// <summary>True when <c>--print-only</c> was passed; consumed by <c>init</c> to emit per-client config snippets to stdout without writing files.</summary>
+    public bool PrintOnly { get; private init; }
+    /// <summary>Tristate: <c>true</c> = <c>--prewarm</c>, <c>false</c> = <c>--no-prewarm</c>, <c>null</c> = unspecified (use the default for the active mode: on under interactive, off under <c>--yes</c>).</summary>
+    public bool? Prewarm { get; private init; }
+    /// <summary>Selected install mode for <c>init</c>'s emitted <c>command</c> + <c>args</c>: <c>global</c> (default), <c>local-tool</c>, or <c>in-repo</c>.</summary>
+    public string? InstallMode { get; private init; }
+    /// <summary>Every <c>--client &lt;id&gt;</c> value (init-only). Empty means "use auto-detected defaults".</summary>
+    public IReadOnlyList<string> Clients { get; private init; } = Array.Empty<string>();
+    /// <summary>Every <c>--no-&lt;client&gt;</c> flag (init-only). Used to drop clients from the auto-detected set.</summary>
+    public IReadOnlyCollection<string> NoClients { get; private init; } = Array.Empty<string>();
+    /// <summary>Every <c>--user-&lt;client&gt;</c> flag (init-only). Switches that client's target from its project-scoped path to its user-scoped path.</summary>
+    public IReadOnlyCollection<string> UserClients { get; private init; } = Array.Empty<string>();
+    /// <summary>True when <c>--claude-desktop</c> was passed; required to opt Claude Desktop into init since it has no project-scoped path.</summary>
+    public bool ClaudeDesktop { get; private init; }
+    /// <summary>Every <c>--solution</c> value, in order. <see cref="SolutionPath"/> mirrors the last entry for back-compat with single-valued consumers.</summary>
+    public IReadOnlyList<string> Solutions { get; private init; } = Array.Empty<string>();
+    /// <summary>True when <c>--json</c> was passed; consumed by <c>doctor</c> to emit a machine-readable structured document instead of glyph output.</summary>
+    public bool Json { get; private init; }
+    /// <summary>True when <c>--no-color</c> was passed; consumed by <c>demo</c> to suppress the green-leaf glyph on per-line output. Independent of <see cref="NoLeaf"/>, which is the server-wide opt-out.</summary>
+    public bool NoColor { get; private init; }
 
     public static CommandLine Parse(string[] args)
     {
@@ -53,6 +77,18 @@ internal sealed class CommandLine
         int? queryTimeoutSeconds = null;
         int? queryRowLimit = null;
         var positional = new List<string>();
+        var yes = false;
+        var force = false;
+        var printOnly = false;
+        bool? prewarm = null;
+        string? installMode = null;
+        var clients = new List<string>();
+        var noClients = new HashSet<string>(StringComparer.Ordinal);
+        var userClients = new HashSet<string>(StringComparer.Ordinal);
+        var claudeDesktop = false;
+        var solutions = new List<string>();
+        var json = false;
+        var noColor = false;
 
         for (var i = 1; i < args.Length; i++)
         {
@@ -63,6 +99,7 @@ internal sealed class CommandLine
                     return new CommandLine { Subcommand = subcommand, ShowHelp = true };
                 case "--solution" or "-s":
                     solution = ExpandTokens(RequireArg(args, ref i, a));
+                    solutions.Add(solution);
                     break;
                 case "--db":
                     db = ExpandTokens(RequireArg(args, ref i, a));
@@ -96,6 +133,44 @@ internal sealed class CommandLine
                     break;
                 case "--query-row-limit":
                     queryRowLimit = RequirePositiveInt(args, ref i, a);
+                    break;
+                case "--yes" or "-y":
+                    yes = true;
+                    break;
+                case "--force":
+                    force = true;
+                    break;
+                case "--print-only":
+                    printOnly = true;
+                    break;
+                case "--prewarm":
+                    prewarm = true;
+                    break;
+                case "--no-prewarm":
+                    prewarm = false;
+                    break;
+                case "--install-mode":
+                    installMode = RequireArg(args, ref i, a);
+                    break;
+                case "--client":
+                    clients.Add(RequireArg(args, ref i, a));
+                    break;
+                case "--claude-desktop":
+                    claudeDesktop = true;
+                    break;
+                case "--no-claude-code" or "--no-copilot" or "--no-cursor"
+                    or "--no-continue" or "--no-claude-desktop":
+                    noClients.Add(a.Substring(5));
+                    break;
+                case "--user-claude-code" or "--user-copilot" or "--user-cursor"
+                    or "--user-continue":
+                    userClients.Add(a.Substring(7));
+                    break;
+                case "--json":
+                    json = true;
+                    break;
+                case "--no-color":
+                    noColor = true;
                     break;
                 default:
                     if (subcommand == "index" && solution is null && !a.StartsWith('-'))
@@ -134,6 +209,18 @@ internal sealed class CommandLine
             QueryTimeoutSeconds = queryTimeoutSeconds,
             QueryRowLimit = queryRowLimit,
             Positional = positional,
+            Yes = yes,
+            Force = force,
+            PrintOnly = printOnly,
+            Prewarm = prewarm,
+            InstallMode = installMode,
+            Clients = clients,
+            NoClients = noClients,
+            UserClients = userClients,
+            ClaudeDesktop = claudeDesktop,
+            Solutions = solutions,
+            Json = json,
+            NoColor = noColor,
         };
     }
 
@@ -205,6 +292,26 @@ internal sealed class CommandLine
 
           sourcegraph-mcp clear [--db <path>]
               Delete all rows from the graph database (schema preserved).
+
+          sourcegraph-mcp init [--yes] [--client <id>] [--no-<client>] [--user-<client>]
+                                [--claude-desktop] [--solution <path>] [--install-mode <mode>]
+                                [--print-only] [--force] [--prewarm | --no-prewarm]
+                                [--no-embeddings] [--no-history] [--root <path>]
+              Interactive (default) or flag-driven onboarding flow. Detects environment, picks
+              MCP clients, writes per-client config files (project-scoped by default), and
+              optionally pre-warms the index. First-class clients: claude-code, copilot, cursor,
+              continue, claude-desktop. Use --print-only for a CI-friendly preview that writes
+              nothing.
+
+          sourcegraph-mcp doctor [--root <path>] [--json]
+              Read-only environment diagnostic. Reports SDK/git/solution/config/per-client status.
+              Exit 0 = all-pass; 2 = at least one warning; 1 = hard failure. --json emits a
+              machine-readable {checks, exit_code} document instead of glyph output.
+
+          sourcegraph-mcp demo [--scope <id>] [--root <path>] [--no-color]
+              Run four canned operations (ping, graph_stats, search_symbols, find_definition)
+              against the active scope's DB and print leaf-stamped markdown — the same shape
+              an MCP client would see. Provides the "ah, it works" confidence moment.
 
           sourcegraph-mcp init-scopes [--root <path>]
               Discover .slnx (or .sln) files at <root> (default: cwd) and write a .sourcegraph.json

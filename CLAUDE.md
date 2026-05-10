@@ -4,6 +4,19 @@ Live code source graph MCP server for .NET solutions. Indexes C# via Roslyn into
 SQLite + FTS5 and exposes graph queries to MCP clients (Claude Code, Cursor) over
 stdio.
 
+## Onboarding CLI: `init`, `doctor`, `demo`
+
+Three subcommands handle first-run setup. `sourcegraph-mcp init` is interactive
+by default; flag-driven (`--yes`) for CI. It detects environment, picks MCP
+clients (project-scope by default, user-scope opt-in via `--user-<client>`),
+and writes per-client config files with merge-by-name semantics — first-class
+support for Claude Code, **GitHub Copilot** (distinct `servers`/`type` schema in
+`.vscode/mcp.json`), Cursor, Continue, and Claude Desktop. `doctor` runs a
+read-only environment diagnostic with `pass | warn | fail` exit-code semantics.
+`demo` runs four canned operations (`ping`, `graph_stats`, `search_symbols`,
+`find_definition`) against the active scope and prints leaf-stamped markdown —
+the same shape an agent sees, available without an agent loop.
+
 ## Tool-usage guidance ships with the server
 
 When this MCP server connects, it publishes "prefer source-graph tools over
@@ -49,11 +62,15 @@ env vars). Cross-view JOINs use the composite `(scope, id)` tuple. The view laye
 is versioned (`view_schema_version`, currently `2`); it bumps on any view-set
 change so cache-aware clients re-introspect after a server upgrade.
 
-`semantic_search`, `impact_of_change`, and `module_summary` emit MCP
-`notifications/progress` when the originating `tools/call` request includes
-a `progressToken` — useful for live status indicators on the slow paths
-(cold-start ONNX model load, deep recursive CTE walks). Clients that don't
-opt in see today's silent-then-result behaviour.
+`semantic_search`, `impact_of_change`, `module_summary`, and `find_definition`
+emit MCP `notifications/progress` when the originating `tools/call` request
+includes a `progressToken` — useful for live status indicators on the slow
+paths (cold-start ONNX model load, deep recursive CTE walks). When any of
+these tools is called against a scope whose initial indexing is still in
+flight, the server forwards per-scope cold-start phase progress (`opening
+workspace` → `indexing` → `ready`) for the duration of the wait, so first-
+call latency narrates itself instead of presenting as a silent spinner.
+Clients that don't opt in see today's silent-then-result behaviour.
 
 ## Scopes (multi-solution monorepos)
 
