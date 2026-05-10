@@ -108,6 +108,14 @@ internal sealed class ServerHarness : IAsyncDisposable
         var configuration = DetectBuildConfiguration();
         var stderrLines = new ConcurrentQueue<string>();
 
+        // Wipe any pre-existing `.sourcegraph/` directory next to the solution before every
+        // harness spawn. Without this, `_meta.db` persists across test runs and tests that
+        // dispose the harness mid-cold-index leave a `Status='indexing'` registry row behind.
+        // The next run's boot reconciliation legitimately marks that scope `degraded` and logs
+        // a warning to stderr — which would break the `stderr should be empty` invariant some
+        // tests check. Cleaning here keeps every spawn hermetic.
+        TryClearSourcegraphDir(serveArgs);
+
         // Build the full argument list. `dotnet run` arguments come before the `--`, then the
         // server's CLI args after. `--no-launch-profile` skips the launchSettings.json lookup
         // that would otherwise log a warning to stderr on every spawn. `--no-build` keeps the
@@ -292,6 +300,30 @@ internal sealed class ServerHarness : IAsyncDisposable
         throw new FileNotFoundException(
             "Could not locate src/DevBitsLab.Mcp.SourceGraph.Server/DevBitsLab.Mcp.SourceGraph.Server.csproj " +
             $"from {AppContext.BaseDirectory}. The IntegrationTests project must run from the repo it lives in.");
+    }
+
+    /// <summary>
+    /// Best-effort clean of the <c>.sourcegraph/</c> directory next to the <c>--solution</c>
+    /// argument the harness was invoked with, so prior-run state can't pollute the current
+    /// spawn. Quietly skips when no <c>--solution</c> is in args, when the path doesn't exist,
+    /// or when the directory can't be removed (a stuck file handle from a flaky prior teardown
+    /// is recoverable on the next run; we'd rather proceed than fail the test setup).
+    /// </summary>
+    private static void TryClearSourcegraphDir(IReadOnlyList<string> serveArgs)
+    {
+        for (var i = 0; i < serveArgs.Count - 1; i++)
+        {
+            if (!string.Equals(serveArgs[i], "--solution", StringComparison.Ordinal)) continue;
+            var solutionPath = serveArgs[i + 1];
+            var dir = Path.GetDirectoryName(solutionPath);
+            if (string.IsNullOrEmpty(dir)) return;
+            var sourcegraphDir = Path.Join(dir, ".sourcegraph");
+            if (!Directory.Exists(sourcegraphDir)) return;
+            try { Directory.Delete(sourcegraphDir, recursive: true); }
+            catch (IOException) { /* best-effort */ }
+            catch (UnauthorizedAccessException) { /* best-effort */ }
+            return;
+        }
     }
 
     /// <summary>

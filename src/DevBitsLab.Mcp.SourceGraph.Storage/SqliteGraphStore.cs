@@ -949,6 +949,74 @@ public sealed class SqliteGraphStore : IGraphStore
         return new GraphStats(files, symbols, refs, edges);
     }
 
+    public async Task<RowCountsRow> RowCountsAsync(CancellationToken ct = default)
+    {
+        // One round-trip; subselects are cheap on indexed COUNT(*).
+        const string sql = """
+            SELECT
+              (SELECT COUNT(*) FROM symbols)     AS Symbols,
+              (SELECT COUNT(*) FROM refs)        AS Refs,
+              (SELECT COUNT(*) FROM edges)       AS Edges,
+              (SELECT COUNT(*) FROM files)       AS Files,
+              (SELECT COUNT(*) FROM annotations) AS Annotations,
+              (SELECT COUNT(*) FROM diagnostics) AS Diagnostics;
+            """;
+        var row = await _connection.QuerySingleAsync<RowCountsRow>(new CommandDefinition(sql, cancellationToken: ct)).ConfigureAwait(false);
+        return row;
+    }
+
+    public async Task<IReadOnlyList<FileShaRow>> SampleFileShasAsync(int limit, CancellationToken ct = default)
+    {
+        const string sql = """
+            SELECT path AS Path, content_sha256 AS ContentSha256
+            FROM files
+            ORDER BY RANDOM()
+            LIMIT @Limit;
+            """;
+        var rows = await _connection.QueryAsync<FileShaRow>(new CommandDefinition(sql, new { Limit = limit }, cancellationToken: ct)).ConfigureAwait(false);
+        return rows.AsList();
+    }
+
+    public async Task<IReadOnlyList<FileShaRow>> GetAllFileShasAsync(CancellationToken ct = default)
+    {
+        const string sql = "SELECT path AS Path, content_sha256 AS ContentSha256 FROM files;";
+        var rows = await _connection.QueryAsync<FileShaRow>(new CommandDefinition(sql, cancellationToken: ct)).ConfigureAwait(false);
+        return rows.AsList();
+    }
+
+    public async Task<string> IntegrityCheckAsync(CancellationToken ct = default)
+    {
+        // PRAGMA integrity_check returns one row "ok" on a clean DB, or N rows of failures
+        // otherwise. On deeply-corrupt files SQLite throws while reading the result set rather
+        // than returning a row — surface that as a non-"ok" string too, so the contract is
+        // simple: this method never throws on integrity-related failures, it returns them.
+        try
+        {
+            var rows = await _connection.QueryAsync<string>(new CommandDefinition("PRAGMA integrity_check;", cancellationToken: ct)).ConfigureAwait(false);
+            var firstFailure = rows.FirstOrDefault(r => !string.Equals(r, "ok", StringComparison.Ordinal));
+            if (firstFailure is not null) return firstFailure;
+        }
+        catch (SqliteException ex)
+        {
+            return $"integrity_check failed: {ex.Message}";
+        }
+
+        // FTS5 integrity-check throws when the FTS index has rotted but the main DB is intact.
+        // The INSERT into the FTS shadow table is the documented integrity-check command.
+        try
+        {
+            await _connection.ExecuteAsync(new CommandDefinition(
+                "INSERT INTO symbols_fts(symbols_fts) VALUES('integrity-check');",
+                cancellationToken: ct)).ConfigureAwait(false);
+        }
+        catch (SqliteException ex)
+        {
+            return $"fts5 integrity-check failed: {ex.Message}";
+        }
+
+        return "ok";
+    }
+
     public async Task BulkInsertAnnotationsAsync(IEnumerable<AnnotationRecord> annotations, CancellationToken ct = default)
     {
         const string sql = """

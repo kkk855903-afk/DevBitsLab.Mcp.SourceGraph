@@ -76,9 +76,11 @@ public sealed class OnboardingCliTests : IDisposable
         var cli = ParseInit("--print-only", "--client", "claude-code,copilot,cursor");
         await InitCli.RunAsync(cli);
         var output = _stdout.ToString();
+        // Paths render with the platform's native separator — `.vscode/mcp.json` on Linux/macOS,
+        // `.vscode\mcp.json` on Windows. Use `Path.Join` so the assertion matches both.
         output.Should().Contain(".mcp.json");
-        output.Should().Contain(".vscode/mcp.json");
-        output.Should().Contain(".cursor/mcp.json");
+        output.Should().Contain(Path.Join(".vscode", "mcp.json"));
+        output.Should().Contain(Path.Join(".cursor", "mcp.json"));
     }
 
     [Fact]

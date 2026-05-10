@@ -122,6 +122,36 @@ public interface IGraphStore : IAsyncDisposable
 
     Task<GraphStats> GetStatsAsync(CancellationToken ct = default);
 
+    /// <summary>
+    /// Detailed row counts for the graph's main tables. Returned to <c>verify_scope</c> as part
+    /// of its structured health snapshot. Counts are taken in a single round-trip via subselect.
+    /// </summary>
+    Task<RowCountsRow> RowCountsAsync(CancellationToken ct = default);
+
+    /// <summary>
+    /// Runs <c>PRAGMA integrity_check</c> on the main DB and the FTS5 integrity-check on
+    /// <c>symbols_fts</c>. Returns the literal string <c>"ok"</c> when both pass; otherwise a
+    /// short diagnostic string identifying the first failure (used as the <c>integrity_check</c>
+    /// field of <c>verify_scope</c> and as the trigger for corruption-recovery flows in later
+    /// phases). The check is read-only and may take seconds on large DBs.
+    /// </summary>
+    Task<string> IntegrityCheckAsync(CancellationToken ct = default);
+
+    /// <summary>
+    /// Returns up to <paramref name="limit"/> random rows from <c>files</c> as
+    /// <c>(path, content_sha256)</c> tuples. Used by <c>verify_scope</c> to compute a drift sample
+    /// against the on-disk file contents. Order is randomised via <c>ORDER BY RANDOM()</c>; ties
+    /// (none — all rows are distinct) are broken arbitrarily.
+    /// </summary>
+    Task<IReadOnlyList<FileShaRow>> SampleFileShasAsync(int limit, CancellationToken ct = default);
+
+    /// <summary>
+    /// Returns every row from <c>files</c> as <c>(path, content_sha256)</c> tuples in arbitrary
+    /// order. Used by <c>reconcile_drift</c> to compute the full symmetric difference against the
+    /// on-disk file set. Unbounded — caller is responsible for sizing.
+    /// </summary>
+    Task<IReadOnlyList<FileShaRow>> GetAllFileShasAsync(CancellationToken ct = default);
+
     // Queries
     Task<IReadOnlyList<SymbolHit>> FindSymbolsAsync(string query, string? filePathHint = null, int limit = 25, CancellationToken ct = default);
     Task<IReadOnlyList<ReferenceHit>> FindReferencesAsync(long symbolId, int limit = 200, CancellationToken ct = default);
@@ -282,6 +312,24 @@ public sealed record SymbolKeyRow(string CanonicalKey, long Id, long FileId);
 public sealed record FileRow(string Path, long Id);
 
 public sealed record GraphStats(int FileCount, int SymbolCount, int ReferenceCount, int EdgeCount);
+
+/// <summary>
+/// Per-table row counts surfaced by <see cref="IGraphStore.RowCountsAsync"/>. Distinct from
+/// <see cref="GraphStats"/> which uses <c>int</c> and predates the broader table set; this record
+/// is the agent-facing shape returned by the <c>verify_scope</c> tool.
+/// </summary>
+public sealed record RowCountsRow(
+    long Symbols,
+    long Refs,
+    long Edges,
+    long Files,
+    long Annotations,
+    long Diagnostics);
+
+/// <summary>
+/// One <c>files</c> row projected to the columns the drift-sample needs.
+/// </summary>
+public sealed record FileShaRow(string Path, byte[] ContentSha256);
 
 /// <summary>One row from <c>vw_recent_changes</c>: the symbol joined to its history entry.</summary>
 public sealed record RecentChangeHit(SymbolHit Symbol, SymbolHistory History);

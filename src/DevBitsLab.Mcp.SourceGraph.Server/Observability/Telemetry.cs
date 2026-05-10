@@ -53,4 +53,10 @@ public static class Telemetry
             name: "sourcegraph.tool.response_size",
             unit: "By",
             description: "Serialised response size of one MCP tool invocation, in UTF-8 bytes — the wire-format size of the JSON payload returned to the MCP client.");
+
+    public static readonly Counter<long> HealFired =
+        Meter.CreateCounter<long>(
+            name: "sourcegraph.heal.fired",
+            unit: "{event}",
+            description: "Heal events fired by the source-graph server (boot reconciliation, repair tools, corruption recovery).");
 }

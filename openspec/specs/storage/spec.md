@@ -318,3 +318,54 @@ The new views SHALL appear in `Views.All` (the curated descriptor list returned 
   ```
 - **THEN** the result row joins the history record to the symbol via `(scope, symbol_id)`, returning the author + Unix-millis timestamp
 
+### Requirement: Typed exception type for SQLite corruption
+
+The storage assembly SHALL expose a public `GraphStoreCorruptedException` type so any layer that wants to translate SQLite corruption into a typed exception (now or in the future) has a stable contract to throw. The exception SHALL carry:
+- `ScopeId` (string) — the scope id of the store that surfaced the error
+- `InnerSqliteException` (`SqliteException`) — the original SQLite exception, preserved unmodified
+
+The current implementation does NOT wrap `SqliteException` at the storage boundary — `SqliteGraphStore` lets raw `SqliteException` propagate. The dispatch layer (`ScopedExecution`, per `Reactive integrity check on corruption suspicion` below) recognises both forms (`SqliteException` with `SqliteErrorCode is 11 or 26` AND `GraphStoreCorruptedException`) via `CorruptionGuard.IsCorruptionError`, so the user-facing behaviour — "corrupt DB → first call fails → subsequent calls return the degraded short-circuit" — is identical regardless of which exception form surfaces. The type is retained as the typed-throw contract for callers (production or test) that want to surface corruption explicitly without depending on `SqliteException`-specific error codes.
+
+#### Scenario: GraphStoreCorruptedException type is exposed
+- **WHEN** a consumer of the storage assembly references `DevBitsLab.Mcp.SourceGraph.Storage.GraphStoreCorruptedException`
+- **THEN** the type is publicly accessible, derives from `Exception`, and exposes `ScopeId : string` and `InnerSqliteException : SqliteException` properties; the constructor signature is `(string scopeId, SqliteException inner)`
+
+#### Scenario: SQLITE_CORRUPT propagates as raw SqliteException
+- **GIVEN** a `SqliteGraphStore` whose underlying file has been physically corrupted (random bytes overwritten at a SQLite page boundary)
+- **WHEN** any read method (e.g. `FindSymbolsAsync`) is called
+- **THEN** the method throws `SqliteException` with `SqliteErrorCode == 11`; the exception is NOT wrapped by the storage layer; the dispatch layer's `CorruptionGuard.IsCorruptionError` recognises it and routes to the verification path
+
+#### Scenario: Other SQLite errors propagate unchanged
+- **GIVEN** a `SqliteGraphStore` whose underlying connection raises `SqliteException { SqliteErrorCode = 5 (SQLITE_BUSY) }` on a write
+- **WHEN** the call surfaces the exception
+- **THEN** the original `SqliteException` propagates to the caller; `CorruptionGuard.IsCorruptionError` returns `false` for this exception so the dispatch layer does NOT run the verification path
+
+### Requirement: Reactive integrity check on corruption suspicion
+
+`ScopedExecution` SHALL catch any exception flagged by `CorruptionGuard.IsCorruptionError` (raw `SqliteException` with `SqliteErrorCode is 11 or 26`, or `GraphStoreCorruptedException`) from any tool body before propagating it. On catch, it SHALL run `IGraphStore.IntegrityCheckAsync` (which executes `PRAGMA integrity_check` AND the FTS5 integrity-check) on the affected scope's store and dispatch on the result:
+
+- **Integrity check returned `"ok"`** (false alarm — the corruption error was transient): emit a heal event with `kind = "corruption-suspected-but-clean"`, `ok = true`, `details = "integrity_check passed; treating as transient"`. Rethrow the original exception so the agent's call still fails. Do NOT mark the scope `degraded`.
+
+- **Integrity check returned a non-`"ok"` string** (corruption confirmed): emit a heal event with `kind = "corruption-detected"`, `ok = true`, `details = $"integrity_check failed: {result}"`. Mark the scope `degraded` with `status_message = $"corruption detected: {result}; call repair_scope mode=rebuild"`. Rethrow the original exception. If the autonomous-rebuild env var is enabled (per `Autonomous corrupt-DB rebuild gated by env var` in the `mcp-tools` capability), additionally fire the rebuild on a background task before rethrow.
+
+- **Integrity check itself threw** (the DB is so broken the check can't complete): log at warning level. Emit a heal event with `kind = "corruption-detected"`, `ok = false`, `details = $"integrity_check itself failed: {ex.Message}"`. Mark the scope `degraded` with the same details. Rethrow the original exception.
+
+The dispatch SHALL execute synchronously inside the `ScopedExecution` catch — the verification adds wall-clock to the failed call's response time (typically single-digit seconds for the integrity check), but the agent already saw the call fail; the structured `degraded` state is what subsequent calls benefit from.
+
+Subsequent tool calls against a scope that this dispatch marked `degraded` SHALL hit the existing `degraded` short-circuit in `ScopedExecution.WaitForReadyAsync` and return the structured diagnostic without contacting SQLite again.
+
+#### Scenario: False alarm — clean integrity check after suspicion
+- **GIVEN** a tool call throws a corruption-flagged exception for scope `backend`, but `IntegrityCheckAsync` against `backend`'s DB returns `"ok"`
+- **WHEN** `ScopedExecution` catches the exception and runs verification
+- **THEN** `heals.jsonl` contains one line with `kind = "corruption-suspected-but-clean"`, `scope = "backend"`, `ok = true`; the `backend` registry row is NOT modified (still `"ok"`); the original exception propagates to the agent; the next tool call against `backend` is dispatched normally (no degraded short-circuit)
+
+#### Scenario: Confirmed corruption marks scope degraded
+- **GIVEN** a tool call throws a corruption-flagged exception for scope `backend` and `IntegrityCheckAsync` returns the string `"*** in database main *** Page 42: invalid header"`
+- **WHEN** `ScopedExecution` catches and verifies
+- **THEN** `heals.jsonl` contains one line with `kind = "corruption-detected"`, `ok = true`, `details = "integrity_check failed: *** in database main *** Page 42: invalid header"`; the `backend` registry row is updated to `Status = "degraded"` with `StatusMessage = "corruption detected: *** in database main *** Page 42: invalid header; call repair_scope mode=rebuild"`; the original exception propagates; the next tool call returns the degraded short-circuit without touching SQLite
+
+#### Scenario: Integrity check itself fails
+- **GIVEN** a tool call throws a corruption-flagged exception and `IntegrityCheckAsync` itself throws (e.g. file unreadable)
+- **WHEN** `ScopedExecution` catches and the verification call also throws
+- **THEN** `heals.jsonl` contains one line with `kind = "corruption-detected"`, `ok = false`, `details` carrying the verification exception's message; the registry row is marked `degraded` with the same details; the original exception propagates to the agent
+

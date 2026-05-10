@@ -128,6 +128,22 @@ public sealed class SqliteEmbeddingsStore : IEmbeddingsStore
             "SELECT COUNT(*) FROM symbol_embeddings;", cancellationToken: ct)).ConfigureAwait(false);
     }
 
+    public async Task<int> PruneOrphanedAsync(CancellationToken ct = default)
+    {
+        // Match-by-symbol-id rather than rowid: vec0's virtual-table primary key is the
+        // symbol_id column we wrote it with, not the synthetic rowid. The companion
+        // `embedding_meta` table is keyed on (symbol_id) too — both prune in a single round-trip.
+        var pruned = await _connection.ExecuteAsync(new CommandDefinition(
+            "DELETE FROM symbol_embeddings WHERE symbol_id NOT IN (SELECT id FROM symbols);",
+            cancellationToken: ct)).ConfigureAwait(false);
+        // embedding_meta is internal bookkeeping (content_hash + model_version per symbol). Keep
+        // it in sync so a re-embed after later symbol resurrection doesn't see stale meta.
+        await _connection.ExecuteAsync(new CommandDefinition(
+            "DELETE FROM embedding_meta WHERE symbol_id NOT IN (SELECT id FROM symbols);",
+            cancellationToken: ct)).ConfigureAwait(false);
+        return pruned;
+    }
+
     /// <summary>
     /// Convert vec0's L2 distance on unit-norm vectors to cosine similarity in <c>[-1, 1]</c>.
     /// For unit-norm vectors <c>||a-b||^2 = 2 - 2*cos(theta)</c>, so <c>cos = 1 - d^2/2</c>.
@@ -157,4 +173,5 @@ public sealed class DisabledEmbeddingsStore : IEmbeddingsStore
     public Task<IReadOnlyList<EmbeddingHit>> SearchAsync(IReadOnlyList<float> queryEmbedding, int k, string? kindFilter = null, CancellationToken ct = default) =>
         Task.FromResult<IReadOnlyList<EmbeddingHit>>(Array.Empty<EmbeddingHit>());
     public Task<long> CountAsync(CancellationToken ct = default) => Task.FromResult(0L);
+    public Task<int> PruneOrphanedAsync(CancellationToken ct = default) => Task.FromResult(0);
 }

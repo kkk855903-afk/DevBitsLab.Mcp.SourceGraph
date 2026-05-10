@@ -116,6 +116,7 @@ static async Task<int> RunServeAsync(CommandLine cli)
     var dbDir = ScopeLayout.SourcegraphDir(repoRoot);
     Directory.CreateDirectory(dbDir);
     ToolMetrics.Configure(Path.Join(dbDir, "usage.jsonl"));
+    HealLog.Configure(Path.Join(dbDir, "heals.jsonl"));
 
     var embeddingsEnabled = !cli.NoEmbeddings;
     // Always know the active model identity so the vec0 table can be sized consistently
@@ -202,7 +203,11 @@ static async Task<int> RunServeAsync(CommandLine cli)
         sp.GetRequiredService<GitBlameRunner>(),
         sp.GetRequiredService<HistoryOptions>(),
         sp.GetRequiredService<ILogger<HistoryHostedService>>()));
-    builder.Services.AddHostedService<LiveIndexService>();
+    // Register as singleton so MCP tools (repair_scope, future repair tools) can resolve the
+    // service to drive scope-level rebuild operations. The same instance is also routed through
+    // the IHostedService factory below — there's only ever one LiveIndexService in the host.
+    builder.Services.AddSingleton<LiveIndexService>();
+    builder.Services.AddHostedService(sp => sp.GetRequiredService<LiveIndexService>());
 
     // Plugin host: discover plugins via .sourcegraph.json's plugins[] array. With NO entry the
     // host is a no-op and single-solution v0.5.0 behaviour is preserved exactly. The built-in
@@ -372,6 +377,36 @@ static async Task<int> RunServeAsync(CommandLine cli)
     }
 
     var host = builder.Build();
+
+    // Corruption-recovery wiring: read SOURCEGRAPH_AUTOREBUILD_CORRUPT_DBS, set the static
+    // CorruptionPolicy hooks the dispatch layer (ScopedExecution → CorruptionGuard) reads on
+    // every wrapped tool call. These are static fields rather than DI-injected because every
+    // existing tool body resolves through `ScopedExecution.RunAsync(...)` without an awareness
+    // of the corruption-recovery pathway; static state keeps the change invisible to those bodies.
+    var autoRebuildEnv = Environment.GetEnvironmentVariable("SOURCEGRAPH_AUTOREBUILD_CORRUPT_DBS");
+    CorruptionPolicy.AutoRebuildEnabled = CorruptionPolicy.ParseEnvVar(autoRebuildEnv);
+    if (CorruptionPolicy.AutoRebuildEnabled)
+    {
+        await Console.Error.WriteLineAsync(
+            "[sourcegraph-mcp] Autonomous corrupt-DB rebuild is ENABLED via SOURCEGRAPH_AUTOREBUILD_CORRUPT_DBS").ConfigureAwait(false);
+    }
+    CorruptionPolicy.Registry = host.Services.GetRequiredService<IScopeRegistry>();
+    CorruptionPolicy.Logger = host.Services.GetRequiredService<ILoggerFactory>().CreateLogger("CorruptionGuard");
+    var liveIndexForRebuild = host.Services.GetRequiredService<LiveIndexService>();
+    // Ignore the ct passed by CorruptionGuard — it's the MCP request's token, which completes
+    // when the failed tool call's response is sent. The autonomous rebuild is fire-and-forget
+    // and must outlive the request; bind it to the host's lifetime instead. The host's
+    // stopping token is `default(CancellationToken)` until ExecuteAsync runs (host start-up is
+    // not yet complete by this point in Program.cs), at which point HostStoppingToken returns
+    // the live token; corruption can't trigger before tool calls dispatch through ScopedExecution
+    // anyway, so a default token in the brief startup window is harmless.
+    CorruptionPolicy.RebuildDelegate = async (scopeId, _) =>
+    {
+        await liveIndexForRebuild.RebuildScopeAsync(
+            scopeId,
+            archiveDiscriminator: "corrupt",
+            liveIndexForRebuild.HostStoppingToken).ConfigureAwait(false);
+    };
 
     // Walk the registered McpServerTool collection and rewrite ProtocolTool.Description to append
     // `Use when: <trigger>` for every method carrying [ToolTrigger]. Done after Build() so we see

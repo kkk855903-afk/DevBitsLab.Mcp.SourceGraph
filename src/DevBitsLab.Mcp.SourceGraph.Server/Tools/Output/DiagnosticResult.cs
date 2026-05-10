@@ -1,3 +1,5 @@
+using System.Text.Json;
+using DevBitsLab.Mcp.SourceGraph.Server.Tools;
 using ModelContextProtocol.Protocol;
 
 namespace DevBitsLab.Mcp.SourceGraph.Server.Tools.Output;
@@ -62,4 +64,49 @@ public static class DiagnosticResult
             Content = new List<ContentBlock> { new TextContentBlock { Text = message } },
             IsError = true,
         };
+
+    /// <summary>
+    /// Build a structured tool-error result matching the convention that <c>query_graph</c> and
+    /// <c>describe_schema</c> use: <see cref="CallToolResult.IsError"/> = true, prose carrying
+    /// <c>"&lt;tool&gt; error: &lt;error&gt;: &lt;message&gt;"</c>, and structured content with
+    /// <c>{ error, message, hint, elapsed_ms, ...extras }</c> so agents and clients can branch
+    /// on the typed error code rather than parsing prose.
+    ///
+    /// <para>Use for tool-level diagnostics that need to ship structured context: <c>no_scopes</c>,
+    /// <c>scope_db_missing</c>, <c>bad_argument</c>, etc. The <see cref="Error"/> helper above
+    /// remains the right choice when the diagnostic is a one-off prose-only message — but tools
+    /// whose error path is part of a documented contract (per spec) should use this shape.</para>
+    /// </summary>
+    public static CallToolResult StructuredError(
+        string toolName,
+        string error,
+        string message,
+        string hint,
+        string scope,
+        long elapsedMs,
+        IReadOnlyDictionary<string, object?>? extras = null)
+    {
+        var leaf = LeafFormatter.Suppressed ? "" : LeafFormatter.Mark;
+        var payload = new Dictionary<string, object?>
+        {
+            ["error"] = error,
+            ["message"] = message,
+            ["hint"] = hint,
+            ["elapsed_ms"] = elapsedMs,
+        };
+        if (extras is not null)
+        {
+            foreach (var (k, v) in extras) payload[k] = v;
+        }
+        return new CallToolResult
+        {
+            IsError = true,
+            Content = new List<ContentBlock>
+            {
+                new TextContentBlock { Text = $"{leaf}{toolName} error: {error}: {message}" },
+                AudienceMetadata.Build(scopeId: scope, latencyMs: elapsedMs, ("error", error)),
+            },
+            StructuredContent = JsonSerializer.SerializeToElement(payload),
+        };
+    }
 }

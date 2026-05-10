@@ -23,6 +23,7 @@ public static class ScopeLayout
 {
     public const string DotDir = ".sourcegraph";
     public const string ScopesDir = "scopes";
+    public const string OrphansDir = "orphans";
     public const string MetaDbName = "_meta.db";
     public const string LegacyDbName = "graph.db";
 
@@ -34,6 +35,12 @@ public static class ScopeLayout
 
     /// <summary>The directory holding per-scope DBs.</summary>
     public static string ScopesDirectory(string repoRoot) => Path.Join(SourcegraphDir(repoRoot), ScopesDir);
+
+    /// <summary>
+    /// The directory where archived (orphaned, rebuilt, or corrupt) scope DBs are preserved for
+    /// inspection. Created lazily on first archive; never auto-pruned by the server.
+    /// </summary>
+    public static string OrphansDirectory(string repoRoot) => Path.Join(SourcegraphDir(repoRoot), OrphansDir);
 
     /// <summary>The DB path for a specific scope id. Caller must validate the id beforehand.</summary>
     public static string ScopeDbPath(string repoRoot, string scopeId) =>

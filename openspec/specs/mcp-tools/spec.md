@@ -876,3 +876,232 @@ The `ServerInstructions` block returned in the MCP `initialize` response SHALL i
 - **WHEN** an MCP client connects
 - **THEN** the `ServerInstructions` payload is empty (or omitted entirely); the layered-guidance sentence is not present
 
+### Requirement: verify_scope read-only health snapshot tool
+
+The server SHALL expose a `verify_scope` MCP tool that returns a structured health snapshot for one scope or all scopes, without mutating any state.
+
+The tool SHALL accept a single argument:
+- `scope` (string, default `"*"`) — a scope id, comma-separated list, or `"*"` for all non-isolated scopes (the same resolution semantics as every other scope-aware tool).
+
+The response SHALL ship `structuredContent` with one entry per resolved scope, each entry carrying:
+- `scope` — the scope id
+- `status` — one of `"ok"`, `"degraded"`, `"indexing"`
+- `status_message` — the registry's `status_message` (may be `null` when `status = "ok"`)
+- `schema_version` — the integer `Schema.Version` value the scope's DB was last opened with
+- `views_schema_version` — the integer `Views.SchemaVersion` (matches `describe_schema`)
+- `last_indexed_at` — ISO-8601 timestamp from the registry
+- `row_counts` — object with `symbols`, `refs`, `edges`, `files`, `annotations`, `diagnostics` long fields
+- `integrity_check` — string; `"ok"` when both `PRAGMA integrity_check` and the FTS5 integrity-check pass; otherwise the first failure line
+- `drift_sample` — object with `sampled` (int, ≤ 20), `total_files` (int, the scope's `files` row count), `changed` (int, count of sampled files whose on-disk SHA-256 differs from the DB's `content_sha256`), and `changed_paths` (string list, capped at the first 5 changed paths so the response stays bounded)
+
+The tool body SHALL emit `notifications/progress` (per the existing `Progress notifications on slow tools` requirement) at three checkpoints when a `progressToken` is on the originating request: `"reading row counts"` (0.0), `"running integrity_check"` (0.4), `"sampling drift"` (0.8). The `integrity_check` step is the slow one on large DBs; the progress checkpoints prevent the call from looking hung.
+
+The tool SHALL NOT mutate any registry row, DB row, or filesystem state. It SHALL NOT emit a heal event (reads are not heals; the call is recorded in `usage.jsonl` like every other tool via `ToolMetrics.TrackAsync`).
+
+When called against a scope whose `status = "degraded"` (e.g., from missing DB or stuck `indexing` detection in this change, or from any other degraded path), the tool SHALL return the registry's `status` and `status_message` and SHALL omit the `row_counts`, `integrity_check`, and `drift_sample` fields (set to `null`) since they require a healthy DB connection.
+
+When called with `scope = "*"` against a registry containing no non-isolated scopes, the tool SHALL return a structured `no_scopes` diagnostic (matching the convention established by `query_graph` and `describe_schema`) rather than throw.
+
+#### Scenario: Verify a healthy scope
+- **GIVEN** a scope `backend` with `status = "ok"`, 1500 symbols, 800 refs, 600 edges, 80 files, 200 annotations, 30 diagnostics, and no drift
+- **WHEN** the agent invokes `verify_scope(scope = "backend")`
+- **THEN** the response's `structuredContent[0]` has `scope = "backend"`, `status = "ok"`, `row_counts = { symbols: 1500, refs: 800, edges: 600, files: 80, annotations: 200, diagnostics: 30 }`, `integrity_check = "ok"`, `drift_sample = { sampled: 20, total_files: 80, changed: 0, changed_paths: [] }`
+
+#### Scenario: Verify a degraded scope
+- **GIVEN** a scope `tools` whose registry row carries `status = "degraded"` and `status_message = "scope DB file missing — call repair_scope or restart"`
+- **WHEN** the agent invokes `verify_scope(scope = "tools")`
+- **THEN** the response's `structuredContent[0]` has `scope = "tools"`, `status = "degraded"`, `status_message = "scope DB file missing — call repair_scope or restart"`, and the `row_counts` / `integrity_check` / `drift_sample` fields are `null`
+
+#### Scenario: Verify all scopes
+- **GIVEN** a registry with non-isolated scopes `frontend` (ok) and `backend` (degraded), plus isolated scope `vendor`
+- **WHEN** the agent invokes `verify_scope()` (default `scope = "*"`)
+- **THEN** the response's `structuredContent` array contains two entries — one for `frontend` and one for `backend`; the `vendor` scope is excluded (matches the standard `*` fan-out semantics)
+
+#### Scenario: Drift sample surfaces watcher-missed edits
+- **GIVEN** a scope `backend` with 100 indexed files; while the server was offline, three of those files were edited so their on-disk SHA-256 no longer matches the DB's `content_sha256`
+- **WHEN** the agent invokes `verify_scope(scope = "backend")` after the server restarts (without triggering any reindex)
+- **THEN** the response's `drift_sample` has `changed >= 0`; if any of the three edited files were sampled (probabilistic with sample size 20 over 100 files), `changed > 0` and the affected paths appear in `changed_paths` (up to the cap of 5)
+
+#### Scenario: Empty registry returns structured diagnostic
+- **GIVEN** a `_meta.db` with no non-isolated scope rows
+- **WHEN** the agent invokes `verify_scope()` (default `scope = "*"`)
+- **THEN** the response is a `no_scopes` structured diagnostic (matching the established convention) rather than an exception
+
+### Requirement: repair_scope tool
+
+The server SHALL expose a `repair_scope` MCP tool that takes a destructive (or potentially destructive) action against a single named scope.
+
+The tool SHALL accept:
+- `scope` (string, required) — a single scope id; `"*"` and comma-separated lists SHALL be rejected with a structured `bad_scope` diagnostic. Repair acts at scope grain; the destructive intent must be explicit and singular.
+- `mode` (string, default `"minimal"`) — one of `"minimal"` or `"rebuild"`. Other values SHALL be rejected with a structured `bad_argument` diagnostic.
+
+The tool SHALL ship `structuredContent` of shape:
+```
+{ scope: string, mode: string, before_status: string, after_status: string, elapsed_ms: long, message: string }
+```
+
+`minimal` mode SHALL:
+1. Capture `before_status` from the registry.
+2. Run `IGraphStore.IntegrityCheckAsync`. If the result is not `"ok"`, return immediately with `after_status = before_status`, `message = "integrity_check failed: <result>; call repair_scope mode=rebuild"`. No mutation occurs.
+3. Otherwise, call `IEmbeddingsStore.PruneOrphanedAsync()` (returning a count of pruned rows for the message).
+4. Re-run the bounded-retry workspace-open path against the scope (per `Bounded retry on initial workspace open`). 
+5. Return with `after_status` from the post-retry registry row, `message = "ok; pruned {N} orphan embeddings; reopened workspace"` (or "...workspace open failed after retries" on final failure).
+
+`rebuild` mode SHALL:
+1. Capture `before_status`.
+2. Move the scope's DB file from `<repo>/.sourcegraph/scopes/<id>.db` to `<repo>/.sourcegraph/orphans/<id>-rebuild-<utc-iso>.db` (with `:` replaced by `-`). The orphans directory SHALL be created lazily. If the scope DB file does not exist (e.g., missing-DB degraded), skip the archive step.
+3. Drop the scope's `IGraphStore` instance and any cached embeddings store; the next operation creates fresh ones.
+4. Run a full cold-index for the scope from its `.sourcegraph.json` configuration (the same path as boot-time bring-up).
+5. Return with `after_status` reflecting the post-cold-index registry row, `message = "rebuilt; archived previous DB to orphans/{filename}; new symbol_count={N}"`.
+
+Both modes SHALL emit a heal event:
+- `kind = "repair-scope-invoked"`
+- `ok = (after_status == "ok")`
+- `ms = elapsed_ms`
+- `details = "mode={mode}; ..."` carrying the same `message` text as the structured response.
+
+Both modes SHALL emit `notifications/progress` per the existing `Progress notifications on slow tools` requirement at the documented checkpoints (minimal: `"running integrity_check"` 0.0, `"pruning orphans"` 0.5, `"reopening workspace"` 0.8; rebuild: `"archiving old DB"` 0.0, `"cold-indexing"` 0.1, `"finalising"` 0.95).
+
+Both modes SHALL be idempotent: calling `minimal` against an already-healthy scope is a no-op (re-runs integrity check + zero-row prune + a no-op workspace reopen); calling `rebuild` twice produces two archive files and two cold-indexes (both end in `ok`).
+
+#### Scenario: minimal on healthy scope is a no-op
+- **GIVEN** scope `backend` with `status = "ok"`, integrity_check returns `"ok"`, and zero orphan embeddings rows
+- **WHEN** the agent invokes `repair_scope(scope = "backend", mode = "minimal")`
+- **THEN** `before_status = after_status = "ok"`; `message` mentions "ok; pruned 0 orphan embeddings; reopened workspace"; `heals.jsonl` contains one `repair-scope-invoked` line with `ok = true`; no DB row in `symbols` / `refs` / `edges` / `files` is touched
+
+#### Scenario: minimal on corrupted scope refuses
+- **GIVEN** scope `backend` whose `IntegrityCheckAsync` returns a non-`"ok"` string
+- **WHEN** the agent invokes `repair_scope(scope = "backend", mode = "minimal")`
+- **THEN** `after_status = before_status` (no mutation); `message` includes the substring "call repair_scope mode=rebuild"; `heals.jsonl` contains one `repair-scope-invoked` line with `ok = false` and `details` carrying the integrity-check failure; the DB file is unchanged on disk
+
+#### Scenario: rebuild archives and reindexes
+- **GIVEN** scope `backend` exists with a populated DB at `<repo>/.sourcegraph/scopes/backend.db`
+- **WHEN** the agent invokes `repair_scope(scope = "backend", mode = "rebuild")`
+- **THEN** an archive file `<repo>/.sourcegraph/orphans/backend-rebuild-<utc-iso>.db` exists with the original byte content; `<repo>/.sourcegraph/scopes/backend.db` exists as a fresh DB at `Schema.Version`; `after_status = "ok"` (assuming the cold-index succeeds); `heals.jsonl` contains one `repair-scope-invoked` line with `ok = true`, `details` matching the message
+
+#### Scenario: rebuild on missing-DB scope skips archive but cold-indexes
+- **GIVEN** scope `tools` whose registry row carries `status = "degraded"`, `status_message = "scope DB file missing — call repair_scope or restart"`, and no `<repo>/.sourcegraph/scopes/tools.db` exists
+- **WHEN** the agent invokes `repair_scope(scope = "tools", mode = "rebuild")`
+- **THEN** no archive file is created (nothing to archive); a fresh `tools.db` is created and cold-indexed; `after_status = "ok"`; `heals.jsonl` contains one `repair-scope-invoked` line
+
+#### Scenario: scope = "*" rejected
+- **WHEN** the agent invokes `repair_scope(scope = "*", mode = "minimal")`
+- **THEN** the response is a structured `bad_scope` diagnostic (matching the established convention); no mutation occurs; no heal event is written
+
+#### Scenario: invalid mode rejected
+- **WHEN** the agent invokes `repair_scope(scope = "backend", mode = "nuke")`
+- **THEN** the response is a structured `bad_argument` diagnostic; no mutation occurs; no heal event is written
+
+### Requirement: reconcile_drift tool
+
+The server SHALL expose a `reconcile_drift` MCP tool that walks a single scope's source tree, compares each file's on-disk SHA-256 to the DB's `content_sha256`, and applies the symmetric difference (reindex changed, index added, remove vanished).
+
+The tool SHALL accept:
+- `scope` (string, required) — single scope id; `"*"` and comma-separated lists SHALL be rejected with a structured `bad_scope` diagnostic.
+- `max_files` (int, default `1000`, hard cap `50000`) — caps the walk; values above the cap SHALL be silently clamped.
+- `dry_run` (bool, default `false`) — when `true`, computes the diff without applying it.
+
+The walk SHALL use the same exclusion list as `SolutionWatcher.ShouldIgnore` (`obj/`, `bin/`, `.git/`, `.sourcegraph/`).
+
+The tool SHALL ship `structuredContent` of shape:
+```
+{ scope: string, scanned_count: int, reindexed_count: int, added_count: int, removed_count: int, unchanged_count: int, partial: bool, dry_run: bool, elapsed_ms: long }
+```
+
+Where `partial = true` indicates the walk hit `max_files` and stopped before scanning every file under the root.
+
+When `dry_run = false`, the tool SHALL dispatch the changed and added paths to `RoslynIndexer.IndexChangedFilesAsync` (the same path the watcher uses) and remove the vanished paths via the existing per-file delete path.
+
+When `dry_run = true`, the tool SHALL compute the diff and return it without invoking the indexer or the delete path; no DB row is touched; no heal event is emitted.
+
+When `dry_run = false`, the tool SHALL emit a heal event:
+- `kind = "reconcile-drift-invoked"`
+- `ok = true` (drift reconciliation does not have a "failed" semantic — partial is reported via the `partial` field, not via `ok`)
+- `details = "scanned={N}, reindexed={M}, added={A}, removed={R}, unchanged={U}"`
+
+The tool SHALL emit `notifications/progress` at three checkpoints: `"walking source tree"` (0.0), `"comparing hashes"` (0.3), `"applying changes"` (0.7) — the third checkpoint omitted when `dry_run = true`.
+
+#### Scenario: Reconcile picks up watcher-missed edits, additions, and deletions
+- **GIVEN** a scope `backend` with 10 indexed files; while the server was offline, file `A.cs` was edited (SHA changed), file `B.cs` was added, file `C.cs` was deleted
+- **WHEN** the agent invokes `reconcile_drift(scope = "backend")` with default args
+- **THEN** the response carries `scanned_count = 10` (the 9 remaining + the new B.cs), `reindexed_count = 1` (A.cs), `added_count = 1` (B.cs), `removed_count = 1` (C.cs), `unchanged_count = 8`, `partial = false`, `dry_run = false`; the DB now has rows for A.cs (with the new SHA), B.cs (newly inserted), and no row for C.cs; `heals.jsonl` contains one `reconcile-drift-invoked` line
+
+#### Scenario: dry_run reports diff without applying
+- **GIVEN** the same drift scenario as above
+- **WHEN** the agent invokes `reconcile_drift(scope = "backend", dry_run = true)`
+- **THEN** the response carries the same counts as above (1/1/1/8); the DB is NOT mutated (A.cs still has the old SHA, B.cs has no row, C.cs row still exists); no `heals.jsonl` line is written
+
+#### Scenario: max_files cap returns partial = true
+- **GIVEN** a scope whose root contains 5000 source files and `max_files = 100`
+- **WHEN** the agent invokes `reconcile_drift(scope = "backend", max_files = 100)`
+- **THEN** `scanned_count = 100`, `partial = true`; only the first-walked 100 files are compared; the response message hints "increase max_files to scan all"; no error
+
+#### Scenario: scope = "*" rejected
+- **WHEN** the agent invokes `reconcile_drift(scope = "*")`
+- **THEN** the response is a structured `bad_scope` diagnostic; no mutation occurs
+
+### Requirement: Autonomous corrupt-DB rebuild gated by env var
+
+When the environment variable `SOURCEGRAPH_AUTOREBUILD_CORRUPT_DBS` is set to a truthy value (`"1"`, `"true"`, `"yes"`, case-insensitive), the server SHALL autonomously rebuild a scope's DB whenever `ScopedExecution`'s reactive verification confirms corruption (per the `storage` capability's `Reactive integrity check on corruption suspicion` requirement). When the variable is unset or any other value, autonomous rebuild SHALL NOT fire — corruption detection stops at marking the scope `degraded`.
+
+When the env var is enabled and the autonomous rebuild fires, the sequence SHALL be:
+
+1. Emit a heal event with `kind = "corrupt-db-rebuild-started"`, `ok = true`, `details = "fire-and-forget rebuild kicked off"`. The agent's failed tool call returns immediately with the original `GraphStoreCorruptedException`; the rebuild does NOT block the response.
+2. Schedule a background task that:
+   - Archives the corrupt DB to `<repo>/.sourcegraph/orphans/<id>-corrupt-<utc-iso>.db` (using the same orphans-directory convention introduced in `add-scope-health-surface`, with the `-corrupt-` discriminator distinguishing it from `-rebuild-` and bare `<id>-<ts>.db`).
+   - Drops the scope's DB file and runs a fresh cold-index from `.sourcegraph.json` (the same path as `repair_scope mode=rebuild`).
+   - On completion, emits a heal event with `kind = "corrupt-db-rebuilt"`, `ok = (after_status == "ok")`, `ms = <wall-clock elapsed>`, `details = $"after_status={after_status}"`.
+   - On exception during the rebuild, emits the same heal kind with `ok = false` and `details` carrying the failure message.
+
+The background task SHALL be tied to the host's lifetime cancellation token; on shutdown, the rebuild gets cooperative cancellation. A partially-completed rebuild leaves a fresh-but-incomplete DB in `scopes/`; the next boot's stuck-`indexing` detection (per `add-scope-health-surface`) catches it.
+
+The env var status SHALL be logged at info level on startup (`"Autonomous corrupt-DB rebuild is ENABLED via SOURCEGRAPH_AUTOREBUILD_CORRUPT_DBS"`) when enabled, and SHALL NOT be logged when disabled (the default has no signal).
+
+#### Scenario: Env var enabled — autonomous rebuild fires
+- **GIVEN** `SOURCEGRAPH_AUTOREBUILD_CORRUPT_DBS=1` is set on server startup AND a scope `backend` whose DB is physically corrupted
+- **WHEN** any tool call against `backend` triggers reactive verification (per the `storage` capability) and the integrity check confirms corruption
+- **THEN** `heals.jsonl` contains, in order: one `corruption-detected` line and one `corrupt-db-rebuild-started` line; the agent's tool call returns immediately with the original exception; within bounded wall-clock time (test wait, e.g. 30s), `heals.jsonl` gains a `corrupt-db-rebuilt` line with `ok = true`; `<repo>/.sourcegraph/orphans/backend-corrupt-<utc-iso>.db` exists with the original (corrupted) byte content; `<repo>/.sourcegraph/scopes/backend.db` is fresh; the `backend` registry row is `Status = "ok"`; subsequent tool calls against `backend` succeed
+
+#### Scenario: Env var unset — no autonomous rebuild
+- **GIVEN** `SOURCEGRAPH_AUTOREBUILD_CORRUPT_DBS` is unset (or set to `"0"` / `"false"` / `""`) AND a scope `backend` whose DB is physically corrupted
+- **WHEN** the same corruption-triggering call as above is made
+- **THEN** `heals.jsonl` contains one `corruption-detected` line; NO `corrupt-db-rebuild-started` line is written; the `backend` registry row is `Status = "degraded"`; subsequent calls return the degraded short-circuit; recovery requires an explicit `repair_scope mode=rebuild` call from the agent
+
+#### Scenario: Background rebuild interrupted by shutdown
+- **GIVEN** the env var is enabled AND an autonomous rebuild is in flight (cold-indexing) when the host receives shutdown
+- **WHEN** the host's cancellation token fires
+- **THEN** the rebuild's `Task.Run` body exits via `OperationCanceledException`; a `corrupt-db-rebuilt` heal line is written with `ok = false` and `details = "rebuild cancelled by host shutdown"`; the partially-built `scopes/<id>.db` is left in place; the next boot's stuck-`indexing` detection catches it (per `add-scope-health-surface`)
+
+### Requirement: Autonomous embeddings prune on cold-index completion
+
+`ScopeHost.ColdIndexAsync` SHALL call `IEmbeddingsStore.PruneOrphanedAsync()` after the cold-index reaches `Status = "ok"`, removing rows from `symbol_embeddings` whose `symbol_id` no longer exists in the `symbols` table. The same prune call SHALL fire from the `repair_scope mode=minimal` path (per `add-scope-repair-tools`), centralised in a small helper to avoid duplication.
+
+When the prune count > 0, the caller SHALL emit a heal event:
+- `kind = "embeddings-pruned"`
+- `ok = true`
+- `ms = <wall-clock elapsed>`
+- `details = $"removed {count} orphan rows"`
+
+When the count == 0, no heal event SHALL be emitted (zero-noise convention; cold-indexes that produce no orphans are the common case).
+
+When `PruneOrphanedAsync` itself throws, the caller SHALL log at warning level and emit a heal event with `kind = "embeddings-pruned"`, `ok = false`, `details = ex.Message`. The cold-index outcome (`ok` status) SHALL NOT be reverted on prune failure; the prune is best-effort.
+
+#### Scenario: Cold-index produces orphans, prune fires, heal recorded
+- **GIVEN** a scope `backend` whose cold-index just completed and whose `symbol_embeddings` table has 5 rows referencing `symbol_id` values that no longer exist in `symbols` (e.g. after a refactor that deleted the corresponding source files)
+- **WHEN** `ColdIndexAsync` completes the post-index prune step
+- **THEN** the 5 orphan rows are deleted from `symbol_embeddings`; `heals.jsonl` contains one line with `kind = "embeddings-pruned"`, `scope = "backend"`, `ok = true`, `details = "removed 5 orphan rows"`; the `backend` registry row remains `Status = "ok"`
+
+#### Scenario: Cold-index produces no orphans, no heal event
+- **GIVEN** a scope whose cold-index just completed and whose `symbol_embeddings` table has zero orphan rows
+- **WHEN** the prune step runs
+- **THEN** `PruneOrphanedAsync` returns 0; no `embeddings-pruned` heal line is written; the registry row remains `Status = "ok"`
+
+#### Scenario: Prune failure does not revert cold-index outcome
+- **GIVEN** a scope whose cold-index just completed and `PruneOrphanedAsync` throws (e.g. embeddings store is in a broken state)
+- **WHEN** the prune step catches the exception
+- **THEN** `heals.jsonl` contains one line with `kind = "embeddings-pruned"`, `ok = false`, `details` carrying the exception message; the registry row remains `Status = "ok"`; subsequent tool calls against the scope succeed
+
+#### Scenario: repair_scope minimal also emits the prune heal
+- **WHEN** `repair_scope(scope = "backend", mode = "minimal")` runs against a scope with 3 orphan embeddings rows
+- **THEN** the prune step within minimal mode emits one `embeddings-pruned` heal line with `details = "removed 3 orphan rows"`, in addition to the `repair-scope-invoked` heal line that the tool itself emits
+

@@ -335,6 +335,9 @@ to the client at handshake time.
 | Tool | Purpose |
 |---|---|
 | `list_scopes` | Enumerate registered scopes (id, name, root, project count, last-indexed time, status, isolation flag) |
+| `verify_scope` | Read-only per-scope health snapshot: schema version, status + message, row counts, `PRAGMA integrity_check` result, and a 20-file drift sample (count of files whose on-disk SHA-256 differs from the DB). Call before invoking repair tools. |
+| `repair_scope` | Recover one named scope. `mode = "minimal"` runs integrity check (refusing on corruption), prunes orphan embeddings, and retry-wraps a workspace reload. `mode = "rebuild"` archives the current DB to `orphans/<id>-rebuild-<ts>.db` and cold-indexes from sources. Single-scope only. |
+| `reconcile_drift` | Walk a scope's source tree, compare each file's on-disk SHA-256 to the DB, and apply the symmetric difference (reindex changed + index added + remove vanished). Use when results look stale or after a long offline period. `dry_run` previews without applying. |
 | `graph_stats` | Counts of files / symbols / references / edges — confirm the index is populated |
 | `usage_stats` | Per-tool call count, error count, latency, average response size, last-called time for the current process |
 | `ping` | Health check — returns `pong @ <UTC ISO-8601>` |
@@ -696,9 +699,38 @@ matches but no outgoing references in store …"`. Healthy installs never see
 this line. Repeated recoveries on the same files would indicate a regression
 in the upstream indexing flow worth investigating.
 
+## Corruption recovery
+
+When SQLite reports an on-disk corruption error (codes `11 = SQLITE_CORRUPT`
+or `26 = SQLITE_NOTADB`) during a tool call, the dispatch layer's
+`CorruptionGuard` runs `PRAGMA integrity_check` to verify. Three outcomes:
+
+- **Integrity check returns `"ok"`** — false alarm (transient I/O or VACUUM
+  race). Records `corruption-suspected-but-clean` and rethrows; the scope is
+  not marked degraded. The next call may succeed.
+- **Integrity check returns a failure string** — corruption confirmed. Records
+  `corruption-detected`, marks the scope `degraded` with status_message
+  `"corruption detected: <result>; call repair_scope mode=rebuild"`, rethrows.
+  Subsequent calls hit the degraded short-circuit until `repair_scope` runs.
+- **Integrity check itself throws** — DB so broken even the check fails.
+  Records `corruption-detected` with `ok=false` and the verification
+  exception, marks degraded, rethrows.
+
+By default the agent decides whether to recover (via `repair_scope mode=rebuild`).
+Setting `SOURCEGRAPH_AUTOREBUILD_CORRUPT_DBS=1` (or `true` / `yes`) opts into
+**autonomous rebuild**: on confirmed corruption the server fires
+`LiveIndexService.RebuildScopeAsync` on a background task, archiving the
+corrupt DB to `orphans/<id>-corrupt-<utc-iso>.db` and cold-indexing from
+sources. The original tool call still fails (the rebuild runs after), but the
+scope recovers without agent intervention. Heal log records
+`corrupt-db-rebuild-started` and `corrupt-db-rebuilt` (with `ok=true|false`)
+for the lifecycle. Off by default: an autonomous rebuild on a misclassified
+corruption silently destroys index state, so production deployments leave it
+off and let the agent escalate.
+
 ## Observability
 
-The server emits three signals you can hook into:
+The server emits five signals you can hook into:
 
 1. **JSONL audit log** — every tool call appends one line to
    `<root>/.sourcegraph/usage.jsonl`, capturing timestamp, tool name, args,
@@ -711,12 +743,36 @@ The server emits three signals you can hook into:
 3. **OpenTelemetry signals** — the server emits spans on
    `ActivitySource("DevBitsLab.Mcp.SourceGraph")` and metrics on
    `Meter("DevBitsLab.Mcp.SourceGraph")`. Counters: `sourcegraph.tool.calls`,
-   `sourcegraph.tool.errors`. Histograms: `sourcegraph.tool.duration` (ms),
-   `sourcegraph.tool.response_size` (bytes). Tags: `mcp.tool`, `mcp.tool.ok`,
-   `mcp.tool.scope`. Both signals are zero-cost when no listener is attached;
+   `sourcegraph.tool.errors`, `sourcegraph.heal.fired`. Histograms:
+   `sourcegraph.tool.duration` (ms), `sourcegraph.tool.response_size` (bytes).
+   Tool tags: `mcp.tool`, `mcp.tool.ok`, `mcp.tool.scope`. Heal tags: `kind`
+   (e.g. `orphan-db-archived`, `missing-db-detected`, `stuck-indexing-detected`),
+   `scope`, `ok`. All signals are zero-cost when no listener is attached;
    pick them up with the OpenTelemetry SDK or `dotnet-counters monitor --name
    sourcegraph-mcp DevBitsLab.Mcp.SourceGraph`.
-4. **MCP `notifications/progress`** — four tools opt in to live progress
+4. **Heal-event JSONL log** — internal state changes (boot reconciliation,
+   repair-tool invocations, corruption detection, embeddings prune) append
+   one line to `<root>/.sourcegraph/heals.jsonl` with shape
+   `{"ts","kind","scope","ok","ms","details"}`. Separate from `usage.jsonl`
+   (which tracks tool calls) to keep the two streams independently scannable.
+   Best-effort: write failures are swallowed and never surface to the agent.
+
+   Heal kinds across the three self-healing phases:
+
+   | Kind | Trigger | Phase |
+   |---|---|---|
+   | `orphan-db-archived` | Boot: scope DB file with no registry row, moved to `orphans/` | 1 |
+   | `missing-db-detected` | Boot: registry row but DB file missing | 1 |
+   | `stuck-indexing-detected` | Boot: prior process died with `status='indexing'` | 1 |
+   | `workspace-open-retried` | Cold-index: bounded retry succeeded (or all 4 attempts failed — 1 initial + 3 retries at `[1s, 5s, 25s]`) | 2 |
+   | `repair-scope-invoked` | `repair_scope` tool fired (mode + outcome in `details`) | 2 |
+   | `reconcile-drift-invoked` | `reconcile_drift` tool fired (counts in `details`) | 2 |
+   | `embeddings-pruned` | Orphan embedding rows removed (after cold-index, after `repair_scope minimal`) | 2/3 |
+   | `corruption-suspected-but-clean` | SQLite error code 11/26 surfaced but `integrity_check` passed (false alarm) | 3 |
+   | `corruption-detected` | SQLite error code 11/26 confirmed by `integrity_check`; scope marked degraded | 3 |
+   | `corrupt-db-rebuild-started` | Autonomous rebuild kicked off (env var enabled) | 3 |
+   | `corrupt-db-rebuilt` | Autonomous rebuild completed (success or failure in `ok`) | 3 |
+5. **MCP `notifications/progress`** — four tools opt in to live progress
    reporting: `semantic_search` (three checkpoints around ONNX-model load +
    vector search + formatting), `impact_of_change`, `module_summary` (one
    starting checkpoint each), and `find_definition` (cold-start phase

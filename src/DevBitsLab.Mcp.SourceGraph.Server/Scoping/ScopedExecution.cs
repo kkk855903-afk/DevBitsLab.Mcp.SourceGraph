@@ -127,7 +127,19 @@ public static class ScopedExecution
                 return DiagnosticResult.Error(
                     $"scope `{host.Scope.Id}` is degraded: {host.StatusMessage ?? "(no message)"}");
             }
-            return await onResolved(host).ConfigureAwait(false);
+            try
+            {
+                return await onResolved(host).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (CorruptionGuard.IsCorruptionError(ex) && CorruptionPolicy.Registry is not null)
+            {
+                // Reactive verification: run integrity_check, mark degraded if confirmed,
+                // optionally fire autonomous rebuild. Original exception still rethrown so the
+                // agent sees the failure once; subsequent calls hit the degraded short-circuit.
+                await CorruptionGuard.VerifyAndMarkAsync(host, CorruptionPolicy.Registry,
+                    ex, CorruptionPolicy.Logger, ct).ConfigureAwait(false);
+                throw;
+            }
         }
 
         // Multi-host fan-out: parallel-run, then concatenate Content lists with a per-scope header.
@@ -147,6 +159,13 @@ public static class ScopedExecution
             catch (OperationCanceledException) { throw; }
             catch (Exception ex)
             {
+                if (CorruptionGuard.IsCorruptionError(ex) && CorruptionPolicy.Registry is not null)
+                {
+                    // Don't bring down the whole multi-host fan-out on one corrupt scope —
+                    // verify, mark degraded, and continue with the structured per-scope error.
+                    await CorruptionGuard.VerifyAndMarkAsync(h, CorruptionPolicy.Registry,
+                        ex, CorruptionPolicy.Logger, ct).ConfigureAwait(false);
+                }
                 return (h.Scope.Id, DiagnosticResult.Error($"scope query failed: {ex.Message}"));
             }
         })).ConfigureAwait(false);
@@ -186,6 +205,12 @@ public static class ScopedExecution
         CancellationToken ct,
         IProgress<ProgressNotificationValue>? progress = null)
     {
+        // A scope that has already settled out of `"indexing"` doesn't need to be waited on —
+        // even if the Ready TCS hasn't been signalled (test fixtures often build a host directly
+        // with Status = "ok" and skip MarkReady). Checking Status first keeps such fixtures from
+        // hanging forever; the Ready.IsCompleted check below is the production-path short-circuit
+        // for hosts whose lifecycle is driven by LiveIndexService.
+        if (host.Status != "indexing") return;
         if (host.Ready.IsCompleted) return;
         if (progress is null)
         {

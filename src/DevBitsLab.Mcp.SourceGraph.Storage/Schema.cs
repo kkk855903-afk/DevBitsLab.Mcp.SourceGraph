@@ -1,6 +1,15 @@
 namespace DevBitsLab.Mcp.SourceGraph.Storage;
 
-internal static class Schema
+/// <summary>
+/// Storage-layer schema definitions. The class itself is public so callers outside the storage
+/// assembly can read <see cref="Version"/> (e.g. <c>verify_scope</c> reports it in its structured
+/// snapshot), but the SQL DDL strings (<see cref="V1"/>, <see cref="V2"/>,
+/// <see cref="V7Embeddings"/>, <see cref="DropAll"/>) are <c>internal</c> — they are
+/// implementation details of <see cref="SqliteGraphStore.EnsureSchemaAsync"/> and not a public
+/// contract. Exposing the DDL would freeze it into the public surface; downstream consumers
+/// should use the <see cref="IGraphStore"/> API to write data, not the raw SQL.
+/// </summary>
+public static class Schema
 {
     /// <summary>
     /// Bumped when the on-disk schema layout changes. <see cref="SqliteGraphStore.EnsureSchemaAsync"/>
@@ -28,7 +37,7 @@ internal static class Schema
     /// data path; <see cref="SqliteGraphStore.EnsureSchemaAsync"/> calls <see cref="DropAll"/>
     /// when the on-disk version is anything below 11.
     /// </summary>
-    public const string V1 = """
+    internal const string V1 = """
         CREATE TABLE IF NOT EXISTS schema_version (
             version INTEGER PRIMARY KEY
         );
@@ -158,7 +167,7 @@ internal static class Schema
         """;
 
     /// <summary>FTS5 trigram-tokenized index over symbols.name/fqn/signature/xml_summary, kept in sync via triggers.</summary>
-    public const string V2 = """
+    internal const string V2 = """
         CREATE VIRTUAL TABLE IF NOT EXISTS symbols_fts USING fts5(
             name,
             fqn,
@@ -234,7 +243,7 @@ internal static class Schema
     /// is parameterised so a future <c>--model</c> override with a different dimension can
     /// rebuild this part of the schema without dropping every other table.
     /// </summary>
-    public static string V7Embeddings(int dim) => $$"""
+    internal static string V7Embeddings(int dim) => $$"""
         CREATE VIRTUAL TABLE IF NOT EXISTS symbol_embeddings USING vec0(
             symbol_id INTEGER PRIMARY KEY,
             embedding FLOAT[{{dim}}]
@@ -249,7 +258,7 @@ internal static class Schema
     /// Includes drops for the legacy v10-and-earlier <c>attributes</c> / <c>attributes_fts</c>
     /// names so a v10 DB cleanly rebuilds into the v11 <c>annotations</c> tables.
     /// </summary>
-    public const string DropAll = """
+    internal const string DropAll = """
         DROP VIEW    IF EXISTS vw_recent_changes;
         DROP TABLE   IF EXISTS symbol_history;
         DROP TABLE   IF EXISTS diagnostics;

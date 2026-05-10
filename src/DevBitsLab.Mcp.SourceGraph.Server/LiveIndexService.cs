@@ -3,6 +3,7 @@ using DevBitsLab.Mcp.SourceGraph.Core;
 using DevBitsLab.Mcp.SourceGraph.Embeddings;
 using DevBitsLab.Mcp.SourceGraph.Indexing;
 using DevBitsLab.Mcp.SourceGraph.Sdk;
+using DevBitsLab.Mcp.SourceGraph.Server.Observability;
 using DevBitsLab.Mcp.SourceGraph.Server.Plugins;
 using DevBitsLab.Mcp.SourceGraph.Server.Scoping;
 using DevBitsLab.Mcp.SourceGraph.Storage;
@@ -34,8 +35,23 @@ public sealed class LiveIndexService : BackgroundService
     private readonly AnalyzerPipeline _analyzerPipeline;
     private readonly LanguageIndexerDispatcher _languageDispatcher;
     private readonly LanguageProjectFactoryRegistry _projectFactories;
+    private readonly RepoRootInfo _repoRoot;
     private readonly ILogger<LiveIndexService> _logger;
     private readonly ILoggerFactory _loggerFactory;
+    private readonly DateTimeOffset _processStart = DateTimeOffset.UtcNow;
+    // Set in ExecuteAsync from BackgroundService.stoppingToken; reads default(CancellationToken)
+    // until then. Used by RebuildScopeAsync's StartWatcher call (the watcher must outlive the
+    // tool request that triggered the rebuild) and by the autonomous-rebuild delegate set in
+    // Program.cs (the fire-and-forget Task must outlive the failed tool call).
+    private CancellationToken _hostStoppingToken;
+
+    /// <summary>
+    /// Cancellation token tied to the host's lifetime (set during <see cref="ExecuteAsync"/>).
+    /// Callers that schedule work which must outlive the originating tool request — autonomous
+    /// rebuild, watcher install after a rebuild — should use this token instead of the per-call
+    /// <c>CancellationToken</c> the MCP SDK threads through tool method parameters.
+    /// </summary>
+    public CancellationToken HostStoppingToken => _hostStoppingToken;
     // Hosts prepared during StartAsync — registered with the router with status="indexing" before
     // the MCP transport (registered after us in DI order) starts accepting requests. ExecuteAsync
     // drives the cold-index against this list; ScopeHost.Ready completes for tools waiting on it.
@@ -61,6 +77,7 @@ public sealed class LiveIndexService : BackgroundService
         AnalyzerPipeline analyzerPipeline,
         LanguageIndexerDispatcher languageDispatcher,
         LanguageProjectFactoryRegistry projectFactories,
+        RepoRootInfo repoRoot,
         ILogger<LiveIndexService> logger,
         ILoggerFactory loggerFactory)
     {
@@ -74,6 +91,7 @@ public sealed class LiveIndexService : BackgroundService
         _analyzerPipeline = analyzerPipeline;
         _languageDispatcher = languageDispatcher;
         _projectFactories = projectFactories;
+        _repoRoot = repoRoot;
         _logger = logger;
         _loggerFactory = loggerFactory;
     }
@@ -95,6 +113,11 @@ public sealed class LiveIndexService : BackgroundService
         if (_config.Scopes.Count > 0)
         {
             await _registry.EnsureSchemaAsync(cancellationToken).ConfigureAwait(false);
+            // Reconcile orphan / missing-DB / stuck-`indexing` state before per-scope bring-up
+            // so the registry reflects the corrected state when PrepareScopeAsync runs against it.
+            // Best-effort: any IO failure here is logged + emitted as a heal event with ok=false,
+            // but never aborts the boot sequence.
+            await ReconcileOnBootAsync(cancellationToken).ConfigureAwait(false);
 
             _logger.LogInformation("Preparing {Count} scope(s) for live indexing: {Ids}",
                 _config.Scopes.Count, string.Join(", ", _config.Scopes.Select(s => s.Id)));
@@ -115,6 +138,11 @@ public sealed class LiveIndexService : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        // Capture the host's lifetime token so RebuildScopeAsync (and the autonomous-rebuild
+        // delegate set in Program.cs) can use it instead of per-call MCP request tokens — work
+        // scheduled mid-request must outlive the response.
+        _hostStoppingToken = stoppingToken;
+
         // BackgroundService.ExecuteAsync is awaited by the host's StartAsync chain in some
         // BackgroundService variants; the explicit Task.Yield here detaches LiveIndexService's
         // long-running cold-index work from the startup path so MCP stdio transport (which sits
@@ -161,6 +189,13 @@ public sealed class LiveIndexService : BackgroundService
         }
         catch (OperationCanceledException) { /* shutting down */ }
     }
+
+    /// <summary>
+    /// Boot-time reconciliation: delegates to <see cref="BootReconciler.ReconcileAsync"/> so the
+    /// branch logic stays in a standalone, unit-testable helper.
+    /// </summary>
+    private Task ReconcileOnBootAsync(CancellationToken ct) =>
+        BootReconciler.ReconcileAsync(_registry, _repoRoot.Path, _processStart, _logger, ct);
 
     /// <summary>
     /// Boot the scope-config watcher and a long-running consumer task that drives the diff-and-
@@ -518,20 +553,29 @@ public sealed class LiveIndexService : BackgroundService
         {
             // Phase 1: workspace open. The MSBuildWorkspace pass dominates this section for real
             // solutions (10s+ on a 1000-doc tree). Emit the coarse phase event so any tool waiting
-            // on Ready (and forwarding our progress) sees motion.
+            // on Ready (and forwarding our progress) sees motion. The open + index_all pair runs
+            // under the bounded-retry policy from `add-scope-repair-tools` (3 attempts at
+            // [1s, 5s, 25s]); the "indexing" phase event fires inside the indexAllAsync delegate
+            // so it lands AFTER a successful open (possibly after retries) and BEFORE the actual
+            // index walk begins, keeping progress monotonically increasing.
             host.ProgressSource.Emit(new ModelContextProtocol.ProgressNotificationValue
             {
                 Progress = 0.0f, Total = 1.0f, Message = "opening workspace",
             });
-            await host.Indexer.OpenAsync(solutionPath, ct).ConfigureAwait(false);
-            // Phase 2: cold index. The IndexAllAsync call walks every document, writes symbols /
-            // refs / edges. We can't see per-document progress from outside the indexer; emit the
-            // single phase marker here so progress monotonically increases.
-            host.ProgressSource.Emit(new ModelContextProtocol.ProgressNotificationValue
-            {
-                Progress = 0.5f, Total = 1.0f, Message = "indexing",
-            });
-            var initial = await host.Indexer.IndexAllAsync(ct).ConfigureAwait(false);
+            var initial = await WorkspaceOpenRetry.RunAsync(
+                host.Scope.Id,
+                tk => host.Indexer.OpenAsync(solutionPath, tk),
+                tk =>
+                {
+                    host.ProgressSource.Emit(new ModelContextProtocol.ProgressNotificationValue
+                    {
+                        Progress = 0.5f, Total = 1.0f, Message = "indexing",
+                    });
+                    return host.Indexer.IndexAllAsync(tk);
+                },
+                WorkspaceOpenRetry.DefaultBackoffs,
+                _logger,
+                ct).ConfigureAwait(false);
             _logger.LogInformation("Scope `{Id}` initial index complete in {Elapsed}: {Files} files re-processed",
                 scope.Id, initial.Elapsed, initial.FilesIndexed);
 
@@ -622,7 +666,34 @@ public sealed class LiveIndexService : BackgroundService
                 host.StatusMessage = null;
             }
             host.LastIndexedAt = DateTimeOffset.UtcNow;
-            await _registry.UpsertAsync(ToRow(scope, host.Status, host.StatusMessage, host.FailedProjects, host.FailedFiles), ct).ConfigureAwait(false);
+            await _registry.UpsertAsync(
+                ToRow(scope, host.Status, host.StatusMessage, host.FailedProjects, host.FailedFiles),
+                ct).ConfigureAwait(false);
+
+            // Autonomous embeddings prune: cold-index can leave behind embeddings for symbols
+            // that were deleted (refactors, file renames, generator-output drift). Prune is
+            // cheap (one DELETE) and reversible (embeddings regenerate on next semantic_search).
+            // Best-effort: a failure here does NOT revert the scope to degraded — the cold-index
+            // outcome is what counts; the prune is opportunistic cleanup.
+            try
+            {
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                var pruned = await host.EmbeddingsStore.PruneOrphanedAsync(ct).ConfigureAwait(false);
+                sw.Stop();
+                if (pruned > 0)
+                {
+                    Observability.HealLog.Append(kind: "embeddings-pruned", scope: scope.Id, ok: true,
+                        ms: sw.Elapsed.TotalMilliseconds, details: $"removed {pruned} orphan rows");
+                }
+                // Zero-noise convention: don't log a heal event when nothing was pruned.
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception pruneEx)
+            {
+                _logger.LogWarning(pruneEx, "Scope `{Id}`: embeddings prune after cold-index failed; ignoring", scope.Id);
+                Observability.HealLog.Append(kind: "embeddings-pruned", scope: scope.Id, ok: false,
+                    ms: 0, details: pruneEx.Message);
+            }
         }
         catch (OperationCanceledException) { throw; }
         catch (Exception ex)
@@ -641,6 +712,107 @@ public sealed class LiveIndexService : BackgroundService
             host.ProgressSource.MarkReady();
             host.MarkReady();
         }
+    }
+
+    /// <summary>
+    /// Drives the <c>minimal</c> repair path for the named scope: delegates to
+    /// <see cref="MinimalRepair.RunAsync"/> with the production
+    /// <see cref="WorkspaceOpenRetry.DefaultBackoffs"/>.
+    /// </summary>
+    public Task<MinimalRepairResult> MinimalRepairScopeAsync(
+        string scopeId,
+        CancellationToken ct,
+        IProgress<ModelContextProtocol.ProgressNotificationValue>? progress = null)
+    {
+        if (!_router.TryGet(scopeId, out var host))
+        {
+            return Task.FromResult(new MinimalRepairResult(
+                Refused: true, IntegrityCheck: "scope-not-found", PrunedEmbeddings: 0,
+                Reindexed: false, Message: "scope not registered"));
+        }
+        return MinimalRepair.RunAsync(host, _registry, WorkspaceOpenRetry.DefaultBackoffs, _logger, ct, progress);
+    }
+
+    /// <summary>
+    /// Drives a full rebuild of the named scope: archives the existing DB to
+    /// <c>orphans/&lt;id&gt;-&lt;archiveDiscriminator&gt;-&lt;utc-iso&gt;.db</c> (if present), disposes the existing
+    /// <see cref="ScopeHost"/>, runs <see cref="PrepareScopeAsync"/> + <see cref="RunInitialIndexAsync"/>
+    /// for the scope, and registers the new host with the router (the call to
+    /// <see cref="ScopeRouter.Register"/> overwrites the prior entry by id, so the rebuild is
+    /// transparent to other components). Used by the <c>repair_scope</c> tool's <c>rebuild</c>
+    /// mode and (in Phase 3) by the autonomous corrupt-DB recovery path.
+    ///
+    /// Returns the post-rebuild <see cref="ScopeHost"/> on success. The host's <see cref="ScopeHost.Status"/>
+    /// reflects the cold-index outcome (<c>"ok"</c> or <c>"degraded"</c>); the caller decides
+    /// whether to surface that as a tool-level success or failure.
+    /// </summary>
+    public async Task<ScopeHost?> RebuildScopeAsync(string scopeId, string archiveDiscriminator, CancellationToken ct)
+    {
+        if (!_router.TryGet(scopeId, out var oldHost))
+        {
+            // No registered host for this id — must be a config scope that's been removed, or
+            // an id that doesn't exist. Nothing to rebuild.
+            return null;
+        }
+        var scope = oldHost.Scope;
+        var dbPath = ScopeLayout.ScopeDbPath(_repoRoot.Path, scopeId);
+
+        // Step 1 — archive the existing DB if present. We dispose the host first to release SQLite
+        // handles; otherwise the move would race with the running connection.
+        await oldHost.DisposeAsync().ConfigureAwait(false);
+        // Drop SQLite's connection pool so any other handle on this DB gets reaped before the move.
+        Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+
+        if (File.Exists(dbPath))
+        {
+            try
+            {
+                var orphansDir = ScopeLayout.OrphansDirectory(_repoRoot.Path);
+                Directory.CreateDirectory(orphansDir);
+                var ts = DateTimeOffset.UtcNow.ToString("yyyy-MM-ddTHH-mm-ssZ");
+                var dest = Path.Join(orphansDir, $"{scopeId}-{archiveDiscriminator}-{ts}.db");
+                File.Move(dbPath, dest);
+                foreach (var suffix in new[] { "-wal", "-shm" })
+                {
+                    var s = dbPath + suffix;
+                    var d = dest + suffix;
+                    if (File.Exists(s) && !File.Exists(d))
+                    {
+                        try { File.Move(s, d); } catch (IOException) { /* best-effort */ }
+                    }
+                }
+                _logger.LogInformation("Archived scope `{Id}` DB to {Dest} ahead of rebuild", scopeId, dest);
+            }
+            catch (IOException ex)
+            {
+                _logger.LogWarning(ex, "Failed to archive scope `{Id}` DB before rebuild; continuing", scopeId);
+            }
+        }
+
+        // Step 2 — re-prepare + cold-index. PrepareScopeAsync registers the new host with the
+        // router (overwriting the disposed entry by id). RunInitialIndexAsync settles status.
+        var newHost = await PrepareScopeAsync(scope, ct).ConfigureAwait(false);
+        if (newHost is null)
+        {
+            // Prepare failed — registry already reflects degraded state, the old entry has been
+            // disposed but isn't in the router anymore (PrepareScopeAsync's catch path doesn't
+            // call Register). Surface the null so the tool body can render the appropriate
+            // diagnostic.
+            return null;
+        }
+        await RunInitialIndexAsync(newHost, ct).ConfigureAwait(false);
+
+        // Re-attach the watcher so live updates resume after the rebuild. The watcher's loop
+        // runs as a `Task.Run(..., stoppingToken)` and is bound to whatever token we pass; if we
+        // used the caller's `ct` (the MCP request token), the watcher would be cancelled when
+        // the tool response goes back, silently breaking live updates after every rebuild. Use
+        // the captured host-lifetime token so the watcher lives as long as the process.
+        if (newHost.Status == "ok")
+        {
+            StartWatcher(newHost, _hostStoppingToken);
+        }
+
+        return newHost;
     }
 
     private void StartWatcher(ScopeHost host, CancellationToken stoppingToken)
@@ -881,6 +1053,13 @@ public sealed record LiveIndexConfig(
     bool WatchConfig,
     int DebounceMs = 200,
     int ScopeReplaceGraceMs = 5000);
+
+/// <summary>
+/// Outcome of <see cref="LiveIndexService.MinimalRepairScopeAsync"/>. <see cref="Refused"/> = true
+/// when the integrity check failed and the rebuild path is required; the agent uses this to
+/// decide whether to escalate to <c>mode=rebuild</c>.
+/// </summary>
+public sealed record MinimalRepairResult(bool Refused, string IntegrityCheck, int PrunedEmbeddings, bool Reindexed, string Message);
 
 /// <summary>
 /// Trivial JSON serialiser for <see cref="ScopeProjectSet"/> so the registry can persist the

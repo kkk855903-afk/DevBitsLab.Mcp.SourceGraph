@@ -49,6 +49,40 @@ A persistent JSONL log of every tool call lives at
 the SQL text; the log is the evidence base for which ad-hoc queries deserve to be
 promoted into curated tools.
 
+A second JSONL log at `<solution>/.sourcegraph/heals.jsonl` records internal
+state changes — boot reconciliation today (orphan DBs archived, missing DBs
+detected, stuck `indexing` rows demoted), repair-tool invocations and
+corruption-recovery actions in later phases. Same shape as `usage.jsonl`
+(`{ts, kind, scope, ok, ms, details}`) but in a separate file so the two
+streams are independently scannable. The matching `sourcegraph.heal.fired`
+Counter on the existing OpenTelemetry meter exposes the same events for live
+scraping.
+
+If a scope looks stale or returns empty results, call `verify_scope` first —
+it's a read-only health snapshot (schema version, row counts, integrity check,
+20-file drift sample) that doesn't mutate any state. Then dispatch on what it
+reports:
+
+- `drift_sample.changed` is high → call `reconcile_drift` (walks the source
+  tree, applies the symmetric difference). `dry_run = true` previews.
+- `integrity_check` is non-`"ok"` → call `repair_scope mode="rebuild"`
+  (archives the current DB and cold-indexes from sources).
+- Status is `"degraded"` from a transient cause (workspace race, stuck
+  `indexing` row from a prior crash) → call `repair_scope mode="minimal"`
+  first; it runs integrity check + prune + retry-wrap a workspace reload.
+
+Cold-index transient failures get a free 3-attempt bounded retry under
+`[1s, 5s, 25s]` backoff before the scope lands in `degraded` — don't intervene
+in the first ~30 seconds of startup unless the user is actively waiting.
+
+When a tool call fails with a SQLite corruption error, the dispatch layer
+auto-runs `integrity_check`: a clean check leaves the scope alone (false
+alarm — try again); a confirmed failure marks the scope `degraded` with
+`status_message` hinting `repair_scope mode=rebuild`. The next call against
+that scope returns the degraded short-circuit (no SQLite contact). The
+autonomous-rebuild env var (`SOURCEGRAPH_AUTOREBUILD_CORRUPT_DBS`) is opt-in;
+on production it's off, so the agent decides when to escalate to rebuild.
+
 For ad-hoc questions that don't fit a curated tool — aggregations, joins, "how many
 public types use X", "which classes implement IDisposable but lack `Dispose`",
 "which `[Obsolete]` types have outstanding CS-warnings", "which methods authored
