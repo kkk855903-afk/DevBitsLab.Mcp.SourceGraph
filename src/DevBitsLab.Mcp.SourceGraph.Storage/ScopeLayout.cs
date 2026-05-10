@@ -27,20 +27,20 @@ public static class ScopeLayout
     public const string LegacyDbName = "graph.db";
 
     /// <summary>The <c>.sourcegraph</c> directory under the given repo root.</summary>
-    public static string SourcegraphDir(string repoRoot) => Path.Combine(repoRoot, DotDir);
+    public static string SourcegraphDir(string repoRoot) => Path.Join(repoRoot, DotDir);
 
     /// <summary>The scope registry DB (<c>_meta.db</c>).</summary>
-    public static string MetaDbPath(string repoRoot) => Path.Combine(SourcegraphDir(repoRoot), MetaDbName);
+    public static string MetaDbPath(string repoRoot) => Path.Join(SourcegraphDir(repoRoot), MetaDbName);
 
     /// <summary>The directory holding per-scope DBs.</summary>
-    public static string ScopesDirectory(string repoRoot) => Path.Combine(SourcegraphDir(repoRoot), ScopesDir);
+    public static string ScopesDirectory(string repoRoot) => Path.Join(SourcegraphDir(repoRoot), ScopesDir);
 
     /// <summary>The DB path for a specific scope id. Caller must validate the id beforehand.</summary>
     public static string ScopeDbPath(string repoRoot, string scopeId) =>
-        Path.Combine(ScopesDirectory(repoRoot), scopeId + ".db");
+        Path.Join(ScopesDirectory(repoRoot), scopeId + ".db");
 
     /// <summary>The legacy single-scope graph DB (pre-scoping layout).</summary>
-    public static string LegacyDbPath(string repoRoot) => Path.Combine(SourcegraphDir(repoRoot), LegacyDbName);
+    public static string LegacyDbPath(string repoRoot) => Path.Join(SourcegraphDir(repoRoot), LegacyDbName);
 
     /// <summary>
     /// One-shot migrator: if the legacy <c>&lt;repo&gt;/.sourcegraph/graph.db</c> exists and

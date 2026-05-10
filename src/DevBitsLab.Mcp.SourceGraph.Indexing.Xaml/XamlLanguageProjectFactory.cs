@@ -162,7 +162,7 @@ public sealed class XamlLanguageProjectFactory : ILanguageProjectFactory
                 if (include.IndexOfAny(new[] { '*', '?' }) >= 0) continue; // globbed; defer to fs walk
                 if (!include.EndsWith(".xaml", StringComparison.OrdinalIgnoreCase)) continue;
                 var relative = include.Replace('\\', '/');
-                var absolute = Path.IsPathRooted(relative) ? relative : Path.GetFullPath(Path.Combine(projectDir, relative));
+                var absolute = Path.IsPathRooted(relative) ? relative : Path.GetFullPath(Path.Join(projectDir, relative));
                 results.Add(absolute);
             }
         }

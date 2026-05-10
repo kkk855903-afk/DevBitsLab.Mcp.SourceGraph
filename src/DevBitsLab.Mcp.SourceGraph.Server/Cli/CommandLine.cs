@@ -269,20 +269,20 @@ internal sealed class CommandLine
             if (!string.IsNullOrEmpty(solutionDir))
             {
                 // Post-scoping layout: scopes/default.db. The migrator handles the legacy graph.db.
-                return EnsureDir(Path.Combine(solutionDir, ".sourcegraph", "scopes", "default.db"));
+                return EnsureDir(Path.Join(solutionDir, ".sourcegraph", "scopes", "default.db"));
             }
         }
 
         var userCache =
             Environment.GetEnvironmentVariable("XDG_CACHE_HOME")
             ?? Environment.GetEnvironmentVariable("LOCALAPPDATA")
-            ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile, Environment.SpecialFolderOption.DoNotVerify), ".cache");
+            ?? Path.Join(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile, Environment.SpecialFolderOption.DoNotVerify), ".cache");
         if (!string.IsNullOrEmpty(userCache))
         {
-            return EnsureDir(Path.Combine(userCache, "sourcegraph-mcp", "graph.db"));
+            return EnsureDir(Path.Join(userCache, "sourcegraph-mcp", "graph.db"));
         }
 
-        return EnsureDir(Path.Combine(Path.GetTempPath(), "sourcegraph-mcp", "graph.db"));
+        return EnsureDir(Path.Join(Path.GetTempPath(), "sourcegraph-mcp", "graph.db"));
     }
 
     private static string EnsureDir(string filePath)

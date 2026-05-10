@@ -112,7 +112,7 @@ static async Task<int> RunServeAsync(CommandLine cli)
 
     var dbDir = ScopeLayout.SourcegraphDir(repoRoot);
     Directory.CreateDirectory(dbDir);
-    ToolMetrics.Configure(Path.Combine(dbDir, "usage.jsonl"));
+    ToolMetrics.Configure(Path.Join(dbDir, "usage.jsonl"));
 
     var embeddingsEnabled = !cli.NoEmbeddings;
     // Always know the active model identity so the vec0 table can be sized consistently
@@ -664,7 +664,7 @@ static async Task<bool> ResolveHistoryDisabledForScopesAsync(CommandLine cli, Sc
     foreach (var scope in config.Scopes)
     {
         var solutionDir = scope.ProjectSet is ScopeProjectSet.Solutions s && s.Items.Count > 0
-            ? Path.GetDirectoryName(Path.IsPathRooted(s.Items[0]) ? s.Items[0] : Path.Combine(scope.Root, s.Items[0]))
+            ? Path.GetDirectoryName(Path.IsPathRooted(s.Items[0]) ? s.Items[0] : Path.Join(scope.Root, s.Items[0]))
             : scope.Root;
         if (string.IsNullOrEmpty(solutionDir)) continue;
         var probe = new GitBlameRunner();

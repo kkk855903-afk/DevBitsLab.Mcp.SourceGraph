@@ -61,7 +61,7 @@ public sealed class SolutionWatcher : IAsyncDisposable
             _gitHeadWatcher.Created += OnGitHeadEvent;
             _gitHeadWatcher.Renamed += (s, e) => OnGitHeadEvent(s, e);
             _gitHeadWatcher.EnableRaisingEvents = true;
-            _logger.LogInformation("Watching git HEAD at {Path}", Path.Combine(gitHeadDir, "HEAD"));
+            _logger.LogInformation("Watching git HEAD at {Path}", Path.Join(gitHeadDir, "HEAD"));
         }
 
         _processor = Task.Run(() => ProcessAsync(_cts.Token));
@@ -76,7 +76,7 @@ public sealed class SolutionWatcher : IAsyncDisposable
     /// </summary>
     internal static string? ResolveGitHeadDir(string solutionRoot, ILogger logger)
     {
-        var dotGit = Path.Combine(solutionRoot, ".git");
+        var dotGit = Path.Join(solutionRoot, ".git");
         if (Directory.Exists(dotGit)) return dotGit;
         if (!File.Exists(dotGit)) return null;
 
@@ -88,7 +88,7 @@ public sealed class SolutionWatcher : IAsyncDisposable
             var dir = content[prefix.Length..].Trim();
             if (!Path.IsPathRooted(dir))
             {
-                dir = Path.GetFullPath(Path.Combine(solutionRoot, dir));
+                dir = Path.GetFullPath(Path.Join(solutionRoot, dir));
             }
             return Directory.Exists(dir) ? dir : null;
         }

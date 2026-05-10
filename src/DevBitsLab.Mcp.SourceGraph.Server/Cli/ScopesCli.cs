@@ -13,7 +13,7 @@ internal static class ScopesCli
     public static async Task<int> RunInitAsync(CommandLine cli)
     {
         var root = cli.ResolvedRepoRoot();
-        var existing = Path.Combine(root, ScopeConfigLoader.FileName);
+        var existing = Path.Join(root, ScopeConfigLoader.FileName);
         if (File.Exists(existing))
         {
             await Console.Error.WriteLineAsync($"{ScopeConfigLoader.FileName} already exists at {existing}; remove it first to re-scaffold.").ConfigureAwait(false);
@@ -44,7 +44,7 @@ internal static class ScopesCli
         var defaultScope = scopes.Count == 1 ? scopes[0].Id : null;
         var config = new ScopeConfig(scopes, defaultScope);
         ScopeConfigLoader.Save(root, config);
-        Console.WriteLine($"Wrote {Path.Combine(root, ScopeConfigLoader.FileName)} with {scopes.Count} scope(s):");
+        Console.WriteLine($"Wrote {Path.Join(root, ScopeConfigLoader.FileName)} with {scopes.Count} scope(s):");
         foreach (var scope in scopes) Console.WriteLine($"  - {scope.Id}  ->  {((ScopeProjectSet.Solutions)scope.ProjectSet).Items[0]}");
         return 0;
     }

@@ -71,7 +71,7 @@ public static class ScopeConfigLoader
     /// </summary>
     public static ScopeConfig Load(string repoRoot, IReadOnlyList<string>? discoveredSolutions = null)
     {
-        var path = Path.Combine(repoRoot, FileName);
+        var path = Path.Join(repoRoot, FileName);
         if (!File.Exists(path))
         {
             return Synthesise(repoRoot, discoveredSolutions ?? Array.Empty<string>());
@@ -254,7 +254,7 @@ public static class ScopeConfigLoader
     /// </summary>
     public static void Save(string repoRoot, ScopeConfig config)
     {
-        var path = Path.Combine(repoRoot, FileName);
+        var path = Path.Join(repoRoot, FileName);
         File.WriteAllText(path, Serialise(config));
     }
 }

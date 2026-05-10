@@ -34,7 +34,7 @@ public sealed class ModelStore
 
     /// <summary>Path that holds the cached files for a specific model id.</summary>
     public string DirectoryFor(string modelId) =>
-        Path.Combine(_baseDir, SanitiseId(modelId));
+        Path.Join(_baseDir, SanitiseId(modelId));
 
     /// <summary>True when every file the model identity requires is present on disk.</summary>
     public bool IsCached(string modelId)
@@ -43,8 +43,8 @@ public sealed class ModelStore
         if (!Directory.Exists(dir)) return false;
         // We require the ONNX graph and the tokenizer.json at minimum; size verification
         // is left to the caller / the manifest check.
-        return File.Exists(Path.Combine(dir, "model.onnx"))
-            && File.Exists(Path.Combine(dir, "tokenizer.json"));
+        return File.Exists(Path.Join(dir, "model.onnx"))
+            && File.Exists(Path.Join(dir, "tokenizer.json"));
     }
 
     /// <summary>
@@ -52,7 +52,7 @@ public sealed class ModelStore
     /// Use <see cref="IsCached"/> to verify presence first.
     /// </summary>
     public string FilePath(string modelId, string fileName) =>
-        Path.Combine(DirectoryFor(modelId), fileName);
+        Path.Join(DirectoryFor(modelId), fileName);
 
     /// <summary>
     /// Default cache root. Mirrors the convention `<see cref="DiskCachePath"/>` for the
@@ -66,8 +66,8 @@ public sealed class ModelStore
         var root =
             Environment.GetEnvironmentVariable("XDG_CACHE_HOME")
             ?? Environment.GetEnvironmentVariable("LOCALAPPDATA")
-            ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile, Environment.SpecialFolderOption.DoNotVerify), ".cache");
-        return Path.Combine(root, "devbitslab.sourcegraph", "models");
+            ?? Path.Join(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile, Environment.SpecialFolderOption.DoNotVerify), ".cache");
+        return Path.Join(root, "devbitslab.sourcegraph", "models");
     }
 
     private static string SanitiseId(string modelId)
@@ -93,7 +93,7 @@ public sealed class ModelStore
 
         foreach (var entry in manifest)
         {
-            var dest = Path.Combine(dir, entry.FileName);
+            var dest = Path.Join(dir, entry.FileName);
             if (File.Exists(dest) && (entry.ExpectedSha256 is null || await VerifySha256Async(dest, entry.ExpectedSha256, ct).ConfigureAwait(false)))
             {
                 _logger.LogDebug("Model file {File} already cached", entry.FileName);

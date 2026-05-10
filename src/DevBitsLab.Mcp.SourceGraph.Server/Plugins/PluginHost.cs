@@ -76,7 +76,7 @@ public sealed class PluginHost
             // ".sourcegraph/plugins/Foo.dll" without remembering the absolute path.
             assemblyPath = Path.IsPathRooted(pref.Path!)
                 ? pref.Path!
-                : Path.GetFullPath(Path.Combine(_repoRoot, pref.Path!));
+                : Path.GetFullPath(Path.Join(_repoRoot, pref.Path!));
             if (!File.Exists(assemblyPath))
             {
                 throw new FileNotFoundException($"Plugin DLL not found: {assemblyPath}");
@@ -231,9 +231,9 @@ public sealed class PluginHost
     /// </summary>
     private async Task<string> RestoreNuGetPluginAsync(PluginRef pref, CancellationToken ct)
     {
-        var restoreDir = Path.Combine(_repoRoot, ".sourcegraph", "plugins", "restore");
+        var restoreDir = Path.Join(_repoRoot, ".sourcegraph", "plugins", "restore");
         Directory.CreateDirectory(restoreDir);
-        var pluginsCsproj = Path.Combine(restoreDir, "plugins.csproj");
+        var pluginsCsproj = Path.Join(restoreDir, "plugins.csproj");
 
         // Single project file restoring every NuGet plugin in one shot; rewriting it is cheap
         // and keeps the on-disk state aligned with the current `.sourcegraph.json`.
@@ -277,19 +277,19 @@ public sealed class PluginHost
         // We ask `dotnet build /t:_FindPluginAssemblies` indirectly: the simplest portable thing
         // is to look in the global packages folder. Mirrors the path NuGet creates by default.
         var nugetGlobal = Environment.GetEnvironmentVariable("NUGET_PACKAGES")
-            ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".nuget", "packages");
-        var pkgDir = Path.Combine(nugetGlobal, pref.Package!.ToLowerInvariant(), pref.Version!);
+            ?? Path.Join(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".nuget", "packages");
+        var pkgDir = Path.Join(nugetGlobal, pref.Package!.ToLowerInvariant(), pref.Version!);
         if (!Directory.Exists(pkgDir))
         {
             throw new DirectoryNotFoundException($"Restored package directory missing: {pkgDir}");
         }
         // Pick the first net10.0 / netstandard2.1 / netstandard2.0 dll matching the package id.
-        var libDir = Path.Combine(pkgDir, "lib");
+        var libDir = Path.Join(pkgDir, "lib");
         if (!Directory.Exists(libDir)) throw new DirectoryNotFoundException($"`lib/` missing under {pkgDir}");
         var preferredTfms = new[] { "net10.0", "net9.0", "net8.0", "netstandard2.1", "netstandard2.0" };
         foreach (var tfm in preferredTfms)
         {
-            var candidate = Path.Combine(libDir, tfm, pref.Package + ".dll");
+            var candidate = Path.Join(libDir, tfm, pref.Package + ".dll");
             if (File.Exists(candidate)) return candidate;
         }
         // Fallback: any DLL named after the package id.

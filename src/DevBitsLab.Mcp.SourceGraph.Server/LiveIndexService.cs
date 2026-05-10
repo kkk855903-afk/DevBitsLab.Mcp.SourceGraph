@@ -502,7 +502,7 @@ public sealed class LiveIndexService : BackgroundService
         if (scope.ProjectSet is ScopeProjectSet.Solutions s && s.Items.Count > 0)
         {
             var path = s.Items[0];
-            return Path.IsPathRooted(path) ? path : Path.Combine(scope.Root, path);
+            return Path.IsPathRooted(path) ? path : Path.Join(scope.Root, path);
         }
         return null;
     }
