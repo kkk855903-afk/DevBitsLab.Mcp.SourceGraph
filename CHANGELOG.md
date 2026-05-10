@@ -10,6 +10,8 @@ below note which package the change applies to.
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-05-10
+
 ### Fixed
 - **Semantic search now actually works on a fresh checkout.** Three coordinated
   changes that together close the gap between "documented as available" and
