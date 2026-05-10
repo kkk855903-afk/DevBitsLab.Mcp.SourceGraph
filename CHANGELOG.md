@@ -69,6 +69,30 @@ below note which package the change applies to.
   pass an explicit `limit=`. (`output-budget-cap`)
 
 ### Added
+- **Live `.sourcegraph.json` reload — no restart required.** New
+  `ScopeConfigWatcher` (mtime-polled at 200ms) plus `ScopeDiff` +
+  `ScopeRouter.Replace`/`Unregister` primitives feed
+  `LiveIndexService.OnConfigChangedAsync`, which routes each save through the
+  four delta kinds: **add** (new scope passes through the existing
+  `PrepareScopeAsync` → `RunInitialIndexAsync` → `StartWatcher` chain),
+  **remove** (host disposed, registry row dropped, on-disk per-scope DB
+  preserved as a re-add cache), **modify** (atomic-swap via
+  `ScopeRouter.Replace` with a 5s deferred-disposal grace window so in-flight
+  tool calls against the old host complete cleanly), and **default-scope**
+  flip (router metadata only, no scope is reindexed). Malformed saves are
+  parse-tolerant: the watcher logs at info and emits nothing, leaving the
+  running scope set untouched until the next valid save. File deletion (or
+  rename away from the repo root) reverts to the synthesised default. Plugin
+  changes (`plugins[]`) are explicitly NOT live-reloadable: a save that
+  touches the array logs a warning and otherwise applies any concurrent
+  scope deltas. The `--solution` CLI override disables the watcher (the JSON
+  is bypassed at startup, so the live path follows suit). Watcher uses mtime
+  polling rather than `FileSystemWatcher` for cross-platform reliability —
+  macOS's FSEventStream backend doesn't deliver events for files at the
+  watched directory's root, and 200ms latency is below any human's edit
+  cadence. `SOURCEGRAPH_SCOPE_REPLACE_GRACE_MS` env var lets test harnesses
+  shrink the grace window. (`watch-scope-config`)
+
 - **Two new MCP tools for payload-aware edge walks: `find_data_bindings`
   and `find_event_handlers`.** Specialised tool surface over the
   `binds-path` and `handles-event` edge kinds, with named parameter knobs

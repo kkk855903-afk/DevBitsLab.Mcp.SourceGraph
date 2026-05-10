@@ -41,6 +41,15 @@ public sealed class LiveIndexService : BackgroundService
     // drives the cold-index against this list; ScopeHost.Ready completes for tools waiting on it.
     private List<ScopeHost> _preparedHosts = new();
 
+    // Live-watch state. The watcher itself is owned by this service so StopAsync can dispose it
+    // alongside the per-scope hosts. The two `_current*` fields are the baselines the diff
+    // compares against — kept in sync with the registered scope set rather than re-derived every
+    // event so plugin warnings don't repeat and default-scope flips diff against the actually-
+    // applied state.
+    private ScopeConfigWatcher? _configWatcher;
+    private string? _currentDefaultScope;
+    private IReadOnlyList<PluginRef> _currentPlugins = Array.Empty<PluginRef>();
+
     public LiveIndexService(
         LiveIndexConfig config,
         ScopeRouter router,
@@ -78,6 +87,11 @@ public sealed class LiveIndexService : BackgroundService
         // status="indexing", and persisting the registry row — before yielding to the next
         // hosted service. The actual cold index runs in ExecuteAsync; tools that hit a still-
         // indexing scope wait on ScopeHost.Ready until the indexer settles.
+        // Seed the diff baselines from startup config so the first observed `.sourcegraph.json`
+        // edit compares against what's actually live, not what was on disk a moment before.
+        _currentDefaultScope = _config.DefaultScope;
+        _currentPlugins = _config.StartupPlugins;
+
         if (_config.Scopes.Count > 0)
         {
             await _registry.EnsureSchemaAsync(cancellationToken).ConfigureAwait(false);
@@ -129,12 +143,237 @@ public sealed class LiveIndexService : BackgroundService
             StartWatcher(host, stoppingToken);
         }
 
+        // Start the scope-config watcher only after every prepared scope's cold index has
+        // settled. A config save during cold-indexing would race the very setup we're trying to
+        // bring up; easier to start watching once the host is steady-state. The watcher's first
+        // poll emits a synthetic event reflecting the on-disk state at that moment, so any save
+        // that landed during cold-indexing is still picked up via the diff (which returns
+        // "no-op" when the on-disk content matches what the server already loaded).
+        if (_config.WatchConfig)
+        {
+            StartScopeConfigWatcher(stoppingToken);
+        }
+
         // Block until shutdown; watchers run on tasks they started themselves.
         try
         {
             await Task.Delay(Timeout.Infinite, stoppingToken).ConfigureAwait(false);
         }
         catch (OperationCanceledException) { /* shutting down */ }
+    }
+
+    /// <summary>
+    /// Boot the scope-config watcher and a long-running consumer task that drives the diff-and-
+    /// apply loop. The watcher itself stays alive until <see cref="StopAsync"/> disposes it; the
+    /// consumer task observes <paramref name="stoppingToken"/> for cooperative shutdown.
+    /// </summary>
+    [SuppressMessage("Design", "CA1031:DoNotCatchGeneralExceptionTypes",
+        Justification = "The consumer task wraps OnConfigChangedAsync which can fail in any number of ways (Roslyn workspace, plugin embeddings, transient I/O, etc.). A broad catch with logging keeps the watcher alive across failures so live reload doesn't silently disable itself for the rest of the server's lifetime; OperationCanceledException is handled separately for cooperative shutdown.")]
+    private void StartScopeConfigWatcher(CancellationToken stoppingToken)
+    {
+        _configWatcher = new ScopeConfigWatcher(
+            _config.RepoRoot,
+            _config.DiscoveredSolutions,
+            debounce: TimeSpan.FromMilliseconds(_config.DebounceMs),
+            logger: _loggerFactory.CreateLogger<ScopeConfigWatcher>());
+
+        _logger.LogInformation("Watching {Path} for scope-config edits",
+            Path.Join(_config.RepoRoot, ".sourcegraph.json"));
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await foreach (var change in _configWatcher.ReadAllAsync(stoppingToken).ConfigureAwait(false))
+                {
+                    try
+                    {
+                        await OnConfigChangedAsync(change.Config, stoppingToken).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException) { break; }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "Scope-config change failed to apply; running scopes unchanged");
+                    }
+                }
+            }
+            catch (OperationCanceledException) { /* shutting down */ }
+        }, stoppingToken);
+    }
+
+    /// <summary>
+    /// Diff the freshly-loaded config against the live router state and route each delta through
+    /// the existing per-scope lifecycle primitives. Plugin deltas are logged-and-skipped (hot-
+    /// reloading <c>AssemblyLoadContext</c>-isolated plugins is out of scope for this change).
+    /// </summary>
+    private async Task OnConfigChangedAsync(ScopeConfig newConfig, CancellationToken ct)
+    {
+        var current = _router.All().Select(h => h.Scope).ToList();
+        var diff = ScopeDiff.Compute(
+            currentScopes: current,
+            newScopes: newConfig.Scopes,
+            currentDefaultScope: _currentDefaultScope,
+            newDefaultScope: newConfig.DefaultScope,
+            currentPlugins: _currentPlugins,
+            newPlugins: newConfig.Plugins);
+
+        if (!diff.HasAny)
+        {
+            return;
+        }
+        _logger.LogInformation("Scope-config delta: {Summary}", diff.Summary());
+
+        if (diff.PluginsChanged)
+        {
+            _logger.LogWarning("Scope-config plugins[] changed; the server is still running with the previous plugin set. Restart to apply plugin changes.");
+            // Advance the baseline so the warning fires once per *change*, not once per save. If
+            // we left _currentPlugins pinned to startup, every subsequent save (even an unrelated
+            // default_scope flip) would re-detect the same plugins[] delta and re-log. The
+            // running plugin host is unchanged either way — we're only updating the diff
+            // baseline, not loading anything.
+            _currentPlugins = newConfig.Plugins;
+        }
+
+        // Iterate `diff.Removed` directly rather than scanning `_router.All()` and matching each
+        // host against `diff.Removed.Any(...)` — that pattern is O(n*m) and allocates an
+        // intermediate list per save. Looking up by id via `TryGet` keeps the tear-down path
+        // linear in the number of removed scopes, regardless of how many other scopes are
+        // registered. `OfType<ScopeHost>()` filters out the lookup-miss case (a Removed entry
+        // whose id was never registered, e.g., live-add+live-remove during cold-index) without
+        // needing an explicit if-guard inside the foreach body.
+        var removedHosts = diff.Removed
+            .Select(r => _router.TryGet(r.Id, out var host) ? host : null)
+            .OfType<ScopeHost>();
+        foreach (var host in removedHosts)
+        {
+            await TearDownScopeAsync(host, TimeSpan.FromMilliseconds(_config.ScopeReplaceGraceMs), ct).ConfigureAwait(false);
+        }
+
+        foreach (var scope in diff.Added)
+        {
+            await BringUpScopeLiveAsync(scope, ct).ConfigureAwait(false);
+        }
+
+        foreach (var replacement in diff.Modified)
+        {
+            await ReplaceScopeAsync(replacement, TimeSpan.FromMilliseconds(_config.ScopeReplaceGraceMs), ct).ConfigureAwait(false);
+        }
+
+        if (diff.DefaultScopeChanged)
+        {
+            _router.SetDefaultScope(newConfig.DefaultScope);
+            _currentDefaultScope = newConfig.DefaultScope;
+        }
+    }
+
+    /// <summary>
+    /// Live tear-down of a scope removed from <c>.sourcegraph.json</c>: unregister from the
+    /// router, drop its registry row, then dispose after a grace period so any in-flight tool
+    /// query that already resolved against this host can complete.
+    /// </summary>
+    [SuppressMessage("Design", "CA1031:DoNotCatchGeneralExceptionTypes",
+        Justification = "Tear-down is best-effort: a failed registry remove or DisposeAsync raises a warning but must not abort the rest of the live-config delta or the server. Both broad catches log with the scope id; cancellation is handled via the deferred-disposal grace window pattern (see Task.Delay).")]
+    private async Task TearDownScopeAsync(ScopeHost host, TimeSpan gracePeriod, CancellationToken ct)
+    {
+        _router.Unregister(host.Scope.Id);
+        try { await _registry.RemoveAsync(host.Scope.Id, ct).ConfigureAwait(false); }
+        catch (Exception ex) { _logger.LogWarning(ex, "Removing scope `{Id}` from registry failed", host.Scope.Id); }
+        // Task.Run with CancellationToken.None: once we've unregistered the host, StopAsync's
+        // _router.All() loop won't pick it up either, so we must guarantee the deferred-dispose
+        // task runs. Passing `ct` to Task.Run would skip-then-orphan the dispose if `ct` is
+        // already cancelled. `ct` is still observed inside — on the Task.Delay only — so an
+        // expedited shutdown collapses the grace window without skipping DisposeAsync.
+        _ = Task.Run(async () =>
+        {
+            try { await Task.Delay(gracePeriod, ct).ConfigureAwait(false); }
+            catch (OperationCanceledException) { /* expedited shutdown — proceed to dispose */ }
+            try { await host.DisposeAsync().ConfigureAwait(false); }
+            catch (Exception ex) { _logger.LogWarning(ex, "Deferred dispose of removed scope `{Id}` raised", host.Scope.Id); }
+        }, CancellationToken.None);
+    }
+
+    /// <summary>
+    /// Bring up a newly-added scope through the same Prepare → RunInitialIndex → StartWatcher
+    /// chain used at startup. Cold indexing is fire-and-forget so the watcher consumer doesn't
+    /// block on it; subsequent config saves can be processed concurrently.
+    /// </summary>
+    [SuppressMessage("Design", "CA1031:DoNotCatchGeneralExceptionTypes",
+        Justification = "The fire-and-forget cold-index Task.Run wraps an unbounded surface (RoslynIndexer, plugin analyzers, embeddings drain). An unobserved exception in that lambda would surface as UnobservedTaskException noise — the broad catch with logging keeps fire-and-forget failures attributable to the scope id while still letting OperationCanceledException pass through silently for cooperative shutdown.")]
+    private async Task BringUpScopeLiveAsync(Scope scope, CancellationToken ct)
+    {
+        var host = await PrepareScopeAsync(scope, ct).ConfigureAwait(false);
+        if (host is null) return; // PrepareScopeAsync logged + persisted the degraded state
+        // Task.Run with CancellationToken.None — the work observes `ct` cooperatively inside
+        // (RunInitialIndexAsync / StartWatcher both honour it) but the scheduling itself must
+        // not be gated on `ct` so a cancellation-during-handoff still kicks off the cold index.
+        // The body is wrapped so an unobserved exception (notably OperationCanceledException on
+        // shutdown) doesn't surface as UnobservedTaskException noise — RunInitialIndexAsync's
+        // own catch already settles the host's status, so anything reaching this layer is either
+        // cooperative cancellation or a programming error worth logging.
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await RunInitialIndexAsync(host, ct).ConfigureAwait(false);
+                if (host.Status == "ok") StartWatcher(host, ct);
+            }
+            catch (OperationCanceledException) { /* shutting down */ }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Live bring-up of scope `{Id}` raised after Prepare", host.Scope.Id);
+            }
+        }, CancellationToken.None);
+    }
+
+    /// <summary>
+    /// Replace a modified scope's host atomically: prepare the new host, then
+    /// <see cref="ScopeRouter.Replace"/> swaps it under a single lock, then dispose the displaced
+    /// host after a grace period so in-flight tool calls resolved against it can complete.
+    /// </summary>
+    [SuppressMessage("Design", "CA1031:DoNotCatchGeneralExceptionTypes",
+        Justification = "Two fire-and-forget Task.Runs here: the new host's cold index, and the displaced host's deferred disposal. Both must not propagate failures into the watcher consumer (which would then die and silently disable live reload). Each broad catch logs with the scope id so fire-and-forget failures stay attributable.")]
+    private async Task ReplaceScopeAsync(ScopeReplacement replacement, TimeSpan gracePeriod, CancellationToken ct)
+    {
+        // Prepare the new host *without* registering it, so the atomic swap below captures the
+        // actual old host as the displaced value. Registering inside PrepareScopeAsync would
+        // overwrite the router slot first, making `Replace` return the new host as its own
+        // "displaced" value — and the real old host would silently leak.
+        var newHost = await PrepareScopeAsync(replacement.New, ct, registerWithRouter: false).ConfigureAwait(false);
+        if (newHost is null) return;
+        var displaced = _router.Replace(replacement.New.Id, newHost);
+
+        // Task.Run with CancellationToken.None: we need this work to actually start even if `ct`
+        // is cancelled (shutdown). Cooperative cancellation still happens inside the task — both
+        // RunInitialIndexAsync and the watcher loop observe `ct` — but the task scheduling itself
+        // mustn't gate on it. Wrapped to swallow `OperationCanceledException` on shutdown and
+        // log anything else, so the fire-and-forget can't surface as UnobservedTaskException.
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await RunInitialIndexAsync(newHost, ct).ConfigureAwait(false);
+                if (newHost.Status == "ok") StartWatcher(newHost, ct);
+            }
+            catch (OperationCanceledException) { /* shutting down */ }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Live replace cold-index for scope `{Id}` raised after Prepare", newHost.Scope.Id);
+            }
+        }, CancellationToken.None);
+
+        if (displaced is not null)
+        {
+            // Same Task.Run-with-None pattern: the deferred-dispose must run even on shutdown.
+            // The `ct` is used only on the Task.Delay so an expedited shutdown collapses the
+            // grace window; DisposeAsync still runs afterwards.
+            _ = Task.Run(async () =>
+            {
+                try { await Task.Delay(gracePeriod, ct).ConfigureAwait(false); }
+                catch (OperationCanceledException) { /* expedited shutdown — proceed to dispose */ }
+                try { await displaced.DisposeAsync().ConfigureAwait(false); }
+                catch (Exception ex) { _logger.LogWarning(ex, "Deferred dispose of displaced scope `{Id}` raised", displaced.Scope.Id); }
+            }, CancellationToken.None);
+        }
     }
 
     /// <summary>
@@ -146,7 +385,7 @@ public sealed class LiveIndexService : BackgroundService
     /// </summary>
     [SuppressMessage("Design", "CA1031:DoNotCatchGeneralExceptionTypes",
         Justification = "Bring-up of any single scope must not crash the host: a per-scope failure (Roslyn workspace, plugin embeddings, malformed config, transient I/O) marks that scope `degraded` in the registry and lets every other scope and the MCP transport keep running. The exception is logged + persisted before the catch returns.")]
-    private async Task<ScopeHost?> PrepareScopeAsync(Scope scope, CancellationToken ct)
+    private async Task<ScopeHost?> PrepareScopeAsync(Scope scope, CancellationToken ct, bool registerWithRouter = true)
     {
         var solutionPath = ResolvePrimarySolution(scope);
         var dbPath = ScopeLayout.ScopeDbPath(scope.Root, scope.Id);
@@ -209,7 +448,11 @@ public sealed class LiveIndexService : BackgroundService
             // double-dispose during StopAsync). Once the upsert succeeds, registration is a
             // pure dictionary insert under a lock and is the last fallible step here.
             await _registry.UpsertAsync(ToRow(scope, host.Status, null), ct).ConfigureAwait(false);
-            _router.Register(host);
+            // The live-modify path passes registerWithRouter=false because it needs to atomically
+            // swap this freshly-prepared host into the slot via ScopeRouter.Replace, capturing the
+            // displaced *old* host. Registering here would cause Replace to return the new host as
+            // its own "displaced" value and the old host would never be disposed.
+            if (registerWithRouter) _router.Register(host);
             return host;
         }
         catch (OperationCanceledException) { throw; }
@@ -451,8 +694,20 @@ public sealed class LiveIndexService : BackgroundService
         }, stoppingToken);
     }
 
+    [SuppressMessage("Design", "CA1031:DoNotCatchGeneralExceptionTypes",
+        Justification = "StopAsync is the BackgroundService shutdown path: it disposes the scope-config watcher and every per-scope host. Any one disposal failing must not prevent the others from running, otherwise resources leak across the process exit. Both broad catches log a warning naming what failed and continue to the next disposal.")]
     public override async Task StopAsync(CancellationToken cancellationToken)
     {
+        // Stop the scope-config watcher first so no late event arrives mid-tear-down.
+        // ScopeConfigWatcher.DisposeAsync cancels its internal CTS which both terminates the
+        // poll loop and lets the channel writer's `TryComplete` (in the loop's finally) signal
+        // any consumer awaiting `ReadAllAsync`.
+        if (_configWatcher is not null)
+        {
+            try { await _configWatcher.DisposeAsync().ConfigureAwait(false); }
+            catch (Exception ex) { _logger.LogWarning(ex, "Disposing scope-config watcher raised"); }
+            _configWatcher = null;
+        }
         await base.StopAsync(cancellationToken).ConfigureAwait(false);
         foreach (var host in _router.All())
         {
@@ -605,9 +860,27 @@ public sealed class LiveIndexService : BackgroundService
 
 /// <summary>
 /// Configuration injected into <see cref="LiveIndexService"/> via DI. Carries the resolved scope
-/// list (already validated by <c>ScopeConfigLoader</c>) plus the watcher debounce.
+/// list (already validated by <c>ScopeConfigLoader</c>) plus the watcher debounce, the
+/// scope-config-watcher root + opt-in flag, and the startup-time plugin list snapshot used as the
+/// baseline for the live plugin-delta detector.
 /// </summary>
-public sealed record LiveIndexConfig(IReadOnlyList<Scope> Scopes, int DebounceMs = 200);
+/// <param name="Scopes">Scopes resolved at startup; live edits to <c>.sourcegraph.json</c> diff against this set.</param>
+/// <param name="RepoRoot">Absolute repo root the scope-config watcher (and synthesised-default fallback) is rooted at.</param>
+/// <param name="DiscoveredSolutions">Solutions list passed to <see cref="ScopeConfigLoader.Synthesise"/> when the watcher reverts to the default scope on file deletion.</param>
+/// <param name="StartupPlugins">Plugin list at server start. Live <c>plugins[]</c> deltas are detected against this baseline so subsequent saves don't repeat the warning.</param>
+/// <param name="DefaultScope">Initial <c>default_scope</c> from the loaded config; live edits to <c>default_scope</c> diff against this.</param>
+/// <param name="WatchConfig">When <c>true</c>, <see cref="LiveIndexService"/> starts a <c>ScopeConfigWatcher</c> after the cold-index settles. Disabled when <c>--solution</c> overrides the JSON.</param>
+/// <param name="DebounceMs">File-system debounce for both the per-scope <c>SolutionWatcher</c> and the <c>ScopeConfigWatcher</c>.</param>
+/// <param name="ScopeReplaceGraceMs">Grace window before a displaced <see cref="ScopeHost"/> is disposed during a live modify, so in-flight tool calls against the old host can complete.</param>
+public sealed record LiveIndexConfig(
+    IReadOnlyList<Scope> Scopes,
+    string RepoRoot,
+    IReadOnlyList<string> DiscoveredSolutions,
+    IReadOnlyList<PluginRef> StartupPlugins,
+    string? DefaultScope,
+    bool WatchConfig,
+    int DebounceMs = 200,
+    int ScopeReplaceGraceMs = 5000);
 
 /// <summary>
 /// Trivial JSON serialiser for <see cref="ScopeProjectSet"/> so the registry can persist the

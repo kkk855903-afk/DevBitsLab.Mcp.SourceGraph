@@ -107,6 +107,17 @@ CLI helpers:
   files at the repo root.
 - `sourcegraph-mcp scopes list` / `add <name> --solution <path>` / `remove <name>`.
 
+A running server picks up `.sourcegraph.json` edits live — no restart required.
+The four delta kinds are: **add scope** (new per-scope DB + cold index), **remove
+scope** (registry row deleted, on-disk DB preserved as a re-add cache), **modify
+scope** (atomic-swap of the host with a 5-second grace window for in-flight
+queries against the old host), and **change `default_scope`** (router metadata
+flip, no scope is reindexed). A malformed save is tolerated: the watcher logs
+at info level and leaves the running scope set untouched until the next valid
+save. **Plugin changes (`plugins[]`) still require a restart** — hot-loading
+`AssemblyLoadContext`-isolated plugins is out of scope; a save that touches
+`plugins[]` logs a warning and otherwise applies any concurrent scope deltas.
+
 The legacy single-DB layout (`.sourcegraph/graph.db`) is migrated automatically
 on first start of the new server — the file is renamed into `scopes/default.db`
 and the synthesised default scope picks it up.

@@ -42,6 +42,39 @@ public sealed class ScopeRouter
         lock (_lock) _hosts[host.Scope.Id] = host;
     }
 
+    /// <summary>
+    /// Remove the host registered under <paramref name="id"/>.
+    /// </summary>
+    /// <returns>
+    /// <c>true</c> when a host was removed; <c>false</c> when no host was registered under
+    /// <paramref name="id"/>. Note that the removed host instance is <em>not</em> returned: the
+    /// caller is expected to already hold a reference to it (typically from the diff or
+    /// <see cref="TryGet"/> call that prompted the unregister) and is responsible for disposal.
+    /// For in-place atomic swaps where the displaced host needs to be captured, use
+    /// <see cref="Replace"/> instead, which does return the previous mapping.
+    /// </returns>
+    public bool Unregister(string id)
+    {
+        lock (_lock) return _hosts.Remove(id);
+    }
+
+    /// <summary>
+    /// Atomically replace the host registered under <paramref name="id"/> with
+    /// <paramref name="newHost"/>. Returns the displaced host (or <c>null</c> if no host was
+    /// previously registered under that id). Performs the swap under a single <c>_lock</c>
+    /// acquisition, so any concurrent <see cref="TryGet"/> sees either the old host or the new
+    /// host — never <c>null</c> and never two distinct old hosts in succession.
+    /// </summary>
+    public ScopeHost? Replace(string id, ScopeHost newHost)
+    {
+        lock (_lock)
+        {
+            _hosts.TryGetValue(id, out var displaced);
+            _hosts[id] = newHost;
+            return displaced;
+        }
+    }
+
     public bool TryGet(string id, out ScopeHost host)
     {
         lock (_lock) return _hosts.TryGetValue(id, out host!);

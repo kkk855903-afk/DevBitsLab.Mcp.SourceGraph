@@ -563,6 +563,10 @@ A `.sourcegraph.json` at the repo root opts a project into multi-scope mode:
   `solutions`-based scopes. Scopes declared via `projects` or `paths` are
   accepted by the config loader but are not indexed by the live server yet —
   prefer `solutions` for now.
+- A running server picks up `.sourcegraph.json` edits live (no restart). Adds,
+  removes, modifications, and `default_scope` changes flow through immediately;
+  malformed saves are tolerated and never tear down working scopes. Plugin
+  entries (`plugins[]`) still require a restart to apply.
 
 Every tool accepts an optional `scope` parameter — pass an id, a
 comma-separated list, or `"*"` to fan out.

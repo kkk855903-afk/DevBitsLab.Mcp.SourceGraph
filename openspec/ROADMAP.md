@@ -17,6 +17,7 @@ Listed here so maintainers can trace history:
 |---|---|---|
 | **`add-otel-signals`** | `ActivitySource("DevBitsLab.Mcp.SourceGraph")` + `Meter` with four named instruments emitted from every wrapped MCP tool call; coexists with the existing JSONL log + `usage_stats` tool. | `observability` |
 | **`harden-release-pipeline`** | `dotnet test` gate before NuGet publish; cross-platform CI (Linux/macOS/Windows); CodeQL; Dependabot; deterministic builds + SourceLink; SDK packed alongside the Tool. | `distribution` |
+| **`watch-scope-config`** | `ScopeConfigWatcher` (mtime polling), `ScopeRouter.Replace`/`Unregister` + `ScopeDiff` for diff-and-apply, `LiveIndexService` brings up/tears down/replaces scopes from `.sourcegraph.json` edits without restart. Plugin reloads explicitly out of scope. | `live-updates`, `scoping` |
 
 ## Phase 1 — Code-meaning enrichment
 

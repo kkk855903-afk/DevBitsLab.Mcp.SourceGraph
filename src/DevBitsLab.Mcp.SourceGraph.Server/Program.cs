@@ -170,7 +170,32 @@ static async Task<int> RunServeAsync(CommandLine cli)
     // per-scope DB files via ScopeLayout.
     builder.Services.AddSingleton(new RepoRootInfo(repoRoot));
 
-    builder.Services.AddSingleton(new LiveIndexConfig(scopeConfig.Scopes));
+    // The scope-config watcher is started by LiveIndexService when WatchConfig is true. We skip
+    // it when --solution is set: --solution is a runtime override that bypasses .sourcegraph.json
+    // entirely (Synthesise above), so an edit to the JSON shouldn't override the user's explicit
+    // CLI argument. Without --solution, the watcher's deletion-revert path uses the same empty
+    // discoveredSolutions Synthesise was called with at startup, which is the symmetry we want.
+    var watchConfig = string.IsNullOrEmpty(cli.SolutionPath);
+    var discoveredSolutions = string.IsNullOrEmpty(cli.SolutionPath)
+        ? Array.Empty<string>()
+        : new[] { Path.GetFullPath(cli.SolutionPath) };
+    // Test harnesses pass SOURCEGRAPH_SCOPE_REPLACE_GRACE_MS=50 to avoid waiting the full
+    // production 5s grace window during a live-modify integration test. Production users never
+    // set it; the default (5000) is the right shape for real workloads.
+    var graceMs = 5000;
+    var graceEnv = Environment.GetEnvironmentVariable("SOURCEGRAPH_SCOPE_REPLACE_GRACE_MS");
+    if (!string.IsNullOrEmpty(graceEnv) && int.TryParse(graceEnv, out var parsedGrace) && parsedGrace > 0)
+    {
+        graceMs = parsedGrace;
+    }
+    builder.Services.AddSingleton(new LiveIndexConfig(
+        Scopes: scopeConfig.Scopes,
+        RepoRoot: repoRoot,
+        DiscoveredSolutions: discoveredSolutions,
+        StartupPlugins: scopeConfig.Plugins,
+        DefaultScope: scopeConfig.DefaultScope,
+        WatchConfig: watchConfig,
+        ScopeReplaceGraceMs: graceMs));
     builder.Services.AddHostedService<HistoryHostedService>(sp => new HistoryHostedService(
         sp.GetRequiredService<HistoryQueue>(),
         sp.GetRequiredService<ScopeRouter>(),

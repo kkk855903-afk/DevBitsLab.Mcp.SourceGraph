@@ -46,6 +46,7 @@ internal static class ScopesCli
         ScopeConfigLoader.Save(root, config);
         Console.WriteLine($"Wrote {Path.Join(root, ScopeConfigLoader.FileName)} with {scopes.Count} scope(s):");
         foreach (var scope in scopes) Console.WriteLine($"  - {scope.Id}  ->  {((ScopeProjectSet.Solutions)scope.ProjectSet).Items[0]}");
+        Console.WriteLine("A running sourcegraph-mcp server will pick up the change automatically.");
         return 0;
     }
 
@@ -145,6 +146,7 @@ internal static class ScopesCli
         var updated = new ScopeConfig(newScopes, config.DefaultScope);
         ScopeConfigLoader.Save(root, updated);
         Console.WriteLine($"Added scope '{name}' -> {solutionPath}");
+        Console.WriteLine("A running sourcegraph-mcp server will pick up the change automatically.");
         return 0;
     }
 
@@ -166,13 +168,13 @@ internal static class ScopesCli
         var newDefault = config.DefaultScope == name ? null : config.DefaultScope;
         var updated = new ScopeConfig(newScopes, newDefault);
         ScopeConfigLoader.Save(root, updated);
-        // Remove the per-scope DB too — it's authoritative-rebuildable from source so this is safe.
-        var dbPath = ScopeLayout.ScopeDbPath(root, name);
-        if (File.Exists(dbPath))
-        {
-            try { File.Delete(dbPath); } catch (IOException) { /* best-effort */ }
-        }
+        // The per-scope DB on disk is preserved. A live server may still hold an open SQLite
+        // connection to it during the live-remove grace window; deleting from underneath would
+        // corrupt the running query. The DB is a rebuildable cache, so leaving it costs only
+        // disk space (recoverable later via a `scopes prune` command) and re-adding the same
+        // scope id reuses the existing DB without a cold reindex.
         Console.WriteLine($"Removed scope '{name}'");
+        Console.WriteLine("A running sourcegraph-mcp server will pick up the change automatically.");
         return 0;
     }
 
