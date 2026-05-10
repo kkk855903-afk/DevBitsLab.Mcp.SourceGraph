@@ -11,6 +11,19 @@ below note which package the change applies to.
 ## [Unreleased]
 
 ### Added
+- **Two new MCP tools for payload-aware edge walks: `find_data_bindings`
+  and `find_event_handlers`.** Specialised tool surface over the
+  `binds-path` and `handles-event` edge kinds, with named parameter knobs
+  matching the SDK `PayloadKeys` constants — `path` (substring) / `mode`
+  (exact) / `converter` (exact) plus optional `target` / `source`
+  canonical-key narrowing for `find_data_bindings`; `event` / `command`
+  plus optional `handler` / `element` for `find_event_handlers`. Soft-empty
+  `note:` line when the active scope's loaded indexers don't emit the
+  queried edge kind (mirrors the lenient `list_callers --kind=…` pattern).
+  Both tools ship typed `structuredContent` (`FindDataBindingsResult` /
+  `FindEventHandlersResult`) alongside the always-render-payload markdown.
+  No SDK changes, no schema changes — `payload` column was already present
+  from `open-language-contract`. (`payload-tooling`)
 - **Built-in XAML indexer.** New in-tree
   `DevBitsLab.Mcp.SourceGraph.Indexing.Xaml` assembly registered for `.xaml`
   files. Indexes WPF / WinUI 3 / UWP / Avalonia / Uno from a single indexer

@@ -59,3 +59,11 @@ public sealed record DiagnosticHit(
 
 /// <summary>One row of <c>list_generated_files</c>: file path + symbol count emitted from that file.</summary>
 public sealed record GeneratedFileRow(long FileId, string FilePath, int SymbolCount);
+
+/// <summary>
+/// Both endpoints of one edge plus its raw <c>edges.payload</c> JSON. Returned by the payload-
+/// projecting helpers (<see cref="IGraphStore.FindDataBindingsAsync"/>,
+/// <see cref="IGraphStore.FindEventHandlersAsync"/>) so the tool renderer has the source and
+/// target symbols on hand without a second round-trip.
+/// </summary>
+public sealed record EdgeWithPayload(SymbolHit Source, SymbolHit Target, string? PayloadJson);

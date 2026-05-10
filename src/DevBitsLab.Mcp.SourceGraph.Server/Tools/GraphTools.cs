@@ -4,6 +4,7 @@ using System.Text.Json;
 using DevBitsLab.Mcp.SourceGraph.Core;
 using DevBitsLab.Mcp.SourceGraph.Embeddings;
 using DevBitsLab.Mcp.SourceGraph.Sdk;
+using DevBitsLab.Mcp.SourceGraph.Sdk.Validation;
 using DevBitsLab.Mcp.SourceGraph.Server.Observability;
 using DevBitsLab.Mcp.SourceGraph.Server.Resources;
 using DevBitsLab.Mcp.SourceGraph.Server.Scoping;
@@ -918,6 +919,399 @@ public static class GraphTools
             StructuredContent = JsonSerializer.SerializeToElement(
                 dto,
                 ToolOutputJsonContext.Default.FindImplementationsResult),
+        };
+    }
+
+    [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(FindDataBindingsResult))]
+    [ToolTrigger("\"where does this property bind?\", \"find every TwoWay binding\", \"which views use this converter?\"")]
+    [Description(
+        "Find or audit data bindings between XAML/UI elements and viewmodel properties. Walks `binds-path` " +
+        "edges; payload-aware filters map to the SDK PayloadKeys constants `path`, `mode`, and `converter` " +
+        "(plus optional `target`/`source` endpoint narrowing). The `converter-parameter` payload key is " +
+        "rendered in the response sub-line when present but is not itself a filter knob. At least one " +
+        "filter should be supplied; without one, the tool returns the first `limit` rows and prepends a " +
+        "note hinting the agent to narrow. On a scope whose stored `binds-path` edge set is empty, the " +
+        "tool returns an empty list plus a one-line `note:` rather than an error.")]
+    public static Task<CallToolResult> FindDataBindingsAsync(
+        ScopeRouter router,
+        [Description("Target symbol — the bound viewmodel/property (name, FQN, or canonical key). Matched against the edge's `dst`. Resolved via the same lookup `find_definition` uses.")] string? target = null,
+        [Description("Source symbol — the XAML element that hosts the binding (name, FQN, or canonical key). Matched against the edge's `src`.")] string? source = null,
+        [Description("Substring filter on the binding's `payload.path` (case-sensitive INSTR match). Example: 'User.' matches 'User.Name', 'User.Email'.")] string? path = null,
+        [Description("Exact match on `payload.mode`. Typical values: 'one-way', 'two-way', 'one-time', 'one-way-to-source'.")] string? mode = null,
+        [Description("Exact match on `payload.converter`. The XAML indexer writes the converter's source identifier (e.g. 'BoolToVisibility'), not a canonical key — pass the same string the markup uses.")] string? converter = null,
+        [Description(ScopeDescription)] string? scope = null,
+        [Description("Maximum rows (default 50)")] int limit = 50,
+        CancellationToken ct = default) =>
+        ToolMetrics.TrackAsync("find_data_bindings", new { target, source, path, mode, converter, scope, limit }, () =>
+            ScopedExecution.RunAsync(router, scope, async host =>
+            {
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+
+                // Soft-empty: when the scope has no binds-path edges in storage AND binds-path
+                // isn't an SDK-built-in (the indexer might just not have run yet), return the
+                // documented note plus an empty list. The condition is "no binds-path edges
+                // observed" — the cause could be either no XAML/web-stack indexer loaded for this
+                // scope, or one is loaded but indexing hasn't produced any bindings yet. The
+                // wording reflects that ambiguity rather than asserting "no indexer".
+                var storedKinds = await host.Store.GetDistinctEdgeKindsAsync(ct).ConfigureAwait(false);
+                var hasBindsPath = storedKinds.Contains(EdgeKindBindsPath, StringComparer.Ordinal)
+                                   || ServerVocabulary.SdkEdgeKinds.Contains(EdgeKindBindsPath);
+                if (!hasBindsPath)
+                {
+                    var msg = $"scope `{host.Scope.Id}` has no `binds-path` edges in storage. Either no indexer that emits `binds-path` (XAML, web stack) is loaded for this scope, or indexing hasn't produced any bindings yet.";
+                    return BuildFindDataBindingsResult(
+                        prose: $"note: {msg}",
+                        note: msg,
+                        bindings: Array.Empty<EdgeWithPayload>(),
+                        scopeId: host.Scope.Id,
+                        elapsedMs: sw.ElapsedMilliseconds);
+                }
+
+                // Resolve target / source. Bare canonical keys (start with `csharp:` / `xaml:` / a
+                // language prefix) are passed through verbatim; any other input goes through the
+                // same FindSymbolsAsync lookup that `find_definition` uses, then we feed the top
+                // hit's canonical_key down to storage.
+                var targetKey = await ResolveCanonicalKeyAsync(host.Store, target, ct).ConfigureAwait(false);
+                var sourceKey = await ResolveCanonicalKeyAsync(host.Store, source, ct).ConfigureAwait(false);
+
+                // All-filters-null detection: emit the documented note but still run the storage
+                // call so the agent sees what's available. Path/mode/converter are pure strings;
+                // a non-null target/source that failed to resolve is treated as "no filter." Per
+                // the spec scenario "All filters null returns hint" — the trigger is "every
+                // filter null AND no scope restriction"; an explicit scope (single id or list,
+                // anything other than the wildcard "*") narrows the query enough that the
+                // hint becomes noise, so it counts as a filter here.
+                var scopeIsRestrictive = !string.IsNullOrEmpty(scope) && scope.Trim() != "*";
+                var anyFilter = targetKey is not null || sourceKey is not null
+                    || !string.IsNullOrEmpty(path) || !string.IsNullOrEmpty(mode) || !string.IsNullOrEmpty(converter)
+                    || scopeIsRestrictive;
+
+                var bindings = await host.Store.FindDataBindingsAsync(
+                    targetCanonicalKey: targetKey,
+                    sourceCanonicalKey: sourceKey,
+                    pathContains: string.IsNullOrEmpty(path) ? null : path,
+                    modeExact: string.IsNullOrEmpty(mode) ? null : mode,
+                    converterExact: string.IsNullOrEmpty(converter) ? null : converter,
+                    limit: limit,
+                    ct: ct).ConfigureAwait(false);
+
+                string? note = null;
+                if (!anyFilter)
+                {
+                    note = "provide at least one filter (target, source, path, mode, converter) to narrow the result";
+                }
+
+                var sb = new StringBuilder();
+                if (note is not null)
+                {
+                    sb.AppendLine($"note: {note}.");
+                    sb.AppendLine();
+                }
+                if (bindings.Count == 0)
+                {
+                    sb.AppendLine("No data bindings matched.");
+                }
+                else
+                {
+                    sb.AppendLine($"{bindings.Count} `binds-path` edge(s):");
+                    foreach (var edge in bindings)
+                    {
+                        sb.AppendLine($"- **{edge.Source.Fqn}**  →  {BindingTargetLabel(edge.Target)}");
+                        var payloadLine = Format.PayloadSubLine(edge.PayloadJson);
+                        if (payloadLine is not null) sb.AppendLine(payloadLine);
+                    }
+                }
+
+                return BuildFindDataBindingsResult(
+                    prose: sb.ToString(),
+                    note: note,
+                    bindings: bindings,
+                    scopeId: host.Scope.Id,
+                    elapsedMs: sw.ElapsedMilliseconds);
+            }, ct));
+
+    /// <summary>
+    /// Render the right-hand side of a binds-path row: bold FQN for a resolved target, an
+    /// italic <c>(unresolved)</c> tag plus the synthesised key for the placeholder rows the XAML
+    /// indexer creates when a binding's data context can't be statically pinned.
+    /// </summary>
+    private static string BindingTargetLabel(SymbolHit target)
+    {
+        // Synthetic placeholder canonical keys for unresolved binds-path targets carry the
+        // `xaml:binding-target:` prefix (see XamlLanguageIndexer). The agent reads "(unresolved)"
+        // and knows the data-context type wasn't statically known — the binding still lands as an
+        // edge so the path is searchable, but no concrete viewmodel symbol matched.
+        const string UnresolvedPrefix = "xaml:binding-target:";
+        if (target.CanonicalKey is { } key && key.StartsWith(UnresolvedPrefix, StringComparison.Ordinal))
+        {
+            return $"_(unresolved)_  `{target.Fqn}`";
+        }
+        return $"**{target.Fqn}**";
+    }
+
+    /// <summary>
+    /// Resolve a free-form symbol identifier (canonical key, name, or FQN suffix) to a canonical
+    /// key. Inputs that pass <see cref="CanonicalKeyValidator.IsValid"/> are passed through
+    /// verbatim so the storage WHERE clause matches by key — single source of truth for the
+    /// scheme list (delegating to the SDK keeps this in lockstep when new languages get
+    /// promoted into <see cref="CanonicalKeyValidator.EnforcedSchemes"/>). Other inputs go
+    /// through the same name-lookup path <c>find_definition</c> uses; the top hit's canonical
+    /// key wins. Returns <c>null</c> for null/empty input or when the lookup produces no hits.
+    /// </summary>
+    private static async Task<string?> ResolveCanonicalKeyAsync(IGraphStore store, string? identifier, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(identifier)) return null;
+        // CanonicalKeyValidator rejects inputs whose scheme isn't an enforced one — XAML
+        // placeholder FQNs like `binding-target:Views/Main.xaml#Text@12:24` fail (the leading
+        // token isn't a valid scheme), so they correctly fall through to FindSymbolsAsync.
+        if (CanonicalKeyValidator.IsValid(identifier)) return identifier;
+        var hits = await store.FindSymbolsAsync(identifier, filePathHint: null, limit: 1, ct).ConfigureAwait(false);
+        return hits.Count == 0 ? null : hits[0].CanonicalKey;
+    }
+
+    private const string EdgeKindBindsPath = "binds-path";
+    private const string EdgeKindHandlesEvent = "handles-event";
+
+    [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(FindEventHandlersResult))]
+    [ToolTrigger("\"find all Click handlers\", \"where is OnSave wired up?\", \"which buttons fire this command?\"")]
+    [Description(
+        "Find or audit event-to-handler wiring in XAML or component-based UI. Walks `handles-event` " +
+        "edges; payload-aware filters are `event` (mapped to the SDK `PayloadKeys.Event` constant) " +
+        "and the forward-looking `command` key for command-bound flavours — `command` is not yet a " +
+        "PayloadKeys constant; the kebab string is treated as the canonical key until the SDK " +
+        "promotes it. The `handler` and `element` parameters narrow by edge endpoints (resolved " +
+        "canonical keys), not payload keys. On a scope whose stored `handles-event` edge set is " +
+        "empty, the tool returns an empty list plus a one-line `note:` rather than an error; " +
+        "`command` filtering against a scope whose `handles-event` edges never carry a `command` " +
+        "payload key returns the same soft-empty shape with a tailored note.")]
+    public static Task<CallToolResult> FindEventHandlersAsync(
+        ScopeRouter router,
+        [Description("Handler symbol — the resolved handler method (name, FQN, or canonical key). Matched against the edge's `dst`. Resolved via the same lookup `find_definition` uses.")] string? handler = null,
+        [Description("Exact match on `payload.event` (e.g. 'Click', 'MouseEnter', 'Loaded'). The kebab-case PayloadKeys constant `event` is what the indexer fills.")] string? @event = null,
+        [Description("Element symbol — the XAML / UI element that owns the event attribute (name, FQN, or canonical key). Matched against the edge's `src`.")] string? element = null,
+        [Description("Exact match on `payload.command` for command-bound flavours where the indexer recorded a command name. Empty on scopes without `Command=\"{Binding ...}\"` patterns.")] string? command = null,
+        [Description(ScopeDescription)] string? scope = null,
+        [Description("Maximum rows (default 50)")] int limit = 50,
+        CancellationToken ct = default) =>
+        ToolMetrics.TrackAsync("find_event_handlers", new { handler, @event, element, command, scope, limit }, () =>
+            ScopedExecution.RunAsync(router, scope, async host =>
+            {
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+
+                // Soft-empty: same shape as find_data_bindings — emit a note plus an empty list
+                // when the scope has no handles-event edges in storage. Cause is ambiguous (no
+                // indexer that emits the kind, OR one is loaded but indexing hasn't run yet);
+                // the wording reflects that.
+                var storedKinds = await host.Store.GetDistinctEdgeKindsAsync(ct).ConfigureAwait(false);
+                var hasHandlesEvent = storedKinds.Contains(EdgeKindHandlesEvent, StringComparer.Ordinal)
+                                      || ServerVocabulary.SdkEdgeKinds.Contains(EdgeKindHandlesEvent);
+                if (!hasHandlesEvent)
+                {
+                    var msg = $"scope `{host.Scope.Id}` has no `handles-event` edges in storage. Either no indexer that emits `handles-event` (XAML, web stack) is loaded for this scope, or indexing hasn't produced any handlers yet.";
+                    return BuildFindEventHandlersResult(
+                        prose: $"note: {msg}",
+                        note: msg,
+                        handlers: Array.Empty<EdgeWithPayload>(),
+                        scopeId: host.Scope.Id,
+                        elapsedMs: sw.ElapsedMilliseconds);
+                }
+
+                // Resolve handler / element via the find_definition-shaped lookup. Bare canonical
+                // keys pass through verbatim.
+                var handlerKey = await ResolveCanonicalKeyAsync(host.Store, handler, ct).ConfigureAwait(false);
+                var elementKey = await ResolveCanonicalKeyAsync(host.Store, element, ct).ConfigureAwait(false);
+
+                var handlers = await host.Store.FindEventHandlersAsync(
+                    handlerCanonicalKey: handlerKey,
+                    eventExact: string.IsNullOrEmpty(@event) ? null : @event,
+                    elementCanonicalKey: elementKey,
+                    commandExact: string.IsNullOrEmpty(command) ? null : command,
+                    limit: limit,
+                    ct: ct).ConfigureAwait(false);
+
+                // Secondary soft-empty: when `command` was the filter and we got 0 rows, probe
+                // whether ANY handles-event edge in storage carries a `command` payload key. None
+                // → the indexer for this scope doesn't record commands at all (XAML scopes
+                // without `Command="{Binding ...}"` patterns); emit the documented `note:` so
+                // the agent doesn't keep guessing other command names.
+                string? commandSoftEmptyNote = null;
+                if (handlers.Count == 0 && !string.IsNullOrEmpty(command))
+                {
+                    var anyCommand = await host.Store.AnyEdgeHasPayloadKeyAsync(
+                        EdgeKindHandlesEvent, "command", ct).ConfigureAwait(false);
+                    if (!anyCommand)
+                    {
+                        commandSoftEmptyNote = $"no `handles-event` edges in scope `{host.Scope.Id}` carry a `command` payload key — the loaded indexer for this scope doesn't record command-bound wirings.";
+                    }
+                }
+
+                var sb = new StringBuilder();
+                if (commandSoftEmptyNote is not null)
+                {
+                    sb.AppendLine($"note: {commandSoftEmptyNote}");
+                    sb.AppendLine();
+                }
+                if (handlers.Count == 0)
+                {
+                    sb.AppendLine("No event handlers matched.");
+                }
+                else
+                {
+                    sb.AppendLine($"{handlers.Count} `handles-event` edge(s):");
+                    foreach (var edge in handlers)
+                    {
+                        var (eventName, commandName) = ExtractEventHandlerPayloadFields(edge.PayloadJson);
+                        var leftLabel = string.IsNullOrEmpty(eventName) ? $"**{edge.Source.Fqn}**" : $"**{edge.Source.Fqn}**.`{eventName}`";
+                        var rightLabel = string.IsNullOrEmpty(commandName) ? $"**{edge.Target.Fqn}**" : $"**{edge.Target.Fqn}** (cmd: `{commandName}`)";
+                        sb.AppendLine($"- {leftLabel}  →  {rightLabel}");
+                        var payloadLine = Format.PayloadSubLine(edge.PayloadJson);
+                        if (payloadLine is not null) sb.AppendLine(payloadLine);
+                    }
+                }
+
+                return BuildFindEventHandlersResult(
+                    prose: sb.ToString(),
+                    note: commandSoftEmptyNote,
+                    handlers: handlers,
+                    scopeId: host.Scope.Id,
+                    elapsedMs: sw.ElapsedMilliseconds);
+            }, ct));
+
+    /// <summary>
+    /// Pre-extract the well-known <c>event</c> and <c>command</c> keys from a handles-event edge
+    /// payload. Returns <c>(null, null)</c> for missing / malformed payloads — defensive: storage
+    /// stores opaque JSON, so a bad row never breaks the renderer or the structured output.
+    /// </summary>
+    private static (string? Event, string? Command) ExtractEventHandlerPayloadFields(string? payloadJson)
+    {
+        if (string.IsNullOrWhiteSpace(payloadJson)) return (null, null);
+        try
+        {
+            using var doc = JsonDocument.Parse(payloadJson);
+            if (doc.RootElement.ValueKind != JsonValueKind.Object) return (null, null);
+            string? evt = doc.RootElement.TryGetProperty("event", out var e) && e.ValueKind == JsonValueKind.String ? e.GetString() : null;
+            string? cmd = doc.RootElement.TryGetProperty("command", out var c) && c.ValueKind == JsonValueKind.String ? c.GetString() : null;
+            return (evt, cmd);
+        }
+        catch (JsonException)
+        {
+            return (null, null);
+        }
+    }
+
+    private static CallToolResult BuildFindEventHandlersResult(
+        string prose,
+        string? note,
+        IReadOnlyList<EdgeWithPayload> handlers,
+        string scopeId,
+        long elapsedMs)
+    {
+        var content = new List<ContentBlock>(capacity: 2 + handlers.Count)
+        {
+            new TextContentBlock { Text = prose },
+        };
+
+        // ResourceLink per handler so the agent can pivot into the handler method's symbol view.
+        foreach (var edge in handlers)
+        {
+            content.Add(new ResourceLinkBlock
+            {
+                Uri = GraphResourceUris.Symbol(edge.Target.Id),
+                Name = edge.Target.Fqn,
+                Title = edge.Target.Fqn,
+                Description = $"handles-event handler — {Format.Location(edge.Target.FilePath, edge.Target.StartLine, edge.Target.StartCol)}",
+                MimeType = "text/markdown",
+            });
+        }
+
+        content.Add(AudienceMetadata.Build(
+            scopeId,
+            elapsedMs,
+            ("edge_kind", EdgeKindHandlesEvent),
+            ("handlers", handlers.Count.ToString())));
+
+        var structuredRows = handlers
+            .Select(e =>
+            {
+                var (evt, cmd) = ExtractEventHandlerPayloadFields(e.PayloadJson);
+                return new FindEventHandlersRow(
+                    ElementSymbolId: e.Source.Id,
+                    ElementFqn: e.Source.Fqn,
+                    ElementCanonicalKey: e.Source.CanonicalKey,
+                    HandlerSymbolId: e.Target.Id,
+                    HandlerFqn: e.Target.Fqn,
+                    HandlerCanonicalKey: e.Target.CanonicalKey,
+                    EventName: evt,
+                    CommandName: cmd,
+                    PayloadJson: string.IsNullOrEmpty(e.PayloadJson) ? null : e.PayloadJson);
+            })
+            .ToList();
+        var dto = new FindEventHandlersResult(
+            EdgeKind: EdgeKindHandlesEvent,
+            Note: note,
+            Handlers: structuredRows);
+        return new CallToolResult
+        {
+            Content = content,
+            StructuredContent = JsonSerializer.SerializeToElement(
+                dto,
+                ToolOutputJsonContext.Default.FindEventHandlersResult),
+        };
+    }
+
+    private static CallToolResult BuildFindDataBindingsResult(
+        string prose,
+        string? note,
+        IReadOnlyList<EdgeWithPayload> bindings,
+        string scopeId,
+        long elapsedMs)
+    {
+        var content = new List<ContentBlock>(capacity: 2 + bindings.Count)
+        {
+            new TextContentBlock { Text = prose },
+        };
+
+        // One ResourceLink per resolved target so the agent can chain into graph://symbol/{id}
+        // for each viewmodel property it found bindings into.
+        foreach (var edge in bindings)
+        {
+            content.Add(new ResourceLinkBlock
+            {
+                Uri = GraphResourceUris.Symbol(edge.Target.Id),
+                Name = edge.Target.Fqn,
+                Title = edge.Target.Fqn,
+                Description = $"binds-path target — {Format.Location(edge.Target.FilePath, edge.Target.StartLine, edge.Target.StartCol)}",
+                MimeType = "text/markdown",
+            });
+        }
+
+        content.Add(AudienceMetadata.Build(
+            scopeId,
+            elapsedMs,
+            ("edge_kind", EdgeKindBindsPath),
+            ("bindings", bindings.Count.ToString())));
+
+        var structuredRows = bindings
+            .Select(e => new FindDataBindingsRow(
+                SourceSymbolId: e.Source.Id,
+                SourceFqn: e.Source.Fqn,
+                SourceCanonicalKey: e.Source.CanonicalKey,
+                TargetSymbolId: e.Target.Id,
+                TargetFqn: e.Target.Fqn,
+                TargetCanonicalKey: e.Target.CanonicalKey,
+                TargetIsUnresolved: e.Target.CanonicalKey?.StartsWith("xaml:binding-target:", StringComparison.Ordinal) == true,
+                PayloadJson: string.IsNullOrEmpty(e.PayloadJson) ? null : e.PayloadJson))
+            .ToList();
+        var dto = new FindDataBindingsResult(
+            EdgeKind: EdgeKindBindsPath,
+            Note: note,
+            Bindings: structuredRows);
+        return new CallToolResult
+        {
+            Content = content,
+            StructuredContent = JsonSerializer.SerializeToElement(
+                dto,
+                ToolOutputJsonContext.Default.FindDataBindingsResult),
         };
     }
 

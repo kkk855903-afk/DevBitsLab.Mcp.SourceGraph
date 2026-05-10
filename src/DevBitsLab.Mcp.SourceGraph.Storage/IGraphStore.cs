@@ -205,6 +205,46 @@ public interface IGraphStore : IAsyncDisposable
     Task<IReadOnlyList<ReferenceHit>> FindReferencesAsync(long symbolId, bool includeGenerated, int limit = 200, CancellationToken ct = default);
 
     /// <summary>
+    /// Walk <c>binds-path</c> edges with optional payload-aware filters (<c>path</c>, <c>mode</c>,
+    /// <c>converter</c>) plus optional source/target canonical-key narrowing. Returns one
+    /// <see cref="EdgeWithPayload"/> per matching edge so the tool renderer has both endpoints
+    /// in hand. Filters are AND-combined; pass <c>null</c> to skip a filter.
+    /// <see cref="EdgeWithPayload.PayloadJson"/> is the verbatim <c>edges.payload</c> column
+    /// (nullable when the originating edge had no metadata).
+    /// </summary>
+    Task<IReadOnlyList<EdgeWithPayload>> FindDataBindingsAsync(
+        string? targetCanonicalKey,
+        string? sourceCanonicalKey,
+        string? pathContains,
+        string? modeExact,
+        string? converterExact,
+        int limit = 50,
+        CancellationToken ct = default);
+
+    /// <summary>
+    /// Walk <c>handles-event</c> edges with optional payload-aware filters (<c>event</c>,
+    /// <c>command</c>) plus optional handler/element canonical-key narrowing. Returns the same
+    /// <see cref="EdgeWithPayload"/> shape as <see cref="FindDataBindingsAsync"/>. Filters are
+    /// AND-combined; pass <c>null</c> to skip a filter.
+    /// </summary>
+    Task<IReadOnlyList<EdgeWithPayload>> FindEventHandlersAsync(
+        string? handlerCanonicalKey,
+        string? eventExact,
+        string? elementCanonicalKey,
+        string? commandExact,
+        int limit = 50,
+        CancellationToken ct = default);
+
+    /// <summary>
+    /// Probe whether <i>any</i> edge of <paramref name="edgeKind"/> has a non-null
+    /// <c>json_extract(payload, '$.&lt;payloadKey&gt;')</c>. Used by tools that need to
+    /// distinguish "the filter didn't match anything" from "the indexer for this scope never
+    /// emits this payload key" (e.g. <c>find_event_handlers --command=…</c> on a XAML scope
+    /// whose indexer didn't record command names). Cheap: stops at the first hit.
+    /// </summary>
+    Task<bool> AnyEdgeHasPayloadKeyAsync(string edgeKind, string payloadKey, CancellationToken ct = default);
+
+    /// <summary>
     /// Distinct edge kind names already present in the store, sorted lowercase. Used by the
     /// vocabulary publisher to enrich the MCP <c>initialize</c> response with what's actually
     /// queryable in this scope.

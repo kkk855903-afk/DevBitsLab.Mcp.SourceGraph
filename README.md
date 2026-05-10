@@ -194,6 +194,8 @@ to the client at handshake time.
 | `neighborhood` | Inbound + outbound edges around X for one `kind` layer at a time (default `calls`; pass `kind=uses_type`, `overrides`, `implements_member`, `instantiates`, `throws`, or `all` to inspect other layers) |
 | `module_summary` | Top symbols in a namespace or directory by inbound call count |
 | `impact_of_change` | Transitive upstream callers of X up to `maxDepth` |
+| `find_data_bindings` | Walks `binds-path` edges with payload-aware filters (`path`, `mode`, `converter`, plus optional `target` / `source` canonical keys). Answers "where does this property bind?", "find every TwoWay binding", "which views use this converter?". Soft-empty `note:` when the active scope hasn't loaded an indexer that emits `binds-path`. |
+| `find_event_handlers` | Walks `handles-event` edges with `event` / `command` payload filters and optional `handler` / `element` canonical keys. Answers "find all Click handlers", "where is OnSave wired up?". Same soft-empty pattern as `find_data_bindings`. |
 
 ### Search
 
@@ -270,6 +272,18 @@ to the client at handshake time.
 // `converter`, and friends (see `harden-sdk-pre-xaml`).
 { "tool": "list_callers",
   "args": { "symbol": "MainViewModel.UserName", "kind": "binds-path" } }
+
+// Specialised payload-aware variant: every TwoWay binding to "User.Name".
+// Against the SampleWpf fixture this resolves the
+// `<TextBox Text="{Binding User.Name, Mode=TwoWay}" />` line in MainWindow.xaml,
+// returning one row whose payload carries `path: "User.Name"` and `mode: "two-way"`.
+{ "tool": "find_data_bindings",
+  "args": { "path": "User.Name", "mode": "two-way" } }
+
+// Every Click handler in the active XAML scope. Against SampleWpf this returns
+// the `SaveButton.Click → SampleWpf.Views.MainWindow.OnSave` wiring.
+{ "tool": "find_event_handlers",
+  "args": { "event": "Click" } }
 
 // Every element with `Grid.Row` set (XAML attached-property annotation).
 { "tool": "find_by_annotation",

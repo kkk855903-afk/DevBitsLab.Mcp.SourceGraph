@@ -690,6 +690,138 @@ public sealed class SqliteGraphStore : IGraphStore
     public Task<IReadOnlyList<SymbolHit>> ListUsersOfTypeAsync(long symbolId, int limit = 50, CancellationToken ct = default)
         => ListCallersAsync(symbolId, limit, "uses-type", ct);
 
+    public Task<IReadOnlyList<EdgeWithPayload>> FindDataBindingsAsync(
+        string? targetCanonicalKey,
+        string? sourceCanonicalKey,
+        string? pathContains,
+        string? modeExact,
+        string? converterExact,
+        int limit = 50,
+        CancellationToken ct = default)
+    {
+        // path uses INSTR for substring match; mode/converter are exact-equality on json_extract.
+        // The kebab JSON keys ("path", "mode", "converter") mirror SDK PayloadKeys constants;
+        // Storage stays SDK-independent so the literals live here.
+        var pathClause = pathContains is null ? "" : "AND INSTR(json_extract(e.payload, '$.path'), @pathContains) > 0";
+        var modeClause = modeExact is null ? "" : "AND json_extract(e.payload, '$.mode') = @modeExact";
+        var converterClause = converterExact is null ? "" : "AND json_extract(e.payload, '$.converter') = @converterExact";
+        return QueryEdgesWithPayloadAsync(
+            edgeKind: EdgeKindBindsPath,
+            targetCanonicalKey: targetCanonicalKey,
+            sourceCanonicalKey: sourceCanonicalKey,
+            extraWhere: $"{pathClause} {modeClause} {converterClause}",
+            extraParameters: new { pathContains, modeExact, converterExact },
+            limit: limit,
+            ct: ct);
+    }
+
+    public Task<IReadOnlyList<EdgeWithPayload>> FindEventHandlersAsync(
+        string? handlerCanonicalKey,
+        string? eventExact,
+        string? elementCanonicalKey,
+        string? commandExact,
+        int limit = 50,
+        CancellationToken ct = default)
+    {
+        // handler maps to dst (the resolved C# method symbol the edge wires to); element maps to
+        // src (the XAML element that owns the event attribute). Mirrors find_data_bindings'
+        // (target = dst, source = src) convention.
+        var eventClause = eventExact is null ? "" : "AND json_extract(e.payload, '$.event') = @eventExact";
+        var commandClause = commandExact is null ? "" : "AND json_extract(e.payload, '$.command') = @commandExact";
+        return QueryEdgesWithPayloadAsync(
+            edgeKind: EdgeKindHandlesEvent,
+            targetCanonicalKey: handlerCanonicalKey,
+            sourceCanonicalKey: elementCanonicalKey,
+            extraWhere: $"{eventClause} {commandClause}",
+            extraParameters: new { eventExact, commandExact },
+            limit: limit,
+            ct: ct);
+    }
+
+    // Edge kind name constants kept local — the Storage layer does not depend on the SDK and
+    // these strings already appear in indexer code and tools as the well-known kebab vocabulary.
+    private const string EdgeKindBindsPath = "binds-path";
+    private const string EdgeKindHandlesEvent = "handles-event";
+
+    /// <summary>
+    /// Two-sided edge walk projecting both endpoints + payload. Used by the payload-aware
+    /// <c>find_*</c> helpers; <paramref name="extraWhere"/> is interpolated verbatim — every
+    /// caller must build it from a fixed set of clauses (no user strings).
+    /// </summary>
+    private async Task<IReadOnlyList<EdgeWithPayload>> QueryEdgesWithPayloadAsync(
+        string edgeKind,
+        string? targetCanonicalKey,
+        string? sourceCanonicalKey,
+        string extraWhere,
+        object extraParameters,
+        int limit,
+        CancellationToken ct)
+    {
+        var targetClause = targetCanonicalKey is null ? "" : "AND dst_s.canonical_key = @targetCanonicalKey";
+        var sourceClause = sourceCanonicalKey is null ? "" : "AND src_s.canonical_key = @sourceCanonicalKey";
+
+        var sql = $"""
+            SELECT
+                src_s.id        AS Src_Id,
+                src_s.name      AS Src_Name,
+                src_s.fqn       AS Src_Fqn,
+                src_s.kind_name AS Src_Kind,
+                src_f.path      AS Src_FilePath,
+                src_s.start_line AS Src_StartLine,
+                src_s.start_col  AS Src_StartCol,
+                src_s.end_line   AS Src_EndLine,
+                src_s.end_col    AS Src_EndCol,
+                src_s.signature  AS Src_Signature,
+                src_s.modifiers  AS Src_Modifiers,
+                src_s.accessibility AS Src_Accessibility,
+                src_s.xml_summary   AS Src_XmlSummary,
+                src_f.is_generated  AS Src_IsGenerated,
+                src_s.test_framework AS Src_TestFramework,
+                src_s.canonical_key  AS Src_CanonicalKey,
+                dst_s.id        AS Dst_Id,
+                dst_s.name      AS Dst_Name,
+                dst_s.fqn       AS Dst_Fqn,
+                dst_s.kind_name AS Dst_Kind,
+                dst_f.path      AS Dst_FilePath,
+                dst_s.start_line AS Dst_StartLine,
+                dst_s.start_col  AS Dst_StartCol,
+                dst_s.end_line   AS Dst_EndLine,
+                dst_s.end_col    AS Dst_EndCol,
+                dst_s.signature  AS Dst_Signature,
+                dst_s.modifiers  AS Dst_Modifiers,
+                dst_s.accessibility AS Dst_Accessibility,
+                dst_s.xml_summary   AS Dst_XmlSummary,
+                dst_f.is_generated  AS Dst_IsGenerated,
+                dst_s.test_framework AS Dst_TestFramework,
+                dst_s.canonical_key  AS Dst_CanonicalKey,
+                e.payload AS PayloadJson
+            FROM edges e
+            JOIN symbols src_s ON src_s.id = e.src
+            JOIN files   src_f ON src_f.id = src_s.file_id
+            JOIN symbols dst_s ON dst_s.id = e.dst
+            JOIN files   dst_f ON dst_f.id = dst_s.file_id
+            WHERE e.kind_name = @edgeKind
+              {targetClause}
+              {sourceClause}
+              {extraWhere}
+            ORDER BY src_f.path, src_s.start_line
+            LIMIT @limit;
+            """;
+
+        // Merge the kind/key/limit parameters with the caller's payload-filter parameters in a
+        // single DynamicParameters bag so Dapper binds them all from one source.
+        var parameters = new DynamicParameters();
+        parameters.Add("edgeKind", edgeKind);
+        parameters.Add("targetCanonicalKey", targetCanonicalKey);
+        parameters.Add("sourceCanonicalKey", sourceCanonicalKey);
+        parameters.Add("limit", limit);
+        parameters.AddDynamicParams(extraParameters);
+
+        var rows = await _connection.QueryAsync<RawEdgeWithPayload>(new CommandDefinition(
+            sql, parameters, cancellationToken: ct)).ConfigureAwait(false);
+        return rows.Select(r => r.ToEdgeWithPayload()).ToList();
+    }
+
     public async Task<SymbolHit?> GetSymbolByIdAsync(long symbolId, CancellationToken ct = default)
     {
         const string sql = """
@@ -754,6 +886,37 @@ public sealed class SqliteGraphStore : IGraphStore
             (int)StartLine, (int)StartCol, (int)EndLine, (int)EndCol, Signature,
             Modifiers, (int)Accessibility, XmlSummary, IsGenerated != 0, TestFramework, CanonicalKey,
             PayloadJson);
+    }
+
+    /// <summary>
+    /// Two-sided edge projection used by <see cref="FindDataBindingsAsync"/> /
+    /// <see cref="FindEventHandlersAsync"/>: full SymbolHit columns for both endpoints
+    /// (Src_*, Dst_*) plus the originating <c>edges.payload</c> column. Constructor parameter
+    /// order matches the SELECT column order in <see cref="QueryEdgesWithPayloadAsync"/>.
+    /// </summary>
+    private sealed record RawEdgeWithPayload(
+        long Src_Id, string Src_Name, string Src_Fqn, string Src_Kind, string Src_FilePath,
+        long Src_StartLine, long Src_StartCol, long Src_EndLine, long Src_EndCol, string? Src_Signature,
+        string? Src_Modifiers, long Src_Accessibility, string? Src_XmlSummary,
+        long Src_IsGenerated, string? Src_TestFramework, string? Src_CanonicalKey,
+        long Dst_Id, string Dst_Name, string Dst_Fqn, string Dst_Kind, string Dst_FilePath,
+        long Dst_StartLine, long Dst_StartCol, long Dst_EndLine, long Dst_EndCol, string? Dst_Signature,
+        string? Dst_Modifiers, long Dst_Accessibility, string? Dst_XmlSummary,
+        long Dst_IsGenerated, string? Dst_TestFramework, string? Dst_CanonicalKey,
+        string? PayloadJson)
+    {
+        public EdgeWithPayload ToEdgeWithPayload() => new(
+            Source: new SymbolHit(
+                Src_Id, Src_Name, Src_Fqn, Src_Kind, Src_FilePath,
+                (int)Src_StartLine, (int)Src_StartCol, (int)Src_EndLine, (int)Src_EndCol, Src_Signature,
+                Src_Modifiers, (int)Src_Accessibility, Src_XmlSummary, Src_IsGenerated != 0,
+                Src_TestFramework, Src_CanonicalKey),
+            Target: new SymbolHit(
+                Dst_Id, Dst_Name, Dst_Fqn, Dst_Kind, Dst_FilePath,
+                (int)Dst_StartLine, (int)Dst_StartCol, (int)Dst_EndLine, (int)Dst_EndCol, Dst_Signature,
+                Dst_Modifiers, (int)Dst_Accessibility, Dst_XmlSummary, Dst_IsGenerated != 0,
+                Dst_TestFramework, Dst_CanonicalKey),
+            PayloadJson: PayloadJson);
     }
 
     private sealed record RawReferenceHit(long Id, long SymbolId, string FilePath, long Line, long Col, long Kind, long IsGenerated)
@@ -876,6 +1039,30 @@ public sealed class SqliteGraphStore : IGraphStore
         const string sql = "SELECT DISTINCT kind_name FROM edges ORDER BY kind_name;";
         var rows = await _connection.QueryAsync<string>(new CommandDefinition(sql, cancellationToken: ct)).ConfigureAwait(false);
         return rows.AsList();
+    }
+
+    public async Task<bool> AnyEdgeHasPayloadKeyAsync(string edgeKind, string payloadKey, CancellationToken ct = default)
+    {
+        // EXISTS short-circuits at the first matching row — cheap on large edge sets. The kind
+        // index narrows to the kind partition; json_extract pulls the field value (NULL when the
+        // payload column is NULL or the key is absent).
+        //
+        // The JSON path is built with `'$."' || @payloadKey || '"'` so the key flows through a
+        // bound parameter (no string interpolation, no SQL injection vector) AND the wrapping
+        // double quotes make hyphenated kebab keys (`converter-parameter`, `data-type`,
+        // `relative-source`) resolve correctly — `$.converter-parameter` would parse as
+        // "$.converter MINUS parameter" without the quotes (SQLite's JSON path grammar).
+        const string sql = """
+            SELECT EXISTS (
+                SELECT 1 FROM edges
+                WHERE kind_name = @edgeKind
+                  AND json_extract(payload, '$."' || @payloadKey || '"') IS NOT NULL
+                LIMIT 1
+            );
+            """;
+        var hit = await _connection.ExecuteScalarAsync<long>(new CommandDefinition(
+            sql, new { edgeKind, payloadKey }, cancellationToken: ct)).ConfigureAwait(false);
+        return hit != 0;
     }
 
     public async Task<IReadOnlyList<string>> GetDistinctSymbolKindsAsync(CancellationToken ct = default)
