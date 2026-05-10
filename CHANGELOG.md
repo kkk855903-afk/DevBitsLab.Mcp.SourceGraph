@@ -10,6 +10,28 @@ below note which package the change applies to.
 
 ## [Unreleased]
 
+### Changed
+- **`ServerInstructions` slimmed; verbose body moved to `graph://help` resource.**
+  The MCP `initialize` preamble dropped from ~22 lines to ~10: it keeps the leaf
+  glyph, the prefer-graph rule, and the `usage_stats` reminder, plus a pointer
+  to `graph://help`. Agents that want the tool-selection guide or the
+  `describe_schema` / `query_graph` ad-hoc-query reference fetch the resource
+  on demand instead of paying the upfront cost on every connection. Suppressed
+  by the same `--no-instructions` / `SOURCEGRAPH_NO_INSTRUCTIONS=1` knobs as
+  before. Leaf glyph unchanged on every surface.
+
+### Added
+- **`--no-tool-triggers` / `SOURCEGRAPH_NO_TOOL_TRIGGERS=1`.** Suppresses the
+  `Use when: …` append on every tool description in `tools/list`. Useful when
+  driving tool-selection guidance from your own `CLAUDE.md` instead. Gates at
+  a single chokepoint inside `ToolDescriptionFormatter`, so the flag covers
+  both built-in tools and plugin tools registered via `ToolRegistry`.
+- **`request_len` field in `.sourcegraph/usage.jsonl`.** Sits next to the
+  existing `response_len` so future tool-call cost analysis can compare the
+  agent's input against the server's output. Recorded as the string length of
+  the serialised `args` JSON (matching how `response_len` is measured — string
+  `.Length`, not UTF-8 byte count). No client-visible behaviour change.
+
 ## [0.8.0] - 2026-05-10
 
 ### Fixed

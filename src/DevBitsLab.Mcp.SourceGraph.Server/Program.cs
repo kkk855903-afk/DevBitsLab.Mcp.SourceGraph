@@ -318,6 +318,13 @@ static async Task<int> RunServeAsync(CommandLine cli)
     LeafFormatter.Suppressed = ServerInstructions.ShouldSuppress(
         cli.NoLeaf,
         Environment.GetEnvironmentVariable(LeafFormatter.EnvVarName));
+
+    // `Use when: …` description-append suppression. Same flag/env shape as --no-leaf so the two
+    // upfront-token knobs compose. Read inside ToolDescriptionFormatter.AppendTrigger and
+    // ApplyTriggersFromAttributes, which gate on this static.
+    ToolDescriptionFormatter.Suppressed = ServerInstructions.ShouldSuppress(
+        cli.NoToolTriggers,
+        Environment.GetEnvironmentVariable(ToolDescriptionFormatter.EnvVarName));
     if (!noInstructions)
     {
         // Use Program as the logger category — ServerVocabulary is static so it can't be a

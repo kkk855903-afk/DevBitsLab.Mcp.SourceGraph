@@ -677,6 +677,7 @@ Common flags:
 | `--no-history` | Disable the git-blame history pipeline. Use in environments without `git` on `PATH` or in CI where per-symbol history isn't needed. |
 | `--no-instructions` | Don't publish server-side usage guidance in the MCP `initialize` response. By default the server tells the connected model to prefer source-graph tools over `Grep` + `Read` for symbol-level questions and to call `usage_stats` at end-of-turn to verify. Equivalent to setting `SOURCEGRAPH_NO_INSTRUCTIONS=1`. |
 | `--no-leaf` | Don't prefix the brand mark `🌿` onto any of the three surfaces the server stamps: per-call response prose (the first user-visible text block of every built-in tool's result), the published `ServerInstructions` string, and the per-tool catalog identity (`Tool.Title` becomes `🌿 <name>` and `Tool.Description` is prefixed with `🌿 ` in `tools/list`). By default the brand mark surfaces in all three places so the agent (and the human reading the chat) can tell at a glance that the answer came from this server. Use this knob if your terminal renders emoji as monospaced fallback boxes or if you simply prefer unbranded output. Equivalent to setting `SOURCEGRAPH_NO_LEAF=1`. Independent of `--no-instructions`. |
+| `--no-tool-triggers` | Don't append the `Use when: …` line to tool descriptions in `tools/list`. By default each built-in tool's description carries a one-line trigger phrase (e.g. *Use when: "where is X defined?"*) so agents pick the closest match before reaching for `Grep` + `Read`. Suppressing trims the upfront `tools/list` payload at the cost of less guidance for tool selection — useful when you're driving tool-pick guidance from your own `CLAUDE.md` instead. Equivalent to setting `SOURCEGRAPH_NO_TOOL_TRIGGERS=1`. |
 
 Examples:
 
@@ -833,6 +834,7 @@ database per scope. The current limits are:
 | Per-symbol `git blame` shellout | enabled | Disable with `--no-history`. |
 | MCP `initialize` instructions payload | enabled | Disable with `--no-instructions` or `SOURCEGRAPH_NO_INSTRUCTIONS=1`. |
 | Green-leaf brand mark on tool responses, `ServerInstructions`, and per-tool `Title`/`Description` in `tools/list` | enabled | Disable with `--no-leaf` or `SOURCEGRAPH_NO_LEAF=1`. |
+| `Use when: …` trigger line on tool descriptions in `tools/list` | enabled | Disable with `--no-tool-triggers` or `SOURCEGRAPH_NO_TOOL_TRIGGERS=1`. |
 | SQLite database size per scope | unbounded | Use `clear` to wipe; databases live under `<root>/.sourcegraph/scopes/<id>.db`. |
 | `query_graph` statement timeout | 5 s | `--query-timeout-seconds <int>` or `SOURCEGRAPH_QUERY_TIMEOUT_SECONDS=<int>`. |
 | `query_graph` row cap | 5000 rows | `--query-row-limit <int>` or `SOURCEGRAPH_QUERY_ROW_LIMIT=<int>`. The tool surfaces `truncated: true` when the cap is hit. |

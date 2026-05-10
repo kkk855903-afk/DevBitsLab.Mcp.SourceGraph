@@ -66,6 +66,46 @@ public sealed class ToolTriggerTests
     }
 
     [Fact]
+    public void AppendTrigger_returnsDescriptionUnchanged_whenSuppressed()
+    {
+        var saved = ToolDescriptionFormatter.Suppressed;
+        try
+        {
+            ToolDescriptionFormatter.Suppressed = true;
+            ToolDescriptionFormatter.AppendTrigger("Find a thing.", "\"where is X?\"")
+                .Should().Be("Find a thing.");
+        }
+        finally
+        {
+            ToolDescriptionFormatter.Suppressed = saved;
+        }
+    }
+
+    [Fact]
+    public void ApplyTriggersFromAttributes_isNoop_whenSuppressed()
+    {
+        var saved = ToolDescriptionFormatter.Suppressed;
+        try
+        {
+            ToolDescriptionFormatter.Suppressed = true;
+            var withTrigger = McpServerTool.Create(
+                typeof(ToolTriggerTests).GetMethod(nameof(WithTriggerSample), BindingFlags.Static | BindingFlags.NonPublic)!,
+                target: null,
+                new McpServerToolCreateOptions());
+            var original = withTrigger.ProtocolTool.Description;
+
+            ToolDescriptionFormatter.ApplyTriggersFromAttributes(new[] { withTrigger });
+
+            withTrigger.ProtocolTool.Description.Should().Be(original);
+            withTrigger.ProtocolTool.Description.Should().NotContain("Use when:");
+        }
+        finally
+        {
+            ToolDescriptionFormatter.Suppressed = saved;
+        }
+    }
+
+    [Fact]
     public void ApplyTriggersFromAttributes_isIdempotent()
     {
         var tool = McpServerTool.Create(

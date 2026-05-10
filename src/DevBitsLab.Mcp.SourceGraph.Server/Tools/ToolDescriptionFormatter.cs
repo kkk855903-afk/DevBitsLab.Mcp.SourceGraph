@@ -12,10 +12,21 @@ namespace DevBitsLab.Mcp.SourceGraph.Server.Tools;
 /// </summary>
 internal static class ToolDescriptionFormatter
 {
+    public const string EnvVarName = "SOURCEGRAPH_NO_TOOL_TRIGGERS";
+
+    /// <summary>
+    /// When true, <see cref="AppendTrigger"/> and <see cref="ApplyTriggersFromAttributes"/> become
+    /// no-ops — the <c>Use when:</c> line is omitted from every tool description. Set once at
+    /// process start by <c>Program.cs</c> from the <c>--no-tool-triggers</c> CLI flag or
+    /// <c>SOURCEGRAPH_NO_TOOL_TRIGGERS=1</c> env var. Not intended to flip mid-session.
+    /// </summary>
+    public static bool Suppressed { get; set; }
+
     private const string UseWhenSeparator = "\n\nUse when: ";
 
     public static string AppendTrigger(string description, string? trigger)
     {
+        if (Suppressed) return description;
         if (string.IsNullOrWhiteSpace(trigger)) return description;
         return string.IsNullOrEmpty(description)
             ? $"Use when: {trigger.Trim()}"
@@ -30,6 +41,7 @@ internal static class ToolDescriptionFormatter
     /// </summary>
     public static void ApplyTriggersFromAttributes(IEnumerable<McpServerTool> tools)
     {
+        if (Suppressed) return;
         foreach (var tool in tools)
         {
             // McpServerTool.Metadata is documented as carrying the source MethodInfo as the first

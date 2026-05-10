@@ -23,6 +23,9 @@ internal sealed class CommandLine
     /// <summary>True when <c>--no-leaf</c> was passed; suppresses the green-leaf brand mark on
     /// every built-in tool response and on the published <c>ServerInstructions</c> string.</summary>
     public bool NoLeaf { get; private init; }
+    /// <summary>True when <c>--no-tool-triggers</c> was passed; suppresses the
+    /// <c>Use when: …</c> append on every tool description (built-in and plugin).</summary>
+    public bool NoToolTriggers { get; private init; }
     /// <summary>True when <c>--strict</c> was passed; consumed by <c>vocabulary list</c> to exit
     /// non-zero when drift candidates are reported.</summary>
     public bool Strict { get; private init; }
@@ -81,6 +84,7 @@ internal sealed class CommandLine
         var noHistory = false;
         var noInstructions = false;
         var noLeaf = false;
+        var noToolTriggers = false;
         var strict = false;
         var all = false;
         string? scopeId = null;
@@ -134,6 +138,9 @@ internal sealed class CommandLine
                     break;
                 case "--no-leaf":
                     noLeaf = true;
+                    break;
+                case "--no-tool-triggers":
+                    noToolTriggers = true;
                     break;
                 case "--strict":
                     strict = true;
@@ -221,6 +228,7 @@ internal sealed class CommandLine
             NoHistory = noHistory,
             NoInstructions = noInstructions,
             NoLeaf = noLeaf,
+            NoToolTriggers = noToolTriggers,
             Strict = strict,
             All = all,
             ScopeId = scopeId,
@@ -397,6 +405,11 @@ internal sealed class CommandLine
           --no-leaf         Don't prefix tool responses (or the published `ServerInstructions`
                             string) with the green-leaf brand mark. Equivalent to setting
                             SOURCEGRAPH_NO_LEAF=1.
+          --no-tool-triggers
+                            Don't append the `Use when: …` line to tool descriptions in
+                            tools/list. Saves upfront tokens at the cost of less guidance
+                            for agents picking between tools. Equivalent to setting
+                            SOURCEGRAPH_NO_TOOL_TRIGGERS=1.
           --scope <id>      Restrict the operation to a single scope. Currently consumed by
                             `vocabulary list`; ignored elsewhere.
           --strict          Treat warnings as errors. Currently consumed by `vocabulary list`,

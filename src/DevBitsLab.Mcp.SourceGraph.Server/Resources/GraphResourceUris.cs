@@ -28,4 +28,10 @@ public static class GraphResourceUris
     /// because namespace identifiers don't carry URI-illegal characters.
     /// </summary>
     public static string Namespace(string name) => $"graph://namespace/{name}";
+
+    /// <summary>
+    /// Static URI for the on-demand help body referenced from <c>ServerInstructions</c>. Served
+    /// by <see cref="GraphResources.GetHelp"/>.
+    /// </summary>
+    public const string Help = "graph://help";
 }

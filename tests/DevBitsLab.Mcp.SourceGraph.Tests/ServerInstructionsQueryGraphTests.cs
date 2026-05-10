@@ -1,4 +1,5 @@
 using DevBitsLab.Mcp.SourceGraph.Server;
+using DevBitsLab.Mcp.SourceGraph.Server.Resources;
 using DevBitsLab.Mcp.SourceGraph.Server.Tools;
 using FluentAssertions;
 using Xunit;
@@ -6,10 +7,11 @@ using Xunit;
 namespace DevBitsLab.Mcp.SourceGraph.Tests;
 
 /// <summary>
-/// Verifies the layered-tooling sentence (describe_schema → query_graph) lives in the published
-/// <c>ServerInstructions</c> template and is suppressed alongside the rest of the payload by
-/// <c>--no-instructions</c> / <c>SOURCEGRAPH_NO_INSTRUCTIONS</c>. Mirrors the existing
-/// <see cref="CommandLineNoInstructionsTests"/> CLI-flag coverage.
+/// Verifies the layered-tooling sentence (describe_schema → query_graph) lives in the on-demand
+/// <c>graph://help</c> body (<see cref="ServerHelp.Template"/>) and that the trimmed
+/// <see cref="ServerInstructions.Template"/> still points agents at the help resource.
+/// Suppression of the published preamble by <c>--no-instructions</c> /
+/// <c>SOURCEGRAPH_NO_INSTRUCTIONS</c> remains unchanged.
 /// </summary>
 [Collection("LeafFormatterState")]
 public sealed class ServerInstructionsQueryGraphTests
@@ -18,16 +20,24 @@ public sealed class ServerInstructionsQueryGraphTests
     private const string LayeredSentenceFragment2 = "query_graph";
 
     [Fact]
-    public void Template_includesTheLayeredQueryGraphSentence()
+    public void HelpResource_includesTheLayeredQueryGraphSentence()
     {
-        ServerInstructions.Template.Should().Contain(LayeredSentenceFragment);
-        ServerInstructions.Template.Should().Contain(LayeredSentenceFragment2);
-        ServerInstructions.Template.Should().Contain("stable contract");
-        ServerInstructions.Template.Should().Contain("v_symbols");
+        ServerHelp.Template.Should().Contain(LayeredSentenceFragment);
+        ServerHelp.Template.Should().Contain(LayeredSentenceFragment2);
+        ServerHelp.Template.Should().Contain("stable contract");
+        ServerHelp.Template.Should().Contain("v_symbols");
     }
 
     [Fact]
-    public void ResolvePublished_withoutLeafSuppression_keepsLeafAndLayeredSentence()
+    public void Template_pointsAtHelpResource()
+    {
+        // The verbose body moved to graph://help to cut upfront tokens; the preamble must still
+        // tell agents where to fetch it, otherwise they'll never discover the SQL escape hatch.
+        ServerInstructions.Template.Should().Contain(GraphResourceUris.Help);
+    }
+
+    [Fact]
+    public void ResolvePublished_withoutLeafSuppression_keepsLeafAndHelpPointer()
     {
         var saved = LeafFormatter.Suppressed;
         try
@@ -35,8 +45,7 @@ public sealed class ServerInstructionsQueryGraphTests
             LeafFormatter.Suppressed = false;
             var published = ServerInstructions.ResolvePublished();
             published.Should().StartWith(LeafFormatter.Mark);
-            published.Should().Contain(LayeredSentenceFragment);
-            published.Should().Contain(LayeredSentenceFragment2);
+            published.Should().Contain(GraphResourceUris.Help);
         }
         finally
         {
@@ -45,7 +54,7 @@ public sealed class ServerInstructionsQueryGraphTests
     }
 
     [Fact]
-    public void ResolvePublished_withLeafSuppression_stripsLeafButKeepsLayeredSentence()
+    public void ResolvePublished_withLeafSuppression_stripsLeafButKeepsHelpPointer()
     {
         var saved = LeafFormatter.Suppressed;
         try
@@ -53,13 +62,22 @@ public sealed class ServerInstructionsQueryGraphTests
             LeafFormatter.Suppressed = true;
             var published = ServerInstructions.ResolvePublished();
             published.Should().NotStartWith(LeafFormatter.Mark);
-            published.Should().Contain(LayeredSentenceFragment);
-            published.Should().Contain(LayeredSentenceFragment2);
+            published.Should().Contain(GraphResourceUris.Help);
         }
         finally
         {
             LeafFormatter.Suppressed = saved;
         }
+    }
+
+    [Fact]
+    public void GraphResources_GetHelp_returnsServerHelpTemplate()
+    {
+        // Wiring smoke-test: the [McpServerResource] handler must return the same body the help
+        // resource is documented to serve. If someone refactors GraphResources.GetHelp, this
+        // catches accidental drift between the Template constant and the served payload.
+        DevBitsLab.Mcp.SourceGraph.Server.Resources.GraphResources.GetHelp()
+            .Should().Be(ServerHelp.Template);
     }
 
     [Fact]

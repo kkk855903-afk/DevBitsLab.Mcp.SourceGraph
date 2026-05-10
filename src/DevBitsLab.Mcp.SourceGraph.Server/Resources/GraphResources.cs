@@ -128,6 +128,10 @@ public static class GraphResources
         return sb.ToString();
     }
 
+    [McpServerResource(UriTemplate = GraphResourceUris.Help, Name = "graph-help", MimeType = "text/markdown")]
+    [Description("Tool-selection guide and the describe_schema / query_graph ad-hoc-query reference. Fetch when picking which sourcegraph tool to use, or when planning a SQL escape-hatch query against the view layer.")]
+    public static string GetHelp() => ServerHelp.Template;
+
     [McpServerResource(UriTemplate = "graph://namespace/{name}", Name = "graph-namespace", MimeType = "text/markdown")]
     [Description("Namespace summary: most-referenced symbols in the namespace, ranked by inbound call count. Resolved against the active scope.")]
     public static async Task<string> GetNamespaceSummaryAsync(

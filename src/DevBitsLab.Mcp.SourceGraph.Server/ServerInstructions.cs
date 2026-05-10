@@ -32,25 +32,14 @@ internal static class ServerInstructions
     public const string Template =
         """
         🌿 This MCP server exposes a live code source graph for the connected .NET solution.
-        For symbol-level questions ("where is X defined?", "who calls X?", "what's in this
-        file?", "what would change if I edit X?", and similar) prefer these tools before
-        reaching for Grep + Read — the graph answers in one structured call instead of
-        dozens of file reads.
+        For symbol-level questions ("where is X defined?", "who calls X?", "what would
+        change if I edit X?", and similar) prefer these tools over Grep + Read — the
+        graph answers in one structured call instead of dozens of file reads.
 
-        Each tool's description includes a "Use when:" line documenting the question shape
-        it answers; pick the closest match. Fall back to Grep / Read only when the graph
-        genuinely doesn't cover the question (config files, plain text, comments, PR
-        descriptions, etc.) or when a tool returns nothing relevant.
+        Fetch `graph://help` for the full tool-selection guide and the `query_graph`
+        ad-hoc-query reference (view layer, SQL escape hatch, examples).
 
-        For ad-hoc questions that don't fit a curated tool — aggregations, joins, "how many
-        public types use X", "which classes implement IDisposable but lack Dispose", etc. —
-        call `describe_schema` to learn the view layer, then `query_graph` to run read-only
-        SQL against it. The view layer (v_symbols, v_edges, v_files, v_references, v_scopes)
-        is a stable contract; the underlying tables remain implementation details.
-
-        Call usage_stats at the end of a turn to verify the graph was actually queried.
-        If the counts didn't move, you fell back to Grep + Read on a question a graph tool
-        would have answered faster.
+        Call `usage_stats` at end-of-turn to verify the graph was actually queried.
         """;
 
     /// <summary>
