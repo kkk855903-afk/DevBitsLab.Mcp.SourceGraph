@@ -10,6 +10,22 @@ below note which package the change applies to.
 
 ## [Unreleased]
 
+### Added
+- **`partial` scope status with per-project + per-file failure isolation.** A
+  single bad project in a multi-project solution no longer marks the whole
+  scope `degraded`. The Roslyn indexer pre-flight-probes each project's
+  `Compilation`, skipping ones that throw or return null. Pass 1B's per-document
+  symbol walk is wrapped in try/catch with a `walkedFileIds` gate so
+  reconcile / Pass 2 / Pass 3 preserve a failing file's prior store state
+  rather than corrupting it with an incomplete walk. `IndexResult` gains
+  `FailedProjects` / `FailedFiles`; `LiveIndexService` settles the scope to
+  `partial` (at least one project produced symbols and something failed),
+  `degraded` (every project failed or workspace open threw), or `ok`.
+  `list_scopes` exposes `failed_projects` / `failed_files` arrays in both
+  prose and structured output; `_meta.db` persists them as JSON columns so
+  the failure detail survives server restarts. `scope = "*"` fan-out
+  includes `partial` scopes alongside `ok`. (`add-per-project-failure-isolation`)
+
 ### Changed
 - **Soft size budget on list-shaped tool results.** Built-in tools that emit
   per-row prose + `ResourceLinkBlock` + structured-content trios now trim

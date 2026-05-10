@@ -28,9 +28,23 @@ public interface IScopeRegistry : IAsyncDisposable
 /// trades a tiny bit of query convenience for forward-compatibility with new scope kinds.
 /// </summary>
 /// <param name="Status">
-///     One of <c>"ok"</c>, <c>"degraded"</c>, <c>"indexing"</c>. Surfaced by <c>list_scopes</c>.
-///     A scope marked <c>degraded</c> still appears in the registry; queries against it return
-///     a "scope is degraded" hint instead of crashing the host.
+///     One of <c>"ok"</c>, <c>"partial"</c>, <c>"degraded"</c>, <c>"indexing"</c>. Surfaced by
+///     <c>list_scopes</c>. A scope marked <c>degraded</c> still appears in the registry; queries
+///     against it return a "scope is degraded" hint instead of crashing the host. <c>partial</c>
+///     means at least one project produced symbols and at least one project or file failed —
+///     queries succeed but results may be incomplete; the failure detail lives in
+///     <see cref="FailedProjects"/> and <see cref="FailedFiles"/>.
+/// </param>
+/// <param name="FailedProjects">
+///     Projects whose Roslyn <c>Compilation</c> could not be obtained during the most recent
+///     cold or incremental index. Empty for healthy scopes. Persisted as JSON so a server
+///     restart that hasn't yet re-triggered indexing still serves accurate failure detail
+///     through <c>list_scopes</c>.
+/// </param>
+/// <param name="FailedFiles">
+///     Files whose Pass 1 walk threw during the most recent index. Empty for healthy scopes.
+///     A failed file's prior store state (symbols, refs, edges, annotations, diagnostics) is
+///     preserved untouched until the next successful walk.
 /// </param>
 public sealed record ScopeRow(
     string Id,
@@ -40,7 +54,9 @@ public sealed record ScopeRow(
     bool Isolated,
     DateTimeOffset LastIndexedAt,
     string Status,
-    string? StatusMessage = null);
+    string? StatusMessage = null,
+    IReadOnlyList<ProjectFailure>? FailedProjects = null,
+    IReadOnlyList<FileFailure>? FailedFiles = null);
 
 /// <summary>
 /// Factory that opens a per-scope <see cref="IGraphStore"/> against

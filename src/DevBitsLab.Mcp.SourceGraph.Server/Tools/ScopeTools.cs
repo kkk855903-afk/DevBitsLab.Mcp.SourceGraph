@@ -18,7 +18,7 @@ public static class ScopeTools
 {
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(ListScopesResult))]
     [ToolTrigger("\"what scopes are configured?\" — call before passing the `scope` parameter to other tools, or after a 'no default_scope' error")]
-    [Description("List every registered scope: id, name, root directory, project count, last-indexed timestamp, status (ok | degraded | indexing), and isolation flag. Pair with the optional `scope` parameter on every other tool.")]
+    [Description("List every registered scope: id, name, root directory, project count, last-indexed timestamp, status (ok | partial | degraded | indexing), isolation flag, and any failed_projects / failed_files surfaced by the most recent index. Pair with the optional `scope` parameter on every other tool. A `partial` status means at least one project produced symbols and one or more failed; queries succeed but results may be incomplete.")]
     public static Task<CallToolResult> ListScopesAsync(ScopeRouter router) =>
         // Body is sync but tracking goes through the async overload that knows how to brand-mark
         // the first user-visible TextContentBlock and serialise StructuredContent. Wrap in
@@ -57,11 +57,44 @@ public static class ScopeTools
             var lastIndexed = host.LastIndexedAt == DateTimeOffset.MinValue
                 ? "_never_"
                 : host.LastIndexedAt.ToString("yyyy-MM-dd HH:mm:ss UTC");
-            var statusCell = host.Status == "degraded" && !string.IsNullOrEmpty(host.StatusMessage)
-                ? $"degraded ({host.StatusMessage})"
+            var statusCell = (host.Status == "degraded" || host.Status == "partial") && !string.IsNullOrEmpty(host.StatusMessage)
+                ? $"{host.Status} ({host.StatusMessage})"
                 : host.Status;
-            sb.AppendLine($"| `{scope.Id}` | {scope.Name} | {statusCell} | {(scope.Isolated ? "yes" : "no")} | {projectCount} | {lastIndexed} | `{scope.Root}` |");
+            // Status messages, names, and roots can contain user data (exception messages, file
+            // paths from `.sourcegraph.json`). A literal `|` or newline in any cell would break
+            // the GFM table renderer; escape both via the shared MarkdownTable helper.
+            sb.AppendLine($"| `{scope.Id}` | {MarkdownTable.EscapeCell(scope.Name)} | {MarkdownTable.EscapeCell(statusCell)} | {(scope.Isolated ? "yes" : "no")} | {projectCount} | {lastIndexed} | `{MarkdownTable.EscapeCell(scope.Root)}` |");
         }
+
+        // Per-scope failure detail: only emit when at least one scope has non-empty failure
+        // lists. Healthy installs see a clean table with no trailing failure section. The
+        // markdown rendering surfaces the same data carried in StructuredContent so operators
+        // reading the prose see the attribution without inspecting the typed shape. Note: the
+        // failure lists reflect the most recent COLD index — watcher-driven incremental
+        // re-indexes don't currently refresh them. Restart the server to force a refresh.
+        if (hosts.Any(h => h.FailedProjects.Count > 0 || h.FailedFiles.Count > 0))
+        {
+            sb.AppendLine();
+            sb.AppendLine("**Failed projects / files (last cold index):**");
+            foreach (var host in hosts)
+            {
+                if (host.FailedProjects.Count == 0 && host.FailedFiles.Count == 0) continue;
+                // Names + paths go inside inline-code spans; reason strings sit as plain
+                // prose. Both populations come from arbitrary user-controlled text (csproj
+                // names, file paths, exception messages), so a literal backtick or newline
+                // would otherwise break the bullet structure.
+                sb.AppendLine($"- `{MarkdownTable.EscapeInlineCode(host.Scope.Id)}`:");
+                foreach (var pf in host.FailedProjects)
+                {
+                    sb.AppendLine($"  - project `{MarkdownTable.EscapeInlineCode(pf.Name)}` — {MarkdownTable.CollapseLines(pf.Reason)}");
+                }
+                foreach (var ff in host.FailedFiles)
+                {
+                    sb.AppendLine($"  - file `{MarkdownTable.EscapeInlineCode(ff.Path)}` — {MarkdownTable.CollapseLines(ff.Reason)}");
+                }
+            }
+        }
+
         if (router.DefaultScope is not null)
         {
             sb.AppendLine();
@@ -103,7 +136,13 @@ public static class ScopeTools
                 LastIndexedAt: host.LastIndexedAt == DateTimeOffset.MinValue
                     ? null
                     : host.LastIndexedAt.ToString("o"),
-                ProjectCount: ProjectCount(host.Scope.ProjectSet)))
+                ProjectCount: ProjectCount(host.Scope.ProjectSet),
+                FailedProjects: host.FailedProjects
+                    .Select(pf => new ListScopesProjectFailure(pf.Name, pf.Reason))
+                    .ToList(),
+                FailedFiles: host.FailedFiles
+                    .Select(ff => new ListScopesFileFailure(ff.Path, ff.Reason))
+                    .ToList()))
             .ToList();
         var dto = new ListScopesResult(DefaultScope: defaultScope, Scopes: rows);
         return new CallToolResult
@@ -122,4 +161,5 @@ public static class ScopeTools
         Core.ScopeProjectSet.Paths g => g.Globs.Count,
         _ => 0,
     };
+
 }

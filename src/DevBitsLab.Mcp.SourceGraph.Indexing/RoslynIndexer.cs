@@ -51,6 +51,17 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
     private readonly Dictionary<string, long> _fileIdByPath = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<long, List<string>> _keysByFileId = new();
 
+    // Set fresh by ProbeProjectCompilationsAsync at the start of every indexing pass. Read by
+    // AllCSharpDocumentsAsync (to filter out failed projects' regular + source-generated docs),
+    // by IndexCoreAsync (to filter inbound documents and populate IndexResult.FailedProjects),
+    // and by Pass 3 (to look up compilations by ProjectId without double-calling
+    // GetCompilationAsync). Stored as instance fields rather than threaded through call args
+    // because the same data feeds three call sites and the indexer holds a single-thread lock
+    // for the duration of a pass.
+    private IReadOnlyDictionary<ProjectId, Compilation> _probedCompilations = new Dictionary<ProjectId, Compilation>();
+    private IReadOnlyList<ProjectFailure> _probedFailures = Array.Empty<ProjectFailure>();
+    private HashSet<ProjectId> _probedFailedProjectIds = new();
+
     /// <summary>
     /// Fires once per (re)indexed file with <c>(fileId, fullPath, contentSha256)</c>. The Server
     /// project hooks this to enqueue work into the history pipeline; the indexer itself never
@@ -102,6 +113,7 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         await _lock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
+            await ProbeProjectCompilationsAsync(_workspace!.CurrentSolution.Projects, ct).ConfigureAwait(false);
             var docs = (await AllCSharpDocumentsAsync(ct).ConfigureAwait(false)).ToList();
             return await IndexCoreAsync(docs, fullReset: false, ct).ConfigureAwait(false);
         }
@@ -177,11 +189,19 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                 }
             }
 
+            // Pre-flight probe over just the touched projects. The probe sets _probedFailedProjectIds
+            // which IndexCoreAsync's filter consumes; touched-project failures land in the resulting
+            // IndexResult.FailedProjects so LiveIndexService can flip the scope to `partial`.
+            await ProbeProjectCompilationsAsync(
+                touchedProjects.Select(pid => solution.GetProject(pid)).Where(p => p is not null)!,
+                ct).ConfigureAwait(false);
+
             // For every project whose input files changed, also walk its source-generated docs.
             // The SHA gate inside IndexCoreAsync will skip generated docs whose synthesised text
             // hasn't changed (per design.md "SHA gate on generated content").
             foreach (var pid in touchedProjects)
             {
+                if (_probedFailedProjectIds.Contains(pid)) continue;
                 var project = solution.GetProject(pid);
                 if (project is null || project.Language != LanguageNames.CSharp) continue;
                 IEnumerable<SourceGeneratedDocument> sourceGenDocs;
@@ -243,11 +263,62 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         if (_workspace is null) throw new InvalidOperationException("Call OpenAsync before indexing.");
     }
 
+    /// <summary>
+    /// Pre-flight probe: ask each project for its <see cref="Compilation"/> once before Pass 1
+    /// begins. Projects that throw or return <c>null</c> are recorded as <see cref="ProjectFailure"/>
+    /// entries and added to <see cref="_probedFailedProjectIds"/>; their documents are excluded from
+    /// every subsequent pass. Successful compilations are cached in <see cref="_probedCompilations"/>
+    /// so Pass 3's diagnostics walk reuses them rather than re-calling <c>GetCompilationAsync</c>.
+    ///
+    /// <para>This produces one log entry per failed project rather than N per-document errors when
+    /// the same root cause (e.g. an unresolvable PackageReference, a missing SDK) hits every doc
+    /// in the project. Cancellation propagates; other exceptions are converted into ProjectFailure
+    /// entries with the truncated exception message as the reason.</para>
+    /// </summary>
+    [SuppressMessage("Design", "CA1031:DoNotCatchGeneralExceptionTypes",
+        Justification = "A misbehaving project (unresolvable references, malformed csproj, source-generator throwing during compilation construction) must not abort the entire indexing pass. Each failure is logged and converted into a ProjectFailure record so the scope can settle to `partial` rather than `degraded`.")]
+    private async Task ProbeProjectCompilationsAsync(IEnumerable<Project> projects, CancellationToken ct)
+    {
+        var ok = new Dictionary<ProjectId, Compilation>();
+        var failed = new List<ProjectFailure>();
+        var failedIds = new HashSet<ProjectId>();
+        foreach (var project in projects)
+        {
+            if (project.Language != LanguageNames.CSharp) continue;
+            ct.ThrowIfCancellationRequested();
+            try
+            {
+                var compilation = await project.GetCompilationAsync(ct).ConfigureAwait(false);
+                if (compilation is null)
+                {
+                    _logger.LogWarning("Project {Project} returned null compilation; skipping", project.Name);
+                    failed.Add(new ProjectFailure(project.Name, "compilation null"));
+                    failedIds.Add(project.Id);
+                }
+                else
+                {
+                    ok[project.Id] = compilation;
+                }
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Project {Project} compilation threw; skipping", project.Name);
+                failed.Add(new ProjectFailure(project.Name, FailureMessage.Truncate(ex.Message)));
+                failedIds.Add(project.Id);
+            }
+        }
+        _probedCompilations = ok;
+        _probedFailures = failed;
+        _probedFailedProjectIds = failedIds;
+    }
+
     private async Task<IEnumerable<Document>> AllCSharpDocumentsAsync(CancellationToken ct)
     {
-        // Regular documents: same set we always walked.
+        // Regular documents: same set we always walked, minus documents in projects whose
+        // pre-flight compilation probe failed.
         var regular = _workspace!.CurrentSolution.Projects
-            .Where(p => p.Language == LanguageNames.CSharp)
+            .Where(p => p.Language == LanguageNames.CSharp && !_probedFailedProjectIds.Contains(p.Id))
             .SelectMany(p => p.Documents)
             .Where(d => d.SourceCodeKind == SourceCodeKind.Regular && !string.IsNullOrEmpty(d.FilePath));
 
@@ -256,8 +327,11 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         // routing, etc.) and surfaces synthesised C# files. They have a stable Document.FilePath
         // string from Roslyn that we can use as the unique key. Marking those rows is_generated = 1
         // is what makes the find_references default-filter and the (generated) annotations work.
+        // Failed-probe projects are skipped here too — their generators would almost certainly
+        // throw given the underlying compilation is unavailable.
         var generatedList = new List<Document>();
-        foreach (var project in _workspace.CurrentSolution.Projects.Where(p => p.Language == LanguageNames.CSharp))
+        foreach (var project in _workspace.CurrentSolution.Projects
+                     .Where(p => p.Language == LanguageNames.CSharp && !_probedFailedProjectIds.Contains(p.Id)))
         {
             ct.ThrowIfCancellationRequested();
             IEnumerable<SourceGeneratedDocument> sourceGenDocs;
@@ -315,6 +389,23 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
     private async Task<IndexResult> IndexCoreAsync(IReadOnlyList<Document> documents, bool fullReset, CancellationToken ct)
     {
         var sw = Stopwatch.StartNew();
+
+        // Defensive filter: skip documents in projects whose pre-flight probe failed. The probe
+        // populates _probedFailedProjectIds before AllCSharpDocumentsAsync is called, so this is
+        // belt-and-suspenders for callers that built `documents` themselves
+        // (IndexChangedFilesAsync's path takes a separate filter for source-generated docs).
+        if (_probedFailedProjectIds.Count > 0)
+        {
+            documents = documents.Where(d => !_probedFailedProjectIds.Contains(d.Project.Id)).ToList();
+        }
+
+        // Track files whose Pass 1B walk completed end-to-end. The set gates Pass 1C reconcile,
+        // Pass 1D annotations, Pass 2 reference walk, and Pass 3 diagnostic reconcile so a
+        // partial Pass-1B walk does not corrupt the file's prior store state. Files absent from
+        // `walkedFileIds` keep their prior symbols/refs/edges/diagnostics until the next pass
+        // re-attempts them. `failedFiles` accumulates FileFailure records for IndexResult.
+        var walkedFileIds = new HashSet<long>();
+        var failedFiles = new List<FileFailure>();
 
         // Hydrate in-memory maps from store on first run (or after a fullReset). This means
         // unchanged files don't need any DB hits — we already know their symbol ids.
@@ -464,85 +555,110 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         var testFrameworkBySymbolId = new Dictionary<long, string>();
         foreach (var (fileId, docs) in docsByChangedFile)
         {
+            // Per-file locals — only published into the shared dictionaries (newKeysForFile /
+            // pendingAttrsByFile / seenSymbolForAttr) on the success path. If the inner walk
+            // throws, these locals are dropped on the floor and Pass 1C/1D iterate without an
+            // entry for this fileId, leaving the file's prior reconciled state intact.
             var fileKeys = new HashSet<string>(StringComparer.Ordinal);
-            newKeysForFile[fileId] = fileKeys;
             var pendingAttrs = new List<PendingAnnotation>();
-            pendingAttrsByFile[fileId] = pendingAttrs;
             var attrSeen = new HashSet<string>(StringComparer.Ordinal);
-            seenSymbolForAttr[fileId] = attrSeen;
+            var path = changedFileMeta.TryGetValue(fileId, out var meta) ? meta.Path : "<unknown>";
 
-            foreach (var document in docs)
+            try
             {
-                var tree = await document.GetSyntaxTreeAsync(ct).ConfigureAwait(false);
-                var model = await document.GetSemanticModelAsync(ct).ConfigureAwait(false);
-                if (tree is null || model is null) continue;
-
-                var root = await tree.GetRootAsync(ct).ConfigureAwait(false);
-                foreach (var node in EnumerateDeclarations(root))
+                foreach (var document in docs)
                 {
-                    var symbol = model.GetDeclaredSymbol(node, ct);
-                    if (symbol is null || !SymbolMapping.IsIndexable(symbol)) continue;
+                    var tree = await document.GetSyntaxTreeAsync(ct).ConfigureAwait(false);
+                    var model = await document.GetSemanticModelAsync(ct).ConfigureAwait(false);
+                    if (tree is null || model is null) continue;
 
-                    var key = SymbolMapping.CanonicalKey(symbol);
-                    if (key is null) continue;
-                    if (!fileKeys.Add(key)) continue;
-
-                    // Remember parent canonical key for the pass-1c container_id batch update.
-                    var parentSym = symbol.ContainingSymbol;
-                    if (parentSym is not null && SymbolMapping.IsIndexable(parentSym))
+                    var root = await tree.GetRootAsync(ct).ConfigureAwait(false);
+                    foreach (var node in EnumerateDeclarations(root))
                     {
-                        var parentKey = SymbolMapping.CanonicalKey(parentSym);
-                        if (parentKey is not null) parentKeyByChildKey[key] = parentKey;
-                    }
+                        var symbol = model.GetDeclaredSymbol(node, ct);
+                        if (symbol is null || !SymbolMapping.IsIndexable(symbol)) continue;
 
-                    // Test framework discrimination — only meaningful for methods.
-                    string? testFramework = symbol is IMethodSymbol ms ? TestDiscriminator.Detect(ms) : null;
+                        var key = SymbolMapping.CanonicalKey(symbol);
+                        if (key is null) continue;
+                        if (!fileKeys.Add(key)) continue;
 
-                    var loc = node.GetLocation().GetLineSpan();
-                    var coreSymbol = new Symbol(
-                        Id: 0,
-                        Name: symbol.Name,
-                        Fqn: SymbolMapping.Fqn(symbol),
-                        Kind: SymbolMapping.ToCoreKind(symbol),
-                        FileId: fileId,
-                        StartLine: loc.StartLinePosition.Line + 1,
-                        StartCol: loc.StartLinePosition.Character + 1,
-                        EndLine: loc.EndLinePosition.Line + 1,
-                        EndCol: loc.EndLinePosition.Character + 1,
-                        Signature: SymbolMapping.Signature(symbol),
-                        ContainerId: null,
-                        Modifiers: SymbolMapping.Modifiers(symbol),
-                        Accessibility: SymbolMapping.Accessibility(symbol),
-                        XmlSummary: SymbolMapping.XmlSummary(symbol),
-                        TestFramework: testFramework);
-
-                    var id = await _store.UpsertSymbolAsync(key, coreSymbol, ct).ConfigureAwait(false);
-                    var isNew = !_symbolIdByKey.ContainsKey(key);
-                    _symbolIdByKey[key] = id;
-                    if (isNew) symbolsIndexed++;
-
-                    if (testFramework is not null)
-                    {
-                        testFrameworkBySymbolId[id] = testFramework;
-                    }
-
-                    // Annotations: only collect once per (file, symbol) tuple even if the symbol
-                    // was discovered in multiple TFM iterations. If the same attribute is
-                    // visible across TFM iterations of the same source file we don't want to
-                    // double-store it.
-                    if (attrSeen.Add(key))
-                    {
-                        AttributeExtractor.AppendAnnotations(symbol, id, pendingAttrs);
-
-                        // Enqueue an embedding request once per (file, symbol). The sink is
-                        // a no-op when --no-embeddings was passed or the model isn't available;
-                        // the indexer never blocks on it.
-                        if (_embeddingsSink.IsEnabled)
+                        // Remember parent canonical key for the pass-1c container_id batch update.
+                        var parentSym = symbol.ContainingSymbol;
+                        if (parentSym is not null && SymbolMapping.IsIndexable(parentSym))
                         {
-                            EnqueueEmbedRequest(id, document.FilePath, symbol, coreSymbol);
+                            var parentKey = SymbolMapping.CanonicalKey(parentSym);
+                            if (parentKey is not null) parentKeyByChildKey[key] = parentKey;
+                        }
+
+                        // Test framework discrimination — only meaningful for methods.
+                        string? testFramework = symbol is IMethodSymbol ms ? TestDiscriminator.Detect(ms) : null;
+
+                        var loc = node.GetLocation().GetLineSpan();
+                        var coreSymbol = new Symbol(
+                            Id: 0,
+                            Name: symbol.Name,
+                            Fqn: SymbolMapping.Fqn(symbol),
+                            Kind: SymbolMapping.ToCoreKind(symbol),
+                            FileId: fileId,
+                            StartLine: loc.StartLinePosition.Line + 1,
+                            StartCol: loc.StartLinePosition.Character + 1,
+                            EndLine: loc.EndLinePosition.Line + 1,
+                            EndCol: loc.EndLinePosition.Character + 1,
+                            Signature: SymbolMapping.Signature(symbol),
+                            ContainerId: null,
+                            Modifiers: SymbolMapping.Modifiers(symbol),
+                            Accessibility: SymbolMapping.Accessibility(symbol),
+                            XmlSummary: SymbolMapping.XmlSummary(symbol),
+                            TestFramework: testFramework);
+
+                        var id = await _store.UpsertSymbolAsync(key, coreSymbol, ct).ConfigureAwait(false);
+                        var isNew = !_symbolIdByKey.ContainsKey(key);
+                        _symbolIdByKey[key] = id;
+                        if (isNew) symbolsIndexed++;
+
+                        if (testFramework is not null)
+                        {
+                            testFrameworkBySymbolId[id] = testFramework;
+                        }
+
+                        // Annotations: only collect once per (file, symbol) tuple even if the symbol
+                        // was discovered in multiple TFM iterations. If the same attribute is
+                        // visible across TFM iterations of the same source file we don't want to
+                        // double-store it.
+                        if (attrSeen.Add(key))
+                        {
+                            AttributeExtractor.AppendAnnotations(symbol, id, pendingAttrs);
+
+                            // Enqueue an embedding request once per (file, symbol). The sink is
+                            // a no-op when --no-embeddings was passed or the model isn't available;
+                            // the indexer never blocks on it.
+                            if (_embeddingsSink.IsEnabled)
+                            {
+                                EnqueueEmbedRequest(id, document.FilePath, symbol, coreSymbol);
+                            }
                         }
                     }
                 }
+
+                // Success: publish per-file state to the shared dictionaries that Pass 1C/1D
+                // iterate. Pass 2 will also gate on walkedFileIds so failed files are skipped.
+                newKeysForFile[fileId] = fileKeys;
+                pendingAttrsByFile[fileId] = pendingAttrs;
+                seenSymbolForAttr[fileId] = attrSeen;
+                walkedFileIds.Add(fileId);
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex)
+            {
+                // One file's Pass-1B walk threw — log it and let the next file proceed. The
+                // file's prior store state (symbols, refs, edges, annotations, diagnostics) is
+                // preserved because we never wrote to newKeysForFile/pendingAttrsByFile, so
+                // Pass 1C's DeleteSymbolsForFileNotInAsync skips it. Pass 2 and Pass 3 also
+                // gate on walkedFileIds. The next index will re-attempt this file.
+                _logger.LogWarning(ex,
+                    "Pass 1 walk failed for {Path}; preserving prior symbol state, file will be re-attempted on the next index",
+                    path);
+                failedFiles.Add(new FileFailure(path, FailureMessage.Truncate(ex.Message)));
             }
         }
 
@@ -614,9 +730,15 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         // inflate counts. The first doc's tree+model is sufficient since the source file's
         // declarations and references are the same across TFMs (modulo #if-conditional code, which
         // we accept losing visibility into for now).
+        // Files whose Pass 1B walk threw (absent from walkedFileIds) are skipped here too —
+        // walking refs against incomplete pass-1 symbol state would emit refs targeting symbols
+        // that don't yet exist in the store.
         var refsIndexed = 0;
-        var docsToIndexRefs = docsByChangedFile.Values.Select(list => list[0]).ToList();
-        var filesIndexed = changedFileIds.Count;
+        var docsToIndexRefs = docsByChangedFile
+            .Where(kv => walkedFileIds.Contains(kv.Key))
+            .Select(kv => kv.Value[0])
+            .ToList();
+        var filesIndexed = walkedFileIds.Count;
         foreach (var document in docsToIndexRefs)
         {
             ct.ThrowIfCancellationRequested();
@@ -864,26 +986,27 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
             foreach (var d in docs) projectsTouched.Add(d.Project.Id);
         }
         var diagnosticsByFile = new Dictionary<long, List<DiagnosticRecord>>();
-        // Pre-create empty buckets for every changed file so files with zero diagnostics still get
-        // an Upsert call to clear out stale rows from a prior index.
-        foreach (var fid in changedFileIds) diagnosticsByFile[fid] = new List<DiagnosticRecord>();
+        // Pre-create empty buckets for every successfully-walked file so files with zero
+        // diagnostics still get an Upsert call to clear out stale rows from a prior index.
+        // Files whose Pass 1B threw (absent from walkedFileIds) are deliberately not pre-bucketed —
+        // their prior diagnostic rows stay in place until a successful re-walk.
+        foreach (var fid in changedFileIds)
+        {
+            if (walkedFileIds.Contains(fid)) diagnosticsByFile[fid] = new List<DiagnosticRecord>();
+        }
 
         foreach (var pid in projectsTouched)
         {
             ct.ThrowIfCancellationRequested();
-            var project = _workspace!.CurrentSolution.GetProject(pid);
-            if (project is null) continue;
-            Compilation? compilation;
-            try
+            // Reuse the pre-flight probe's compilation rather than calling GetCompilationAsync
+            // again (Roslyn caches per project, but skipping the round-trip is cheaper). Failed
+            // probe projects are already excluded from `projectsTouched` because their docs were
+            // filtered out before Pass 1A; the TryGetValue branch is a safety net for any TFM
+            // iteration that escaped the filter.
+            if (!_probedCompilations.TryGetValue(pid, out var compilation))
             {
-                compilation = await project.GetCompilationAsync(ct).ConfigureAwait(false);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "Failed to get compilation for {Project}; skipping diagnostics", project.Name);
                 continue;
             }
-            if (compilation is null) continue;
 
             ImmutableArray<Diagnostic> diags;
             try
@@ -892,7 +1015,8 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
             }
             catch (Exception ex)
             {
-                _logger.LogWarning(ex, "Failed to read diagnostics for {Project}", project.Name);
+                var project = _workspace!.CurrentSolution.GetProject(pid);
+                _logger.LogWarning(ex, "Failed to read diagnostics for {Project}", project?.Name ?? pid.ToString());
                 continue;
             }
 
@@ -907,6 +1031,7 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                 if (string.IsNullOrEmpty(path)) continue;
                 if (!_fileIdByPath.TryGetValue(path, out var fileId)) continue;
                 if (!changedFileIds.Contains(fileId)) continue; // only touch files we re-indexed
+                if (!walkedFileIds.Contains(fileId)) continue;  // skip files whose Pass 1B threw
 
                 long? symbolId = null;
                 try
@@ -982,7 +1107,11 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
             }
         }
 
-        return new IndexResult(filesIndexed, symbolsIndexed, refsIndexed, sw.Elapsed);
+        return new IndexResult(filesIndexed, symbolsIndexed, refsIndexed, sw.Elapsed)
+        {
+            FailedProjects = _probedFailures,
+            FailedFiles = failedFiles,
+        };
     }
 
     /// <summary>
@@ -1483,4 +1612,19 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
     }
 }
 
-public sealed record IndexResult(int FilesIndexed, int SymbolsIndexed, int ReferencesIndexed, TimeSpan Elapsed);
+public sealed record IndexResult(int FilesIndexed, int SymbolsIndexed, int ReferencesIndexed, TimeSpan Elapsed)
+{
+    /// <summary>
+    /// Projects whose Roslyn <c>Compilation</c> could not be obtained during the index pass.
+    /// Empty for healthy installs. The pre-flight probe in <see cref="RoslynIndexer"/> populates
+    /// this list and skips the project's documents in every subsequent pass.
+    /// </summary>
+    public IReadOnlyList<ProjectFailure> FailedProjects { get; init; } = Array.Empty<ProjectFailure>();
+
+    /// <summary>
+    /// Files whose Pass 1 symbol walk threw during the index pass. Empty for healthy installs.
+    /// The pass 1B per-document try/catch in <see cref="RoslynIndexer"/> populates this list;
+    /// failed files retain their prior store state until the next successful walk.
+    /// </summary>
+    public IReadOnlyList<FileFailure> FailedFiles { get; init; } = Array.Empty<FileFailure>();
+}

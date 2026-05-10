@@ -60,6 +60,18 @@
                       Private="false"
                       PrivateAssets="all"
                       SetConfiguration="Configuration=Debug" />
+    <!-- PartialFailure fixture: Good.csproj is restored + built so MSBuildWorkspace can
+         evaluate it cleanly. Broken.csproj is deliberately NOT referenced here — its
+         unresolvable PackageReference would fail the test project's build. The
+         PartialFailure tests open the .sln via MSBuildWorkspace at runtime; OpenSolutionAsync
+         tolerates Broken's evaluation failure (it's emitted as a WorkspaceFailed event, not
+         an exception) and the per-project compilation probe in RoslynIndexer attributes
+         the failure to ProjectFailure(Broken, …). -->
+    <ProjectReference Include="..\fixtures\PartialFailure\Good\Good.csproj"
+                      ReferenceOutputAssembly="false"
+                      Private="false"
+                      PrivateAssets="all"
+                      SetConfiguration="Configuration=Debug" />
   </ItemGroup>
 
   <!-- MSBuildLocator requires that Microsoft.Build.* assemblies are not loaded from the project's

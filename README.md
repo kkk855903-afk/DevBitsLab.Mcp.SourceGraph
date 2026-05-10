@@ -445,8 +445,8 @@ A `.sourcegraph.json` at the repo root opts a project into multi-scope mode:
 ```
 
 - Each scope owns its own SQLite database at `.sourcegraph/scopes/<id>.db`.
-- A `_meta.db` registry tracks per-scope status (`ok | degraded | indexing`)
-  and last-indexed timestamp.
+- A `_meta.db` registry tracks per-scope status
+  (`ok | partial | degraded | indexing`) and last-indexed timestamp.
 - `isolated: true` excludes a scope from `scope = "*"` fan-out — useful for
   vendored or generated code that shouldn't pollute references on production
   symbols.
@@ -461,6 +461,40 @@ A `.sourcegraph.json` at the repo root opts a project into multi-scope mode:
 
 Every tool accepts an optional `scope` parameter — pass an id, a
 comma-separated list, or `"*"` to fan out.
+
+### Partial indexing (one bad project doesn't take down the scope)
+
+Real-world solutions often contain at least one quirky project (legacy MSBuild
+quirks, missing source generator NuGet, in-progress migration). Rather than
+marking the whole scope `degraded` when a single project's compilation fails,
+the indexer isolates per-project and per-file failures and surfaces them on
+`list_scopes`:
+
+- A project whose `Compilation` cannot be obtained (probe failure) is recorded
+  in `failed_projects` with a short reason string. Its documents are excluded
+  from every subsequent indexing pass; the rest of the solution indexes
+  normally.
+- A file whose Pass 1 symbol walk throws (rare — a transient Roslyn state, a
+  generator-affected source going wonky) is recorded in `failed_files`. The
+  file's prior store state is preserved untouched until the next successful
+  walk.
+
+Status semantics:
+
+| Status     | Meaning                                                                                           |
+|------------|---------------------------------------------------------------------------------------------------|
+| `ok`       | Every project and file indexed cleanly. `failed_projects` / `failed_files` are empty.             |
+| `partial`  | At least one project produced symbols and at least one project or file failed. Tools serve best-effort results from healthy projects; consult `list_scopes` for the failure detail. |
+| `degraded` | Workspace failed to open, OR every project failed. Tools return `"scope is degraded: <error>"`.   |
+| `indexing` | Cold index in progress.                                                                           |
+
+Tool fan-out (`scope = "*"`) targets every non-isolated scope regardless
+of status. Healthy and `partial` scopes return query results; `degraded`
+scopes contribute a per-scope error block (`scope is degraded: <message>`)
+to the merged response so operators see why a scope returned no data
+without the call failing as a whole. Querying a `partial` scope by id
+returns the indexed symbols (best-effort); use `list_scopes` to see
+what's missing.
 
 ## Command-line interface
 

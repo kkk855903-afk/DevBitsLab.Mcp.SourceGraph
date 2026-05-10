@@ -3558,7 +3558,7 @@ internal static class Format
         foreach (var h in headers)
         {
             sb.Append(' ');
-            sb.Append(EscapeCell(h));
+            sb.Append(MarkdownTable.EscapeCell(h));
             sb.Append(" |");
         }
         sb.AppendLine();
@@ -3591,16 +3591,12 @@ internal static class Format
             foreach (var cell in row)
             {
                 sb.Append(' ');
-                sb.Append(EscapeCell(cell));
+                sb.Append(MarkdownTable.EscapeCell(cell));
                 sb.Append(" |");
             }
             sb.AppendLine();
         }
     }
-
-    /// <summary>Escape a literal <c>|</c> in cell content so it doesn't break GFM table parsing.</summary>
-    private static string EscapeCell(string s) =>
-        string.IsNullOrEmpty(s) ? string.Empty : s.Replace("|", "\\|", StringComparison.Ordinal);
 
     /// <summary>
     /// Build a <see cref="ProgressNotificationValue"/> for emission via an injected

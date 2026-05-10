@@ -71,9 +71,13 @@ A `.sourcegraph.json` at the repo root opts a project into multi-scope mode:
 ```
 
 Each scope owns its own SQLite DB at `.sourcegraph/scopes/<id>.db`; a separate
-`_meta.db` registry tracks status (`ok | degraded | indexing`) and last-indexed
-time. An `isolated` scope is excluded from `scope = "*"` fan-out — useful for
-vendored / generated code that shouldn't pollute `find_references` on production.
+`_meta.db` registry tracks status (`ok | partial | degraded | indexing`) and
+last-indexed time. `partial` means one or more projects/files failed to index
+but at least one project produced symbols; `list_scopes` carries
+`failed_projects` / `failed_files` arrays so operators see which projects'
+symbols are missing without scraping logs. An `isolated` scope is excluded from
+`scope = "*"` fan-out — useful for vendored / generated code that shouldn't
+pollute `find_references` on production.
 
 Every existing tool gains an optional `scope` parameter (string id, comma-separated
 list, or `"*"`). Call `list_scopes` to discover the configured scopes. Without a

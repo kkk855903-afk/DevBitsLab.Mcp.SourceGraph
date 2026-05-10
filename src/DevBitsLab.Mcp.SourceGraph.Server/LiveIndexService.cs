@@ -121,8 +121,10 @@ public sealed class LiveIndexService : BackgroundService
         var indexTasks = _preparedHosts.Select(host => RunInitialIndexAsync(host, stoppingToken)).ToArray();
         await Task.WhenAll(indexTasks).ConfigureAwait(false);
 
-        // Start watching every scope that finished cold-indexing cleanly.
-        foreach (var host in _preparedHosts.Where(h => h.Status == "ok"))
+        // Start watching every scope that finished cold-indexing with at least one project's
+        // worth of symbols — both `ok` and `partial`. `degraded` scopes have no usable graph,
+        // so a watcher is pointless; `indexing` shouldn't appear here (cold index has settled).
+        foreach (var host in _preparedHosts.Where(h => h.Status == "ok" || h.Status == "partial"))
         {
             StartWatcher(host, stoppingToken);
         }
@@ -275,6 +277,12 @@ public sealed class LiveIndexService : BackgroundService
             _logger.LogInformation("Scope `{Id}` initial index complete in {Elapsed}: {Files} files re-processed",
                 scope.Id, initial.Elapsed, initial.FilesIndexed);
 
+            // Capture per-project / per-file failures for surfacing via list_scopes. They feed
+            // into the status decision below and ride along on the registry row that gets
+            // persisted at the end of this method.
+            host.FailedProjects = initial.FailedProjects;
+            host.FailedFiles = initial.FailedFiles;
+
             // Carryover from open-language-contract task 5.3 / 6.1 / 6.2: build the per-scope
             // file → project lookup so IndexContext.Project is populated for every dispatched
             // document. The MSBuild factory needs the live workspace; build a per-scope dispatcher
@@ -319,9 +327,44 @@ public sealed class LiveIndexService : BackgroundService
                 await DispatchAnalyzersForScopeAsync(host, ct).ConfigureAwait(false);
             }
 
-            host.Status = "ok";
+            // Settle status per the decision matrix in design.md §Decision 3:
+            //   - degraded if FilesIndexed == 0 AND there were failures (no usable graph)
+            //   - partial if any project or file failed but the scope produced something
+            //   - ok if everything indexed cleanly
+            // The "no resolvable solution" early return above and the catch block below cover
+            // the other degraded paths (workspace open threw, scope has no solution at all).
+            var failedProjectCount = initial.FailedProjects.Count;
+            var failedFileCount = initial.FailedFiles.Count;
+            var hasFailures = failedProjectCount > 0 || failedFileCount > 0;
+            if (initial.FilesIndexed == 0 && hasFailures)
+            {
+                host.Status = "degraded";
+                host.StatusMessage = BuildFailureSummary(
+                    "Cold index produced zero files",
+                    failedProjectCount,
+                    failedFileCount);
+                _logger.LogWarning(
+                    "Scope `{Id}` cold index produced zero files; marking degraded ({ProjectFailures} project failures, {FileFailures} file failures)",
+                    scope.Id, failedProjectCount, failedFileCount);
+            }
+            else if (hasFailures)
+            {
+                host.Status = "partial";
+                host.StatusMessage = BuildFailureSummary(
+                    "Indexed with failures",
+                    failedProjectCount,
+                    failedFileCount);
+                _logger.LogWarning(
+                    "Scope `{Id}` cold index settled to partial: {ProjectFailures} project failures, {FileFailures} file failures",
+                    scope.Id, failedProjectCount, failedFileCount);
+            }
+            else
+            {
+                host.Status = "ok";
+                host.StatusMessage = null;
+            }
             host.LastIndexedAt = DateTimeOffset.UtcNow;
-            await _registry.UpsertAsync(ToRow(scope, host.Status, null), ct).ConfigureAwait(false);
+            await _registry.UpsertAsync(ToRow(scope, host.Status, host.StatusMessage, host.FailedProjects, host.FailedFiles), ct).ConfigureAwait(false);
         }
         catch (OperationCanceledException) { throw; }
         catch (Exception ex)
@@ -329,7 +372,7 @@ public sealed class LiveIndexService : BackgroundService
             _logger.LogError(ex, "Scope `{Id}` initial indexing failed; marking degraded", scope.Id);
             host.Status = "degraded";
             host.StatusMessage = ex.Message;
-            await _registry.UpsertAsync(ToRow(scope, host.Status, host.StatusMessage), ct).ConfigureAwait(false);
+            await _registry.UpsertAsync(ToRow(scope, host.Status, host.StatusMessage, host.FailedProjects, host.FailedFiles), ct).ConfigureAwait(false);
         }
         finally
         {
@@ -507,7 +550,28 @@ public sealed class LiveIndexService : BackgroundService
         return null;
     }
 
-    private static ScopeRow ToRow(Scope scope, string status, string? statusMessage) =>
+    /// <summary>
+    /// Build a human-readable summary string for a partial / degraded scope status. Phrases
+    /// the count fragment based on what actually failed: "2 project(s) failed",
+    /// "3 file(s) failed", or "2 project(s), 3 file(s) failed" when both populations are
+    /// non-empty. Avoids the "0 project(s)" wart that a naive interpolation produces when only
+    /// file-level failures occurred.
+    /// </summary>
+    private static string BuildFailureSummary(string prefix, int projectCount, int fileCount)
+    {
+        if (projectCount == 0 && fileCount == 0) return prefix + ".";
+        var parts = new List<string>(2);
+        if (projectCount > 0) parts.Add($"{projectCount} project(s)");
+        if (fileCount > 0) parts.Add($"{fileCount} file(s)");
+        return $"{prefix}: {string.Join(", ", parts)} failed.";
+    }
+
+    private static ScopeRow ToRow(
+        Scope scope,
+        string status,
+        string? statusMessage,
+        IReadOnlyList<ProjectFailure>? failedProjects = null,
+        IReadOnlyList<FileFailure>? failedFiles = null) =>
         new(
             Id: scope.Id,
             Name: scope.Name,
@@ -516,7 +580,9 @@ public sealed class LiveIndexService : BackgroundService
             Isolated: scope.Isolated,
             LastIndexedAt: DateTimeOffset.UtcNow,
             Status: status,
-            StatusMessage: statusMessage);
+            StatusMessage: statusMessage,
+            FailedProjects: failedProjects,
+            FailedFiles: failedFiles);
 }
 
 /// <summary>

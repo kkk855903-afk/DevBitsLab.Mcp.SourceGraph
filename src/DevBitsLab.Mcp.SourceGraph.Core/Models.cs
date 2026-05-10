@@ -102,3 +102,52 @@ public sealed record DiagnosticRecord(
     string Message,
     int Line,
     int Col);
+
+/// <summary>
+/// One project that the indexer could not compile during a cold or incremental indexing pass.
+/// Surfaces as part of <c>IndexResult.FailedProjects</c> and is persisted on the scope row in
+/// <c>_meta.db</c> so <c>list_scopes</c> can attribute partial-scope status to specific
+/// projects without needing the indexer to be live. <see cref="Reason"/> is the failing
+/// exception's <c>Message</c>, truncated via <see cref="FailureMessage.Truncate"/>; full
+/// stack traces are written to the indexer log, not to clients.
+/// </summary>
+public sealed record ProjectFailure(string Name, string Reason);
+
+/// <summary>
+/// One file whose Pass 1 symbol walk threw during a cold or incremental indexing pass.
+/// Surfaces as part of <c>IndexResult.FailedFiles</c> and is persisted on the scope row in
+/// <c>_meta.db</c>. The file's prior store state is preserved untouched (no reconcile, no
+/// Pass 2/3 for it) until the next successful walk. <see cref="Reason"/> is the failing
+/// exception's <c>Message</c>, truncated via <see cref="FailureMessage.Truncate"/>.
+/// </summary>
+public sealed record FileFailure(string Path, string Reason);
+
+/// <summary>
+/// Helpers for normalising failure-record text. Exception messages are sometimes stack-trace
+/// shaped or include very long paths; truncating keeps <c>list_scopes</c> output readable
+/// without losing the leading bytes that usually carry the actionable detail.
+/// </summary>
+public static class FailureMessage
+{
+    /// <summary>Maximum length retained on a failure <c>Reason</c> string.</summary>
+    public const int MaxReasonLength = 256;
+
+    /// <summary>
+    /// Returns <paramref name="message"/> unchanged when shorter than <paramref name="max"/>
+    /// (default <see cref="MaxReasonLength"/>); otherwise returns the leading <c>max - 1</c>
+    /// characters with a trailing ellipsis (<c>…</c>) so callers can tell the value was cut.
+    /// Null or empty input is normalised to the empty string.
+    /// </summary>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// Thrown when <paramref name="max"/> is less than 2. Truncation needs at least one
+    /// content character plus the ellipsis suffix, so smaller values can't produce a
+    /// meaningful result.
+    /// </exception>
+    public static string Truncate(string? message, int max = MaxReasonLength)
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThan(max, 2);
+        if (string.IsNullOrEmpty(message)) return string.Empty;
+        if (message.Length <= max) return message;
+        return message.AsSpan(0, max - 1).ToString() + "…";
+    }
+}
