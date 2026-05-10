@@ -10,6 +10,20 @@ below note which package the change applies to.
 
 ## [Unreleased]
 
+### Changed
+- **Soft size budget on list-shaped tool results.** Built-in tools that emit
+  per-row prose + `ResourceLinkBlock` + structured-content trios now trim
+  upstream of emission when the projected serialized size would exceed
+  Claude Code's ~64K-character per-`tools/call` ceiling. Wired into
+  `find_references`, `list_members`, `list_symbols_in_file`, and
+  `semantic_search` (the four highest-risk helpers). When the cap activates,
+  the tool appends `omitted_size=N` to its existing audience-restricted
+  `_meta:` block so the connected model can detect truncation and re-query.
+  Also lowers two default `limit` values that routinely overran the cap:
+  `find_references` 200 → 50 (matches `list_callers` / `list_callees` /
+  `find_implementations`) and `list_members` 200 → 100. Callers needing more
+  pass an explicit `limit=`. (`output-budget-cap`)
+
 ### Added
 - **Two new MCP tools for payload-aware edge walks: `find_data_bindings`
   and `find_event_handlers`.** Specialised tool surface over the

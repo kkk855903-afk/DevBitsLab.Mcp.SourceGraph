@@ -296,7 +296,7 @@ public static class GraphTools
     public static Task<CallToolResult> FindReferencesAsync(
         ScopeRouter router,
         [Description("Symbol name or FQN, same matching rules as find_definition")] string symbol,
-        [Description("Maximum number of references to return (default 200)")] int limit = 200,
+        [Description("Maximum number of references to return (default 50)")] int limit = 50,
         [Description("Include references from source-generated files (default false)")] bool includeGenerated = false,
         [Description(ScopeDescription)] string? scope = null,
         CancellationToken ct = default) =>
@@ -338,6 +338,8 @@ public static class GraphTools
                         scopeId: host.Scope.Id,
                         elapsedMs: sw.ElapsedMilliseconds);
                 }
+                var (refsKept, refsOmitted) = OutputBudget.ChooseKeep(refs.Count, OutputBudget.CompactRowChars);
+                if (refsOmitted > 0) refs = refs.Take(refsKept).ToList();
                 sb.AppendLine();
                 sb.AppendLine($"{refs.Count} references:");
                 if (refs.Count >= 2)
@@ -365,7 +367,8 @@ public static class GraphTools
                     target: top,
                     refs: refs,
                     scopeId: host.Scope.Id,
-                    elapsedMs: sw.ElapsedMilliseconds);
+                    elapsedMs: sw.ElapsedMilliseconds,
+                    omittedSize: refsOmitted);
             }, ct));
 
     /// <summary>
@@ -382,7 +385,8 @@ public static class GraphTools
         SymbolHit target,
         IReadOnlyList<ReferenceHit> refs,
         string scopeId,
-        long elapsedMs)
+        long elapsedMs,
+        int omittedSize = 0)
     {
         var content = new List<ContentBlock>(capacity: 2 + refs.Count)
         {
@@ -409,10 +413,10 @@ public static class GraphTools
             });
         }
 
-        content.Add(AudienceMetadata.Build(
-            scopeId,
-            elapsedMs,
-            ("references", refs.Count.ToString())));
+        var extras = omittedSize > 0
+            ? new[] { ("references", refs.Count.ToString()), ("omitted_size", omittedSize.ToString()) }
+            : new[] { ("references", refs.Count.ToString()) };
+        content.Add(AudienceMetadata.Build(scopeId, elapsedMs, extras));
 
         var structuredReferences = refs
             .Select(r => new FindReferenceHit(
@@ -455,6 +459,8 @@ public static class GraphTools
                     return DiagnosticResult.Build(
                         $"No indexed symbols in '{path}'. The file may not be part of an indexed solution, or may not exist.");
                 }
+                var (hitsKept, hitsOmitted) = OutputBudget.ChooseKeep(hits.Count, OutputBudget.RichRowChars);
+                if (hitsOmitted > 0) hits = hits.Take(hitsKept).ToList();
 
                 var historyById = await host.Store.GetSymbolHistoryBatchAsync(hits.Select(h => h.Id).ToList(), ct).ConfigureAwait(false);
                 var multipleFlavors = await HasMultipleAnnotationFlavorsAsync(host.Store, ct).ConfigureAwait(false);
@@ -481,7 +487,8 @@ public static class GraphTools
                     filePath: hits[0].FilePath,
                     symbols: hits,
                     scopeId: host.Scope.Id,
-                    elapsedMs: sw.ElapsedMilliseconds);
+                    elapsedMs: sw.ElapsedMilliseconds,
+                    omittedSize: hitsOmitted);
             }, ct));
 
     private static CallToolResult BuildListSymbolsInFileResult(
@@ -489,7 +496,8 @@ public static class GraphTools
         string filePath,
         IReadOnlyList<SymbolHit> symbols,
         string scopeId,
-        long elapsedMs)
+        long elapsedMs,
+        int omittedSize = 0)
     {
         var content = new List<ContentBlock>(capacity: 2 + symbols.Count)
         {
@@ -508,11 +516,19 @@ public static class GraphTools
             });
         }
 
-        content.Add(AudienceMetadata.Build(
-            scopeId,
-            elapsedMs,
-            ("symbols", symbols.Count.ToString()),
-            ("file", $"`{filePath}`")));
+        var extras = omittedSize > 0
+            ? new[]
+            {
+                ("symbols", symbols.Count.ToString()),
+                ("file", $"`{filePath}`"),
+                ("omitted_size", omittedSize.ToString()),
+            }
+            : new[]
+            {
+                ("symbols", symbols.Count.ToString()),
+                ("file", $"`{filePath}`"),
+            };
+        content.Add(AudienceMetadata.Build(scopeId, elapsedMs, extras));
 
         var structuredSymbols = symbols
             .Select(s => new ListSymbolsInFileRow(
@@ -1887,7 +1903,7 @@ public static class GraphTools
         [Description("Container FQN (e.g. 'Sample.Domain.Calculator', 'Sample.Domain'). Resolved with the same matching rules as find_definition; the top match is used.")] string container,
         [Description("Reserved for a future change that follows inherits/implements edges; currently ignored.")] bool includeInherited = false,
         [Description("Optional accessibility filter: public|internal|private|protected|protected internal|private protected.")] string? accessibility = null,
-        [Description("Maximum members to return (default 200)")] int limit = 200,
+        [Description("Maximum members to return (default 100)")] int limit = 100,
         [Description(ScopeDescription)] string? scope = null,
         CancellationToken ct = default) =>
         ToolMetrics.TrackAsync("list_members", new { container, includeInherited, accessibility, limit, scope }, () =>
@@ -1906,6 +1922,8 @@ public static class GraphTools
                 }
 
                 var members = await host.Store.ListMembersAsync(top.Id, accFilter, limit, ct).ConfigureAwait(false);
+                var (membersKept, membersOmitted) = OutputBudget.ChooseKeep(members.Count, OutputBudget.RichRowChars);
+                if (membersOmitted > 0) members = members.Take(membersKept).ToList();
                 var sb = new StringBuilder();
                 var filterNote = accFilter is null ? "" : $" (accessibility = {accessibility})";
                 sb.AppendLine($"{members.Count} members of **{top.Fqn}** ({Format.KindWithAttrs(top)}){filterNote}:");
@@ -1952,7 +1970,8 @@ public static class GraphTools
                     container: top,
                     members: members,
                     scopeId: host.Scope.Id,
-                    elapsedMs: sw.ElapsedMilliseconds);
+                    elapsedMs: sw.ElapsedMilliseconds,
+                    omittedSize: membersOmitted);
             }, ct));
 
     private static CallToolResult BuildListMembersResult(
@@ -1960,7 +1979,8 @@ public static class GraphTools
         SymbolHit container,
         IReadOnlyList<SymbolHit> members,
         string scopeId,
-        long elapsedMs)
+        long elapsedMs,
+        int omittedSize = 0)
     {
         var content = new List<ContentBlock>(capacity: 2 + members.Count)
         {
@@ -1979,10 +1999,10 @@ public static class GraphTools
             });
         }
 
-        content.Add(AudienceMetadata.Build(
-            scopeId,
-            elapsedMs,
-            ("members", members.Count.ToString())));
+        var extras = omittedSize > 0
+            ? new[] { ("members", members.Count.ToString()), ("omitted_size", omittedSize.ToString()) }
+            : new[] { ("members", members.Count.ToString()) };
+        content.Add(AudienceMetadata.Build(scopeId, elapsedMs, extras));
 
         var structuredMembers = members
             .Select(m => new ListMembersRow(
@@ -2068,10 +2088,14 @@ public static class GraphTools
                 }
 
                 progress?.Report(Format.Progress(0.9, "formatting results"));
-                // Resolve every hit into its SymbolHit once; downstream prose render and structured
-                // output share this list so prose-row count and structured-array length stay in lockstep.
-                var resolved = new List<(EmbeddingHit Hit, SymbolHit Symbol)>(hits.Count);
-                foreach (var h in hits)
+                // Apply the size budget at the hit level *before* resolving symbols so omitted rows
+                // don't incur per-row GetSymbolByIdAsync calls — important when callers pass a large
+                // k and the budget trims to ~30. Resolving only the kept hits keeps prose-row count
+                // and structured-array length in lockstep with the budget decision.
+                var (hitsKept, hitsOmitted) = OutputBudget.ChooseKeep(hits.Count, OutputBudget.SnippetRowChars);
+                IEnumerable<EmbeddingHit> hitsToResolve = hitsOmitted > 0 ? hits.Take(hitsKept) : hits;
+                var resolved = new List<(EmbeddingHit Hit, SymbolHit Symbol)>(hitsKept);
+                foreach (var h in hitsToResolve)
                 {
                     var sym = await host.Store.GetSymbolByIdAsync(h.SymbolId, ct).ConfigureAwait(false);
                     if (sym is not null) resolved.Add((h, sym));
@@ -2112,7 +2136,8 @@ public static class GraphTools
                     query: query,
                     rows: resolved,
                     scopeId: host.Scope.Id,
-                    elapsedMs: sw.ElapsedMilliseconds);
+                    elapsedMs: sw.ElapsedMilliseconds,
+                    omittedSize: hitsOmitted);
             }, ct));
 
     private static CallToolResult BuildSemanticSearchResult(
@@ -2120,7 +2145,8 @@ public static class GraphTools
         string query,
         IReadOnlyList<(EmbeddingHit Hit, SymbolHit Symbol)> rows,
         string scopeId,
-        long elapsedMs)
+        long elapsedMs,
+        int omittedSize = 0)
     {
         var content = new List<ContentBlock>(capacity: 2 + rows.Count)
         {
@@ -2139,10 +2165,10 @@ public static class GraphTools
             });
         }
 
-        content.Add(AudienceMetadata.Build(
-            scopeId,
-            elapsedMs,
-            ("hits", rows.Count.ToString())));
+        var extras = omittedSize > 0
+            ? new[] { ("hits", rows.Count.ToString()), ("omitted_size", omittedSize.ToString()) }
+            : new[] { ("hits", rows.Count.ToString()) };
+        content.Add(AudienceMetadata.Build(scopeId, elapsedMs, extras));
 
         var structuredHits = rows
             .Select(r => new SemanticSearchHit(

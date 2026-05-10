@@ -542,7 +542,7 @@ database per scope. The current limits are:
 |---|---|---|
 | Roslyn analyzer timeout per document | 30 s | Hard-coded in `AnalyzerPipeline`; override via fork. |
 | File-watcher debounce window | 200 ms | Hard-coded in `SolutionWatcher`. |
-| Default `SearchSymbols` / `find_references` result limit | 25 / 200 rows | Pass `limit` on the MCP tool call. |
+| Default `SearchSymbols` / `find_references` / `list_members` result limit | 25 / 50 / 100 rows | Pass `limit` on the MCP tool call. A soft serialized-size cap (~50K chars) trims further if a larger `limit` would exceed Claude Code's per-call ceiling; trim is signalled via `omitted_size=N` in the audience-restricted `_meta:` block. |
 | `impact_of_change` max depth | 4 hops | Pass `maxDepth` on the tool call. |
 | `semantic_search` top-k default | 10 | Pass `k` on the tool call. |
 | Embedding model download | ~480 MB | Disable with `--no-embeddings`. |
