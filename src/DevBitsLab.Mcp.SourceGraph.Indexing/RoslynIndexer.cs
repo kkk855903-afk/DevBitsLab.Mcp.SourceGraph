@@ -1,5 +1,6 @@
 using System.Collections.Immutable;
 using System.Diagnostics;
+using System.Diagnostics.CodeAnalysis;
 using System.Security.Cryptography;
 using DevBitsLab.Mcp.SourceGraph.Core;
 using DevBitsLab.Mcp.SourceGraph.Embeddings;
@@ -280,6 +281,37 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         return regular.Concat(generatedList);
     }
 
+    /// <summary>
+    /// Best-effort post-failure clear of <paramref name="fileId"/>'s outgoing refs/edges.
+    /// Called from <see cref="IndexCoreAsync"/>'s pass-2 catch handler when a file's walk
+    /// threw partway through: a partial commit (refs done, edges throws) would leave the
+    /// integrity check satisfied (refs > 0) on the next index and strand the missing edges,
+    /// so we drop both halves here. A failure of the clear itself is logged but not rethrown
+    /// — letting it propagate would defeat the surrounding catch's "keep walking the rest"
+    /// purpose. The original walk failure is logged separately by the caller.
+    /// </summary>
+    [SuppressMessage("Design", "CA1031:DoNotCatchGeneralExceptionTypes",
+        Justification = "Best-effort cleanup: a thrown exception here would propagate out of the catch handler in IndexCoreAsync and abort the entire pass-2 loop, defeating the surrounding catch's intent. The clear's failure is logged at warn so operators see secondary failures.")]
+    private async Task TryClearFileOutgoingAsync(long fileId, string path, CancellationToken ct)
+    {
+        try
+        {
+            await _store.ClearFileOutgoingAsync(fileId, ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception clearEx)
+        {
+            // The clear itself failed. Best-effort: log and move on. The file may hold
+            // partial state until the next clear+re-walk; an operator who notices repeated
+            // recoveries can wipe the .sourcegraph DB to recover fully.
+            _logger.LogWarning(clearEx,
+                "Pass 2's post-failure clear for {Path} also failed; file may have stale partial refs/edges",
+                path);
+        }
+    }
+
+    [SuppressMessage("Design", "CA1031:DoNotCatchGeneralExceptionTypes",
+        Justification = "IndexCoreAsync's per-file walks must not let one document's failure (a misbehaving source generator, a transient compile gap, an analyzer throwing inside Roslyn) bring the whole indexing pass down. Each catch logs the file path + exception and continues with the next file; OperationCanceledException is rethrown explicitly so user-driven cancellation surfaces.")]
     private async Task<IndexResult> IndexCoreAsync(IReadOnlyList<Document> documents, bool fullReset, CancellationToken ct)
     {
         var sw = Stopwatch.StartNew();
@@ -303,6 +335,11 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         var changedFileIds = new HashSet<long>();
         var docsByChangedFile = new Dictionary<long, List<Document>>();
         var changedFileMeta = new Dictionary<long, (string Path, byte[] Sha)>();
+        // Memoize HasOutgoingReferencesAsync per fileId for the lifetime of this pass: in
+        // multi-target / linked-project solutions the same fileId enumerates once per TFM,
+        // and the integrity check answer is invariant within a single pass. Caching also
+        // collapses the recovery log line to one entry per zombied file rather than N.
+        var hasOutgoingRefsCache = new Dictionary<long, bool>();
         var symbolsIndexed = 0;
 
         foreach (var document in documents)
@@ -350,10 +387,47 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
             var fileId = await _store.UpsertFileAsync(path, sha, DateTimeOffset.UtcNow, isGenerated, ct).ConfigureAwait(false);
             _fileIdByPath[path] = fileId;
 
-            if (unchanged && !fullReset && _keysByFileId.ContainsKey(fileId))
+            if (unchanged && !fullReset && _keysByFileId.TryGetValue(fileId, out var keysForFile))
             {
-                // DB and in-memory map are already consistent for this file — skip entirely.
-                continue;
+                // SHA matches and the in-memory symbol map is hydrated. Verify the store's
+                // refs/edges are in agreement before we skip pass 2: a symbol-bearing file
+                // with zero outgoing refs AND zero outgoing edges is "zombied" (pass 1
+                // cleared, pass 2 never repopulated). Without this check the SHA-skip would
+                // keep that file stranded forever.
+                //
+                // Files with zero declared symbols (a usings-only file, an [assembly:]
+                // attribute file, etc.) take the early-out: pass 2 has nothing useful to
+                // walk for them. Hydration seeds `_keysByFileId[fileId] = []` for every
+                // file row regardless of whether the file has any symbol rows, so this
+                // branch fires on a process restart even for symbol-less files.
+                if (keysForFile.Count == 0)
+                {
+                    continue;
+                }
+                bool hasOutgoingRefs;
+                if (hasOutgoingRefsCache.TryGetValue(fileId, out var cached))
+                {
+                    hasOutgoingRefs = cached;
+                }
+                else
+                {
+                    hasOutgoingRefs = await _store.HasOutgoingReferencesAsync(fileId, ct).ConfigureAwait(false);
+                    hasOutgoingRefsCache[fileId] = hasOutgoingRefs;
+                    // Log once per zombied fileId on first detection — subsequent TFM
+                    // iterations of the same path hit the cache branch and stay quiet.
+                    if (!hasOutgoingRefs)
+                    {
+                        _logger.LogInformation(
+                            "Re-walking references for {Path}: file SHA matches but no outgoing references in store " +
+                            "(likely zombied by a prior incomplete indexing pass; recovering)",
+                            path);
+                    }
+                }
+                if (hasOutgoingRefs)
+                {
+                    continue;
+                }
+                // Fall through to the changed-file path so pass 2 walks this file.
             }
 
             if (changedFileIds.Add(fileId))
@@ -549,217 +623,229 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
             var path = document.FilePath;
             if (path is null || !_fileIdByPath.TryGetValue(path, out var fileId)) continue;
 
-            var tree = await document.GetSyntaxTreeAsync(ct).ConfigureAwait(false);
-            var model = await document.GetSemanticModelAsync(ct).ConfigureAwait(false);
-            if (tree is null || model is null) continue;
-
-            var root = await tree.GetRootAsync(ct).ConfigureAwait(false);
-            var refBatch = new List<SymbolReference>(capacity: 256);
-            var edgeBatch = new List<Edge>(capacity: 64);
-            // Dedupe edges within this file's pass-2 to avoid bombarding SQLite with duplicates that
-            // INSERT OR IGNORE would just throw away. Tuple key keeps it allocation-light.
-            // Edge kind is now a kebab-case TEXT identifier rather than an int enum; comparing by
-            // ordinal is the cheapest stable form.
-            var emittedEdges = new HashSet<(long src, long dst, string kind)>();
-            void AddEdge(long src, long dst, string kind)
+            try
             {
-                if (src == dst) return;
-                if (emittedEdges.Add((src, dst, kind)))
+                var tree = await document.GetSyntaxTreeAsync(ct).ConfigureAwait(false);
+                var model = await document.GetSemanticModelAsync(ct).ConfigureAwait(false);
+                if (tree is null || model is null) continue;
+
+                var root = await tree.GetRootAsync(ct).ConfigureAwait(false);
+                var refBatch = new List<SymbolReference>(capacity: 256);
+                var edgeBatch = new List<Edge>(capacity: 64);
+                // Dedupe edges within this file's pass-2 to avoid bombarding SQLite with duplicates that
+                // INSERT OR IGNORE would just throw away. Tuple key keeps it allocation-light.
+                // Edge kind is now a kebab-case TEXT identifier rather than an int enum; comparing by
+                // ordinal is the cheapest stable form.
+                var emittedEdges = new HashSet<(long src, long dst, string kind)>();
+                void AddEdge(long src, long dst, string kind)
                 {
-                    edgeBatch.Add(new Edge(src, dst, kind));
-                }
-            }
-
-            foreach (var node in root.DescendantNodes())
-            {
-                ISymbol? referenced = null;
-                ReferenceKind kind = ReferenceKind.Reference;
-                SyntaxNode? refNode = null; // node whose position we record
-
-                switch (node)
-                {
-                    case IdentifierNameSyntax id when id.Parent is not (NamespaceDeclarationSyntax or BaseTypeDeclarationSyntax or MethodDeclarationSyntax or PropertyDeclarationSyntax or VariableDeclaratorSyntax or ParameterSyntax or TypeParameterSyntax):
-                        referenced = model.GetSymbolInfo(id, ct).Symbol;
-                        refNode = id;
-                        if (id.Parent is InvocationExpressionSyntax inv && inv.Expression == id)
-                        {
-                            kind = ReferenceKind.Call;
-                        }
-                        else
-                        {
-                            kind = ClassifyReadWrite(id, referenced) ?? ReferenceKind.Reference;
-                        }
-                        break;
-
-                    case GenericNameSyntax gn:
-                        referenced = model.GetSymbolInfo(gn, ct).Symbol;
-                        refNode = gn;
-                        break;
-
-                    case MemberAccessExpressionSyntax mae:
-                        referenced = model.GetSymbolInfo(mae.Name, ct).Symbol;
-                        refNode = mae.Name;
-                        if (mae.Parent is InvocationExpressionSyntax invMa && invMa.Expression == mae)
-                        {
-                            kind = ReferenceKind.Call;
-                        }
-                        else
-                        {
-                            kind = ClassifyReadWrite(mae, referenced) ?? ReferenceKind.Reference;
-                        }
-                        break;
-
-                    case ObjectCreationExpressionSyntax oce:
-                        referenced = model.GetSymbolInfo(oce, ct).Symbol;
-                        refNode = oce;
-                        kind = ReferenceKind.Call;
-                        break;
-                }
-
-                if (referenced is null || refNode is null) continue;
-                var key = SymbolMapping.CanonicalKey(referenced);
-                if (key is null) continue;
-                if (!_symbolIdByKey.TryGetValue(key, out var symId)) continue;
-
-                var pos = refNode.GetLocation().GetLineSpan().StartLinePosition;
-
-                // For ReferenceKind.Read|Write on increments/decrements/compound-assignment/ref params,
-                // we may need to emit two ref rows at the same position (one Read, one Write).
-                var emit = SplitReadWrite(kind, refNode, referenced);
-                foreach (var rk in emit)
-                {
-                    refBatch.Add(new SymbolReference(
-                        Id: 0,
-                        SymbolId: symId,
-                        FileId: fileId,
-                        Line: pos.Line + 1,
-                        Col: pos.Character + 1,
-                        Kind: rk));
-                }
-
-                // Calls edge: source = enclosing named member, target = referenced
-                if (kind == ReferenceKind.Call)
-                {
-                    var enclosing = FindEnclosingMember(model, refNode.SpanStart, ct);
-                    if (enclosing is not null)
+                    if (src == dst) return;
+                    if (emittedEdges.Add((src, dst, kind)))
                     {
-                        var encKey = SymbolMapping.CanonicalKey(enclosing);
-                        if (encKey is not null && _symbolIdByKey.TryGetValue(encKey, out var srcId))
-                        {
-                            AddEdge(srcId, symId, EdgeKinds.Calls);
-                        }
+                        edgeBatch.Add(new Edge(src, dst, kind));
                     }
                 }
 
-                // Instantiates edge: every `new T()` becomes an Instantiates(enclosing -> T) edge,
-                // alongside the Calls edge to the constructor that the case above already emitted.
-                // We also emit a UsesType edge so kind=uses_type can answer "every consumer of T",
-                // including body-local instantiations (per design.md point 1).
-                if (node is ObjectCreationExpressionSyntax oceNode && referenced is IMethodSymbol ctor)
+                foreach (var node in root.DescendantNodes())
                 {
-                    var typeSym = ctor.ContainingType;
-                    if (typeSym is not null)
+                    ISymbol? referenced = null;
+                    ReferenceKind kind = ReferenceKind.Reference;
+                    SyntaxNode? refNode = null; // node whose position we record
+
+                    switch (node)
                     {
-                        var typeKey = SymbolMapping.CanonicalKey(typeSym);
-                        if (typeKey is not null && _symbolIdByKey.TryGetValue(typeKey, out var dstId))
+                        case IdentifierNameSyntax id when id.Parent is not (NamespaceDeclarationSyntax or BaseTypeDeclarationSyntax or MethodDeclarationSyntax or PropertyDeclarationSyntax or VariableDeclaratorSyntax or ParameterSyntax or TypeParameterSyntax):
+                            referenced = model.GetSymbolInfo(id, ct).Symbol;
+                            refNode = id;
+                            kind = id.Parent is InvocationExpressionSyntax inv && inv.Expression == id
+                                ? ReferenceKind.Call
+                                : ClassifyReadWrite(id, referenced) ?? ReferenceKind.Reference;
+                            break;
+
+                        case GenericNameSyntax gn:
+                            referenced = model.GetSymbolInfo(gn, ct).Symbol;
+                            refNode = gn;
+                            break;
+
+                        case MemberAccessExpressionSyntax mae:
+                            referenced = model.GetSymbolInfo(mae.Name, ct).Symbol;
+                            refNode = mae.Name;
+                            kind = mae.Parent is InvocationExpressionSyntax invMa && invMa.Expression == mae
+                                ? ReferenceKind.Call
+                                : ClassifyReadWrite(mae, referenced) ?? ReferenceKind.Reference;
+                            break;
+
+                        case ObjectCreationExpressionSyntax oce:
+                            referenced = model.GetSymbolInfo(oce, ct).Symbol;
+                            refNode = oce;
+                            kind = ReferenceKind.Call;
+                            break;
+                    }
+
+                    if (referenced is null || refNode is null) continue;
+                    var key = SymbolMapping.CanonicalKey(referenced);
+                    if (key is null) continue;
+                    if (!_symbolIdByKey.TryGetValue(key, out var symId)) continue;
+
+                    var pos = refNode.GetLocation().GetLineSpan().StartLinePosition;
+
+                    // For ReferenceKind.Read|Write on increments/decrements/compound-assignment/ref params,
+                    // we may need to emit two ref rows at the same position (one Read, one Write).
+                    var emit = SplitReadWrite(kind, refNode, referenced);
+                    foreach (var rk in emit)
+                    {
+                        refBatch.Add(new SymbolReference(
+                            Id: 0,
+                            SymbolId: symId,
+                            FileId: fileId,
+                            Line: pos.Line + 1,
+                            Col: pos.Character + 1,
+                            Kind: rk));
+                    }
+
+                    // Calls edge: source = enclosing named member, target = referenced
+                    if (kind == ReferenceKind.Call)
+                    {
+                        var enclosing = FindEnclosingMember(model, refNode.SpanStart, ct);
+                        if (enclosing is not null)
                         {
-                            var enclosing = FindEnclosingMember(model, oceNode.SpanStart, ct);
-                            if (enclosing is not null)
+                            var encKey = SymbolMapping.CanonicalKey(enclosing);
+                            if (encKey is not null && _symbolIdByKey.TryGetValue(encKey, out var srcId))
                             {
-                                var encKey = SymbolMapping.CanonicalKey(enclosing);
-                                if (encKey is not null && _symbolIdByKey.TryGetValue(encKey, out var srcId))
+                                AddEdge(srcId, symId, EdgeKinds.Calls);
+                            }
+                        }
+                    }
+
+                    // Instantiates edge: every `new T()` becomes an Instantiates(enclosing -> T) edge,
+                    // alongside the Calls edge to the constructor that the case above already emitted.
+                    // We also emit a UsesType edge so kind=uses_type can answer "every consumer of T",
+                    // including body-local instantiations (per design.md point 1).
+                    if (node is ObjectCreationExpressionSyntax oceNode && referenced is IMethodSymbol ctor)
+                    {
+                        var typeSym = ctor.ContainingType;
+                        if (typeSym is not null)
+                        {
+                            var typeKey = SymbolMapping.CanonicalKey(typeSym);
+                            if (typeKey is not null && _symbolIdByKey.TryGetValue(typeKey, out var dstId))
+                            {
+                                var enclosing = FindEnclosingMember(model, oceNode.SpanStart, ct);
+                                if (enclosing is not null)
                                 {
-                                    AddEdge(srcId, dstId, EdgeKinds.Instantiates);
-                                    AddEdge(srcId, dstId, EdgeKinds.UsesType);
+                                    var encKey = SymbolMapping.CanonicalKey(enclosing);
+                                    if (encKey is not null && _symbolIdByKey.TryGetValue(encKey, out var srcId))
+                                    {
+                                        AddEdge(srcId, dstId, EdgeKinds.Instantiates);
+                                        AddEdge(srcId, dstId, EdgeKinds.UsesType);
+                                    }
                                 }
                             }
                         }
                     }
                 }
-            }
 
-            // Throws edges from `throw` syntax (statement and expression).
-            foreach (var node in root.DescendantNodes())
-            {
-                ExpressionSyntax? thrown = node switch
+                // Throws edges from `throw` syntax (statement and expression).
+                foreach (var node in root.DescendantNodes())
                 {
-                    ThrowStatementSyntax ts => ts.Expression,
-                    ThrowExpressionSyntax te => te.Expression,
-                    _ => null,
-                };
-                if (thrown is null) continue;
-                var thrownType = model.GetTypeInfo(thrown, ct).Type;
-                if (thrownType is null) continue;
-                var typeKey = SymbolMapping.CanonicalKey(thrownType);
-                if (typeKey is null || !_symbolIdByKey.TryGetValue(typeKey, out var dstId)) continue;
-                var enclosing = FindEnclosingMember(model, node.SpanStart, ct);
-                if (enclosing is null) continue;
-                var encKey = SymbolMapping.CanonicalKey(enclosing);
-                if (encKey is null || !_symbolIdByKey.TryGetValue(encKey, out var srcId)) continue;
-                AddEdge(srcId, dstId, EdgeKinds.Throws);
-            }
-
-            // Inherits / Implements edges from BaseListSyntax + UsesType for the same targets.
-            foreach (var typeDecl in root.DescendantNodes().OfType<TypeDeclarationSyntax>())
-            {
-                var typeSym = model.GetDeclaredSymbol(typeDecl, ct);
-                if (typeSym is null) continue;
-                var typeKey = SymbolMapping.CanonicalKey(typeSym);
-                if (typeKey is null || !_symbolIdByKey.TryGetValue(typeKey, out var srcId)) continue;
-
-                if (typeDecl.BaseList is not null)
-                {
-                    foreach (var baseTypeSyntax in typeDecl.BaseList.Types)
+                    ExpressionSyntax? thrown = node switch
                     {
-                        var baseSym = model.GetSymbolInfo(baseTypeSyntax.Type, ct).Symbol;
-                        if (baseSym is null) continue;
-                        var baseKey = SymbolMapping.CanonicalKey(baseSym);
-                        if (baseKey is null || !_symbolIdByKey.TryGetValue(baseKey, out var dstId)) continue;
+                        ThrowStatementSyntax ts => ts.Expression,
+                        ThrowExpressionSyntax te => te.Expression,
+                        _ => null,
+                    };
+                    if (thrown is null) continue;
+                    var thrownType = model.GetTypeInfo(thrown, ct).Type;
+                    if (thrownType is null) continue;
+                    var typeKey = SymbolMapping.CanonicalKey(thrownType);
+                    if (typeKey is null || !_symbolIdByKey.TryGetValue(typeKey, out var dstId)) continue;
+                    var enclosing = FindEnclosingMember(model, node.SpanStart, ct);
+                    if (enclosing is null) continue;
+                    var encKey = SymbolMapping.CanonicalKey(enclosing);
+                    if (encKey is null || !_symbolIdByKey.TryGetValue(encKey, out var srcId)) continue;
+                    AddEdge(srcId, dstId, EdgeKinds.Throws);
+                }
 
-                        var ek = baseSym is INamedTypeSymbol nt && nt.TypeKind == TypeKind.Interface
-                            ? EdgeKinds.Implements
-                            : EdgeKinds.Inherits;
-                        AddEdge(srcId, dstId, ek);
-                        // Also a UsesType edge so kind=uses_type can answer "every consumer of B".
-                        AddEdge(srcId, dstId, EdgeKinds.UsesType);
+                // Inherits / Implements edges from BaseListSyntax + UsesType for the same targets.
+                foreach (var typeDecl in root.DescendantNodes().OfType<TypeDeclarationSyntax>())
+                {
+                    var typeSym = model.GetDeclaredSymbol(typeDecl, ct);
+                    if (typeSym is null) continue;
+                    var typeKey = SymbolMapping.CanonicalKey(typeSym);
+                    if (typeKey is null || !_symbolIdByKey.TryGetValue(typeKey, out var srcId)) continue;
+
+                    if (typeDecl.BaseList is not null)
+                    {
+                        foreach (var baseTypeSyntax in typeDecl.BaseList.Types)
+                        {
+                            var baseSym = model.GetSymbolInfo(baseTypeSyntax.Type, ct).Symbol;
+                            if (baseSym is null) continue;
+                            var baseKey = SymbolMapping.CanonicalKey(baseSym);
+                            if (baseKey is null || !_symbolIdByKey.TryGetValue(baseKey, out var dstId)) continue;
+
+                            var ek = baseSym is INamedTypeSymbol nt && nt.TypeKind == TypeKind.Interface
+                                ? EdgeKinds.Implements
+                                : EdgeKinds.Inherits;
+                            AddEdge(srcId, dstId, ek);
+                            // Also a UsesType edge so kind=uses_type can answer "every consumer of B".
+                            AddEdge(srcId, dstId, EdgeKinds.UsesType);
+                        }
+                    }
+
+                    // Member-level ImplementsMember: walk every interface this type implements and ask
+                    // Roslyn which member satisfies each interface member. Done once per type declaration.
+                    EmitMemberImplements(typeSym, AddEdge);
+                }
+
+                // Per-member emitters: UsesType from signatures, OverridesMember from Overridden*,
+                // Tests from test methods to first non-test production call.
+                // We walk the same declaration set pass 1 does (via EnumerateDeclarations) so this
+                // touches type/method/property/event/field nodes — the only ones that have signatures
+                // worth scanning for type usage.
+                foreach (var node in EnumerateDeclarations(root))
+                {
+                    if (model.GetDeclaredSymbol(node, ct) is not ISymbol declSym) continue;
+                    var key = SymbolMapping.CanonicalKey(declSym);
+                    if (key is null || !_symbolIdByKey.TryGetValue(key, out var memberId)) continue;
+
+                    EmitUsesTypeForSignature(declSym, memberId, AddEdge);
+                    EmitOverrides(declSym, memberId, AddEdge);
+
+                    // Tests edge: the source is a test method (carries a recognised framework),
+                    // the destination is the first non-trivial production call inside its body.
+                    if (declSym is IMethodSymbol testMethod && TestDiscriminator.Detect(testMethod) is not null)
+                    {
+                        EmitTestsEdge(node, model, memberId, AddEdge, ct);
                     }
                 }
 
-                // Member-level ImplementsMember: walk every interface this type implements and ask
-                // Roslyn which member satisfies each interface member. Done once per type declaration.
-                EmitMemberImplements(typeSym, AddEdge);
-            }
-
-            // Per-member emitters: UsesType from signatures, OverridesMember from Overridden*,
-            // Tests from test methods to first non-test production call.
-            // We walk the same declaration set pass 1 does (via EnumerateDeclarations) so this
-            // touches type/method/property/event/field nodes — the only ones that have signatures
-            // worth scanning for type usage.
-            foreach (var node in EnumerateDeclarations(root))
-            {
-                if (model.GetDeclaredSymbol(node, ct) is not ISymbol declSym) continue;
-                var key = SymbolMapping.CanonicalKey(declSym);
-                if (key is null || !_symbolIdByKey.TryGetValue(key, out var memberId)) continue;
-
-                EmitUsesTypeForSignature(declSym, memberId, AddEdge);
-                EmitOverrides(declSym, memberId, AddEdge);
-
-                // Tests edge: the source is a test method (carries a recognised framework),
-                // the destination is the first non-trivial production call inside its body.
-                if (declSym is IMethodSymbol testMethod && TestDiscriminator.Detect(testMethod) is not null)
+                if (refBatch.Count > 0)
                 {
-                    EmitTestsEdge(node, model, memberId, AddEdge, ct);
+                    await _store.BulkInsertReferencesAsync(refBatch, ct).ConfigureAwait(false);
+                    refsIndexed += refBatch.Count;
+                }
+                if (edgeBatch.Count > 0)
+                {
+                    await _store.BulkInsertEdgesAsync(edgeBatch, ct).ConfigureAwait(false);
                 }
             }
-
-            if (refBatch.Count > 0)
+            catch (OperationCanceledException)
             {
-                await _store.BulkInsertReferencesAsync(refBatch, ct).ConfigureAwait(false);
-                refsIndexed += refBatch.Count;
+                // User-driven cancellation must propagate so the caller learns the run aborted.
+                throw;
             }
-            if (edgeBatch.Count > 0)
+            catch (Exception ex)
             {
-                await _store.BulkInsertEdgesAsync(edgeBatch, ct).ConfigureAwait(false);
+                // One file's walk threw — log it and let the next file's walk proceed. Pass 2
+                // calls BulkInsertReferencesAsync first then BulkInsertEdgesAsync; each is
+                // atomic but they aren't sequenced under one outer transaction, so a throw on
+                // edges would leave refs committed. That state is invisible to the next
+                // index's integrity check (refs > 0 → SHA-skip → edges stranded forever), so
+                // re-clear here to drop any partial commit and force a full re-walk next time.
+                await TryClearFileOutgoingAsync(fileId, path, ct).ConfigureAwait(false);
+
+                _logger.LogWarning(ex,
+                    "Pass 2 walk failed for {Path}; cleared partial refs/edges, will re-attempt on the next index",
+                    path);
             }
         }
 
@@ -959,6 +1045,15 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         foreach (var fr in fileRows)
         {
             _fileIdByPath[fr.Path] = fr.Id;
+            // Seed `_keysByFileId` with an empty list for files that didn't contribute any
+            // symbol rows above (usings-only files, files containing only `[assembly:]` /
+            // `[module:]` attributes, etc.). Without this, the pass-1 SHA-skip path's
+            // TryGetValue check would miss those files after a process restart and fall
+            // through to a redundant pass-2 walk that emits nothing.
+            if (!_keysByFileId.ContainsKey(fr.Id))
+            {
+                _keysByFileId[fr.Id] = new List<string>();
+            }
         }
         if (hydrated > 0)
         {

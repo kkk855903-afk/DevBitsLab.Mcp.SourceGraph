@@ -47,7 +47,7 @@ if (unchanged && !fullReset && _keysByFileId.ContainsKey(fileId)
 }
 ```
 
-Files with declared symbols but zero outgoing refs fall through to pass 2 for re-walking. Files with no declared symbols don't need re-walking (an empty file has nothing to reference). The `HasOutgoingReferencesAsync` query is `SELECT EXISTS (SELECT 1 FROM symbol_references WHERE file_id = ? LIMIT 1)` against the existing index on `file_id`.
+Files with declared symbols but zero outgoing refs AND zero outgoing edges fall through to pass 2 for re-walking. Files with no declared symbols don't need re-walking (an empty file has nothing to reference). The `HasOutgoingReferencesAsync` query is an `EXISTS (refs by file_id) OR EXISTS (edges joined to symbols.file_id)` probe — checking edges in addition to refs avoids spurious re-walks of files that legitimately produce zero refs but emit signature-only edges (`uses-type`, `inherits`, `implements-member`).
 
 **Rationale**: catches the zombie state with a single cheap query per unchanged file. No restructuring of the pass-1/pass-2 flow; no new persistent state.
 
@@ -98,11 +98,11 @@ The regression test bypasses Roslyn entirely:
 [Fact]
 public async Task IndexCoreAsync_zombieFile_isReWalked()
 {
-    // Arrange: build a zombie state. File row + symbols, but no symbol_references for that file.
+    // Arrange: build a zombie state. File row + symbols, but no refs for that file.
     // Use direct store inserts to skip Roslyn's contribution.
     await store.UpsertFileAsync(zombiePath, sha, ts, isGenerated: false);
     await store.UpsertSymbolAsync(/* fileId from above, fqn, kind, ... */);
-    // Deliberately do NOT insert any symbol_references for this fileId.
+    // Deliberately do NOT insert any refs for this fileId.
 
     // Act: rerun IndexCoreAsync — same SHA, file appears unchanged, but pass 2 should still walk.
     await indexer.IndexCoreAsync(documents, ct);
@@ -121,7 +121,7 @@ public async Task IndexCoreAsync_zombieFile_isReWalked()
 
 ```csharp
 /// <summary>
-/// True when the store has at least one symbol_references row whose file_id matches
+/// True when the store has at least one refs row whose file_id matches
 /// <paramref name="fileId"/>. Used by the indexer's pass-1 integrity check to detect
 /// "zombied" files whose references were cleared but never repopulated.
 /// </summary>

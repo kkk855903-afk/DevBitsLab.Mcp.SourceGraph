@@ -1205,6 +1205,27 @@ public sealed class SqliteGraphStore : IGraphStore
         return v is not null && v.Value != 0;
     }
 
+    public async Task<bool> HasOutgoingReferencesAsync(long fileId, CancellationToken ct = default)
+    {
+        // EXISTS short-circuits on the first hit. Refs probe uses idx_refs_file; edges probe
+        // joins via idx_symbols_file (file_id) onto edges.src (PK leftmost column on the
+        // edges PRIMARY KEY (src, dst, kind_name)). Checking both tables avoids forcing a
+        // re-walk of files that legitimately produce zero refs but emit edges from member
+        // signatures (uses-type / inherits / implements-member).
+        const string sql = """
+            SELECT
+              EXISTS (SELECT 1 FROM refs WHERE file_id = @id)
+              OR EXISTS (
+                SELECT 1 FROM edges e
+                JOIN symbols s ON s.id = e.src
+                WHERE s.file_id = @id
+              );
+            """;
+        var v = await _connection.ExecuteScalarAsync<long?>(new CommandDefinition(
+            sql, new { id = fileId }, cancellationToken: ct)).ConfigureAwait(false);
+        return v is not null && v.Value != 0;
+    }
+
     private sealed record RawDiagnosticHit(long Id, long? SymbolId, long FileId, string FilePath,
         long Severity, string Code, string Message, long Line, long Col)
     {
