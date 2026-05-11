@@ -19,6 +19,12 @@ calls with a single structured tool call:
 > *"Find every controller action attributed `[HttpPost]` whose route contains `/v2/`."*
 > *"Which tests cover this method, and who authored it last?"*
 
+> **Note on the 🌿 icon:** This server uses a green-leaf emoji (`🌿`) as a brand
+> mark to indicate that responses come from the source graph tools. You'll see it
+> in tool responses, tool titles, and descriptions. Some AI agents may strip or
+> filter emoji from their output, so the icon might not always be visible in your
+> chat interface. You can disable it entirely with `--no-leaf` if preferred.
+
 ## Contents
 
 - [Features](#features)
