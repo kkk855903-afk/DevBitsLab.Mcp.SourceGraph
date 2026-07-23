@@ -19,6 +19,10 @@ public sealed class SolutionWatcher : IAsyncDisposable
     private readonly TimeSpan _debounce;
     private readonly ILogger<SolutionWatcher> _logger;
     private readonly ScopePathPolicy _pathPolicy;
+    private readonly string _policyRoot;
+    private readonly ScopeProjectSet? _projectSet;
+    private readonly object _projectSetMatcherLock = new();
+    private ScopeProjectSetPathMatcher? _projectSetMatcher;
     private readonly HashSet<string> _sourceExtensions;
     private readonly FileSystemWatcher _sourceWatcher;
     private readonly FileSystemWatcher? _gitHeadWatcher;
@@ -71,17 +75,30 @@ public sealed class SolutionWatcher : IAsyncDisposable
         ILogger<SolutionWatcher>? logger,
         IEnumerable<string>? sourceExtensions,
         IReadOnlyList<string>? excludePatterns,
-        string policyRoot)
+        string policyRoot,
+        ScopeProjectSet? projectSet = null)
     {
         _root = Path.GetFullPath(solutionDirectory);
         _debounce = debounce ?? TimeSpan.FromMilliseconds(200);
         _logger = logger ?? NullLogger<SolutionWatcher>.Instance;
         var normalizedPolicyRoot = Path.GetFullPath(policyRoot);
+        _policyRoot = normalizedPolicyRoot;
+        _projectSet = projectSet;
         _pathPolicy = new ScopePathPolicy(normalizedPolicyRoot, excludePatterns);
+        _projectSetMatcher = projectSet is null
+            ? null
+            : new ScopeProjectSetPathMatcher(normalizedPolicyRoot, projectSet);
         var privacyPathPolicy = new PrivacyPathPolicy(normalizedPolicyRoot);
         _sourceExtensions = NormalizeSourceExtensions(sourceExtensions);
         _sourceExtensions.RemoveWhere(extension =>
             privacyPathPolicy.IsExcluded(Path.Join(_root, $"source{extension}")));
+        if (projectSet is not null)
+        {
+            // Project files are control-plane events, not language-indexer input. Keeping the
+            // extension in the watcher filter ensures create/delete/change can refresh the
+            // positive matcher even when no indexer claims .csproj.
+            _sourceExtensions.Add(".csproj");
+        }
         if (_sourceExtensions.Count == 0)
         {
             throw new ArgumentException(
@@ -183,9 +200,38 @@ public sealed class SolutionWatcher : IAsyncDisposable
         _raw.Writer.TryWrite(new RawEvent(string.Empty, FileChangeReason.GitHeadChanged));
     }
 
-    private bool IsTrackedSourcePath(string path) =>
-        !_pathPolicy.IsExcluded(path)
-        && _sourceExtensions.Contains(Path.GetExtension(path));
+    private bool IsTrackedSourcePath(string path)
+    {
+        if (_pathPolicy.IsExcluded(path)) return false;
+
+        var matcher = Volatile.Read(ref _projectSetMatcher);
+        if (string.Equals(
+                Path.GetExtension(path),
+                ".csproj",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            if (matcher?.IsProjectAnchorCandidate(path) != true) return false;
+
+            // The matcher snapshots existing project anchors. Refresh it synchronously before
+            // queueing the control event so a subsequent source event observes the new boundary.
+            RefreshProjectSetMatcher();
+            return true;
+        }
+
+        return _sourceExtensions.Contains(Path.GetExtension(path))
+            && (matcher?.Includes(path) ?? true);
+    }
+
+    private void RefreshProjectSetMatcher()
+    {
+        if (_projectSet is null) return;
+        lock (_projectSetMatcherLock)
+        {
+            Volatile.Write(
+                ref _projectSetMatcher,
+                new ScopeProjectSetPathMatcher(_policyRoot, _projectSet));
+        }
+    }
 
     private static HashSet<string> NormalizeSourceExtensions(IEnumerable<string>? sourceExtensions)
     {

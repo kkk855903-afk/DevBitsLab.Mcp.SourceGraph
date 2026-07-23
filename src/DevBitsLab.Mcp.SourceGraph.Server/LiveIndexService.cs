@@ -19,9 +19,9 @@ namespace DevBitsLab.Mcp.SourceGraph.Server;
 /// running it consumes per-scope file-change batches and triggers incremental reindexing on the
 /// matching scope.
 ///
-/// A failing scope marks itself <c>degraded</c> in the registry and stops watching; the rest of
-/// the host stays up so queries against healthy scopes still work. Replaces the v0.4 single-scope
-/// service in place.
+/// A scope with only failures and no usable graph marks itself <c>degraded</c> and stops watching;
+/// a scope with usable output plus isolated failures is <c>partial</c> and remains watchable. The
+/// rest of the host stays up so queries against healthy scopes still work.
 /// </summary>
 public sealed class LiveIndexService : BackgroundService
 {
@@ -161,14 +161,14 @@ public sealed class LiveIndexService : BackgroundService
         }
 
         // Run the cold index for every prepared scope concurrently. Each call settles its own
-        // host status to "ok" or "degraded" and calls MarkReady so tools waiting on
+        // host status to "ok", "partial", or "degraded" and calls MarkReady so tools waiting on
         // ScopeHost.Ready can proceed.
         var indexTasks = _preparedHosts.Select(host => RunInitialIndexAsync(host, stoppingToken)).ToArray();
         await Task.WhenAll(indexTasks).ConfigureAwait(false);
 
-        // Start watching every scope that finished cold-indexing with at least one project's
-        // worth of symbols — both `ok` and `partial`. `degraded` scopes have no usable graph,
-        // so a watcher is pointless; `indexing` shouldn't appear here (cold index has settled).
+        // Start watching every clean or partially successful scope. An empty but clean `ok` scope
+        // still needs a watcher so the first future source file is indexed. `degraded` scopes have
+        // no usable graph, and `indexing` should not appear here after the cold pass settles.
         foreach (var host in _preparedHosts.Where(h => h.Status == "ok" || h.Status == "partial"))
         {
             StartWatcher(host, stoppingToken);
@@ -353,7 +353,7 @@ public sealed class LiveIndexService : BackgroundService
             try
             {
                 await RunInitialIndexAsync(host, ct).ConfigureAwait(false);
-                if (host.Status == "ok") StartWatcher(host, ct);
+                if (IsWatchable(host)) StartWatcher(host, ct);
             }
             catch (OperationCanceledException) { /* shutting down */ }
             catch (Exception ex)
@@ -390,7 +390,7 @@ public sealed class LiveIndexService : BackgroundService
             try
             {
                 await RunInitialIndexAsync(newHost, ct).ConfigureAwait(false);
-                if (newHost.Status == "ok") StartWatcher(newHost, ct);
+                if (IsWatchable(newHost)) StartWatcher(newHost, ct);
             }
             catch (OperationCanceledException) { /* shutting down */ }
             catch (Exception ex)
@@ -548,7 +548,8 @@ public sealed class LiveIndexService : BackgroundService
     /// Phase 2 of scope bring-up. Runs during <see cref="ExecuteAsync"/> after MCP is already
     /// accepting requests against the prepared (status="indexing") host. Opens the solution,
     /// runs the cold index, dispatches plugin analyzers, then settles <see cref="ScopeHost.Status"/>
-    /// to either <c>"ok"</c> or <c>"degraded"</c> and calls <see cref="ScopeHost.MarkReady"/> so
+    /// to <c>"ok"</c>, <c>"partial"</c>, or <c>"degraded"</c> and calls
+    /// <see cref="ScopeHost.MarkReady"/> so
     /// tools waiting on <see cref="ScopeHost.Ready"/> can proceed.
     /// </summary>
     [SuppressMessage("Design", "CA1031:DoNotCatchGeneralExceptionTypes",
@@ -557,6 +558,10 @@ public sealed class LiveIndexService : BackgroundService
     {
         var scope = host.Scope;
         var solutionPath = host.SolutionPath;
+        var nonCSharpFilesIndexed = 0;
+        var roslynProducedUsableOutput = false;
+        var nonCSharpProducedUsableOutput = false;
+        var projectDiscoveryFailed = false;
 
         try
         {
@@ -572,95 +577,97 @@ public sealed class LiveIndexService : BackgroundService
                     purgedFiles);
             }
 
-            if (string.IsNullOrEmpty(solutionPath))
+            if (!string.IsNullOrEmpty(solutionPath))
             {
-                _logger.LogInformation("Scope `{Id}` has no resolvable solution; skipping cold index", scope.Id);
-                host.Status = "ok"; // empty graph but openable
-                await _registry.UpsertAsync(ToRow(scope, host.Status, null), ct).ConfigureAwait(false);
-                host.ProgressSource.MarkReady();
-                return;
-            }
-
-            // Phase 1: workspace open. The MSBuildWorkspace pass dominates this section for real
-            // solutions (10s+ on a 1000-doc tree). Emit the coarse phase event so any tool waiting
-            // on Ready (and forwarding our progress) sees motion. The open + index_all pair runs
-            // under the bounded-retry policy from `add-scope-repair-tools` (3 attempts at
-            // [1s, 5s, 25s]); the "indexing" phase event fires inside the indexAllAsync delegate
-            // so it lands AFTER a successful open (possibly after retries) and BEFORE the actual
-            // index walk begins, keeping progress monotonically increasing.
-            host.ProgressSource.Emit(new ModelContextProtocol.ProgressNotificationValue
-            {
-                Progress = 0.0f, Total = 1.0f, Message = "opening workspace",
-            });
-            var initial = await WorkspaceOpenRetry.RunAsync(
-                host.Scope.Id,
-                tk => host.Indexer.OpenAsync(solutionPath, tk),
-                tk =>
+                // Phase 1: workspace open. The MSBuildWorkspace pass dominates this section for
+                // real solutions (10s+ on a 1000-doc tree). Emit the coarse phase event so any
+                // tool waiting on Ready (and forwarding our progress) sees motion. The open +
+                // index_all pair runs under the bounded-retry policy from
+                // `add-scope-repair-tools` (3 attempts at [1s, 5s, 25s]).
+                host.ProgressSource.Emit(new ModelContextProtocol.ProgressNotificationValue
                 {
-                    host.ProgressSource.Emit(new ModelContextProtocol.ProgressNotificationValue
+                    Progress = 0.0f, Total = 1.0f, Message = "opening workspace",
+                });
+                var initial = await WorkspaceOpenRetry.RunAsync(
+                    host.Scope.Id,
+                    tk => host.Indexer.OpenAsync(solutionPath, tk),
+                    tk =>
                     {
-                        Progress = 0.5f, Total = 1.0f, Message = "indexing",
-                    });
-                    return host.Indexer.IndexAllAsync(tk);
-                },
-                WorkspaceOpenRetry.DefaultBackoffs,
-                _logger,
-                ct).ConfigureAwait(false);
-            _logger.LogInformation("Scope `{Id}` initial index complete in {Elapsed}: {Files} files re-processed",
-                scope.Id, initial.Elapsed, initial.FilesIndexed);
+                        host.ProgressSource.Emit(new ModelContextProtocol.ProgressNotificationValue
+                        {
+                            Progress = 0.5f, Total = 1.0f, Message = "indexing",
+                        });
+                        return host.Indexer.IndexAllAsync(tk);
+                    },
+                    WorkspaceOpenRetry.DefaultBackoffs,
+                    _logger,
+                    ct).ConfigureAwait(false);
+                roslynProducedUsableOutput =
+                    initial.SymbolsIndexed > 0 || initial.ReferencesIndexed > 0;
+                _logger.LogInformation(
+                    "Scope `{Id}` initial index complete in {Elapsed}: {Files} files re-processed",
+                    scope.Id,
+                    initial.Elapsed,
+                    initial.FilesIndexed);
 
-            // Capture per-project / per-file failures for surfacing via list_scopes. They feed
-            // into the status decision below and ride along on the registry row that gets
-            // persisted at the end of this method.
-            host.FailedProjects = initial.FailedProjects;
-            host.FailedFiles = initial.FailedFiles;
-
-            // Carryover from open-language-contract task 5.3 / 6.1 / 6.2: build the per-scope
-            // file → project lookup so IndexContext.Project is populated for every dispatched
-            // document. The MSBuild factory needs the live workspace; build a per-scope dispatcher
-            // here that includes it alongside the global factory pool (which already has the
-            // built-in XAML factory). Then dispatch every non-`.cs` file the registry knows about
-            // — XAML and any plugin-supplied indexer (.py, .ts, …) — so their events land in the
-            // store before the analyzer pipeline runs over them.
-            if (host.Indexer.SanitizedSolution is not null)
-            {
-                var perScopeFactories = new LanguageProjectFactoryRegistry();
-                perScopeFactories.Register(
-                    new DevBitsLab.Mcp.SourceGraph.Indexing.Xaml.XamlLanguageProjectFactory(
-                        () => host.Indexer.SanitizedSolution));
-                foreach (var f in _projectFactories.All())
-                {
-                    // Replace the process-wide discovery-only XAML factory with this scope's
-                    // Roslyn-aware instance. First-write-wins project mapping would otherwise
-                    // pin each .xaml file to a project with no semantic compilation.
-                    if (f is DevBitsLab.Mcp.SourceGraph.Indexing.Xaml.XamlLanguageProjectFactory)
-                    {
-                        continue;
-                    }
-                    perScopeFactories.Register(f);
-                }
-                perScopeFactories.Register(new MSBuildLanguageProjectFactory(host.Indexer));
-                var perScopeDispatcher = new LanguageIndexerDispatcher(
-                    _languageDispatcher.Indexers,
-                    perScopeFactories,
-                    _loggerFactory.CreateLogger<LanguageIndexerDispatcher>());
-                await perScopeDispatcher.BuildProjectMapAsync(host, ct).ConfigureAwait(false);
-                var nonCsCount = await perScopeDispatcher.DispatchAllAsync(host, ct).ConfigureAwait(false);
-                if (nonCsCount > 0)
-                {
-                    _logger.LogInformation("Scope `{Id}` non-C# dispatch indexed {Count} files",
-                        scope.Id, nonCsCount);
-                }
+                // Capture per-project / per-file failures for surfacing via list_scopes. They feed
+                // into the status decision below and ride along on the registry row persisted at
+                // the end of this method.
+                host.FailedProjects = initial.FailedProjects;
+                host.FailedFiles = initial.FailedFiles;
             }
             else
             {
-                await _languageDispatcher.BuildProjectMapAsync(host, ct).ConfigureAwait(false);
-                var nonCsCount = await _languageDispatcher.DispatchAllAsync(host, ct).ConfigureAwait(false);
-                if (nonCsCount > 0)
+                // A paths-only or non-.NET repository still has a valid cold-index path: every
+                // extension claimed by ILanguageIndexer is discovered below. Roslyn is the only
+                // phase omitted when no solution can be resolved.
+                _logger.LogInformation(
+                    "Scope `{Id}` has no resolvable solution; indexing registered non-C# languages",
+                    scope.Id);
+                host.ProgressSource.Emit(new ModelContextProtocol.ProgressNotificationValue
                 {
-                    _logger.LogInformation("Scope `{Id}` non-C# dispatch indexed {Count} files (no MSBuild workspace)",
-                        scope.Id, nonCsCount);
-                }
+                    Progress = 0.5f, Total = 1.0f, Message = "indexing registered languages",
+                });
+                host.FailedProjects = Array.Empty<ProjectFailure>();
+                host.FailedFiles = Array.Empty<FileFailure>();
+            }
+
+            // Build the per-scope file → project lookup and dispatch every registered non-C#
+            // language whether or not a Roslyn solution exists. When a workspace is available,
+            // CreateScopeLanguageDispatcher supplies the Roslyn-aware XAML/MSBuild factories;
+            // otherwise it reuses the process-wide discovery factories.
+            var coldDispatcher = CreateScopeLanguageDispatcher(host);
+            var projectMapResult =
+                await coldDispatcher.BuildProjectMapAsync(host, ct).ConfigureAwait(false);
+            projectDiscoveryFailed = !projectMapResult.Succeeded;
+            var languageResult = projectMapResult.Succeeded
+                ? await coldDispatcher.DispatchAllAsync(host, ct).ConfigureAwait(false)
+                : LanguageDispatchResult.Empty with
+                {
+                    FailedProjects = projectMapResult.FailedProjects,
+                };
+            nonCSharpFilesIndexed = languageResult.IndexedFiles;
+            nonCSharpProducedUsableOutput = languageResult.UsableOutputFiles > 0;
+            if (languageResult.FailedProjects.Count > 0)
+            {
+                host.FailedProjects = host.FailedProjects
+                    .Concat(languageResult.FailedProjects)
+                    .Distinct()
+                    .ToArray();
+            }
+            if (languageResult.FailedFiles.Count > 0)
+            {
+                host.FailedFiles = host.FailedFiles
+                    .Concat(languageResult.FailedFiles)
+                    .ToArray();
+            }
+            if (nonCSharpFilesIndexed > 0)
+            {
+                _logger.LogInformation(
+                    "Scope `{Id}` non-C# dispatch indexed {Count} files{WorkspaceSuffix}",
+                    scope.Id,
+                    nonCSharpFilesIndexed,
+                    host.Indexer.SanitizedSolution is null ? " (no MSBuild workspace)" : string.Empty);
             }
 
             // Plugin analyzers: walk every indexed file and dispatch the registered analyzers.
@@ -672,41 +679,33 @@ public sealed class LiveIndexService : BackgroundService
                 await DispatchAnalyzersForScopeAsync(host, ct).ConfigureAwait(false);
             }
 
-            // Settle status per the decision matrix in design.md §Decision 3:
-            //   - degraded if FilesIndexed == 0 AND there were failures (no usable graph)
-            //   - partial if any project or file failed but the scope produced something
-            //   - ok if everything indexed cleanly
-            // The "no resolvable solution" early return above and the catch block below cover
-            // the other degraded paths (workspace open threw, scope has no solution at all).
-            var failedProjectCount = initial.FailedProjects.Count;
-            var failedFileCount = initial.FailedFiles.Count;
-            var hasFailures = failedProjectCount > 0 || failedFileCount > 0;
-            if (initial.FilesIndexed == 0 && hasFailures)
+            // Settle against both this pass and the graph that remains transactionally stored.
+            // A failed project-map rebuild intentionally preserves the last good graph; treating
+            // that scope as degraded would hide queryable evidence and prevent the watcher from
+            // retrying discovery on the next control/source event.
+            var failedProjectCount = host.FailedProjects.Count;
+            var failedFileCount = host.FailedFiles.Count;
+            var currentPassProducedUsableOutput =
+                roslynProducedUsableOutput || nonCSharpProducedUsableOutput;
+            var retainedCounts =
+                await host.Store.RowCountsAsync(ct).ConfigureAwait(false);
+            var status = ResolveColdIndexStatus(
+                currentPassProducedUsableOutput,
+                retainedCounts,
+                failedProjectCount,
+                failedFileCount,
+                projectDiscoveryFailed);
+            host.Status = status.Status;
+            host.StatusMessage = status.StatusMessage;
+            if (status.Status is "partial" or "degraded")
             {
-                host.Status = "degraded";
-                host.StatusMessage = BuildFailureSummary(
-                    "Cold index produced zero files",
-                    failedProjectCount,
-                    failedFileCount);
                 _logger.LogWarning(
-                    "Scope `{Id}` cold index produced zero files; marking degraded ({ProjectFailures} project failures, {FileFailures} file failures)",
-                    scope.Id, failedProjectCount, failedFileCount);
-            }
-            else if (hasFailures)
-            {
-                host.Status = "partial";
-                host.StatusMessage = BuildFailureSummary(
-                    "Indexed with failures",
+                    "Scope `{Id}` cold index settled to {Status} ({ProjectFailures} project failures, {FileFailures} file failures, retained graph: {RetainedGraph})",
+                    scope.Id,
+                    status.Status,
                     failedProjectCount,
-                    failedFileCount);
-                _logger.LogWarning(
-                    "Scope `{Id}` cold index settled to partial: {ProjectFailures} project failures, {FileFailures} file failures",
-                    scope.Id, failedProjectCount, failedFileCount);
-            }
-            else
-            {
-                host.Status = "ok";
-                host.StatusMessage = null;
+                    failedFileCount,
+                    status.UsesRetainedGraph);
             }
             host.LastIndexedAt = DateTimeOffset.UtcNow;
             await _registry.UpsertAsync(
@@ -850,7 +849,7 @@ public sealed class LiveIndexService : BackgroundService
         // used the caller's `ct` (the MCP request token), the watcher would be cancelled when
         // the tool response goes back, silently breaking live updates after every rebuild. Use
         // the captured host-lifetime token so the watcher lives as long as the process.
-        if (newHost.Status == "ok")
+        if (IsWatchable(newHost))
         {
             StartWatcher(newHost, _hostStoppingToken);
         }
@@ -858,22 +857,175 @@ public sealed class LiveIndexService : BackgroundService
         return newHost;
     }
 
+    private LanguageIndexerDispatcher CreateScopeLanguageDispatcher(ScopeHost host)
+    {
+        if (host.Indexer.SanitizedSolution is null)
+        {
+            return _languageDispatcher;
+        }
+
+        var perScopeFactories = new LanguageProjectFactoryRegistry();
+        perScopeFactories.Register(
+            new DevBitsLab.Mcp.SourceGraph.Indexing.Xaml.XamlLanguageProjectFactory(
+                () => host.Indexer.SanitizedSolution));
+        foreach (var factory in _projectFactories.All())
+        {
+            // Replace the process-wide discovery-only XAML factory with this scope's
+            // Roslyn-aware instance. First-write-wins project mapping would otherwise pin each
+            // .xaml file to a project with no semantic compilation.
+            if (factory is DevBitsLab.Mcp.SourceGraph.Indexing.Xaml.XamlLanguageProjectFactory)
+            {
+                continue;
+            }
+            perScopeFactories.Register(factory);
+        }
+        perScopeFactories.Register(new MSBuildLanguageProjectFactory(host.Indexer));
+        return new LanguageIndexerDispatcher(
+            _languageDispatcher.Indexers,
+            perScopeFactories,
+            _loggerFactory.CreateLogger<LanguageIndexerDispatcher>(),
+            _languageDispatcher.AnalyzerPipeline);
+    }
+
+    internal static bool IsWatchable(ScopeHost host) =>
+        host.Status is "ok" or "partial";
+
+    internal static async Task<LiveControlReconciliationResult>
+        RunControlReconciliationAsync(
+            Func<CancellationToken, Task<IndexResult?>> roslynAction,
+            Func<CancellationToken, Task<LanguageDispatchResult>> languageAction,
+            CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(roslynAction);
+        ArgumentNullException.ThrowIfNull(languageAction);
+        ct.ThrowIfCancellationRequested();
+
+        IndexResult? roslynResult = null;
+        ProjectFailure? roslynFailure = null;
+        try
+        {
+            roslynResult = await roslynAction(ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            roslynFailure = new ProjectFailure(
+                "roslyn-reload",
+                FailureMessage.Truncate(ex.Message));
+        }
+
+        ct.ThrowIfCancellationRequested();
+        LanguageDispatchResult languageResult;
+        try
+        {
+            languageResult = await languageAction(ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            languageResult = LanguageDispatchResult.Empty with
+            {
+                FailedProjects =
+                [
+                    new ProjectFailure(
+                        "registered-language-reconciliation",
+                        FailureMessage.Truncate(ex.Message)),
+                ],
+            };
+        }
+
+        if (roslynFailure is not null)
+        {
+            languageResult = languageResult with
+            {
+                FailedProjects = languageResult.FailedProjects
+                    .Prepend(roslynFailure)
+                    .Distinct()
+                    .ToArray(),
+            };
+        }
+
+        return new LiveControlReconciliationResult(
+            roslynResult,
+            languageResult,
+            roslynFailure);
+    }
+
+    internal static ColdIndexStatusResolution ResolveColdIndexStatus(
+        bool currentPassProducedUsableOutput,
+        RowCountsRow retainedCounts,
+        int failedProjectCount,
+        int failedFileCount,
+        bool projectDiscoveryFailed)
+    {
+        var hasFailures = failedProjectCount > 0 || failedFileCount > 0;
+        if (!hasFailures)
+        {
+            return new ColdIndexStatusResolution("ok", null, UsesRetainedGraph: false);
+        }
+
+        var storedGraphIsUsable = retainedCounts.Symbols > 0
+            || retainedCounts.Refs > 0
+            || retainedCounts.Edges > 0
+            || retainedCounts.Annotations > 0;
+        if (currentPassProducedUsableOutput || storedGraphIsUsable)
+        {
+            var usesRetainedGraph =
+                !currentPassProducedUsableOutput && storedGraphIsUsable;
+            var prefix = usesRetainedGraph
+                ? projectDiscoveryFailed
+                    ? "Project discovery failed; serving stale stored graph"
+                    : "Cold index failed; serving stale stored graph"
+                : "Indexed with failures";
+            return new ColdIndexStatusResolution(
+                "partial",
+                BuildFailureSummary(prefix, failedProjectCount, failedFileCount),
+                usesRetainedGraph);
+        }
+
+        var degradedPrefix = projectDiscoveryFailed
+            ? "Project discovery failed and no usable graph remains"
+            : "Cold index produced no usable graph";
+        return new ColdIndexStatusResolution(
+            "degraded",
+            BuildFailureSummary(
+                degradedPrefix,
+                failedProjectCount,
+                failedFileCount),
+            UsesRetainedGraph: false);
+    }
+
     private void StartWatcher(ScopeHost host, CancellationToken stoppingToken)
     {
         var solutionPath = host.SolutionPath;
-        if (string.IsNullOrEmpty(solutionPath)) return;
+        var watchRoot = Path.GetFullPath(host.Scope.Root);
+        var watchedExtensions = _languageDispatcher.RegisteredSourceExtensions
+            .Append(".csproj")
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        if (watchedExtensions.Length == 0)
+        {
+            _logger.LogWarning(
+                "Scope `{Id}` has no registered source extensions; live watching is disabled",
+                host.Scope.Id);
+            return;
+        }
 
-        var watchRoot = Path.GetDirectoryName(solutionPath)!;
         var watcher = new SolutionWatcher(
             watchRoot,
             debounce: TimeSpan.FromMilliseconds(_config.DebounceMs),
             logger: _loggerFactory.CreateLogger<SolutionWatcher>(),
-            sourceExtensions: null,
+            sourceExtensions: watchedExtensions,
             excludePatterns: host.Scope.ProjectSet.Exclude,
-            policyRoot: host.Scope.Root);
+            policyRoot: host.Scope.Root,
+            projectSet: host.Scope.ProjectSet);
         host.Watcher = watcher;
 
-        _logger.LogInformation("Scope `{Id}`: watching {Root} for .cs, .xaml, and .git/HEAD changes", host.Scope.Id, watchRoot);
+        _logger.LogInformation(
+            "Scope `{Id}`: watching {Root} for registered extensions {Extensions} and .git/HEAD changes",
+            host.Scope.Id,
+            watchRoot,
+            string.Join(", ", watchedExtensions));
 
         // Run the watcher loop on a dedicated task so we can supervise multiple scopes from one
         // ExecuteAsync. Failures inside the loop are logged per-scope; we never let one scope's
@@ -889,16 +1041,121 @@ public sealed class LiveIndexService : BackgroundService
                         if (batch.Reason == FileChangeReason.GitHeadChanged)
                         {
                             _logger.LogInformation("Scope `{Id}`: git HEAD changed; running full reindex", host.Scope.Id);
-                            var r = await host.Indexer.ReloadAndIndexAllAsync(stoppingToken).ConfigureAwait(false);
+                            var dispatcher = CreateScopeLanguageDispatcher(host);
+                            var reconciliation = await RunControlReconciliationAsync(
+                                async tk =>
+                                {
+                                    if (string.IsNullOrEmpty(solutionPath)) return null;
+                                    return await host.Indexer
+                                        .ReloadAndIndexAllAsync(tk)
+                                        .ConfigureAwait(false);
+                                },
+                                async tk =>
+                                {
+                                    var projectMapResult = await dispatcher
+                                        .BuildProjectMapAsync(host, tk)
+                                        .ConfigureAwait(false);
+                                    return projectMapResult.Succeeded
+                                        ? await dispatcher
+                                            .DispatchAllAsync(host, tk)
+                                            .ConfigureAwait(false)
+                                        : LanguageDispatchResult.Empty with
+                                        {
+                                            FailedProjects =
+                                                projectMapResult.FailedProjects,
+                                        };
+                                },
+                                stoppingToken).ConfigureAwait(false);
+                            if (reconciliation.RoslynFailure is not null)
+                            {
+                                _logger.LogWarning(
+                                    "Scope `{Id}` Roslyn reload failed during git HEAD reconciliation: {Reason}; registered-language reconciliation still ran",
+                                    host.Scope.Id,
+                                    reconciliation.RoslynFailure.Reason);
+                            }
+                            var languageResult = reconciliation.LanguageResult;
+                            await RecordLiveLanguageFailuresAsync(
+                                host,
+                                languageResult,
+                                stoppingToken).ConfigureAwait(false);
                             host.LastIndexedAt = DateTimeOffset.UtcNow;
-                            _logger.LogInformation("Scope `{Id}`: reindex done in {Elapsed}", host.Scope.Id, r.Elapsed);
+                            _logger.LogInformation(
+                                "Scope `{Id}`: full reindex complete ({CSharpFiles} C# files, {OtherFiles} registered-language files)",
+                                host.Scope.Id,
+                                reconciliation.RoslynResult?.FilesIndexed ?? 0,
+                                languageResult.IndexedFiles);
                         }
                         else if (batch.Paths.Count > 0)
                         {
-                            var r = await host.Indexer.IndexChangedFilesAsync(batch.Paths, stoppingToken).ConfigureAwait(false);
+                            var projectControlChanged = batch.Paths.Any(path =>
+                                string.Equals(
+                                    Path.GetExtension(path),
+                                    ".csproj",
+                                    StringComparison.OrdinalIgnoreCase));
+                            var csharpPaths = string.IsNullOrEmpty(solutionPath)
+                                ? Array.Empty<string>()
+                                : batch.Paths
+                                    .Where(path => string.Equals(
+                                        Path.GetExtension(path),
+                                        ".cs",
+                                        StringComparison.OrdinalIgnoreCase))
+                                    .ToArray();
+                            var dispatcher = CreateScopeLanguageDispatcher(host);
+                            IndexResult? roslynResult;
+                            LanguageDispatchResult languageResult;
+                            if (projectControlChanged)
+                            {
+                                var reconciliation =
+                                    await RunControlReconciliationAsync(
+                                        async tk =>
+                                        {
+                                            if (string.IsNullOrEmpty(solutionPath)) return null;
+                                            return await host.Indexer
+                                                .ReloadAndIndexAllAsync(tk)
+                                                .ConfigureAwait(false);
+                                        },
+                                        tk => dispatcher.DispatchChangedFilesAsync(
+                                            host,
+                                            batch.Paths,
+                                            tk),
+                                        stoppingToken).ConfigureAwait(false);
+                                roslynResult = reconciliation.RoslynResult;
+                                languageResult = reconciliation.LanguageResult;
+                                if (reconciliation.RoslynFailure is not null)
+                                {
+                                    _logger.LogWarning(
+                                        "Scope `{Id}` Roslyn reload failed for project-control event: {Reason}; registered-language reconciliation still ran",
+                                        host.Scope.Id,
+                                        reconciliation.RoslynFailure.Reason);
+                                }
+                            }
+                            else
+                            {
+                                roslynResult = csharpPaths.Length > 0
+                                    ? await host.Indexer
+                                        .IndexChangedFilesAsync(
+                                            csharpPaths,
+                                            stoppingToken)
+                                        .ConfigureAwait(false)
+                                    : null;
+                                languageResult = await dispatcher
+                                    .DispatchChangedFilesAsync(
+                                        host,
+                                        batch.Paths,
+                                        stoppingToken)
+                                    .ConfigureAwait(false);
+                            }
+                            await RecordLiveLanguageFailuresAsync(
+                                host,
+                                languageResult,
+                                stoppingToken).ConfigureAwait(false);
                             host.LastIndexedAt = DateTimeOffset.UtcNow;
-                            _logger.LogInformation("Scope `{Id}`: reindexed {Count} changed file(s) in {Elapsed}",
-                                host.Scope.Id, r.FilesIndexed, r.Elapsed);
+                            _logger.LogInformation(
+                                "Scope `{Id}`: applied live batch ({CSharpFiles} C# indexed, {OtherFiles} registered-language indexed, {DeletedFiles} deleted)",
+                                host.Scope.Id,
+                                roslynResult?.FilesIndexed ?? 0,
+                                languageResult.IndexedFiles,
+                                languageResult.DeletedFiles);
                         }
                     }
                     catch (OperationCanceledException) { break; }
@@ -968,7 +1225,14 @@ public sealed class LiveIndexService : BackgroundService
         foreach (var file in files)
         {
             ct.ThrowIfCancellationRequested();
-            if (pathPolicy.IsExcluded(file.Path)) continue;
+            if (!string.Equals(
+                    Path.GetExtension(file.Path),
+                    ".cs",
+                    StringComparison.OrdinalIgnoreCase)
+                || pathPolicy.IsExcluded(file.Path))
+            {
+                continue;
+            }
             byte[] contents;
             try
             {
@@ -1030,13 +1294,53 @@ public sealed class LiveIndexService : BackgroundService
         }
     }
 
+    private async Task RecordLiveLanguageFailuresAsync(
+        ScopeHost host,
+        LanguageDispatchResult result,
+        CancellationToken ct)
+    {
+        if (!ApplyLiveLanguageFailures(host, result)) return;
+        await _registry.UpsertAsync(
+            ToRow(
+                host.Scope,
+                host.Status,
+                host.StatusMessage,
+                host.FailedProjects,
+                host.FailedFiles),
+            ct).ConfigureAwait(false);
+        _logger.LogWarning(
+            "Scope `{Id}` live indexing reported {ProjectFailures} project and {FileFailures} file failures",
+            host.Scope.Id,
+            result.FailedProjects.Count,
+            result.FailedFiles.Count);
+    }
+
+    internal static bool ApplyLiveLanguageFailures(
+        ScopeHost host,
+        LanguageDispatchResult result)
+    {
+        if (!result.HasFailures) return false;
+        host.FailedProjects = host.FailedProjects
+            .Concat(result.FailedProjects)
+            .Distinct()
+            .ToArray();
+        host.FailedFiles = host.FailedFiles
+            .Concat(result.FailedFiles)
+            .Distinct()
+            .ToArray();
+        host.Status = "partial";
+        host.StatusMessage = BuildFailureSummary(
+            "Live indexing retained the last usable graph after failures",
+            host.FailedProjects.Count,
+            host.FailedFiles.Count);
+        return true;
+    }
+
     private static string? ResolvePrimarySolution(Scope scope)
     {
-        // For solutions-based scopes, return the first solution path. For projects/paths, we
-        // currently don't open a single .sln (Roslyn workspace-wise that's a TODO); the indexer
-        // will refuse to open without a solution. This mirrors the v1 design's "solutions are the
-        // first-class kind"; project-globs are accepted via the schema but warn at runtime when
-        // chosen alone.
+        // For solutions-based scopes, return the first solution path. Projects/paths scopes do
+        // not open a Roslyn workspace yet, but they remain fully indexable by every registered
+        // non-C# language dispatcher and receive the same live watcher lifecycle.
         if (scope.ProjectSet is ScopeProjectSet.Solutions s && s.Items.Count > 0)
         {
             var path = s.Items[0];
@@ -1079,6 +1383,16 @@ public sealed class LiveIndexService : BackgroundService
             FailedProjects: failedProjects,
             FailedFiles: failedFiles);
 }
+
+internal sealed record ColdIndexStatusResolution(
+    string Status,
+    string? StatusMessage,
+    bool UsesRetainedGraph);
+
+internal sealed record LiveControlReconciliationResult(
+    IndexResult? RoslynResult,
+    LanguageDispatchResult LanguageResult,
+    ProjectFailure? RoslynFailure);
 
 /// <summary>
 /// Configuration injected into <see cref="LiveIndexService"/> via DI. Carries the resolved scope

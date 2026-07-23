@@ -1,3 +1,4 @@
+using DevBitsLab.Mcp.SourceGraph.Core;
 using DevBitsLab.Mcp.SourceGraph.Watcher;
 using FluentAssertions;
 using Xunit;
@@ -201,6 +202,133 @@ public sealed class SolutionWatcherTests
                 _eventTimeout);
 
             observed.Should().BeEquivalentTo([includedChanged]);
+        }
+        finally
+        {
+            DeleteTempRoot(root);
+        }
+    }
+
+    [Fact]
+    public async Task PathsScope_filtersEventsOutsidePositiveBoundary()
+    {
+        var root = MakeTempRoot();
+        try
+        {
+            var includedPath = CreateParentedPath(root, "src", "web", "Changed.ts");
+            var outsidePath = CreateParentedPath(root, "vendor", "Changed.ts");
+            var projectPath = CreateParentedPath(root, "src", "web", "Web.csproj");
+            await File.WriteAllTextAsync(projectPath, "<Project />");
+            await File.WriteAllTextAsync(includedPath, "before");
+            await File.WriteAllTextAsync(outsidePath, "before");
+
+            await using var watcher = new SolutionWatcher(
+                root,
+                debounce: _shortDebounce,
+                logger: null,
+                sourceExtensions: [".ts"],
+                excludePatterns: Array.Empty<string>(),
+                policyRoot: root,
+                projectSet: new ScopeProjectSet.Paths(
+                    ["src/**/*.csproj"],
+                    Array.Empty<string>()));
+
+            await File.WriteAllTextAsync(outsidePath, "after");
+            await Task.Delay(_shortDebounce * 3);
+            await File.WriteAllTextAsync(includedPath, "after");
+
+            var observed = await ReadPathsUntilAsync(
+                watcher,
+                paths => paths.Contains(includedPath),
+                _eventTimeout);
+
+            observed.Should().BeEquivalentTo([includedPath]);
+        }
+        finally
+        {
+            DeleteTempRoot(root);
+        }
+    }
+
+    [Fact]
+    public async Task ProjectsScope_newAnchorRefreshesMatcher_beforeFollowingSourceEvent()
+    {
+        var root = MakeTempRoot();
+        try
+        {
+            var projectPath = CreateParentedPath(root, "src", "App", "App.csproj");
+            var sourcePath = Path.Join(Path.GetDirectoryName(projectPath)!, "app.ts");
+
+            await using var watcher = new SolutionWatcher(
+                root,
+                debounce: _shortDebounce,
+                logger: null,
+                sourceExtensions: [".ts"],
+                excludePatterns: Array.Empty<string>(),
+                policyRoot: root,
+                projectSet: new ScopeProjectSet.Projects(
+                    ["src/App/App.csproj"],
+                    Array.Empty<string>()));
+
+            await File.WriteAllTextAsync(projectPath, "<Project />");
+            var controlPaths = await ReadPathsUntilAsync(
+                watcher,
+                paths => paths.Contains(projectPath),
+                _eventTimeout);
+            controlPaths.Should().Contain(projectPath);
+
+            await File.WriteAllTextAsync(sourcePath, "export const live = true;");
+            var sourcePaths = await ReadPathsUntilAsync(
+                watcher,
+                paths => paths.Contains(sourcePath),
+                _eventTimeout);
+
+            sourcePaths.Should().Contain(sourcePath);
+        }
+        finally
+        {
+            DeleteTempRoot(root);
+        }
+    }
+
+    [Fact]
+    public async Task PathsScope_deletedAnchorRefreshesMatcher_andBlocksLaterSourceEvent()
+    {
+        var root = MakeTempRoot();
+        try
+        {
+            var projectPath = CreateParentedPath(root, "src", "App", "App.csproj");
+            var sourcePath = Path.Join(Path.GetDirectoryName(projectPath)!, "app.ts");
+            await File.WriteAllTextAsync(projectPath, "<Project />");
+            await File.WriteAllTextAsync(sourcePath, "before");
+
+            await using var watcher = new SolutionWatcher(
+                root,
+                debounce: _shortDebounce,
+                logger: null,
+                sourceExtensions: [".ts"],
+                excludePatterns: Array.Empty<string>(),
+                policyRoot: root,
+                projectSet: new ScopeProjectSet.Paths(
+                    ["src/**/*.csproj"],
+                    Array.Empty<string>()));
+
+            File.Delete(projectPath);
+            var controlPaths = await ReadPathsUntilAsync(
+                watcher,
+                paths => paths.Contains(projectPath),
+                _eventTimeout);
+            controlPaths.Should().Contain(projectPath);
+
+            await File.WriteAllTextAsync(sourcePath, "after");
+            var laterPaths = await ReadPathsUntilAsync(
+                watcher,
+                paths => paths.Contains(sourcePath),
+                _shortDebounce * 6);
+
+            laterPaths.Should().NotContain(
+                sourcePath,
+                "the deleted project anchor removes its source subtree from the live matcher");
         }
         finally
         {

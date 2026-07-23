@@ -471,6 +471,9 @@ static async Task<int> RunIndexAsync(CommandLine cli)
         await Console.Error.WriteLineAsync("error: index requires a solution path").ConfigureAwait(false);
         return 2;
     }
+    IReadOnlyList<FileFailure> nonCSharpFailedFiles = Array.Empty<FileFailure>();
+    IReadOnlyList<ProjectFailure> nonCSharpFailedProjects =
+        Array.Empty<ProjectFailure>();
     var solutionFull = Path.GetFullPath(cli.SolutionPath);
     var repoRootForIndex = cli.ResolvedRepoRoot();
     ScopeConfig indexScopeConfig;
@@ -638,63 +641,63 @@ static async Task<int> RunIndexAsync(CommandLine cli)
         {
             projectFactoryRegistry.Register(new MSBuildLanguageProjectFactory(indexer));
         }
+        var analyzerPipeline = new AnalyzerPipeline(
+            pluginHost,
+            loggerFactory.CreateLogger<AnalyzerPipeline>());
 
         // Dispatch non-C# files (XAML + plugin-supplied) for the one-shot path. The C# bulk index
         // above already covered .cs. We use the dispatcher's test-friendly overload here rather
         // than constructing a ScopeHost: ScopeHost owns indexer/embeddings/store lifetimes via
         // its DisposeAsync, but the one-shot CLI path keeps `await using var indexer = new ...`
         // and `await using var store = new ...` for those — wrapping the host would either
-        // double-dispose them or leak when the dispatcher throws. Building the project map
-        // inline against the existing store sidesteps both problems.
-        var dispatcher = new LanguageIndexerDispatcher(langRegistry, projectFactoryRegistry, loggerFactory.CreateLogger<LanguageIndexerDispatcher>());
-        var oneShotProjectMap = new Dictionary<string, ILanguageProject>(StringComparer.OrdinalIgnoreCase);
-        foreach (var factory in projectFactoryRegistry.All())
-        {
-            IReadOnlyList<ILanguageProject> projects;
-            try
-            {
-                projects = factory is IExclusionAwareLanguageProjectFactory exclusionAware
-                    ? await exclusionAware.DiscoverAsync(
-                        repoRootForIndex,
-                        excludePatterns,
-                        CancellationToken.None).ConfigureAwait(false)
-                    : await factory.DiscoverAsync(
-                        repoRootForIndex,
-                        CancellationToken.None).ConfigureAwait(false);
-            }
-            catch (Exception ex)
-            {
-                await Console.Error.WriteLineAsync($"[sourcegraph-mcp] factory `{factory.GetType().FullName}` failed DiscoverAsync: {ex.Message}").ConfigureAwait(false);
-                continue;
-            }
-            foreach (var p in projects)
-            {
-                foreach (var path in p.FilePaths)
-                {
-                    if (string.IsNullOrWhiteSpace(path)
-                        || indexScopeSelection.PathPolicy.IsExcluded(path))
-                    {
-                        continue;
-                    }
-                    if (!oneShotProjectMap.ContainsKey(path)) oneShotProjectMap[path] = p;
-                }
-            }
-        }
-        var dispatched = await dispatcher.DispatchAllForTestAsync(
-            store,
-            selectedScopeId,
+        // double-dispose them or leak when the dispatcher throws. Discovery is still delegated
+        // to the dispatcher so selected-project roots and fail-closed map replacement are
+        // identical in `index` and `serve`.
+        var dispatcher = new LanguageIndexerDispatcher(
+            langRegistry,
+            projectFactoryRegistry,
+            loggerFactory.CreateLogger<LanguageIndexerDispatcher>(),
+            analyzerPipeline);
+        var projectMapResult = await dispatcher.DiscoverProjectMapAsync(
             repoRootForIndex,
-            oneShotProjectMap,
-            excludePatterns,
+            selectedScope.ProjectSet,
+            selectedScopeId,
             CancellationToken.None).ConfigureAwait(false);
-        if (dispatched > 0)
+        nonCSharpFailedProjects = projectMapResult.FailedProjects;
+        var languageResult = projectMapResult.Succeeded
+            ? await dispatcher.DispatchAllForTestAsync(
+                store,
+                selectedScopeId,
+                repoRootForIndex,
+                projectMapResult.ProjectByFilePath,
+                excludePatterns,
+                ct: CancellationToken.None,
+                projectSet: selectedScope.ProjectSet).ConfigureAwait(false)
+            : LanguageDispatchResult.Empty with
+            {
+                FailedProjects = projectMapResult.FailedProjects,
+            };
+        nonCSharpFailedFiles = languageResult.FailedFiles;
+        if (languageResult.IndexedFiles > 0)
         {
-            Console.WriteLine($"non-C# dispatch: indexed {dispatched} files");
+            Console.WriteLine(
+                $"non-C# dispatch: indexed {languageResult.IndexedFiles} files");
+        }
+        foreach (var failure in nonCSharpFailedFiles)
+        {
+            await Console.Error.WriteLineAsync(
+                $"[sourcegraph-mcp] non-C# index failed for `{failure.Path}`: {failure.Reason}")
+                .ConfigureAwait(false);
+        }
+        foreach (var failure in nonCSharpFailedProjects)
+        {
+            await Console.Error.WriteLineAsync(
+                $"[sourcegraph-mcp] project discovery failed for `{failure.Name}`: {failure.Reason}")
+                .ConfigureAwait(false);
         }
 
         if (indexScopeConfig.Plugins.Count > 0)
         {
-            var analyzerPipeline = new AnalyzerPipeline(pluginHost, loggerFactory.CreateLogger<AnalyzerPipeline>());
             if (analyzerPipeline.HasAnalyzers)
             {
                 await DispatchAnalyzersForOneShotAsync(
@@ -723,7 +726,10 @@ static async Task<int> RunIndexAsync(CommandLine cli)
     Console.WriteLine($"indexed {result.FilesIndexed} files, {result.SymbolsIndexed} symbols, {result.ReferencesIndexed} refs in {result.Elapsed.TotalSeconds:F2}s");
     Console.WriteLine($"database: {cli.ResolvedDbPath()}");
     if (historyDisabled) Console.WriteLine("history: disabled (--no-history or git unavailable)");
-    return 0;
+    return nonCSharpFailedFiles.Count == 0
+        && nonCSharpFailedProjects.Count == 0
+            ? 0
+            : 1;
 }
 
 /// <summary>
@@ -759,7 +765,14 @@ static async Task DispatchAnalyzersForOneShotAsync(
 
     foreach (var file in files)
     {
-        if (pathPolicy.IsExcluded(file.Path)) continue;
+        if (!string.Equals(
+                Path.GetExtension(file.Path),
+                ".cs",
+                StringComparison.OrdinalIgnoreCase)
+            || pathPolicy.IsExcluded(file.Path))
+        {
+            continue;
+        }
 
         byte[] contents;
         try

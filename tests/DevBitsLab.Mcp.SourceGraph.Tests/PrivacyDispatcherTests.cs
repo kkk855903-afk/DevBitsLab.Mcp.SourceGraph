@@ -49,7 +49,8 @@ public sealed class PrivacyDispatcherTests : IDisposable
             _root,
             new Dictionary<string, ILanguageProject>(StringComparer.OrdinalIgnoreCase));
 
-        dispatched.Should().Be(1);
+        dispatched.IndexedFiles.Should().Be(1);
+        dispatched.FailedFiles.Should().BeEmpty();
         indexer.Paths.Should().Equal(allowed);
     }
 
@@ -79,7 +80,8 @@ public sealed class PrivacyDispatcherTests : IDisposable
             ["**/generated/**"],
             CancellationToken.None);
 
-        dispatched.Should().Be(1);
+        dispatched.IndexedFiles.Should().Be(1);
+        dispatched.FailedFiles.Should().BeEmpty();
         indexer.Paths.Should().Equal(allowed);
     }
 
@@ -116,7 +118,8 @@ public sealed class PrivacyDispatcherTests : IDisposable
                 _root,
                 new Dictionary<string, ILanguageProject>(StringComparer.OrdinalIgnoreCase));
 
-            dispatched.Should().Be(1);
+            dispatched.IndexedFiles.Should().Be(1);
+            dispatched.FailedFiles.Should().BeEmpty();
             indexer.Paths.Should().Equal(allowed);
         }
         finally
@@ -128,6 +131,9 @@ public sealed class PrivacyDispatcherTests : IDisposable
     [Fact]
     public async Task ProjectMap_forwardsAndEnforcesEveryScopeExclude()
     {
+        var projectAnchor = await PlantAsync(
+            Path.Join(_root, "src", "App.csproj"),
+            "<Project />");
         var allowed = Path.Join(_root, "src", "Allowed.privacytest");
         var generated = Path.Join(_root, "src", "Generated", "Hidden.privacytest");
         var patient = Path.Join(_root, "pAtIeNtDaTa", "Hidden.privacytest");
@@ -147,7 +153,7 @@ public sealed class PrivacyDispatcherTests : IDisposable
             Name: "test",
             Root: _root,
             ProjectSet: new ScopeProjectSet.Paths(
-                Globs: ["**/*", "**/*.DCM"],
+                Globs: ["src/**/*.csproj"],
                 Exclude: ["**/generated/**"]),
             Isolated: false,
             LastIndexedAt: DateTimeOffset.MinValue);
@@ -160,9 +166,11 @@ public sealed class PrivacyDispatcherTests : IDisposable
 
         try
         {
-            await dispatcher.BuildProjectMapAsync(host);
+            var result = await dispatcher.BuildProjectMapAsync(host);
 
-            factory.ObservedExcludePatterns.Should().Equal("**/generated/**");
+            result.Succeeded.Should().BeTrue();
+            factory.ObservedRoots.Should().Equal(Path.GetDirectoryName(projectAnchor));
+            factory.ObservedExcludePatterns.Should().Contain("**/generated/**");
             host.ProjectByFilePath.Keys.Should().Equal(allowed);
         }
         finally
@@ -201,6 +209,7 @@ public sealed class PrivacyDispatcherTests : IDisposable
         public IReadOnlyCollection<string> ProjectMarkers { get; } = ["*.privacytest"];
 
         public IReadOnlyList<string> ObservedExcludePatterns { get; private set; } = [];
+        public List<string> ObservedRoots { get; } = [];
 
         public Task<IReadOnlyList<ILanguageProject>> DiscoverAsync(
             string repoRoot,
@@ -212,6 +221,7 @@ public sealed class PrivacyDispatcherTests : IDisposable
             IReadOnlyList<string> excludePatterns,
             CancellationToken ct)
         {
+            ObservedRoots.Add(repoRoot);
             ObservedExcludePatterns = excludePatterns.ToArray();
             return Task.FromResult<IReadOnlyList<ILanguageProject>>([project]);
         }

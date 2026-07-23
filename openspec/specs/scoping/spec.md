@@ -94,12 +94,12 @@ When a scope has `isolated: true`, it SHALL be excluded from `scope = "*"` fan-o
 - **THEN** results come from `frontend` and `backend` only; rows from `vendor` are excluded unless `scope` explicitly includes `"vendor"`
 
 ### Requirement: Partial scope reports per-project failures
-A scope whose cold-index completed and produced symbols for at least one project, but where one or more projects or files failed, SHALL be marked with status `partial`. A partial scope SHALL be queryable: tools targeting `scope = "<id>"` against a partial scope SHALL return whatever symbols were indexed (best-effort); `scope = "*"` fan-out SHALL include partial scopes alongside `ok` scopes (and SHALL also reach `degraded` scopes per the existing `Degraded scope doesn't crash the host` requirement — those contribute a `"scope is degraded: <error>"` block to the merged response instead of running the query). The registry SHALL persist the failure lists alongside the scope row so `list_scopes` returns accurate failure detail even after a server restart that hasn't yet re-triggered indexing.
+A scope whose cold-index completed and produced symbols from at least one registered language, but where one or more projects or files failed, SHALL be marked with status `partial`. A partial scope SHALL be queryable: tools targeting `scope = "<id>"` against a partial scope SHALL return whatever symbols were indexed (best-effort); `scope = "*"` fan-out SHALL include partial scopes alongside `ok` scopes (and SHALL also reach `degraded` scopes per the existing `Degraded scope doesn't crash the host` requirement — those contribute a `"scope is degraded: <error>"` block to the merged response instead of running the query). The registry SHALL persist the failure lists alongside the scope row so `list_scopes` returns accurate failure detail even after a server restart that hasn't yet re-triggered indexing.
 
 A scope status SHALL be:
 - `ok` — every project and file indexed cleanly; `failed_projects` and `failed_files` are empty
 - `indexing` — cold index in progress
-- `partial` — at least one project produced symbols and at least one project or file failed; `failed_projects` and/or `failed_files` are non-empty
+- `partial` — at least one registered language produced usable graph output and at least one project or file failed; `failed_projects` and/or `failed_files` are non-empty
 - `degraded` — workspace failed to open, OR every project failed (zero files indexed), OR an unanticipated exception escaped to the scope-level safety net; tools return `"scope is degraded: <error>"`
 
 #### Scenario: Solution with one bad project lands `partial`, not `degraded`
@@ -118,7 +118,7 @@ A scope status SHALL be:
 - **THEN** the scope's status is `degraded` (because zero files were indexed); `failed_projects` enumerates every project; tools targeting the scope return the existing degraded-scope error message; `scope = "*"` reaches the scope as today (per `Degraded scope doesn't crash the host`) and contributes the per-scope error block to the merged response without breaking the call
 
 ### Requirement: Degraded scope doesn't crash the host
-If a scope's initial index fails with no recoverable output (workspace error, missing solution, every project failed to compile, or an unanticipated exception escaped to the scope-level safety net), the registry SHALL mark that scope as `degraded`; queries against it return an empty result with a status note, while every other scope continues to serve. A scope with at least one project that produced symbols SHALL be marked `partial` instead — `degraded` is reserved for the no-recoverable-output case.
+If a scope's initial index fails with no recoverable output (a declared solution cannot be opened, every project failed to compile and no other registered language produced output, or an unanticipated exception escaped to the scope-level safety net), the registry SHALL mark that scope as `degraded`; queries against it return an empty result with a status note, while every other scope continues to serve. A paths/projects scope that declares no solution is valid: it skips Roslyn and cold-indexes registered non-C# languages. A scope with usable output from any registered language SHALL be marked `partial` instead — `degraded` is reserved for the no-recoverable-output case.
 
 #### Scenario: Bad solution path
 - **WHEN** `.sourcegraph.json` lists a `tools.slnx` that fails to load

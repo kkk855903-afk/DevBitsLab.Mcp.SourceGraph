@@ -117,6 +117,13 @@ public sealed class ScopeHost : IAsyncDisposable
     /// </summary>
     public Dictionary<string, ILanguageProject> ProjectByFilePath { get; } = new(StringComparer.OrdinalIgnoreCase);
 
+    /// <summary>
+    /// Whether <see cref="ProjectByFilePath"/> reflects a complete successful discovery pass.
+    /// A failed cold/control-plane discovery keeps the prior dictionary for query safety but
+    /// clears this flag so the next ordinary source event retries discovery before indexing.
+    /// </summary>
+    public bool ProjectMapReady { get; internal set; }
+
     public async ValueTask DisposeAsync()
     {
         // Stop the embeddings drain first so any in-flight upserts complete before the underlying
