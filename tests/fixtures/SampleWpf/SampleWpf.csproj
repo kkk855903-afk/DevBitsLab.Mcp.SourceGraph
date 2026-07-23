@@ -11,7 +11,17 @@
     <TargetFramework>net10.0</TargetFramework>
     <RootNamespace>SampleWpf</RootNamespace>
     <Nullable>enable</Nullable>
-    <ImplicitUsings>enable</ImplicitUsings>
+    <!--
+      Keep the raw Roslyn workspace identical to the privacy-sanitized semantic workspace.
+      This fixture tests repository inputs, so it deliberately opts out of SDK-authored source
+      and analyzer-config inputs instead of trusting spoofable obj paths or generated filenames.
+    -->
+    <ImplicitUsings>disable</ImplicitUsings>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <GenerateTargetFrameworkAttribute>false</GenerateTargetFrameworkAttribute>
+    <GenerateMSBuildEditorConfigFile>false</GenerateMSBuildEditorConfigFile>
+    <EnableNETAnalyzers>false</EnableNETAnalyzers>
+    <AnalysisLevel>none</AnalysisLevel>
     <!-- Defeat the parent Directory.Build.props warning-as-error so the partial-class fixtures
          (which deliberately omit the markup-compiler's .g.cs half) don't fail the test build. -->
     <TreatWarningsAsErrors>false</TreatWarningsAsErrors>

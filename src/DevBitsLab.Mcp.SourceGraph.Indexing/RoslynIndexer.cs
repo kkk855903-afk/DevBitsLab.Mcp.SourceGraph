@@ -169,6 +169,115 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
     /// </summary>
     public Solution? SanitizedSolution => _sanitizedSolution;
 
+    /// <summary>
+    /// Returns whether every Roslyn input for all target-framework iterations of
+    /// <paramref name="projectFilePath"/> survived the scope privacy sanitizer. XAML semantic
+    /// analysis uses this as a fail-closed completeness signal: a clean compilation assembled
+    /// after an excluded source/additional/config document or referenced project was removed
+    /// cannot prove that a binding member is missing.
+    /// </summary>
+    public bool IsProjectSemanticInputComplete(string projectFilePath)
+    {
+        var workspace = _workspace;
+        var sanitized = _sanitizedSolution;
+        if (workspace is null || sanitized is null || _disposed) return false;
+
+        var complete = IsProjectSemanticInputComplete(
+            workspace.CurrentSolution,
+            sanitized,
+            projectFilePath);
+
+        // A structural reload can swap either snapshot while this read-only comparison runs.
+        // Treat a mixed generation as incomplete and let the next dispatch retry.
+        return complete
+               && ReferenceEquals(workspace, _workspace)
+               && ReferenceEquals(sanitized, _sanitizedSolution);
+    }
+
+    internal static bool IsProjectSemanticInputComplete(
+        Solution rawSolution,
+        Solution sanitized,
+        string projectFilePath)
+    {
+        ArgumentNullException.ThrowIfNull(rawSolution);
+        ArgumentNullException.ThrowIfNull(sanitized);
+        if (string.IsNullOrWhiteSpace(projectFilePath)) return false;
+
+        string normalizedProjectPath;
+        try
+        {
+            normalizedProjectPath = Path.GetFullPath(projectFilePath);
+        }
+        catch (Exception ex) when (
+            ex is ArgumentException
+                or NotSupportedException
+                or PathTooLongException
+                or System.Security.SecurityException)
+        {
+            return false;
+        }
+
+        var rawMatches = rawSolution.Projects
+            .Where(project =>
+                project.Language == LanguageNames.CSharp
+                && ProjectPathMatches(project.FilePath, normalizedProjectPath))
+            .ToArray();
+        if (rawMatches.Length == 0) return false;
+
+        var pending = new Stack<Project>(rawMatches);
+        var visited = new HashSet<ProjectId>();
+        while (pending.Count > 0)
+        {
+            var rawProject = pending.Pop();
+            if (!visited.Add(rawProject.Id)) continue;
+
+            var safeProject = sanitized.GetProject(rawProject.Id);
+            if (safeProject is null
+                || rawProject.Documents.Any(document =>
+                    safeProject.GetDocument(document.Id) is null)
+                || rawProject.AdditionalDocuments.Any(document =>
+                    safeProject.GetAdditionalDocument(document.Id) is null)
+                || rawProject.AnalyzerConfigDocuments.Any(document =>
+                    safeProject.GetAnalyzerConfigDocument(document.Id) is null)
+                || rawProject.ProjectReferences.Any(reference =>
+                    sanitized.GetProject(reference.ProjectId) is null
+                    || !safeProject.ProjectReferences.Any(candidate =>
+                        candidate.ProjectId == reference.ProjectId)))
+            {
+                return false;
+            }
+
+            foreach (var reference in rawProject.ProjectReferences)
+            {
+                var referencedProject = rawSolution.GetProject(reference.ProjectId);
+                if (referencedProject is null) return false;
+                pending.Push(referencedProject);
+            }
+        }
+
+        return true;
+
+        static bool ProjectPathMatches(string? candidatePath, string expectedPath)
+        {
+            if (string.IsNullOrWhiteSpace(candidatePath)) return false;
+            try
+            {
+                return string.Equals(
+                    Path.GetFullPath(candidatePath),
+                    expectedPath,
+                    _pathComparison);
+            }
+            catch (Exception ex) when (
+                ex is ArgumentException
+                    or NotSupportedException
+                    or PathTooLongException
+                    or System.Security.SecurityException)
+            {
+                return false;
+            }
+        }
+    }
+
     public async Task OpenAsync(string solutionPath, CancellationToken ct = default)
     {
         await _lock.WaitAsync(ct).ConfigureAwait(false);
