@@ -80,3 +80,68 @@ their field facts but not claim a compiler-dependent cross-part offset order.
 
 - **WHEN** a struct explicitly uses `LayoutKind.Auto`
 - **THEN** no ABI layout fact is emitted
+
+### Requirement: Phase 2 risk rules consume only proven normalized facts
+
+The Phase 2 rule pack SHALL contain `Interop001` and `Interop003` through `Interop006`.
+`Interop002` SHALL remain in the Phase 3 ABI-layout pack. Callback lifetime, native exception
+escape, and memory ownership adapters SHALL normalize their results into Core domain facts before
+rule evaluation; Roslyn, Clang, and other third-party objects SHALL NOT cross into these rules.
+Every usage and native proof SHALL identify one explicit `InteropTarget` and carry occurrence
+evidence. A missing fact, `Unknown` callback rooting, or `Unknown` allocator family SHALL remain
+unknown and SHALL NOT produce a risk finding.
+
+### Requirement: Interop004 requires retention and unrooted-call proof
+
+`Interop004` SHALL emit a warning only when the native export is proven to retain a callback
+parameter and a managed invocation of that same parameter position is proven not to establish a
+GC root. The finding's managed symbol SHALL be the managed caller, not the import declaration.
+The finding SHALL include declaration, retention, and call-site evidence, and its confidence SHALL
+be the weakest included confidence.
+
+#### Scenario: Retained callback passed without a GC root
+
+- **WHEN** native data flow proves that callback parameter `0` is retained and managed data flow proves that caller `RegisterUnrootedCallback` passes parameter `0` without establishing a GC root for the same target
+- **THEN** `Interop004` emits one warning attributed to `RegisterUnrootedCallback` with both proof locations
+
+#### Scenario: One callback proof is absent
+
+- **WHEN** retention is unknown, managed rooting is unknown, or the callback is proven rooted
+- **THEN** `Interop004` emits no finding
+
+### Requirement: Interop005 requires proven exception escape
+
+`Interop005` SHALL emit an error only when native control flow proves that an exception can leave
+the matched export across the C ABI for the same target. Declaration syntax, a throwable callee,
+or an unknown catch path alone SHALL NOT be treated as escape proof. The finding SHALL include the
+native escape evidence and boundary declaration evidence, and its confidence SHALL be the weakest
+included confidence.
+
+#### Scenario: Untranslated native throw reaches the export boundary
+
+- **WHEN** native control flow proves that an exception can leave `risk_throws` without translation
+- **THEN** `Interop005` emits one error for that import/export boundary
+
+#### Scenario: Exception flow is unknown
+
+- **WHEN** no native exception-escape fact exists for the target
+- **THEN** `Interop005` emits no finding
+
+### Requirement: Interop006 compares proven allocation and release families
+
+`Interop006` SHALL emit a warning only when native return-flow analysis proves an allocator family
+and managed use-flow analysis proves a different release family for that returned value on the
+same target. The finding's managed symbol SHALL be the release caller. Equal families, unknown
+families, facts for different targets, or a release not proven to consume the returned value SHALL
+NOT produce a finding. The finding SHALL include allocation and release evidence plus boundary
+declaration evidence, and its confidence SHALL be the weakest included confidence.
+
+#### Scenario: CRT allocation released as COM task memory
+
+- **WHEN** native return flow proves `risk_allocate` returns `CrtHeap` memory and managed caller `FreeWithWrongAllocator` is proven to release that value with `CoTaskMem`
+- **THEN** `Interop006` emits one warning attributed to `FreeWithWrongAllocator`
+
+#### Scenario: Ownership compatibility is not disproven
+
+- **WHEN** the families are equal or either family is unknown
+- **THEN** `Interop006` emits no finding

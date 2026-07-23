@@ -12,7 +12,20 @@ public static class InteropRuleIds
     public const string AllocatorMismatch = "Interop006";
 }
 
-public sealed record InteropBoundary(ManagedImport Managed, NativeExport Native);
+public sealed record InteropBoundary(ManagedImport Managed, NativeExport Native)
+{
+    /// <summary>
+    /// Managed callback invocations associated with this exact import/export boundary. Empty means
+    /// no call-site lifetime fact is known.
+    /// </summary>
+    public IReadOnlyList<ManagedCallbackUsage> CallbackUsages { get; init; } = [];
+
+    /// <summary>
+    /// Managed releases of memory returned through this boundary. Empty means release behavior is
+    /// unknown.
+    /// </summary>
+    public IReadOnlyList<ManagedReturnRelease> ReturnReleases { get; init; } = [];
+}
 
 public interface IInteropRule
 {
@@ -41,7 +54,14 @@ public sealed class InteropRuleEngine
     }
 
     public static InteropRuleEngine CreatePhase2() =>
-        new([new CallingConventionRule(), new ParameterTypeRiskRule()]);
+        new(
+            [
+                new CallingConventionRule(),
+                new ParameterTypeRiskRule(),
+                new CallbackGcRiskRule(),
+                new NativeExceptionRule(),
+                new AllocatorMismatchRule(),
+            ]);
 
     public IReadOnlyList<InteropFinding> Evaluate(InteropBoundary boundary)
     {
@@ -397,6 +417,142 @@ public sealed class ParameterTypeRiskRule : IInteropRule
             or AbiTypeCategory.Array;
 }
 
+public sealed class CallbackGcRiskRule : IInteropRule
+{
+    public string RuleId => InteropRuleIds.CallbackGcRisk;
+
+    public IReadOnlyList<InteropFinding> Evaluate(InteropBoundary boundary)
+    {
+        ArgumentNullException.ThrowIfNull(boundary);
+        if (!RuleEvidence.SameTarget(boundary.Managed.Target, boundary.Native.Target))
+        {
+            return [];
+        }
+
+        var findings = new List<InteropFinding>();
+        foreach (var retention in boundary.Native.RetainedCallbacks)
+        {
+            if (retention.ParameterPosition < 0
+                || !boundary.Native.Parameters.Any(parameter =>
+                    parameter.Position == retention.ParameterPosition)
+                || !RuleEvidence.SameTarget(retention.Target, boundary.Native.Target))
+            {
+                continue;
+            }
+
+            foreach (var usage in boundary.CallbackUsages)
+            {
+                if (usage.Rooting != CallbackGcRooting.Unrooted
+                    || usage.ParameterPosition != retention.ParameterPosition
+                    || string.IsNullOrWhiteSpace(usage.CallerSymbolCanonicalKey)
+                    || !boundary.Managed.Parameters.Any(parameter =>
+                        parameter.Position == usage.ParameterPosition)
+                    || !RuleEvidence.SameTarget(usage.Target, boundary.Managed.Target))
+                {
+                    continue;
+                }
+
+                var evidence = RuleEvidence.Combine(
+                    boundary.Managed.Evidence,
+                    boundary.Native.Evidence,
+                    retention.Evidence,
+                    usage.Evidence);
+                findings.Add(RuleEvidence.Finding(
+                    RuleId,
+                    InteropFindingSeverity.Warning,
+                    $"Callback parameter {usage.ParameterPosition} is retained by native code but managed caller '{usage.CallerSymbolCanonicalKey}' does not establish a GC root.",
+                    boundary.Managed,
+                    boundary.Native,
+                    RuleEvidence.WeakestEvidence(evidence),
+                    evidence,
+                    usage.CallerSymbolCanonicalKey));
+            }
+        }
+
+        return findings;
+    }
+}
+
+public sealed class NativeExceptionRule : IInteropRule
+{
+    public string RuleId => InteropRuleIds.NativeException;
+
+    public IReadOnlyList<InteropFinding> Evaluate(InteropBoundary boundary)
+    {
+        ArgumentNullException.ThrowIfNull(boundary);
+        var escape = boundary.Native.ExceptionEscape;
+        if (escape is null
+            || !RuleEvidence.SameTarget(boundary.Managed.Target, boundary.Native.Target)
+            || !RuleEvidence.SameTarget(escape.Target, boundary.Native.Target))
+        {
+            return [];
+        }
+
+        var evidence = RuleEvidence.Combine(
+            boundary.Managed.Evidence,
+            boundary.Native.Evidence,
+            escape.Evidence);
+        return
+        [
+            RuleEvidence.Finding(
+                RuleId,
+                InteropFindingSeverity.Error,
+                "A native exception is proven able to escape across the C ABI boundary.",
+                boundary.Managed,
+                boundary.Native,
+                RuleEvidence.WeakestEvidence(evidence),
+                evidence),
+        ];
+    }
+}
+
+public sealed class AllocatorMismatchRule : IInteropRule
+{
+    public string RuleId => InteropRuleIds.AllocatorMismatch;
+
+    public IReadOnlyList<InteropFinding> Evaluate(InteropBoundary boundary)
+    {
+        ArgumentNullException.ThrowIfNull(boundary);
+        var allocation = boundary.Native.ReturnAllocation;
+        if (allocation is null
+            || allocation.AllocatorFamily == InteropAllocatorFamily.Unknown
+            || !RuleEvidence.SameTarget(boundary.Managed.Target, boundary.Native.Target)
+            || !RuleEvidence.SameTarget(allocation.Target, boundary.Native.Target))
+        {
+            return [];
+        }
+
+        var findings = new List<InteropFinding>();
+        foreach (var release in boundary.ReturnReleases)
+        {
+            if (release.ReleaseFamily == InteropAllocatorFamily.Unknown
+                || release.ReleaseFamily == allocation.AllocatorFamily
+                || string.IsNullOrWhiteSpace(release.CallerSymbolCanonicalKey)
+                || !RuleEvidence.SameTarget(release.Target, boundary.Managed.Target))
+            {
+                continue;
+            }
+
+            var evidence = RuleEvidence.Combine(
+                boundary.Managed.Evidence,
+                boundary.Native.Evidence,
+                allocation.Evidence,
+                release.Evidence);
+            findings.Add(RuleEvidence.Finding(
+                RuleId,
+                InteropFindingSeverity.Warning,
+                $"Native return memory uses {allocation.AllocatorFamily}, but managed caller '{release.CallerSymbolCanonicalKey}' releases it with {release.ReleaseFamily}.",
+                boundary.Managed,
+                boundary.Native,
+                RuleEvidence.WeakestEvidence(evidence),
+                evidence,
+                release.CallerSymbolCanonicalKey));
+        }
+
+        return findings;
+    }
+}
+
 internal static class RuleEvidence
 {
     public static bool SameTarget(InteropTarget left, InteropTarget right) =>
@@ -422,12 +578,13 @@ internal static class RuleEvidence
         ManagedImport managed,
         NativeExport native,
         EvidenceConfidence confidence,
-        IReadOnlyList<Evidence> evidence) =>
+        IReadOnlyList<Evidence> evidence,
+        string? managedSymbolCanonicalKey = null) =>
         new(
             ruleId,
             severity,
             message,
-            managed.SymbolCanonicalKey,
+            managedSymbolCanonicalKey ?? managed.SymbolCanonicalKey,
             native.SymbolCanonicalKey,
             confidence,
             evidence);

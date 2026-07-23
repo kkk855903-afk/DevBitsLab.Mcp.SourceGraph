@@ -89,6 +89,31 @@ public enum InteropFindingSeverity
 }
 
 /// <summary>
+/// Proven managed lifetime state for a callback argument at one native invocation. Unknown facts
+/// must remain <see cref="Unknown"/> rather than being treated as unrooted.
+/// </summary>
+public enum CallbackGcRooting
+{
+    Unknown,
+    Rooted,
+    Unrooted,
+}
+
+/// <summary>
+/// Normalized allocation/release families. Members describe compatible ownership protocols, not
+/// individual APIs; <see cref="Unknown"/> never compares as a proven match or mismatch.
+/// </summary>
+public enum InteropAllocatorFamily
+{
+    Unknown,
+    CrtHeap,
+    CppNew,
+    CppNewArray,
+    CoTaskMem,
+    HGlobal,
+}
+
+/// <summary>
 /// One explicit ABI evaluation target. ABI conclusions are meaningless without this provenance;
 /// in particular C <c>long</c>, pointers, default packing, and calling conventions vary by target.
 /// </summary>
@@ -229,6 +254,50 @@ public sealed record ManagedImport(
     InteropTarget Target,
     Evidence Evidence);
 
+/// <summary>
+/// Proof that a native export retains one callback parameter after the call returns. Presence of
+/// this fact is the positive retention proof; an absent fact remains unknown.
+/// </summary>
+public sealed record NativeCallbackRetention(
+    int ParameterPosition,
+    InteropTarget Target,
+    Evidence Evidence);
+
+/// <summary>
+/// One managed invocation of an imported callback parameter, including the caller that owns the
+/// lifetime decision. Rules report that caller rather than the import declaration.
+/// </summary>
+public sealed record ManagedCallbackUsage(
+    int ParameterPosition,
+    string CallerSymbolCanonicalKey,
+    CallbackGcRooting Rooting,
+    InteropTarget Target,
+    Evidence Evidence);
+
+/// <summary>
+/// Proof that a native exception can leave the export without being translated before the C ABI.
+/// An absent fact means the escape status is unknown.
+/// </summary>
+public sealed record NativeExceptionEscape(
+    InteropTarget Target,
+    Evidence Evidence);
+
+/// <summary>Proven allocator family for memory returned by a native export.</summary>
+public sealed record NativeReturnAllocation(
+    InteropAllocatorFamily AllocatorFamily,
+    InteropTarget Target,
+    Evidence Evidence);
+
+/// <summary>
+/// One managed release of memory returned by an import, including the managed caller responsible
+/// for choosing the release family.
+/// </summary>
+public sealed record ManagedReturnRelease(
+    string CallerSymbolCanonicalKey,
+    InteropAllocatorFamily ReleaseFamily,
+    InteropTarget Target,
+    Evidence Evidence);
+
 /// <summary>Normalized exported C ABI function, independent of the parser that discovered it.</summary>
 public sealed record NativeExport(
     string SymbolCanonicalKey,
@@ -246,6 +315,23 @@ public sealed record NativeExport(
     /// unknown; matchers must not infer a DLL from source folder or project-name similarity.
     /// </summary>
     public string? LibraryName { get; init; }
+
+    /// <summary>
+    /// Callback parameters proven to be retained by this export. Empty means no retention fact is
+    /// known, not that callbacks are proven synchronous.
+    /// </summary>
+    public IReadOnlyList<NativeCallbackRetention> RetainedCallbacks { get; init; } = [];
+
+    /// <summary>
+    /// Proven native exception escape, when available. <see langword="null"/> remains unknown.
+    /// </summary>
+    public NativeExceptionEscape? ExceptionEscape { get; init; }
+
+    /// <summary>
+    /// Proven allocator family of returned memory, when available. <see langword="null"/> remains
+    /// unknown.
+    /// </summary>
+    public NativeReturnAllocation? ReturnAllocation { get; init; }
 }
 
 public sealed record AbiFieldLayout(
