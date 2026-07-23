@@ -302,6 +302,200 @@ public sealed class SqliteGraphStore : IGraphStore
         }
     }
 
+    public async Task<bool> DeleteFileAsync(long fileId, CancellationToken ct = default)
+    {
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            using var tx = _connection.BeginTransaction();
+            var deleted = await DeleteFileCoreAsync(fileId, tx, ct).ConfigureAwait(false);
+            tx.Commit();
+            return deleted;
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public async Task<bool> DeleteFileAsync(string path, CancellationToken ct = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(path);
+
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            using var tx = _connection.BeginTransaction();
+            var fileId = await _connection.ExecuteScalarAsync<long?>(new CommandDefinition(
+                "SELECT id FROM files WHERE path = @path;",
+                new { path },
+                transaction: tx,
+                cancellationToken: ct)).ConfigureAwait(false);
+            if (fileId is null)
+            {
+                tx.Commit();
+                return false;
+            }
+
+            var deleted = await DeleteFileCoreAsync(fileId.Value, tx, ct).ConfigureAwait(false);
+            tx.Commit();
+            return deleted;
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    private async Task<bool> DeleteFileCoreAsync(
+        long fileId,
+        SqliteTransaction tx,
+        CancellationToken ct)
+    {
+        var parameters = new { id = fileId };
+
+        // Preserve the compatibility payload of any logical edge that also has evidence from a
+        // surviving file. Edges whose final evidence belongs to this file are deleted below.
+        await _connection.ExecuteAsync(new CommandDefinition(
+            """
+            UPDATE edges AS edge
+            SET payload = (
+                SELECT NULLIF(ev.payload, '')
+                FROM edge_evidence ev
+                WHERE ev.src = edge.src
+                  AND ev.dst = edge.dst
+                  AND ev.kind_name = edge.kind_name
+                  AND ev.producing_file_id <> @id
+                ORDER BY ev.id
+                LIMIT 1
+            )
+            WHERE EXISTS (
+                SELECT 1
+                FROM edge_evidence owned
+                WHERE owned.src = edge.src
+                  AND owned.dst = edge.dst
+                  AND owned.kind_name = edge.kind_name
+                  AND owned.producing_file_id = @id
+            );
+            """,
+            parameters,
+            transaction: tx,
+            cancellationToken: ct)).ConfigureAwait(false);
+
+        // Remove logical edges whose endpoint is disappearing, plus edges whose last supporting
+        // occurrence was produced by this file. Do this before deleting evidence so the latter
+        // predicate can distinguish touched edges from unrelated legacy rows.
+        await _connection.ExecuteAsync(new CommandDefinition(
+            """
+            DELETE FROM edges
+            WHERE src IN (SELECT id FROM symbols WHERE file_id = @id)
+               OR dst IN (SELECT id FROM symbols WHERE file_id = @id)
+               OR (
+                    EXISTS (
+                        SELECT 1
+                        FROM edge_evidence owned
+                        WHERE owned.src = edges.src
+                          AND owned.dst = edges.dst
+                          AND owned.kind_name = edges.kind_name
+                          AND owned.producing_file_id = @id
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1
+                        FROM edge_evidence survivor
+                        WHERE survivor.src = edges.src
+                          AND survivor.dst = edges.dst
+                          AND survivor.kind_name = edges.kind_name
+                          AND survivor.producing_file_id <> @id
+                    )
+               );
+            """,
+            parameters,
+            transaction: tx,
+            cancellationToken: ct)).ConfigureAwait(false);
+
+        await _connection.ExecuteAsync(new CommandDefinition(
+            """
+            DELETE FROM edge_evidence
+            WHERE producing_file_id = @id
+               OR src IN (SELECT id FROM symbols WHERE file_id = @id)
+               OR dst IN (SELECT id FROM symbols WHERE file_id = @id);
+            """,
+            parameters,
+            transaction: tx,
+            cancellationToken: ct)).ConfigureAwait(false);
+
+        await _connection.ExecuteAsync(new CommandDefinition(
+            """
+            DELETE FROM refs
+            WHERE file_id = @id
+               OR symbol_id IN (SELECT id FROM symbols WHERE file_id = @id);
+            """,
+            parameters,
+            transaction: tx,
+            cancellationToken: ct)).ConfigureAwait(false);
+
+        // An annotation belongs to its host symbol, not to its optional attribute-definition
+        // symbol. Keep annotations on surviving hosts and sever only the disappearing join.
+        await _connection.ExecuteAsync(new CommandDefinition(
+            """
+            UPDATE annotations
+            SET attribute_symbol_id = NULL
+            WHERE attribute_symbol_id IN (SELECT id FROM symbols WHERE file_id = @id);
+
+            DELETE FROM annotations
+            WHERE symbol_id IN (SELECT id FROM symbols WHERE file_id = @id);
+            """,
+            parameters,
+            transaction: tx,
+            cancellationToken: ct)).ConfigureAwait(false);
+
+        await _connection.ExecuteAsync(new CommandDefinition(
+            """
+            DELETE FROM diagnostics
+            WHERE file_id = @id
+               OR symbol_id IN (SELECT id FROM symbols WHERE file_id = @id);
+
+            DELETE FROM symbol_history
+            WHERE symbol_id IN (SELECT id FROM symbols WHERE file_id = @id);
+
+            DELETE FROM embedding_meta
+            WHERE symbol_id IN (SELECT id FROM symbols WHERE file_id = @id);
+
+            UPDATE symbols
+            SET container_id = NULL
+            WHERE container_id IN (SELECT id FROM symbols WHERE file_id = @id);
+            """,
+            parameters,
+            transaction: tx,
+            cancellationToken: ct)).ConfigureAwait(false);
+
+        // The vec0 table is optional and only queryable on a connection that loaded the native
+        // extension. Its metadata table above exists unconditionally.
+        if (_vectorExtensionLoaded)
+        {
+            await _connection.ExecuteAsync(new CommandDefinition(
+                """
+                DELETE FROM symbol_embeddings
+                WHERE symbol_id IN (SELECT id FROM symbols WHERE file_id = @id);
+                """,
+                parameters,
+                transaction: tx,
+                cancellationToken: ct)).ConfigureAwait(false);
+        }
+
+        await _connection.ExecuteAsync(new CommandDefinition(
+            "DELETE FROM symbols WHERE file_id = @id;",
+            parameters,
+            transaction: tx,
+            cancellationToken: ct)).ConfigureAwait(false);
+        var deletedFiles = await _connection.ExecuteAsync(new CommandDefinition(
+            "DELETE FROM files WHERE id = @id;",
+            parameters,
+            transaction: tx,
+            cancellationToken: ct)).ConfigureAwait(false);
+        return deletedFiles > 0;
+    }
+
     public async Task<long> UpsertSymbolAsync(string canonicalKey, Symbol symbol, CancellationToken ct = default)
     {
         // Stable id by canonical_key. On conflict we update the location/signature/etc but the

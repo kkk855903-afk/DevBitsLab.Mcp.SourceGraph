@@ -17,6 +17,20 @@ public interface IGraphStore : IAsyncDisposable
     /// <paramref name="keysToKeep"/>, plus all refs/edges that touch those removed symbols.</summary>
     Task DeleteSymbolsForFileNotInAsync(long fileId, IReadOnlyCollection<string> keysToKeep, CancellationToken ct = default);
 
+    /// <summary>
+    /// Transactionally removes an indexed file and every artifact owned by it or pointing at one
+    /// of its symbols. This includes refs, logical edges and evidence, annotations, diagnostics,
+    /// history, and embeddings. Returns <see langword="true"/> when the file row existed.
+    /// </summary>
+    Task<bool> DeleteFileAsync(long fileId, CancellationToken ct = default);
+
+    /// <summary>
+    /// Path-based counterpart to <see cref="DeleteFileAsync(long, CancellationToken)"/>.
+    /// Path lookup and deletion happen in the same transaction. Returns <see langword="false"/>
+    /// when no indexed file has the exact stored path.
+    /// </summary>
+    Task<bool> DeleteFileAsync(string path, CancellationToken ct = default);
+
     /// <summary>Upsert a symbol by canonical key. Returns the symbol's stable id (existing or newly created).</summary>
     Task<long> UpsertSymbolAsync(string canonicalKey, Symbol symbol, CancellationToken ct = default);
 

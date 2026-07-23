@@ -557,18 +557,30 @@ public sealed class LiveIndexService : BackgroundService
     {
         var scope = host.Scope;
         var solutionPath = host.SolutionPath;
-        if (string.IsNullOrEmpty(solutionPath))
-        {
-            _logger.LogInformation("Scope `{Id}` has no resolvable solution; skipping cold index", scope.Id);
-            host.Status = "ok"; // empty graph but openable
-            await _registry.UpsertAsync(ToRow(scope, host.Status, null), ct).ConfigureAwait(false);
-            host.ProgressSource.MarkReady();
-            host.MarkReady();
-            return;
-        }
 
         try
         {
+            // Purge data captured under an older, wider scope policy before opening a workspace
+            // or dispatching any file reader. Configuration replacements also enter through this
+            // method, so newly-added excludes take effect immediately in the existing scope DB.
+            var purgedFiles = await ExcludedFilePurger.PurgeAsync(host, ct).ConfigureAwait(false);
+            if (purgedFiles > 0)
+            {
+                _logger.LogInformation(
+                    "Scope `{Id}` purged {Count} previously indexed files now outside its boundary",
+                    scope.Id,
+                    purgedFiles);
+            }
+
+            if (string.IsNullOrEmpty(solutionPath))
+            {
+                _logger.LogInformation("Scope `{Id}` has no resolvable solution; skipping cold index", scope.Id);
+                host.Status = "ok"; // empty graph but openable
+                await _registry.UpsertAsync(ToRow(scope, host.Status, null), ct).ConfigureAwait(false);
+                host.ProgressSource.MarkReady();
+                return;
+            }
+
             // Phase 1: workspace open. The MSBuildWorkspace pass dominates this section for real
             // solutions (10s+ on a 1000-doc tree). Emit the coarse phase event so any tool waiting
             // on Ready (and forwarding our progress) sees motion. The open + index_all pair runs

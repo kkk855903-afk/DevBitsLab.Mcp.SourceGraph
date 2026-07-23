@@ -23,6 +23,11 @@ internal static class DriftReconciler
         CancellationToken ct,
         IProgress<ProgressNotificationValue>? progress = null)
     {
+        // A scope can become narrower after rows have already been indexed. Purge those rows
+        // before walking (and therefore before reading) any source file so excluded data cannot
+        // survive in query results or be mistaken for ordinary drift.
+        await ExcludedFilePurger.PurgeAsync(host, ct).ConfigureAwait(false);
+
         // Phase 1 (0.0): walk the source tree under the scope's root. SourceTreeWalker uses the
         // same exclusion rules as SolutionWatcher (obj/, bin/, .git/, .sourcegraph/) so the file
         // set matches. The walker's HitLimit flag is the authoritative "did the cap actually

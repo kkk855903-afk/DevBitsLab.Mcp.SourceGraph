@@ -165,16 +165,83 @@ public sealed class ReconcileDriftToolTests : IAsyncLifetime
         diff.Added.Should().NotContain(excluded);
     }
 
+    [Fact]
+    public async Task ComputeAsync_purgesRowsIndexedBeforeExcludeWasAdded()
+    {
+        var excluded = Path.Join(_root, "src", "Generated", "StaleSecret.cs");
+        await PlantFile(excluded, "class StaleSecret {}");
+        var fileId = await UpsertFile(excluded);
+        await _store!.UpsertSymbolAsync(
+            "csharp:T:StaleSecret",
+            new Symbol(
+                0,
+                "StaleSecret",
+                "StaleSecret",
+                "class",
+                fileId,
+                1,
+                1,
+                1,
+                21,
+                "class StaleSecret",
+                null));
+
+        (await _store.FindSymbolsAsync("StaleSecret")).Should().ContainSingle(
+            "the row models data indexed before the generated/** exclude was introduced");
+
+        var diff = await DriftReconciler.ComputeAsync(
+            _host!,
+            maxFiles: 100,
+            CancellationToken.None);
+
+        diff.Scanned.Should().Be(0);
+        diff.Removed.Should().BeEmpty(
+            "excluded rows are purged before ordinary drift comparison");
+        (await _store.FindSymbolsAsync("StaleSecret")).Should().BeEmpty();
+        (await _store.GetAllFilesAsync()).Should().NotContain(file => file.Path == excluded);
+    }
+
+    [Fact]
+    public async Task ExcludedFilePurger_preservesAllowedSourceGeneratedBuildOutput()
+    {
+        var generated = Path.Join(_root, "obj", "CompilerOutput.g.cs");
+        await PlantFile(generated, "class CompilerOutput {}");
+        var bytes = await File.ReadAllBytesAsync(generated);
+        var fileId = await _store!.UpsertFileAsync(
+            generated,
+            SHA256.HashData(bytes),
+            DateTimeOffset.UtcNow,
+            isGenerated: true);
+        await _store.UpsertSymbolAsync(
+            "csharp:T:CompilerOutput",
+            new Symbol(
+                0,
+                "CompilerOutput",
+                "CompilerOutput",
+                "class",
+                fileId,
+                1,
+                1,
+                1,
+                24,
+                "class CompilerOutput",
+                null));
+
+        (await ExcludedFilePurger.PurgeAsync(_host!, CancellationToken.None)).Should().Be(0);
+        (await _store.FindSymbolsAsync("CompilerOutput")).Should().ContainSingle();
+        (await _store.GetAllFilesAsync()).Should().Contain(file => file.Path == generated);
+    }
+
     private static async Task PlantFile(string path, string content)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
         await File.WriteAllTextAsync(path, content);
     }
 
-    private async Task UpsertFile(string path)
+    private async Task<long> UpsertFile(string path)
     {
         var bytes = await File.ReadAllBytesAsync(path);
         var sha = SHA256.HashData(bytes);
-        await _store!.UpsertFileAsync(path, sha, DateTimeOffset.UtcNow);
+        return await _store!.UpsertFileAsync(path, sha, DateTimeOffset.UtcNow);
     }
 }
