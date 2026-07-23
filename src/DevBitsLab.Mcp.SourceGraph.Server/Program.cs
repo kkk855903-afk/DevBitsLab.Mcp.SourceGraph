@@ -538,13 +538,18 @@ static async Task<int> RunIndexAsync(CommandLine cli)
     var historyDisabled = await ResolveHistoryDisabledAsync(cli, solutionFull).ConfigureAwait(false);
     var historyQueue = new HistoryQueue();
     var blamer = new GitBlameRunner(loggerFactory.CreateLogger<GitBlameRunner>());
+    // Respect an explicit --root so history and source indexing share the same fail-closed
+    // repository boundary even when the solution lives in a subdirectory.
+    var repoRootForIndex = cli.ResolvedRepoRoot();
     var historyTask = historyDisabled
         ? Task.CompletedTask
-        : RunHistoryPipelineAsync(historyQueue, store, blamer, loggerFactory.CreateLogger<HistoryHostedService>());
+        : RunHistoryPipelineAsync(
+            historyQueue,
+            store,
+            blamer,
+            repoRootForIndex,
+            loggerFactory.CreateLogger<HistoryHostedService>());
 
-    // Respect an explicit --root so solutions kept in a subdirectory can still reference
-    // ordinary projects elsewhere in the repository without being mistaken for root escapes.
-    var repoRootForIndex = cli.ResolvedRepoRoot();
     await using var indexer = new RoslynIndexer(
         store,
         loggerFactory.CreateLogger<RoslynIndexer>(),
@@ -763,10 +768,15 @@ static async Task RunHistoryPipelineAsync(
     HistoryQueue queue,
     DevBitsLab.Mcp.SourceGraph.Storage.IGraphStore store,
     GitBlameRunner blamer,
+    string repositoryRoot,
     ILogger<HistoryHostedService> logger)
 {
     var svc = new HistoryHostedService(
-        queue, store, blamer, new HistoryOptions(false), logger);
+        queue,
+        store,
+        blamer,
+        new HistoryOptions(false) { RepositoryRoot = repositoryRoot },
+        logger);
     var runner = svc.ExecuteAsyncForOneShot(CancellationToken.None);
     await runner.ConfigureAwait(false);
 }

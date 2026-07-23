@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Globalization;
+using DevBitsLab.Mcp.SourceGraph.Core;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
@@ -32,15 +33,25 @@ public readonly record struct BlameLine(string CommitSha, string Author, long Au
 /// expected to log it once and continue without history. On a successful run the returned list
 /// is exactly <c>file_line_count</c> entries long, indexed 0-based.
 /// </summary>
-public sealed class GitBlameRunner
+public class GitBlameRunner
 {
     private readonly ILogger<GitBlameRunner> _logger;
     private readonly TimeSpan _timeout;
+    private readonly Func<ProcessStartInfo, Process?> _startProcess;
 
     public GitBlameRunner(ILogger<GitBlameRunner>? logger = null, TimeSpan? timeout = null)
+        : this(logger, timeout, Process.Start)
+    {
+    }
+
+    internal GitBlameRunner(
+        ILogger<GitBlameRunner>? logger,
+        TimeSpan? timeout,
+        Func<ProcessStartInfo, Process?> startProcess)
     {
         _logger = logger ?? NullLogger<GitBlameRunner>.Instance;
         _timeout = timeout ?? TimeSpan.FromSeconds(30);
+        _startProcess = startProcess ?? throw new ArgumentNullException(nameof(startProcess));
     }
 
     /// <summary>
@@ -48,8 +59,30 @@ public sealed class GitBlameRunner
     /// so blame runs against the right working tree even when the host process's CWD is
     /// different. Cancellation kills the subprocess.
     /// </summary>
-    public async Task<GitBlameResult> BlameAsync(string path, CancellationToken ct = default)
+    public virtual Task<GitBlameResult> BlameAsync(string path, CancellationToken ct = default) =>
+        BlameCoreAsync(path, repositoryRoot: null, ct);
+
+    /// <summary>
+    /// Run blame with an explicit repository privacy boundary. Paths outside
+    /// <paramref name="repositoryRoot"/> or matching a mandatory privacy exclusion fail closed
+    /// before the file system or a git subprocess is touched.
+    /// </summary>
+    public virtual Task<GitBlameResult> BlameAsync(
+        string path,
+        string repositoryRoot,
+        CancellationToken ct = default) =>
+        BlameCoreAsync(path, repositoryRoot, ct);
+
+    private async Task<GitBlameResult> BlameCoreAsync(
+        string path,
+        string? repositoryRoot,
+        CancellationToken ct)
     {
+        if (IsExcluded(path, repositoryRoot))
+        {
+            return GitBlameResult.Failure("path excluded by privacy policy");
+        }
+
         if (!File.Exists(path))
         {
             return GitBlameResult.Failure($"file not found: {path}");
@@ -68,7 +101,7 @@ public sealed class GitBlameRunner
         Process process;
         try
         {
-            process = Process.Start(startInfo) ?? throw new InvalidOperationException("Process.Start returned null");
+            process = _startProcess(startInfo) ?? throw new InvalidOperationException("Process.Start returned null");
         }
         catch (Exception ex)
         {
@@ -121,8 +154,9 @@ public sealed class GitBlameRunner
     /// decide whether to enable the history pipeline at all. Cheap (one <c>rev-parse</c>) and
     /// silent: we never log the user-visible "git not available" — that's the caller's job.
     /// </summary>
-    public async Task<bool> IsGitWorkingTreeAsync(string directory, CancellationToken ct = default)
+    public virtual async Task<bool> IsGitWorkingTreeAsync(string directory, CancellationToken ct = default)
     {
+        if (IsExcluded(directory, repositoryRoot: null)) return false;
         if (!Directory.Exists(directory)) return false;
         var startInfo = new ProcessStartInfo("git", "rev-parse --is-inside-work-tree")
         {
@@ -135,7 +169,7 @@ public sealed class GitBlameRunner
         Process? process;
         try
         {
-            process = Process.Start(startInfo);
+            process = _startProcess(startInfo);
         }
         catch
         {
@@ -156,6 +190,32 @@ public sealed class GitBlameRunner
                 return false;
             }
             return process.ExitCode == 0;
+        }
+    }
+
+    private static bool IsExcluded(string? path, string? repositoryRoot)
+    {
+        try
+        {
+            if (string.IsNullOrWhiteSpace(path)) return true;
+            var fullPath = Path.GetFullPath(path);
+            var privacyRoot = string.IsNullOrWhiteSpace(repositoryRoot)
+                ? Path.GetPathRoot(fullPath)
+                : Path.GetFullPath(repositoryRoot);
+            return string.IsNullOrWhiteSpace(privacyRoot)
+                || new PrivacyPathPolicy(privacyRoot).IsExcluded(fullPath);
+        }
+        catch (ArgumentException)
+        {
+            return true;
+        }
+        catch (NotSupportedException)
+        {
+            return true;
+        }
+        catch (PathTooLongException)
+        {
+            return true;
         }
     }
 

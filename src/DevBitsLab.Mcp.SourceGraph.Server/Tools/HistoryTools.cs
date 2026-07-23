@@ -1,6 +1,7 @@
 using System.ComponentModel;
 using System.Text;
 using System.Text.Json;
+using DevBitsLab.Mcp.SourceGraph.Core;
 using DevBitsLab.Mcp.SourceGraph.Server.Observability;
 using DevBitsLab.Mcp.SourceGraph.Server.Resources;
 using DevBitsLab.Mcp.SourceGraph.Server.Scoping;
@@ -164,8 +165,8 @@ public static class HistoryTools
                     return DiagnosticResult.Error("git history unavailable on this server (--no-history)");
                 }
                 var hits = await host.Store.FindSymbolsAsync(symbol, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
-                if (hits.Count == 0) return DiagnosticResult.Build($"No matches for '{symbol}'.");
-                var top = hits[0];
+                var top = hits.FirstOrDefault(hit => IsAllowedHistoryPath(host, hit.FilePath));
+                if (top is null) return DiagnosticResult.Build($"No matches for '{symbol}'.");
                 var history = await host.Store.GetSymbolHistoryAsync(top.Id, ct).ConfigureAwait(false);
                 if (history is null || string.IsNullOrEmpty(history.LastCommitSha))
                 {
@@ -251,7 +252,9 @@ public static class HistoryTools
                     return DiagnosticResult.Error("git history unavailable on this server (--no-history)");
                 }
                 var sinceMs = DateTimeOffset.UtcNow.AddDays(-days).ToUnixTimeMilliseconds();
-                var rows = await host.Store.ListRecentChangesAsync(sinceMs, author, limit, ct).ConfigureAwait(false);
+                var rows = (await host.Store.ListRecentChangesAsync(sinceMs, author, limit, ct).ConfigureAwait(false))
+                    .Where(row => IsAllowedHistoryPath(host, row.Symbol.FilePath))
+                    .ToList();
                 var sb = new StringBuilder();
                 var authorClause = string.IsNullOrEmpty(author) ? "" : $" by author~'{author}'";
                 var symbolNoun = rows.Count == 1 ? "symbol" : "symbols";
@@ -351,5 +354,25 @@ public static class HistoryTools
                 dto,
                 ToolOutputJsonContext.Default.RecentChangesResult),
         };
+    }
+
+    private static bool IsAllowedHistoryPath(ScopeHost host, string? path)
+    {
+        try
+        {
+            return !new PrivacyPathPolicy(Path.GetFullPath(host.Scope.Root)).IsExcluded(path);
+        }
+        catch (ArgumentException)
+        {
+            return false;
+        }
+        catch (NotSupportedException)
+        {
+            return false;
+        }
+        catch (PathTooLongException)
+        {
+            return false;
+        }
     }
 }

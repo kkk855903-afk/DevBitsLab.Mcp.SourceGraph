@@ -42,7 +42,15 @@ public sealed class HistoryQueue
 /// pipeline never runs (CLI <c>--no-history</c>, or auto-detected when git isn't on PATH /
 /// the indexed solution doesn't sit in a git working tree).
 /// </summary>
-public sealed record HistoryOptions(bool Disabled);
+public sealed record HistoryOptions(bool Disabled)
+{
+    /// <summary>
+    /// Optional repository privacy boundary for the single-store, one-shot index path.
+    /// Multi-scope requests use their registered scope root. When omitted, the runner still
+    /// rejects every mandatory directory/extension exclusion against the path's volume root.
+    /// </summary>
+    public string? RepositoryRoot { get; init; }
+}
 
 /// <summary>
 /// Background consumer of <see cref="HistoryQueue"/>. For each request:
@@ -101,11 +109,26 @@ public sealed class HistoryHostedService : BackgroundService
         _logger = logger;
     }
 
-    private IGraphStore? StoreFor(string scopeId)
+    private bool TryResolveContext(
+        string scopeId,
+        out IGraphStore? store,
+        out string? repositoryRoot)
     {
-        if (_legacyStore is not null) return _legacyStore;
-        if (_router is null) return null;
-        return _router.TryGet(scopeId, out var host) ? host.Store : null;
+        if (_legacyStore is not null)
+        {
+            store = _legacyStore;
+            repositoryRoot = _options.RepositoryRoot;
+            return true;
+        }
+        if (_router is not null && _router.TryGet(scopeId, out var host))
+        {
+            store = host.Store;
+            repositoryRoot = host.Scope.Root;
+            return true;
+        }
+        store = null;
+        repositoryRoot = null;
+        return false;
     }
 
     protected override Task ExecuteAsync(CancellationToken stoppingToken) => RunAsync(stoppingToken);
@@ -147,12 +170,17 @@ public sealed class HistoryHostedService : BackgroundService
 
     private async Task ProcessAsync(HistoryRequest req, CancellationToken ct)
     {
-        var store = StoreFor(req.ScopeId);
-        if (store is null)
+        if (!TryResolveContext(req.ScopeId, out var store, out var repositoryRoot) || store is null)
         {
             _logger.LogDebug("History request for unknown scope `{Scope}`; dropping", req.ScopeId);
             return;
         }
+
+        // This is the queue choke-point shared by cold indexing and changed/incremental paths.
+        // Apply the policy before any store lookup and before the git runner receives the path.
+        // The runner repeats the same check as defense in depth for direct callers.
+        if (IsExcluded(req.Path, repositoryRoot)) return;
+
         var spans = await store.GetSymbolSpansForFileAsync(req.FileId, ct).ConfigureAwait(false);
         if (spans.Count == 0) return;
 
@@ -163,7 +191,9 @@ public sealed class HistoryHostedService : BackgroundService
             cached.TryGetValue(s.SymbolId, out var sha) && sha is not null && sha.AsSpan().SequenceEqual(req.ContentSha256));
         if (allCached) return;
 
-        var blame = await _blamer.BlameAsync(req.Path, ct).ConfigureAwait(false);
+        var blame = repositoryRoot is null
+            ? await _blamer.BlameAsync(req.Path, ct).ConfigureAwait(false)
+            : await _blamer.BlameAsync(req.Path, repositoryRoot, ct).ConfigureAwait(false);
         if (!blame.IsSuccess)
         {
             if (!_warnedDisabled)
@@ -208,6 +238,32 @@ public sealed class HistoryHostedService : BackgroundService
                 BlamedContentSha: req.ContentSha256);
 
             await store.UpsertSymbolHistoryAsync(history, ct).ConfigureAwait(false);
+        }
+    }
+
+    private static bool IsExcluded(string? path, string? repositoryRoot)
+    {
+        try
+        {
+            if (string.IsNullOrWhiteSpace(path)) return true;
+            var fullPath = Path.GetFullPath(path);
+            var privacyRoot = string.IsNullOrWhiteSpace(repositoryRoot)
+                ? Path.GetPathRoot(fullPath)
+                : Path.GetFullPath(repositoryRoot);
+            return string.IsNullOrWhiteSpace(privacyRoot)
+                || new PrivacyPathPolicy(privacyRoot).IsExcluded(fullPath);
+        }
+        catch (ArgumentException)
+        {
+            return true;
+        }
+        catch (NotSupportedException)
+        {
+            return true;
+        }
+        catch (PathTooLongException)
+        {
+            return true;
         }
     }
 }
