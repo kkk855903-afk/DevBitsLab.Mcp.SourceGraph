@@ -211,6 +211,134 @@ public sealed class IndexedFileDeletionTests : IAsyncLifetime
         (await _store.DeleteFileAsync(path)).Should().BeFalse();
     }
 
+    [Fact]
+    public async Task ReplaceFileFactsAsync_removingDeclaration_cleansInboundLinksAndOrphanMetadata()
+    {
+        var replacedPath = Path.Join(_tempDir, "src", "Replaced.cs");
+        var survivorPath = Path.Join(_tempDir, "src", "Survivor.cs");
+        var replacedFileId = await SeedFileAsync(replacedPath);
+        var survivorFileId = await SeedFileAsync(survivorPath);
+        var staleSymbolId = await SeedSymbolAsync(
+            replacedFileId,
+            "StaleAttribute",
+            "Replacement.StaleAttribute");
+        var keptSymbolId = await SeedSymbolAsync(
+            replacedFileId,
+            "Keep",
+            "Replacement.Keep");
+        var survivorHostId = await SeedSymbolAsync(
+            survivorFileId,
+            "SurvivorHost",
+            "Replacement.SurvivorHost");
+        var survivorChildId = await SeedSymbolAsync(
+            survivorFileId,
+            "SurvivorChild",
+            "Replacement.SurvivorChild");
+
+        await _store!.BatchUpdateContainerIdsAsync([(survivorChildId, staleSymbolId)]);
+        await _store.BulkInsertAnnotationsAsync(
+        [
+            new AnnotationRecord(
+                survivorHostId,
+                "StaleAttribute",
+                "Replacement.StaleAttribute",
+                "csharp-attribute",
+                null,
+                staleSymbolId),
+        ]);
+        await _store.UpsertSymbolHistoryAsync(
+            new SymbolHistory(
+                staleSymbolId,
+                "stale-sha",
+                "Stale Author",
+                DateTimeOffset.UtcNow,
+                1,
+                [1]));
+
+        var embeddings = _store.CreateEmbeddingsStore(EmbeddingDimension);
+        if (_vec0Loaded)
+        {
+            await embeddings.UpsertAsync(
+                staleSymbolId,
+                [1],
+                new float[EmbeddingDimension],
+                "test/v1");
+        }
+        else
+        {
+            await ExecuteAsync(
+                """
+                INSERT INTO embedding_meta(symbol_id, content_hash, model_version)
+                VALUES (@id, X'01', 'test/v1');
+                """,
+                new { id = staleSymbolId });
+        }
+
+        var newSha = new byte[] { 9, 8, 7, 6 };
+        await _store.ReplaceFileFactsAsync(
+            new FileFactsReplacement(
+                replacedPath,
+                newSha,
+                DateTimeOffset.UtcNow,
+                IsGenerated: false,
+                Symbols:
+                [
+                    new FileSymbolFact(
+                        "csharp:M:Replacement.Keep",
+                        "Keep",
+                        "Replacement.Keep",
+                        "method",
+                        2,
+                        1,
+                        4,
+                        1,
+                        "void Keep()",
+                        ContainerCanonicalKey: null,
+                        Modifiers: null,
+                        Accessibility: 0,
+                        XmlSummary: null),
+                ],
+                Edges: Array.Empty<FileEdgeFact>(),
+                Annotations: Array.Empty<FileAnnotationFact>(),
+                References: Array.Empty<FileReferenceFact>()));
+
+        (await _store.GetFileContentHashAsync(replacedPath)).Should().Equal(newSha);
+        (await ScalarAsync<long>(
+            "SELECT COUNT(*) FROM symbols WHERE id = @id;",
+            new { id = staleSymbolId })).Should().Be(0);
+        (await ScalarAsync<long>(
+            "SELECT COUNT(*) FROM symbols WHERE id = @id AND start_line = 2;",
+            new { id = keptSymbolId })).Should().Be(
+            1,
+            "kept declarations retain their stable id and receive updated facts");
+        (await ScalarAsync<long>(
+            """
+            SELECT COUNT(*)
+            FROM annotations
+            WHERE symbol_id = @hostId
+              AND attribute_symbol_id IS NULL;
+            """,
+            new { hostId = survivorHostId })).Should().Be(1);
+        (await ScalarAsync<long>(
+            """
+            SELECT COUNT(*)
+            FROM symbols
+            WHERE id = @childId
+              AND container_id IS NULL;
+            """,
+            new { childId = survivorChildId })).Should().Be(1);
+        (await ScalarAsync<long>(
+            "SELECT COUNT(*) FROM symbol_history WHERE symbol_id = @id;",
+            new { id = staleSymbolId })).Should().Be(0);
+        (await ScalarAsync<long>(
+            "SELECT COUNT(*) FROM embedding_meta WHERE symbol_id = @id;",
+            new { id = staleSymbolId })).Should().Be(0);
+        if (_vec0Loaded)
+        {
+            (await embeddings.CountAsync()).Should().Be(0);
+        }
+    }
+
     private async Task<long> SeedFileAsync(string path) =>
         await _store!.UpsertFileAsync(path, [1, 2, 3, 4], DateTimeOffset.UtcNow);
 

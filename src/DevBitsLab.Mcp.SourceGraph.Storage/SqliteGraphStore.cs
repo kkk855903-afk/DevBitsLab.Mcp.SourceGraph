@@ -445,6 +445,448 @@ public sealed class SqliteGraphStore : IGraphStore
         }
     }
 
+    public async Task<FileFactsReplacementResult> ReplaceFileFactsAsync(
+        FileFactsReplacement replacement,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(replacement);
+        ArgumentException.ThrowIfNullOrWhiteSpace(replacement.Path);
+        ArgumentNullException.ThrowIfNull(replacement.ContentSha256);
+        ArgumentNullException.ThrowIfNull(replacement.Symbols);
+        ArgumentNullException.ThrowIfNull(replacement.Edges);
+        ArgumentNullException.ThrowIfNull(replacement.Annotations);
+        ArgumentNullException.ThrowIfNull(replacement.References);
+
+        const string upsertFileSql = """
+            INSERT INTO files(path, content_sha256, last_indexed_at, is_generated)
+            VALUES (@path, @sha, @at, @gen)
+            ON CONFLICT(path) DO UPDATE SET
+                content_sha256 = excluded.content_sha256,
+                last_indexed_at = excluded.last_indexed_at,
+                is_generated   = excluded.is_generated
+            RETURNING id;
+            """;
+        const string upsertSymbolSql = """
+            INSERT INTO symbols(canonical_key, name, fqn, kind_name, file_id, start_line, start_col, end_line, end_col, signature, container_id, modifiers, accessibility, xml_summary, test_framework)
+            VALUES (@Key, @Name, @Fqn, @Kind, @FileId, @StartLine, @StartCol, @EndLine, @EndCol, @Signature, NULL, @Modifiers, @Accessibility, @XmlSummary, NULL)
+            ON CONFLICT(canonical_key) DO UPDATE SET
+                name          = excluded.name,
+                fqn           = excluded.fqn,
+                kind_name     = excluded.kind_name,
+                file_id       = excluded.file_id,
+                start_line    = excluded.start_line,
+                start_col     = excluded.start_col,
+                end_line      = excluded.end_line,
+                end_col       = excluded.end_col,
+                signature     = excluded.signature,
+                container_id  = NULL,
+                modifiers     = excluded.modifiers,
+                accessibility = excluded.accessibility,
+                xml_summary   = excluded.xml_summary
+            RETURNING id;
+            """;
+        const string insertEdgeSql = """
+            INSERT OR IGNORE INTO edges(src, dst, kind_name, payload)
+            VALUES (@Src, @Dst, @Kind, @Payload);
+            """;
+        const string insertEvidenceSql = """
+            INSERT OR IGNORE INTO edge_evidence(
+                src, dst, kind_name, producing_file_id, file_path,
+                start_line, start_col, end_line, end_col,
+                confidence, producer, payload)
+            VALUES (
+                @Src, @Dst, @Kind, @ProducingFileId, @FilePath,
+                @StartLine, @StartColumn, @EndLine, @EndColumn,
+                @Confidence, @Producer, @Payload);
+            """;
+        const string syncLogicalPayloadSql = """
+            UPDATE edges
+            SET payload = (
+                SELECT NULLIF(ev.payload, '')
+                FROM edge_evidence ev
+                WHERE ev.src = @Src
+                  AND ev.dst = @Dst
+                  AND ev.kind_name = @Kind
+                ORDER BY ev.id
+                LIMIT 1
+            )
+            WHERE src = @Src
+              AND dst = @Dst
+              AND kind_name = @Kind;
+            """;
+
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            using var tx = _connection.BeginTransaction();
+            var fileId = await _connection.ExecuteScalarAsync<long>(new CommandDefinition(
+                upsertFileSql,
+                new
+                {
+                    path = replacement.Path,
+                    sha = replacement.ContentSha256,
+                    at = replacement.IndexedAt.ToUnixTimeMilliseconds(),
+                    gen = replacement.IsGenerated ? 1 : 0,
+                },
+                transaction: tx,
+                cancellationToken: ct)).ConfigureAwait(false);
+
+            // Remove only facts produced by the prior pass for this file, retaining logical
+            // edges that still have evidence from another producer file.
+            await _connection.ExecuteAsync(new CommandDefinition(
+                """
+                UPDATE edges AS edge
+                SET payload = (
+                    SELECT NULLIF(ev.payload, '')
+                    FROM edge_evidence ev
+                    WHERE ev.src = edge.src
+                      AND ev.dst = edge.dst
+                      AND ev.kind_name = edge.kind_name
+                      AND ev.producing_file_id <> @id
+                    ORDER BY ev.id
+                    LIMIT 1
+                )
+                WHERE EXISTS (
+                    SELECT 1
+                    FROM edge_evidence owned
+                    WHERE owned.src = edge.src
+                      AND owned.dst = edge.dst
+                      AND owned.kind_name = edge.kind_name
+                      AND owned.producing_file_id = @id
+                );
+                DELETE FROM edge_evidence WHERE producing_file_id = @id;
+                DELETE FROM refs WHERE file_id = @id;
+                DELETE FROM edges
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM edge_evidence ev
+                    WHERE ev.src = edges.src
+                      AND ev.dst = edges.dst
+                      AND ev.kind_name = edges.kind_name
+                );
+                """,
+                new { id = fileId },
+                transaction: tx,
+                cancellationToken: ct)).ConfigureAwait(false);
+
+            // Reconcile declarations and per-symbol facts against the complete new declaration
+            // set. Temp id materialization lets every dependent-table cleanup use the exact same
+            // stale declaration set, including surviving cross-file container/attribute links.
+            await _connection.ExecuteAsync(new CommandDefinition(
+                """
+                CREATE TEMP TABLE IF NOT EXISTS keep_keys(key TEXT PRIMARY KEY);
+                CREATE TEMP TABLE IF NOT EXISTS stale_symbol_ids(id INTEGER PRIMARY KEY);
+                DELETE FROM keep_keys;
+                DELETE FROM stale_symbol_ids;
+                """,
+                transaction: tx,
+                cancellationToken: ct)).ConfigureAwait(false);
+            if (replacement.Symbols.Count > 0)
+            {
+                await _connection.ExecuteAsync(new CommandDefinition(
+                    "INSERT OR IGNORE INTO keep_keys(key) VALUES (@key);",
+                    replacement.Symbols.Select(symbol => new { key = symbol.CanonicalKey }),
+                    transaction: tx,
+                    cancellationToken: ct)).ConfigureAwait(false);
+            }
+            await _connection.ExecuteAsync(new CommandDefinition(
+                """
+                INSERT OR IGNORE INTO stale_symbol_ids(id)
+                SELECT id
+                FROM symbols
+                WHERE file_id = @id
+                  AND canonical_key NOT IN (SELECT key FROM keep_keys);
+
+                DELETE FROM refs
+                WHERE symbol_id IN (SELECT id FROM stale_symbol_ids);
+
+                DELETE FROM edge_evidence
+                WHERE src IN (SELECT id FROM stale_symbol_ids)
+                   OR dst IN (SELECT id FROM stale_symbol_ids);
+
+                DELETE FROM edges
+                WHERE src IN (SELECT id FROM stale_symbol_ids)
+                   OR dst IN (SELECT id FROM stale_symbol_ids);
+
+                UPDATE annotations
+                SET attribute_symbol_id = NULL
+                WHERE attribute_symbol_id IN (SELECT id FROM stale_symbol_ids);
+
+                DELETE FROM annotations
+                WHERE symbol_id IN (SELECT id FROM symbols WHERE file_id = @id);
+
+                DELETE FROM diagnostics
+                WHERE file_id = @id
+                   OR symbol_id IN (SELECT id FROM stale_symbol_ids);
+
+                DELETE FROM symbol_history
+                WHERE symbol_id IN (SELECT id FROM stale_symbol_ids);
+
+                DELETE FROM embedding_meta
+                WHERE symbol_id IN (SELECT id FROM stale_symbol_ids);
+
+                UPDATE symbols
+                SET container_id = NULL
+                WHERE container_id IN (SELECT id FROM stale_symbol_ids);
+
+                DELETE FROM keep_keys;
+                """,
+                new { id = fileId },
+                transaction: tx,
+                cancellationToken: ct)).ConfigureAwait(false);
+
+            if (_vectorExtensionLoaded)
+            {
+                await _connection.ExecuteAsync(new CommandDefinition(
+                    """
+                    DELETE FROM symbol_embeddings
+                    WHERE symbol_id IN (SELECT id FROM stale_symbol_ids);
+                    """,
+                    transaction: tx,
+                    cancellationToken: ct)).ConfigureAwait(false);
+            }
+            await _connection.ExecuteAsync(new CommandDefinition(
+                """
+                DELETE FROM symbols
+                WHERE id IN (SELECT id FROM stale_symbol_ids);
+
+                DELETE FROM stale_symbol_ids;
+                """,
+                transaction: tx,
+                cancellationToken: ct)).ConfigureAwait(false);
+
+            var symbolIds = new Dictionary<string, long>(StringComparer.Ordinal);
+            foreach (var symbol in replacement.Symbols)
+            {
+                var symbolId = await _connection.ExecuteScalarAsync<long>(new CommandDefinition(
+                    upsertSymbolSql,
+                    new
+                    {
+                        Key = symbol.CanonicalKey,
+                        symbol.Name,
+                        symbol.Fqn,
+                        Kind = symbol.Kind,
+                        FileId = fileId,
+                        symbol.StartLine,
+                        StartCol = symbol.StartColumn,
+                        symbol.EndLine,
+                        EndCol = symbol.EndColumn,
+                        symbol.Signature,
+                        symbol.Modifiers,
+                        symbol.Accessibility,
+                        symbol.XmlSummary,
+                    },
+                    transaction: tx,
+                    cancellationToken: ct)).ConfigureAwait(false);
+                symbolIds[symbol.CanonicalKey] = symbolId;
+            }
+
+            // A canonical declaration may move between files while retaining its stable id.
+            // Clear symbol-owned replaceable facts after the upserts as well so such a move does
+            // not carry annotations or diagnostics emitted for the declaration's old location.
+            await _connection.ExecuteAsync(new CommandDefinition(
+                """
+                DELETE FROM annotations
+                WHERE symbol_id IN (SELECT id FROM symbols WHERE file_id = @id);
+
+                DELETE FROM diagnostics
+                WHERE symbol_id IN (SELECT id FROM symbols WHERE file_id = @id);
+                """,
+                new { id = fileId },
+                transaction: tx,
+                cancellationToken: ct)).ConfigureAwait(false);
+
+            async Task<long> ResolveSymbolIdAsync(string canonicalKey)
+            {
+                if (symbolIds.TryGetValue(canonicalKey, out var cached)) return cached;
+                var resolved = await _connection.ExecuteScalarAsync<long?>(new CommandDefinition(
+                    "SELECT id FROM symbols WHERE canonical_key = @canonicalKey;",
+                    new { canonicalKey },
+                    transaction: tx,
+                    cancellationToken: ct)).ConfigureAwait(false);
+                if (resolved is null)
+                {
+                    throw new InvalidOperationException(
+                        $"Atomic file replacement could not resolve symbol `{canonicalKey}`.");
+                }
+                symbolIds[canonicalKey] = resolved.Value;
+                return resolved.Value;
+            }
+
+            foreach (var symbol in replacement.Symbols)
+            {
+                if (symbol.ContainerCanonicalKey is null) continue;
+                var childId = await ResolveSymbolIdAsync(symbol.CanonicalKey).ConfigureAwait(false);
+                var parentId = await ResolveSymbolIdAsync(symbol.ContainerCanonicalKey).ConfigureAwait(false);
+                await _connection.ExecuteAsync(new CommandDefinition(
+                    """
+                    UPDATE symbols
+                    SET container_id = @parentId
+                    WHERE id = @childId
+                      AND EXISTS (SELECT 1 FROM symbols WHERE id = @parentId);
+                    """,
+                    new { childId, parentId },
+                    transaction: tx,
+                    cancellationToken: ct)).ConfigureAwait(false);
+            }
+
+            var replacementSymbolsByKey = replacement.Symbols
+                .GroupBy(symbol => symbol.CanonicalKey, StringComparer.Ordinal)
+                .ToDictionary(group => group.Key, group => group.Last(), StringComparer.Ordinal);
+            var fallbackBySource = new Dictionary<long, Evidence>();
+            foreach (var edge in replacement.Edges)
+            {
+                var src = await ResolveSymbolIdAsync(edge.SourceCanonicalKey).ConfigureAwait(false);
+                var dst = await ResolveSymbolIdAsync(edge.TargetCanonicalKey).ConfigureAwait(false);
+                var logicalPayload = SerializeMetadata(edge.Metadata);
+                await _connection.ExecuteAsync(new CommandDefinition(
+                    insertEdgeSql,
+                    new { Src = src, Dst = dst, Kind = edge.Kind, Payload = logicalPayload },
+                    transaction: tx,
+                    cancellationToken: ct)).ConfigureAwait(false);
+
+                Evidence evidence;
+                if (edge.Evidence is null)
+                {
+                    if (!fallbackBySource.TryGetValue(src, out evidence!))
+                    {
+                        replacementSymbolsByKey.TryGetValue(
+                            edge.SourceCanonicalKey,
+                            out var source);
+                        var startLine = Math.Max(1, source?.StartLine ?? 1);
+                        var startColumn = Math.Max(1, source?.StartColumn ?? 1);
+                        var endLine = Math.Max(startLine, source?.EndLine ?? startLine);
+                        var endColumn = Math.Max(
+                            endLine == startLine ? startColumn : 1,
+                            source?.EndColumn ?? startColumn);
+                        evidence = new Evidence(
+                            fileId,
+                            new SourceLocation(
+                                replacement.Path,
+                                startLine,
+                                startColumn,
+                                endLine,
+                                endColumn),
+                            EvidenceConfidence.Inferred,
+                            "legacy-declaration");
+                        fallbackBySource[src] = evidence;
+                    }
+                }
+                else
+                {
+                    evidence = new Evidence(
+                        fileId,
+                        edge.Evidence.Location,
+                        edge.Evidence.Confidence,
+                        edge.Evidence.Producer,
+                        edge.Evidence.Metadata);
+                }
+
+                ValidateEvidence(evidence);
+                var producerPath = await _connection.ExecuteScalarAsync<string?>(new CommandDefinition(
+                    "SELECT path FROM files WHERE id = @ProducingFileId;",
+                    new { evidence.ProducingFileId },
+                    transaction: tx,
+                    cancellationToken: ct)).ConfigureAwait(false)
+                    ?? throw new InvalidOperationException(
+                        $"Evidence producing file {evidence.ProducingFileId} is not indexed.");
+                if (!PathsEquivalent(producerPath, evidence.Location.FilePath))
+                {
+                    throw new InvalidOperationException(
+                        $"Evidence path does not match producing file {evidence.ProducingFileId}.");
+                }
+
+                await _connection.ExecuteAsync(new CommandDefinition(
+                    insertEvidenceSql,
+                    new
+                    {
+                        Src = src,
+                        Dst = dst,
+                        Kind = edge.Kind,
+                        evidence.ProducingFileId,
+                        evidence.Location.FilePath,
+                        evidence.Location.StartLine,
+                        evidence.Location.StartColumn,
+                        evidence.Location.EndLine,
+                        evidence.Location.EndColumn,
+                        Confidence = (int)evidence.Confidence,
+                        evidence.Producer,
+                        Payload = SerializeMetadata(evidence.Metadata ?? edge.Metadata) ?? string.Empty,
+                    },
+                    transaction: tx,
+                    cancellationToken: ct)).ConfigureAwait(false);
+                await _connection.ExecuteAsync(new CommandDefinition(
+                    syncLogicalPayloadSql,
+                    new { Src = src, Dst = dst, Kind = edge.Kind },
+                    transaction: tx,
+                    cancellationToken: ct)).ConfigureAwait(false);
+            }
+
+            foreach (var annotation in replacement.Annotations)
+            {
+                if (!replacementSymbolsByKey.ContainsKey(annotation.SymbolCanonicalKey))
+                {
+                    throw new InvalidOperationException(
+                        "Atomic file replacement annotations must target a symbol declared "
+                        + $"by the same file; `{annotation.SymbolCanonicalKey}` is external.");
+                }
+                var symbolId =
+                    await ResolveSymbolIdAsync(annotation.SymbolCanonicalKey).ConfigureAwait(false);
+                long? attributeSymbolId = annotation.AttributeCanonicalKey is null
+                    ? null
+                    : await ResolveSymbolIdAsync(annotation.AttributeCanonicalKey).ConfigureAwait(false);
+                await _connection.ExecuteAsync(new CommandDefinition(
+                    """
+                    INSERT INTO annotations(symbol_id, name, full_name, flavor, args_json, attribute_symbol_id)
+                    VALUES (@SymbolId, @Name, @FullName, @Flavor, @ArgsJson, @AttributeSymbolId);
+                    """,
+                    new
+                    {
+                        SymbolId = symbolId,
+                        annotation.Name,
+                        annotation.FullName,
+                        annotation.Flavor,
+                        annotation.ArgsJson,
+                        AttributeSymbolId = attributeSymbolId,
+                    },
+                    transaction: tx,
+                    cancellationToken: ct)).ConfigureAwait(false);
+            }
+
+            foreach (var reference in replacement.References)
+            {
+                var symbolId =
+                    await ResolveSymbolIdAsync(reference.TargetCanonicalKey).ConfigureAwait(false);
+                await _connection.ExecuteAsync(new CommandDefinition(
+                    """
+                    INSERT INTO refs(symbol_id, file_id, line, col, kind)
+                    VALUES (@SymbolId, @FileId, @Line, @Col, @Kind);
+                    """,
+                    new
+                    {
+                        SymbolId = symbolId,
+                        FileId = fileId,
+                        reference.Line,
+                        Col = reference.Column,
+                        Kind = (int)reference.Kind,
+                    },
+                    transaction: tx,
+                    cancellationToken: ct)).ConfigureAwait(false);
+            }
+
+            tx.Commit();
+            var declaredIds = replacement.Symbols
+                .Select(symbol => symbol.CanonicalKey)
+                .Distinct(StringComparer.Ordinal)
+                .ToDictionary(key => key, key => symbolIds[key], StringComparer.Ordinal);
+            return new FileFactsReplacementResult(fileId, declaredIds);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
     private async Task<bool> DeleteFileCoreAsync(
         long fileId,
         SqliteTransaction tx,

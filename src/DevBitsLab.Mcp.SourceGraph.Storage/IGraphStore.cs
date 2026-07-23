@@ -45,6 +45,18 @@ public interface IGraphStore : IAsyncDisposable
     /// </summary>
     Task<bool> DeleteFileAsync(string path, CancellationToken ct = default);
 
+    /// <summary>
+    /// Atomically replaces one file row and every graph fact produced by that file. The store
+    /// resolves canonical-key references, reconciles stale declarations, and writes symbols,
+    /// edges/evidence, annotations, and references in one transaction. Any validation, lookup,
+    /// or database failure leaves the prior file hash and graph untouched.
+    /// </summary>
+    Task<FileFactsReplacementResult> ReplaceFileFactsAsync(
+        FileFactsReplacement replacement,
+        CancellationToken ct = default) =>
+        throw new NotSupportedException(
+            "This graph-store implementation predates atomic file-facts replacement.");
+
     /// <summary>Upsert a symbol by canonical key. Returns the symbol's stable id (existing or newly created).</summary>
     Task<long> UpsertSymbolAsync(string canonicalKey, Symbol symbol, CancellationToken ct = default);
 

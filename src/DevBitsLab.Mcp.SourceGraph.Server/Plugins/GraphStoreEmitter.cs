@@ -52,6 +52,141 @@ public sealed class GraphStoreEmitter : IGraphEmitter
     public void EmitReference(IndexEvent.ReferenceFound reference) => _references.Add(reference);
 
     /// <summary>
+    /// Compile and validate one indexer's complete event list into storage-native, canonical-key
+    /// facts. Unknown speculative targets retain the emitter's existing skip semantics. The
+    /// returned batch has no database ids and is safe to hand to
+    /// <see cref="IGraphStore.ReplaceFileFactsAsync"/> for one-transaction resolution.
+    /// </summary>
+    internal static FileFactsReplacement CompileFileFacts(
+        string filePath,
+        byte[] contentSha256,
+        IReadOnlyList<IndexEvent> events,
+        IReadOnlySet<string> knownCanonicalKeys,
+        ILogger? logger = null)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(filePath);
+        ArgumentNullException.ThrowIfNull(contentSha256);
+        ArgumentNullException.ThrowIfNull(events);
+        ArgumentNullException.ThrowIfNull(knownCanonicalKeys);
+        var log = logger ?? NullLogger.Instance;
+
+        var symbols = new List<FileSymbolFact>();
+        var edges = new List<FileEdgeFact>();
+        var annotations = new List<FileAnnotationFact>();
+        var references = new List<FileReferenceFact>();
+        foreach (var ev in events)
+        {
+            switch (ev)
+            {
+                case IndexEvent.SymbolDeclared symbol:
+                    var containerKey = symbol.ContainerCanonicalKey;
+                    if (containerKey is not null && !knownCanonicalKeys.Contains(containerKey))
+                    {
+                        log.LogDebug(
+                            "Container skipped: unknown parent canonical key `{Key}`",
+                            containerKey);
+                        containerKey = null;
+                    }
+                    symbols.Add(new FileSymbolFact(
+                        symbol.CanonicalKey,
+                        symbol.Name,
+                        symbol.Fqn,
+                        symbol.Kind,
+                        symbol.StartLine,
+                        symbol.StartColumn,
+                        symbol.EndLine,
+                        symbol.EndColumn,
+                        symbol.Signature,
+                        containerKey,
+                        symbol.Modifiers,
+                        symbol.Accessibility,
+                        symbol.XmlSummary));
+                    break;
+
+                case IndexEvent.EdgeEmitted edge:
+                    if (!knownCanonicalKeys.Contains(edge.SourceCanonicalKey))
+                    {
+                        log.LogDebug(
+                            "Edge skipped: unknown source canonical key `{Key}`",
+                            edge.SourceCanonicalKey);
+                        break;
+                    }
+                    if (!knownCanonicalKeys.Contains(edge.TargetCanonicalKey))
+                    {
+                        log.LogDebug(
+                            "Edge skipped: unknown target canonical key `{Key}`",
+                            edge.TargetCanonicalKey);
+                        break;
+                    }
+                    edges.Add(new FileEdgeFact(
+                        edge.SourceCanonicalKey,
+                        edge.TargetCanonicalKey,
+                        edge.EdgeKindName,
+                        edge.Metadata,
+                        CompileEvidence(edge.Evidence)));
+                    break;
+
+                case IndexEvent.AnnotationAttached annotation:
+                    if (!knownCanonicalKeys.Contains(annotation.SymbolCanonicalKey))
+                    {
+                        log.LogDebug(
+                            "Annotation skipped: unknown symbol canonical key `{Key}`",
+                            annotation.SymbolCanonicalKey);
+                        break;
+                    }
+                    var attributeKey = annotation.TargetCanonicalKey;
+                    if (attributeKey is not null && !knownCanonicalKeys.Contains(attributeKey))
+                    {
+                        attributeKey = null;
+                    }
+                    annotations.Add(new FileAnnotationFact(
+                        annotation.SymbolCanonicalKey,
+                        annotation.AnnotationName,
+                        annotation.FullName ?? annotation.AnnotationName,
+                        annotation.Flavor,
+                        annotation.ArgsJson,
+                        attributeKey));
+                    break;
+
+                case IndexEvent.ReferenceFound reference:
+                    if (!knownCanonicalKeys.Contains(reference.TargetCanonicalKey))
+                    {
+                        log.LogDebug(
+                            "Reference skipped: unknown target canonical key `{Key}`",
+                            reference.TargetCanonicalKey);
+                        break;
+                    }
+                    if (!Enum.TryParse<ReferenceKind>(
+                            reference.Kind,
+                            ignoreCase: true,
+                            out var referenceKind))
+                    {
+                        referenceKind = ReferenceKind.Reference;
+                    }
+                    references.Add(new FileReferenceFact(
+                        reference.TargetCanonicalKey,
+                        reference.Line,
+                        reference.Column,
+                        referenceKind));
+                    break;
+
+                case IndexEvent.FileScanned:
+                    break;
+            }
+        }
+
+        return new FileFactsReplacement(
+            filePath,
+            contentSha256,
+            DateTimeOffset.UtcNow,
+            IsGenerated: false,
+            symbols,
+            edges,
+            annotations,
+            references);
+    }
+
+    /// <summary>
     /// Resolve every queued emission into storage rows and write them. Symbols are upserted
     /// first so subsequent edges/annotations/refs can resolve their canonical-key references to
     /// stable ids. The same key map (<see cref="_symbolIdByCanonicalKey"/>) is shared with the
@@ -207,8 +342,20 @@ public sealed class GraphStoreEmitter : IGraphEmitter
 
     private CoreEvidence? MapEvidence(EdgeEvidence? evidence)
     {
-        if (evidence is null) return null;
+        var compiled = CompileEvidence(evidence);
+        return compiled is null
+            ? null
+            : new CoreEvidence(
+                _fileId,
+                compiled.Location,
+                compiled.Confidence,
+                compiled.Producer,
+                compiled.Metadata);
+    }
 
+    private static FileEvidenceFact? CompileEvidence(EdgeEvidence? evidence)
+    {
+        if (evidence is null) return null;
         var location = evidence.Location
             ?? throw new ArgumentException("Edge evidence location is required.", nameof(evidence));
         if (string.IsNullOrWhiteSpace(location.FilePath)
@@ -245,8 +392,7 @@ public sealed class GraphStoreEmitter : IGraphEmitter
                 "Edge evidence confidence is not defined."),
         };
 
-        return new CoreEvidence(
-            _fileId,
+        return new FileEvidenceFact(
             new CoreSourceLocation(
                 location.FilePath,
                 location.StartLine,
