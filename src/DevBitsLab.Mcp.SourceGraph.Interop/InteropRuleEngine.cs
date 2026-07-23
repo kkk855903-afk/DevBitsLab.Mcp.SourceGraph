@@ -400,11 +400,7 @@ public sealed class ParameterTypeRiskRule : IInteropRule
 internal static class RuleEvidence
 {
     public static bool SameTarget(InteropTarget left, InteropTarget right) =>
-        left.RuntimeIdentifier == right.RuntimeIdentifier
-        && left.Architecture == right.Architecture
-        && left.CompilerAbi == right.CompilerAbi
-        && left.PointerSizeBytes == right.PointerSizeBytes
-        && left.DefaultPack == right.DefaultPack;
+        left.IsAbiEquivalentTo(right);
 
     public static EvidenceConfidence Weakest(
         EvidenceConfidence left,

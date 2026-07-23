@@ -130,6 +130,17 @@ public sealed record InteropTarget
     public int PointerSizeBytes { get; }
     public int DefaultPack { get; }
 
+    public bool IsAbiEquivalentTo(InteropTarget? other) =>
+        other is not null
+        && string.Equals(
+            RuntimeIdentifier,
+            other.RuntimeIdentifier,
+            StringComparison.OrdinalIgnoreCase)
+        && Architecture == other.Architecture
+        && CompilerAbi == other.CompilerAbi
+        && PointerSizeBytes == other.PointerSizeBytes
+        && DefaultPack == other.DefaultPack;
+
     public static InteropTarget WindowsX64Msvc { get; } =
         new("win-x64", InteropArchitecture.X64, InteropCompilerAbi.Msvc, 8, 8);
 
@@ -228,7 +239,14 @@ public sealed record NativeExport(
     bool HasCLinkage,
     bool IsBinaryVerified,
     InteropTarget Target,
-    Evidence Evidence);
+    Evidence Evidence)
+{
+    /// <summary>
+    /// Native module that owns the export when the adapter can prove it. A missing value remains
+    /// unknown; matchers must not infer a DLL from source folder or project-name similarity.
+    /// </summary>
+    public string? LibraryName { get; init; }
+}
 
 public sealed record AbiFieldLayout(
     int Order,
