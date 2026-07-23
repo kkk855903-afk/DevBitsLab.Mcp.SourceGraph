@@ -19,6 +19,10 @@
          plugin pinned at <Version>1.0.0</Version> stays buildable across server minor bumps. -->
     <PackageId>DevBitsLab.Mcp.SourceGraph.Sdk</PackageId>
     <!--
+      2.3.0 (edge evidence): additive — adds EvidenceConfidence, SourceLocation, EdgeEvidence,
+      and an init-only EdgeEmitted.Evidence property. The existing EdgeEmitted constructor is
+      unchanged so plugins compiled against SDK 2.2 remain binary-compatible.
+
       2.2.0 (add-tree-sitter-language-indexer-host): additive — adds INodeKindMapper,
       IModuleResolver, LanguageIndexerOptions, ITreeSitterGrammarConfig. The four together
       form the contract surface a tree-sitter-backed language plugin sits on
@@ -43,7 +47,7 @@
 
       1.0.0: initial plugin SDK shape (ILanguageIndexer / ICodeAnalyzer / IMcpToolPlugin).
     -->
-    <Version>2.2.0</Version>
+    <Version>2.3.0</Version>
     <Description>Plugin SDK for DevBitsLab.Mcp.SourceGraph. Public contracts (ILanguageIndexer, ICodeAnalyzer, IMcpToolPlugin, INodeKindMapper, IModuleResolver, ITreeSitterGrammarConfig) plus the IndexEvent discriminated union, LanguageIndexerOptions, and helper base classes for authoring third-party plugins. Targets netstandard2.0 so a single plugin DLL works with every supported host version.</Description>
     <Authors>DevBitsLab</Authors>
     <PackageTags>mcp;sourcegraph;plugin-sdk;roslyn;analyzers</PackageTags>

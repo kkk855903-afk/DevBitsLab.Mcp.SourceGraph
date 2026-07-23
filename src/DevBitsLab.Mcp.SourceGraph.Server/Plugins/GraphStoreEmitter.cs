@@ -3,7 +3,11 @@ using DevBitsLab.Mcp.SourceGraph.Sdk;
 using DevBitsLab.Mcp.SourceGraph.Storage;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
+using CoreEvidence = DevBitsLab.Mcp.SourceGraph.Core.Evidence;
+using CoreEvidenceConfidence = DevBitsLab.Mcp.SourceGraph.Core.EvidenceConfidence;
+using CoreSourceLocation = DevBitsLab.Mcp.SourceGraph.Core.SourceLocation;
 using CoreSymbol = DevBitsLab.Mcp.SourceGraph.Core.Symbol;
+using SdkEvidenceConfidence = DevBitsLab.Mcp.SourceGraph.Sdk.EvidenceConfidence;
 
 namespace DevBitsLab.Mcp.SourceGraph.Server.Plugins;
 
@@ -98,7 +102,12 @@ public sealed class GraphStoreEmitter : IGraphEmitter
                 // Edge kind is now an open kebab-case string: pass through unchanged. The SDK has
                 // already validated kebab-case-ness at construction time. Storage accepts the
                 // string as-is (TEXT column, indexed).
-                resolvedEdges.Add(new Edge(src, dst, e.EdgeKindName, e.Metadata));
+                resolvedEdges.Add(new Edge(
+                    src,
+                    dst,
+                    e.EdgeKindName,
+                    e.Metadata,
+                    MapEvidence(e.Evidence)));
             }
             if (resolvedEdges.Count > 0)
             {
@@ -157,5 +166,58 @@ public sealed class GraphStoreEmitter : IGraphEmitter
                 await _store.BulkInsertReferencesAsync(resolvedRefs, ct).ConfigureAwait(false);
             }
         }
+    }
+
+    private CoreEvidence? MapEvidence(EdgeEvidence? evidence)
+    {
+        if (evidence is null) return null;
+
+        var location = evidence.Location
+            ?? throw new ArgumentException("Edge evidence location is required.", nameof(evidence));
+        if (string.IsNullOrWhiteSpace(location.FilePath)
+            || !Path.IsPathFullyQualified(location.FilePath))
+        {
+            throw new ArgumentException(
+                "Edge evidence file path must be an absolute path.",
+                nameof(evidence));
+        }
+        if (location.StartLine <= 0
+            || location.StartColumn <= 0
+            || location.EndLine < location.StartLine
+            || location.EndColumn <= 0
+            || (location.EndLine == location.StartLine
+                && location.EndColumn < location.StartColumn))
+        {
+            throw new ArgumentException(
+                "Edge evidence must use a valid 1-based source range.",
+                nameof(evidence));
+        }
+        if (string.IsNullOrWhiteSpace(evidence.Producer))
+        {
+            throw new ArgumentException("Edge evidence producer is required.", nameof(evidence));
+        }
+
+        var confidence = evidence.Confidence switch
+        {
+            SdkEvidenceConfidence.Inferred => CoreEvidenceConfidence.Inferred,
+            SdkEvidenceConfidence.Semantic => CoreEvidenceConfidence.Semantic,
+            SdkEvidenceConfidence.Exact => CoreEvidenceConfidence.Exact,
+            _ => throw new ArgumentOutOfRangeException(
+                nameof(evidence),
+                evidence.Confidence,
+                "Edge evidence confidence is not defined."),
+        };
+
+        return new CoreEvidence(
+            _fileId,
+            new CoreSourceLocation(
+                location.FilePath,
+                location.StartLine,
+                location.StartColumn,
+                location.EndLine,
+                location.EndColumn),
+            confidence,
+            evidence.Producer,
+            evidence.Metadata);
     }
 }

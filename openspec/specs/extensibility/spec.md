@@ -111,6 +111,29 @@ The SDK SHALL expose edge kinds and symbol kinds as `string` values at the plugi
 - **WHEN** a plugin emits `EdgeEmitted(src, dst, "binds-path", Metadata: { ["path"] = "User.Name", ["mode"] = "two-way" })`
 - **THEN** the resulting `edges` row has `payload` equal to the JSON serialization of that dictionary, and a query for the row deserializes the same key-value pairs
 
+### Requirement: Additive SDK edge-evidence channel
+SDK 2.3 SHALL expose `EvidenceConfidence`, `SourceLocation`, and `EdgeEvidence`, plus an
+optional init-only `EdgeEmitted.Evidence` property. The original public four-parameter
+`EdgeEmitted` constructor SHALL retain its exact runtime signature so plugins compiled
+against SDK 2.2 remain binary-compatible.
+
+When evidence is present, the host SHALL map its absolute file path, valid 1-based range,
+producer, metadata, and ordered confidence into storage. The host — not the plugin — SHALL
+assign the current indexed file id as the producing file, and storage SHALL reject a path
+that does not match that file.
+
+#### Scenario: Existing plugin omits evidence
+- **WHEN** a plugin compiled against SDK 2.2 constructs `EdgeEmitted` through the original constructor
+- **THEN** it loads unchanged under SDK 2.3 and `Evidence` is `null`
+
+#### Scenario: Plugin supplies exact occurrence evidence
+- **WHEN** a plugin emits an edge with `Evidence = EdgeEvidence(location, Exact, "sample-plugin")`
+- **THEN** the stored proof has confidence `exact`, producer `sample-plugin`, that source range, and the host-owned producing file id
+
+#### Scenario: Plugin cannot attribute evidence to another file
+- **WHEN** the evidence path is relative, malformed, or differs from the current indexed file
+- **THEN** the host rejects the emission transactionally before an edge or proof is persisted
+
 ### Requirement: Canonical-key URI convention
 Every canonical key emitted by an `ILanguageIndexer` SHALL match the format `<scheme>:<rest>`, where `<scheme>` is one of the reserved-and-enforced schemes at this SDK version (`csharp`, `xaml`, `js`, `ts`, `jsx`, `tsx`). Schemes `vbnet`, `fsharp`, `razor`, `vue`, `svelte`, `python`, `go`, `rust` are documented as reserved-for-future-use but are NOT yet accepted by the host; emissions using those schemes SHALL be rejected.
 

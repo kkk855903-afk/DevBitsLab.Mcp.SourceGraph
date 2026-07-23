@@ -145,6 +145,9 @@ public abstract record IndexEvent
     /// <para><see cref="Metadata"/> carries per-edge facts that the storage layer cannot capture
     /// in <c>(src, dst, kind)</c>. Examples: a binding's path string, an event handler's event
     /// name, a JSX prop list. Stored as JSON in the <c>edges.payload</c> column when non-null.</para>
+    /// <para><see cref="Evidence"/> optionally identifies the exact source occurrence supporting
+    /// this edge. It is an init-only property, rather than a new constructor parameter, so the
+    /// original four-parameter constructor remains binary-compatible with existing plugins.</para>
     /// </remarks>
     public sealed record EdgeEmitted : IndexEvent
     {
@@ -168,6 +171,7 @@ public abstract record IndexEvent
         public string TargetCanonicalKey { get; }
         public string EdgeKindName { get; }
         public IReadOnlyDictionary<string, string>? Metadata { get; }
+        public EdgeEvidence? Evidence { get; init; }
     }
 
     /// <summary>
