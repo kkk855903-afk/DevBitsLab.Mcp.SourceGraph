@@ -17,8 +17,8 @@ namespace DevBitsLab.Mcp.SourceGraph.Indexing.Xaml;
 /// <see cref="ILanguageProjectFactory"/> for the in-tree XAML indexer. Walks every
 /// <c>.csproj</c> under the repo root, locates the <c>.xaml</c> files belonging to each project
 /// (via <c>&lt;Page&gt;</c> / <c>&lt;ApplicationDefinition&gt;</c> / <c>&lt;EmbeddedResource&gt;</c>
-/// / <c>&lt;Resource&gt;</c> items, falling back to a directory scan when the items aren't
-/// present), and builds a two-pass per-project resource catalog. Pass one parses every allowed
+/// / <c>&lt;Resource&gt;</c> items unioned with a complete policy-pruned directory scan), and
+/// builds a two-pass per-project resource catalog. Pass one parses every allowed
 /// project XAML document into declarations plus merged-dictionary links; pass two walks the
 /// cascades rooted at <c>App.xaml</c> and <c>Themes/Generic.xaml</c>. Relative
 /// <c>MergedDictionaries Source=</c> links are followed only when their physical target is an
@@ -27,6 +27,7 @@ namespace DevBitsLab.Mcp.SourceGraph.Indexing.Xaml;
 public sealed class XamlLanguageProjectFactory : IExclusionAwareLanguageProjectFactory
 {
     private readonly Func<Solution?>? _solutionProvider;
+    private readonly Action<XamlDiscoveryAccess, string>? _beforeAccess;
 
     public XamlLanguageProjectFactory()
     {
@@ -40,6 +41,13 @@ public sealed class XamlLanguageProjectFactory : IExclusionAwareLanguageProjectF
     {
         _solutionProvider = solutionProvider
             ?? throw new ArgumentNullException(nameof(solutionProvider));
+    }
+
+    internal XamlLanguageProjectFactory(
+        Action<XamlDiscoveryAccess, string> beforeAccess)
+    {
+        _beforeAccess = beforeAccess
+            ?? throw new ArgumentNullException(nameof(beforeAccess));
     }
 
     /// <inheritdoc />
@@ -57,24 +65,23 @@ public sealed class XamlLanguageProjectFactory : IExclusionAwareLanguageProjectF
         IReadOnlyList<string> excludePatterns,
         CancellationToken ct)
     {
+        ct.ThrowIfCancellationRequested();
         if (string.IsNullOrEmpty(repoRoot)) throw new ArgumentException("repoRoot must be non-empty", nameof(repoRoot));
-        if (!Directory.Exists(repoRoot)) return Task.FromResult<IReadOnlyList<ILanguageProject>>(Array.Empty<ILanguageProject>());
 
         var root = Path.GetFullPath(repoRoot);
         var pathPolicy = new ScopePathPolicy(root, excludePatterns);
         var projects = new List<ILanguageProject>();
-        // Use an explicit directory walker so a single unreadable folder doesn't abort discovery,
-        // and so we skip the same noise dirs the dispatcher does. `Directory.EnumerateFiles(...,
-        // SearchOption.AllDirectories)` is lazy and can throw mid-iteration when it hits an
-        // inaccessible directory; the explicit stack walk below contains the failure to that one
-        // subtree.
-        foreach (var csproj in EnumerateCsprojFiles(root, pathPolicy))
+        // Use an explicit directory walker so excluded subtrees are pruned before they are read.
+        // Any non-excluded read failure must abort the discovery pass: returning a partial project
+        // set would let the dispatcher replace a previously complete per-scope project map.
+        foreach (var csproj in EnumerateCsprojFiles(root, pathPolicy, ct))
         {
             ct.ThrowIfCancellationRequested();
-            var project = TryBuildProject(csproj, pathPolicy);
+            var project = BuildProject(csproj, pathPolicy, ct);
             if (project is not null) projects.Add(project);
         }
 
+        ct.ThrowIfCancellationRequested();
         return Task.FromResult<IReadOnlyList<ILanguageProject>>(projects);
     }
 
@@ -82,67 +89,113 @@ public sealed class XamlLanguageProjectFactory : IExclusionAwareLanguageProjectF
     /// Walk <paramref name="root"/> for <c>.csproj</c> files. Skips <c>bin/</c>, <c>obj/</c>,
     /// <c>node_modules/</c>, <c>.git/</c>, and <c>.sourcegraph/</c> wholesale (matching the
     /// dispatcher's own walker) so build outputs and vendored sources don't pollute project
-    /// discovery. Each directory's enumeration is wrapped so an inaccessible subtree
-    /// degrades to "skipped" rather than aborting the whole pass.
+    /// discovery. Enumeration failures propagate so callers cannot mistake an incomplete walk
+    /// for a complete project map.
     /// </summary>
-    private static IEnumerable<string> EnumerateCsprojFiles(
+    private IEnumerable<string> EnumerateCsprojFiles(
         string root,
-        ScopePathPolicy pathPolicy)
+        ScopePathPolicy pathPolicy,
+        CancellationToken ct)
     {
         var stack = new Stack<string>();
+        var visitedPhysicalDirectories = new HashSet<string>(
+            StringComparer.OrdinalIgnoreCase);
         stack.Push(root);
         while (stack.Count > 0)
         {
+            ct.ThrowIfCancellationRequested();
             var dir = stack.Pop();
-            if (pathPolicy.IsExcluded(dir)) continue;
-
-            IEnumerable<string> children;
-            try { children = Directory.EnumerateDirectories(dir); }
-            catch (UnauthorizedAccessException) { continue; }
-            catch (IOException) { continue; }
-
-            foreach (var child in children)
+            if (pathPolicy.IsExcludedForDiscovery(dir, out var physicalDirectory))
             {
-                if (!pathPolicy.IsExcluded(child)) stack.Push(child);
+                continue;
+            }
+            if (physicalDirectory is null
+                || !visitedPhysicalDirectories.Add(physicalDirectory))
+            {
+                continue;
             }
 
-            IEnumerable<string> files;
-            try { files = Directory.EnumerateFiles(dir, "*.csproj"); }
-            catch (UnauthorizedAccessException) { continue; }
-            catch (IOException) { continue; }
-
-            foreach (var f in files)
+            foreach (var entry in EnumerateDirectoryEntries(
+                         dir,
+                         XamlDiscoveryAccess.EnumerateProjectEntries,
+                         ct))
             {
-                if (!pathPolicy.IsExcluded(f)) yield return f;
+                ct.ThrowIfCancellationRequested();
+                if (pathPolicy.IsExcludedForDiscovery(entry)) continue;
+
+                ct.ThrowIfCancellationRequested();
+                var attributes = File.GetAttributes(entry);
+                ct.ThrowIfCancellationRequested();
+                if ((attributes & FileAttributes.Directory) != 0)
+                {
+                    stack.Push(entry);
+                }
+                else if (string.Equals(
+                             Path.GetExtension(entry),
+                             ".csproj",
+                             StringComparison.OrdinalIgnoreCase))
+                {
+                    yield return entry;
+                }
             }
         }
     }
 
-    private XamlLanguageProject? TryBuildProject(
-        string csprojPath,
-        ScopePathPolicy pathPolicy)
+    private IReadOnlyList<string> EnumerateDirectoryEntries(
+        string directory,
+        XamlDiscoveryAccess access,
+        CancellationToken ct)
     {
-        try
-        {
-            var projectDir = Path.GetDirectoryName(Path.GetFullPath(csprojPath))!;
-            var xamlFiles = EnumerateXamlFiles(csprojPath, projectDir, pathPolicy);
-            if (xamlFiles.Count == 0) return null;
+        BeforeAccess(access, directory, ct);
+        var entries = Directory
+            .EnumerateFileSystemEntries(directory)
+            .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(path => path, StringComparer.Ordinal)
+            .ToArray();
+        ct.ThrowIfCancellationRequested();
+        return entries;
+    }
 
-            var resourceCache = BuildResourceCache(xamlFiles, pathPolicy);
-            var fullProjectPath = Path.GetFullPath(csprojPath);
-            Func<Project?>? roslynProjectProvider = _solutionProvider is null
-                ? null
-                : () => FindRoslynProject(_solutionProvider(), fullProjectPath);
-            return new XamlLanguageProject(
-                fullProjectPath,
+    private void BeforeAccess(
+        XamlDiscoveryAccess access,
+        string path,
+        CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+        _beforeAccess?.Invoke(access, path);
+        ct.ThrowIfCancellationRequested();
+    }
+
+    private XamlLanguageProject? BuildProject(
+        string csprojPath,
+        ScopePathPolicy pathPolicy,
+        CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+        var projectDir = Path.GetDirectoryName(Path.GetFullPath(csprojPath))!;
+        var xamlFiles = EnumerateXamlFiles(
+            csprojPath,
+            projectDir,
+            pathPolicy,
+            ct);
+        if (xamlFiles.Count == 0) return null;
+
+        ct.ThrowIfCancellationRequested();
+        var resourceCache = BuildResourceCache(xamlFiles, pathPolicy, ct);
+        ct.ThrowIfCancellationRequested();
+        var fullProjectPath = Path.GetFullPath(csprojPath);
+        Func<Project?>? roslynProjectProvider = _solutionProvider is null
+            ? null
+            : () => FindRoslynProject(_solutionProvider(), fullProjectPath);
+        return new XamlLanguageProject(
+            fullProjectPath,
+            xamlFiles,
+            resourceCache,
+            () => BuildResourceCache(
                 xamlFiles,
-                resourceCache,
-                () => BuildResourceCache(xamlFiles, pathPolicy),
-                roslynProjectProvider);
-        }
-        catch (IOException) { return null; }
-        catch (XmlException) { return null; }
-        catch (UnauthorizedAccessException) { return null; }
+                pathPolicy,
+                CancellationToken.None),
+            roslynProjectProvider);
     }
 
     private static Project? FindRoslynProject(Solution? solution, string projectFilePath)
@@ -172,86 +225,118 @@ public sealed class XamlLanguageProjectFactory : IExclusionAwareLanguageProjectF
     }
 
     /// <summary>
-    /// Find the <c>.xaml</c> files that belong to the project. Reads the csproj XML for explicit
-    /// <c>&lt;Page&gt;</c> / <c>&lt;ApplicationDefinition&gt;</c> items first; if either yields
-    /// nothing, falls back to a recursive directory scan from the project's directory. Falls back
-    /// quietly when the csproj uses globbed includes that the indexer can't statically expand —
-    /// the directory scan covers those cases.
+    /// Find the <c>.xaml</c> files that belong to the project. Explicit
+    /// <c>&lt;Page&gt;</c> / <c>&lt;ApplicationDefinition&gt;</c> items are unioned with a complete
+    /// policy-pruned recursive scan. An <c>Update</c> item only changes metadata for an SDK default
+    /// item and therefore can never be treated as the complete project file set.
     /// </summary>
-    private static IReadOnlyList<string> EnumerateXamlFiles(
+    private IReadOnlyList<string> EnumerateXamlFiles(
         string csprojPath,
         string projectDir,
-        ScopePathPolicy pathPolicy)
+        ScopePathPolicy pathPolicy,
+        CancellationToken ct)
     {
-        var fromItems = ReadXamlItemsFromCsproj(csprojPath, projectDir, pathPolicy);
-        if (fromItems.Count > 0) return fromItems;
+        ct.ThrowIfCancellationRequested();
+        var results = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var item in ReadXamlItemsFromCsproj(
+                     csprojPath,
+                     projectDir,
+                     pathPolicy,
+                     ct))
+        {
+            results.Add(item);
+        }
 
-        // Fallback: walk the project directory for *.xaml. Privacy-excluded directories are
-        // pruned before enumeration, so markup outputs and medical data are never opened.
-        var results = new List<string>();
+        // Always walk the project directory for *.xaml. Privacy-excluded directories are pruned
+        // before enumeration, so markup outputs and medical data are never opened.
         var stack = new Stack<string>();
+        var visitedPhysicalDirectories = new HashSet<string>(
+            StringComparer.OrdinalIgnoreCase);
         stack.Push(projectDir);
         while (stack.Count > 0)
         {
+            ct.ThrowIfCancellationRequested();
             var dir = stack.Pop();
-            if (pathPolicy.IsExcluded(dir)) continue;
-
-            IEnumerable<string> children;
-            try { children = Directory.EnumerateDirectories(dir); }
-            catch (UnauthorizedAccessException) { continue; }
-            catch (IOException) { continue; }
-
-            foreach (var child in children)
+            if (pathPolicy.IsExcludedForDiscovery(dir, out var physicalDirectory))
             {
-                if (!pathPolicy.IsExcluded(child)) stack.Push(child);
+                continue;
+            }
+            if (physicalDirectory is null
+                || !visitedPhysicalDirectories.Add(physicalDirectory))
+            {
+                continue;
             }
 
-            IEnumerable<string> files;
-            try { files = Directory.EnumerateFiles(dir, "*.xaml"); }
-            catch (UnauthorizedAccessException) { continue; }
-            catch (IOException) { continue; }
-
-            foreach (var path in files)
+            foreach (var entry in EnumerateDirectoryEntries(
+                         dir,
+                         XamlDiscoveryAccess.EnumerateXamlEntries,
+                         ct))
             {
-                if (!pathPolicy.IsExcluded(path)) results.Add(Path.GetFullPath(path));
+                ct.ThrowIfCancellationRequested();
+                if (pathPolicy.IsExcludedForDiscovery(entry)) continue;
+
+                ct.ThrowIfCancellationRequested();
+                var attributes = File.GetAttributes(entry);
+                ct.ThrowIfCancellationRequested();
+                if ((attributes & FileAttributes.Directory) != 0)
+                {
+                    stack.Push(entry);
+                }
+                else if (string.Equals(
+                             Path.GetExtension(entry),
+                             ".xaml",
+                             StringComparison.OrdinalIgnoreCase))
+                {
+                    results.Add(Path.GetFullPath(entry));
+                }
             }
         }
-        return results;
+        ct.ThrowIfCancellationRequested();
+        return results
+            .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(path => path, StringComparer.Ordinal)
+            .ToArray();
     }
 
-    private static IReadOnlyList<string> ReadXamlItemsFromCsproj(
+    private IReadOnlyList<string> ReadXamlItemsFromCsproj(
         string csprojPath,
         string projectDir,
-        ScopePathPolicy pathPolicy)
+        ScopePathPolicy pathPolicy,
+        CancellationToken ct)
     {
         var results = new List<string>();
-        try
+        BeforeAccess(XamlDiscoveryAccess.ReadProjectFile, csprojPath, ct);
+        using var stream = File.OpenRead(csprojPath);
+        ct.ThrowIfCancellationRequested();
+        var settings = new XmlReaderSettings
         {
-            using var stream = File.OpenRead(csprojPath);
-            var settings = new XmlReaderSettings
+            DtdProcessing = DtdProcessing.Prohibit,
+            IgnoreComments = true,
+            IgnoreWhitespace = true,
+            IgnoreProcessingInstructions = true,
+            CloseInput = false,
+        };
+        using var reader = XmlReader.Create(stream, settings);
+        while (true)
+        {
+            ct.ThrowIfCancellationRequested();
+            if (!reader.Read()) break;
+            ct.ThrowIfCancellationRequested();
+            if (reader.NodeType != XmlNodeType.Element) continue;
+            if (!IsXamlItemElement(reader.LocalName)) continue;
+            var include = reader.GetAttribute("Include") ?? reader.GetAttribute("Update");
+            if (string.IsNullOrEmpty(include)) continue;
+            if (include.IndexOfAny(new[] { '*', '?' }) >= 0) continue; // globbed; defer to fs walk
+            if (!include.EndsWith(".xaml", StringComparison.OrdinalIgnoreCase)) continue;
+            var relative = include.Replace('\\', '/');
+            var absolute = Path.IsPathRooted(relative) ? relative : Path.GetFullPath(Path.Join(projectDir, relative));
+            ct.ThrowIfCancellationRequested();
+            if (!pathPolicy.IsExcludedForDiscovery(absolute))
             {
-                DtdProcessing = DtdProcessing.Prohibit,
-                IgnoreComments = true,
-                IgnoreWhitespace = true,
-                IgnoreProcessingInstructions = true,
-                CloseInput = false,
-            };
-            using var reader = XmlReader.Create(stream, settings);
-            while (reader.Read())
-            {
-                if (reader.NodeType != XmlNodeType.Element) continue;
-                if (!IsXamlItemElement(reader.LocalName)) continue;
-                var include = reader.GetAttribute("Include") ?? reader.GetAttribute("Update");
-                if (string.IsNullOrEmpty(include)) continue;
-                if (include.IndexOfAny(new[] { '*', '?' }) >= 0) continue; // globbed; defer to fs walk
-                if (!include.EndsWith(".xaml", StringComparison.OrdinalIgnoreCase)) continue;
-                var relative = include.Replace('\\', '/');
-                var absolute = Path.IsPathRooted(relative) ? relative : Path.GetFullPath(Path.Join(projectDir, relative));
-                if (!pathPolicy.IsExcluded(absolute)) results.Add(absolute);
+                results.Add(absolute);
             }
         }
-        catch (XmlException) { return Array.Empty<string>(); }
-        catch (IOException) { return Array.Empty<string>(); }
+        ct.ThrowIfCancellationRequested();
         return results;
     }
 
@@ -259,7 +344,7 @@ public sealed class XamlLanguageProjectFactory : IExclusionAwareLanguageProjectF
         // <Page> + <ApplicationDefinition> are the WPF/WinUI markup-compiler item types; many
         // projects also include resource dictionaries via <Resource> or <EmbeddedResource> when
         // the file isn't compiled at build time but still belongs to the project. Match all
-        // four so explicit item includes are honoured before the directory-scan fallback runs.
+        // four so explicit item includes are honoured alongside the complete directory scan.
         string.Equals(localName, "Page", StringComparison.OrdinalIgnoreCase) ||
         string.Equals(localName, "ApplicationDefinition", StringComparison.OrdinalIgnoreCase) ||
         string.Equals(localName, "EmbeddedResource", StringComparison.OrdinalIgnoreCase) ||
@@ -272,10 +357,12 @@ public sealed class XamlLanguageProjectFactory : IExclusionAwareLanguageProjectF
     /// every declaration so lookup can report ambiguity rather than depending on enumeration
     /// order.
     /// </summary>
-    private static IReadOnlyDictionary<string, IReadOnlyList<ResourceDefinition>> BuildResourceCache(
+    private IReadOnlyDictionary<string, IReadOnlyList<ResourceDefinition>> BuildResourceCache(
         IReadOnlyList<string> xamlFiles,
-        ScopePathPolicy pathPolicy)
+        ScopePathPolicy pathPolicy,
+        CancellationToken ct)
     {
+        ct.ThrowIfCancellationRequested();
         var documents = new Dictionary<string, ResourceDocument>(
             StringComparer.OrdinalIgnoreCase);
 
@@ -285,21 +372,20 @@ public sealed class XamlLanguageProjectFactory : IExclusionAwareLanguageProjectF
                      .Distinct(StringComparer.OrdinalIgnoreCase)
                      .OrderBy(path => path, StringComparer.OrdinalIgnoreCase))
         {
-            if (pathPolicy.IsExcluded(candidate)) continue;
+            ct.ThrowIfCancellationRequested();
+            if (pathPolicy.IsExcludedForDiscovery(candidate)) continue;
 
-            byte[] bytes;
-            try { bytes = File.ReadAllBytes(candidate); }
-            catch (IOException) { continue; }
-            catch (UnauthorizedAccessException) { continue; }
-
-            XamlDocument document;
-            try { document = XamlReader.Parse(bytes); }
-            catch (XmlException) { continue; }
+            BeforeAccess(XamlDiscoveryAccess.ReadXamlFile, candidate, ct);
+            var bytes = File.ReadAllBytes(candidate);
+            ct.ThrowIfCancellationRequested();
+            var document = XamlReader.Parse(bytes);
+            ct.ThrowIfCancellationRequested();
 
             var definitions = new List<ResourceDefinition>();
             var mergedSources = new List<string>();
             XamlReader.Walk(document.Root, (element, ancestors) =>
             {
+                ct.ThrowIfCancellationRequested();
                 var keyAttribute = element.FindAttribute(
                     XamlReader.XamlNamespace,
                     "Key");
@@ -330,6 +416,7 @@ public sealed class XamlLanguageProjectFactory : IExclusionAwareLanguageProjectF
             documents[candidate] = new ResourceDocument(definitions, mergedSources);
         }
 
+        ct.ThrowIfCancellationRequested();
         // Pass 2: walk only the project-global cascade roots and their same-project merges.
         var roots = documents.Keys
             .Where(IsProjectResourceRoot)
@@ -348,6 +435,7 @@ public sealed class XamlLanguageProjectFactory : IExclusionAwareLanguageProjectF
 
         foreach (var root in roots)
         {
+            ct.ThrowIfCancellationRequested();
             Visit(root);
         }
 
@@ -363,11 +451,13 @@ public sealed class XamlLanguageProjectFactory : IExclusionAwareLanguageProjectF
 
         void Visit(string path)
         {
+            ct.ThrowIfCancellationRequested();
             if (!visited.Add(path)) return;
             if (!documents.TryGetValue(path, out var document)) return;
 
             foreach (var definition in document.Definitions)
             {
+                ct.ThrowIfCancellationRequested();
                 if (!visible.TryGetValue(definition.Key, out var candidates))
                 {
                     candidates = new List<ResourceDefinition>();
@@ -387,11 +477,13 @@ public sealed class XamlLanguageProjectFactory : IExclusionAwareLanguageProjectF
 
             foreach (var source in document.MergedSources)
             {
+                ct.ThrowIfCancellationRequested();
                 var mergedPath = ResolveMergedDictionaryPath(
                     path,
                     source,
                     documents,
-                    pathPolicy);
+                    pathPolicy,
+                    ct);
                 if (mergedPath is not null) Visit(mergedPath);
             }
         }
@@ -441,8 +533,10 @@ public sealed class XamlLanguageProjectFactory : IExclusionAwareLanguageProjectF
         string containingFile,
         string source,
         IReadOnlyDictionary<string, ResourceDocument> documents,
-        ScopePathPolicy pathPolicy)
+        ScopePathPolicy pathPolicy,
+        CancellationToken ct)
     {
+        ct.ThrowIfCancellationRequested();
         var clean = source;
         var suffix = clean.IndexOfAny(new[] { '?', '#' });
         if (suffix >= 0) clean = clean.Substring(0, suffix);
@@ -463,7 +557,8 @@ public sealed class XamlLanguageProjectFactory : IExclusionAwareLanguageProjectF
             var containingDirectory = Path.GetDirectoryName(containingFile);
             if (string.IsNullOrEmpty(containingDirectory)) return null;
             var candidate = Path.GetFullPath(Path.Combine(containingDirectory, clean));
-            if (pathPolicy.IsExcluded(candidate)) return null;
+            ct.ThrowIfCancellationRequested();
+            if (pathPolicy.IsExcludedForDiscovery(candidate)) return null;
             return documents.ContainsKey(candidate) ? candidate : null;
         }
         catch (Exception ex) when (ex is ArgumentException
@@ -478,4 +573,12 @@ public sealed class XamlLanguageProjectFactory : IExclusionAwareLanguageProjectF
     private sealed record ResourceDocument(
         IReadOnlyList<ResourceDefinition> Definitions,
         IReadOnlyList<string> MergedSources);
+}
+
+internal enum XamlDiscoveryAccess
+{
+    EnumerateProjectEntries,
+    ReadProjectFile,
+    EnumerateXamlEntries,
+    ReadXamlFile,
 }

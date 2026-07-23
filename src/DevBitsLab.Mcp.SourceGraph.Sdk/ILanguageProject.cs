@@ -79,14 +79,16 @@ public interface ILanguageProjectFactory
 /// <summary>
 /// Optional project-factory capability for hosts that carry repository-relative scope excludes.
 /// Implementations apply the patterns before reading project anchors or project-owned files.
-/// Older factories remain compatible through <see cref="ILanguageProjectFactory"/>; the host
-/// still filters their returned file maps.
+/// Hosts that require a before-read privacy boundary invoke only this capability for project
+/// discovery. The supplied list may contain both user-configured scope excludes and mandatory
+/// host privacy patterns; implementations must prune them before opening anchors or sources.
 /// </summary>
 public interface IExclusionAwareLanguageProjectFactory : ILanguageProjectFactory
 {
     /// <summary>
-    /// Discover projects while excluding every path matched by <paramref name="excludePatterns"/>.
-    /// Patterns narrow the host's mandatory privacy boundary and cannot expand it.
+    /// Discover projects while excluding every path matched by <paramref name="excludePatterns"/>
+    /// before reading it. Patterns include the host's mandatory privacy boundary and any
+    /// scope-specific excludes; they can only narrow discovery.
     /// </summary>
     Task<IReadOnlyList<ILanguageProject>> DiscoverAsync(
         string repoRoot,

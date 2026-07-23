@@ -72,6 +72,88 @@ public sealed class ScopePathPolicy
     }
 
     /// <summary>
+    /// Applies the ordinary scope/privacy boundary for project discovery while distinguishing an
+    /// explicitly excluded path from one whose physical identity cannot be established safely.
+    /// Explicit lexical privacy and scope exclusions return <see langword="true"/> without
+    /// probing the excluded path. A non-excluded path whose repository root or reparse-point
+    /// chain cannot be resolved throws <see cref="IOException"/> so discovery cannot publish an
+    /// incomplete project map.
+    /// </summary>
+    /// <param name="path">Repository-relative or absolute path to classify.</param>
+    /// <param name="physicalPath">
+    /// Resolved physical path when the path is allowed; otherwise <see langword="null"/>.
+    /// </param>
+    /// <returns>
+    /// <see langword="true"/> only for a path that is safely known to be outside the allowed
+    /// discovery boundary; <see langword="false"/> for an allowed, physically resolved path.
+    /// </returns>
+    /// <exception cref="IOException">
+    /// The path is not explicitly excluded, but its physical identity cannot be resolved.
+    /// </exception>
+    public bool IsExcludedForDiscovery(string? path, out string? physicalPath)
+    {
+        physicalPath = null;
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            throw new IOException("A blank discovery path cannot be classified safely.");
+        }
+
+        string fullPath;
+        try
+        {
+            var normalizedPath = NormalizeSeparators(path);
+            fullPath = Path.IsPathFullyQualified(normalizedPath)
+                ? Path.GetFullPath(normalizedPath)
+                : Path.GetFullPath(normalizedPath, _repoRoot);
+        }
+        catch (Exception ex) when (ex is ArgumentException
+                                   or NotSupportedException
+                                   or PathTooLongException)
+        {
+            throw new IOException(
+                $"Discovery path `{path}` cannot be normalized safely.",
+                ex);
+        }
+
+        // These checks are deliberately lexical. A configured or mandatory privacy exclusion
+        // must be pruned before touching an unreadable/dangling path beneath it.
+        if (_privacyPathPolicy.IsExcluded(fullPath)
+            || MatchesConfiguredExclude(fullPath, _repoRoot))
+        {
+            return true;
+        }
+
+        if (_physicalRepoRoot is null || _physicalPrivacyPathPolicy is null)
+        {
+            throw new IOException(
+                $"Repository root `{_repoRoot}` cannot be resolved physically for discovery.");
+        }
+        if (!TryResolvePhysicalPath(fullPath, out var resolvedPath))
+        {
+            throw new IOException(
+                $"Discovery path `{fullPath}` cannot be resolved physically.");
+        }
+        if (!IsContainedByPhysicalRoot(resolvedPath))
+        {
+            return true;
+        }
+        if (_physicalPrivacyPathPolicy.IsExcluded(resolvedPath)
+            || MatchesConfiguredExclude(resolvedPath, _physicalRepoRoot))
+        {
+            return true;
+        }
+
+        physicalPath = resolvedPath;
+        return false;
+    }
+
+    /// <summary>
+    /// Convenience overload for discovery callers that do not need the resolved physical path.
+    /// </summary>
+    public bool IsExcludedForDiscovery(string? path) =>
+        IsExcludedForDiscovery(path, out _);
+
+    /// <summary>
     /// Applies the generated-document boundary: synthetic paths below <c>obj/</c> or
     /// <c>bin/</c> may pass, but repository containment, medical/privacy directories, sensitive
     /// extensions, and configured scope excludes remain enforced.
@@ -205,7 +287,11 @@ public sealed class ScopePathPolicy
     /// in-memory source-generated document paths usable without weakening checks on existing
     /// ancestors. An unreadable or unresolvable reparse point fails closed.
     /// </summary>
-    private static bool TryResolvePhysicalPath(string path, out string physicalPath)
+    /// <summary>
+    /// Resolves existing reparse-point components while preserving a missing lexical suffix.
+    /// Returns <see langword="false"/> when a component cannot be resolved safely.
+    /// </summary>
+    public static bool TryResolvePhysicalPath(string path, out string physicalPath)
     {
         var visitedLinks = new HashSet<string>(_pathComparer);
         return TryResolvePhysicalPath(path, visitedLinks, depth: 0, out physicalPath);
@@ -374,7 +460,7 @@ public sealed class ScopePathPolicy
         path.Replace('\\', Path.DirectorySeparatorChar)
             .Replace('/', Path.DirectorySeparatorChar);
 
-    private sealed class GlobPattern
+    internal sealed class GlobPattern
     {
         private readonly string[] _segments;
 
@@ -461,6 +547,70 @@ public sealed class ScopePathPolicy
                     memo[key] = result;
                     return result;
                 }
+            }
+        }
+
+        /// <summary>
+        /// Derive the equivalent exclude patterns below a fixed repository-relative directory.
+        /// The result is the residual glob language after consuming
+        /// <paramref name="relativeDirectory"/>. Multiple patterns can be required because a
+        /// <c>**</c> segment may either keep consuming or advance to the following segment.
+        /// </summary>
+        internal IReadOnlyList<string> Rebase(string relativeDirectory)
+        {
+            var directorySegments = relativeDirectory.Split(
+                '/',
+                StringSplitOptions.RemoveEmptyEntries);
+            var states = EpsilonClosure([0]);
+            foreach (var directorySegment in directorySegments)
+            {
+                var next = new HashSet<int>();
+                foreach (var state in states)
+                {
+                    if (state >= _segments.Length) continue;
+                    if (_segments[state] == "**")
+                    {
+                        next.Add(state);
+                    }
+                    else if (SegmentMatches(_segments[state], directorySegment))
+                    {
+                        next.Add(state + 1);
+                    }
+                }
+                states = EpsilonClosure(next);
+                if (states.Count == 0) return Array.Empty<string>();
+            }
+
+            // A terminal state means the fixed directory itself is excluded. Returning `**`
+            // makes a child-rooted ScopePathPolicy fail closed before it enumerates anything.
+            if (states.Contains(_segments.Length))
+            {
+                return ["**"];
+            }
+
+            return states
+                .Where(state => state < _segments.Length)
+                .Select(state => string.Join('/', _segments[state..]))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .OrderBy(pattern => pattern, StringComparer.OrdinalIgnoreCase)
+                .ThenBy(pattern => pattern, StringComparer.Ordinal)
+                .ToArray();
+
+            HashSet<int> EpsilonClosure(IEnumerable<int> seeds)
+            {
+                var closure = new HashSet<int>(seeds);
+                var pending = new Stack<int>(closure);
+                while (pending.Count > 0)
+                {
+                    var state = pending.Pop();
+                    if (state < _segments.Length
+                        && _segments[state] == "**"
+                        && closure.Add(state + 1))
+                    {
+                        pending.Push(state + 1);
+                    }
+                }
+                return closure;
             }
         }
 

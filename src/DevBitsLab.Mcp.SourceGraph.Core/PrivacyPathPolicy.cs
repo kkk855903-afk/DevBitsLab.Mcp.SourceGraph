@@ -6,6 +6,27 @@ namespace DevBitsLab.Mcp.SourceGraph.Core;
 /// </summary>
 public sealed class PrivacyPathPolicy
 {
+    private static readonly IReadOnlyList<string> _mandatoryExcludePatterns =
+        Array.AsReadOnly(
+        [
+            "**/bin/**",
+            "**/obj/**",
+            "**/.vs/**",
+            "**/Debug/**",
+            "**/Release/**",
+            "**/Images/**",
+            "**/PatientData/**",
+            "**/Database/**",
+            "**/Logs/**",
+            "**/.git/**",
+            "**/.sourcegraph/**",
+            "**/node_modules/**",
+            "**/*.dcm",
+            "**/*.jpg",
+            "**/*.jpeg",
+            "**/*.png",
+        ]);
+
     private static readonly HashSet<string> _excludedDirectoryNames = new(StringComparer.OrdinalIgnoreCase)
     {
         "bin",
@@ -46,6 +67,14 @@ public sealed class PrivacyPathPolicy
 
     private readonly string _repoRoot;
     private readonly string _repoRootPrefix;
+
+    /// <summary>
+    /// Glob representation of the mandatory lexical privacy boundary. Hosts pass these to
+    /// exclusion-aware project factories so they can prune sensitive paths before reading them.
+    /// The host still re-validates every returned path physically with <see cref="IsExcluded"/>.
+    /// </summary>
+    public static IReadOnlyList<string> MandatoryExcludePatterns =>
+        _mandatoryExcludePatterns;
 
     public PrivacyPathPolicy(string repoRoot)
     {
