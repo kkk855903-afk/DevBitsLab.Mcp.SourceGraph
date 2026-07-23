@@ -20,6 +20,9 @@
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <!-- Secret.cs deliberately contains a #warning privacy canary; keep routine fixture builds
+         quiet while the Roslyn boundary tests verify that its syntax tree is removed. -->
+    <NoWarn>$(NoWarn);CS1030</NoWarn>
   </PropertyGroup>
 
 </Project>
