@@ -1,0 +1,71 @@
+{
+  "version": 2,
+  "dependencies": {
+    "net10.0": {
+      "ClangSharp": {
+        "type": "Direct",
+        "requested": "[21.1.8.4, )",
+        "resolved": "21.1.8.4",
+        "contentHash": "mAy085Giu/OLyAFFW+BZc/R4xX+/dB6QUHHS38/HvdKt+gunqdWzyy9IwvbHNDjeDcRT+WsB8D1XC8pm45aHAA==",
+        "dependencies": {
+          "ClangSharp.Interop": "21.1.8.4"
+        }
+      },
+      "libclang": {
+        "type": "Direct",
+        "requested": "[21.1.8, )",
+        "resolved": "21.1.8",
+        "contentHash": "dxAwUIutPYoFubhIBT/jbXbbvyQIggs8RusBBC6BAO2r08I2K6UcCVDTA/g5+Cpwp/FHJFBH0tpPH2rFV+gOsQ=="
+      },
+      "Microsoft.SourceLink.GitHub": {
+        "type": "Direct",
+        "requested": "[10.0.203, )",
+        "resolved": "10.0.203",
+        "contentHash": "R4Tvr1oACImMS+Y5M7NM07ll9QyJSKnki3Dvz8QwG1W6FEmd+9fmZXAF6BE6UPswHF6n0v41wgMQGlaudOspqA==",
+        "dependencies": {
+          "Microsoft.Build.Tasks.Git": "10.0.203",
+          "Microsoft.SourceLink.Common": "10.0.203",
+          "System.IO.Hashing": "10.0.7"
+        }
+      },
+      "ClangSharp.Interop": {
+        "type": "Transitive",
+        "resolved": "21.1.8.4",
+        "contentHash": "EPRNDWJ7BDxMAI/cZkJ2CvqzgDjr+dtOmYf+v81z0yOUOCWszvslVTetSQzvcgr6leJ7oCDLqn7QDPTar9Ui/g==",
+        "dependencies": {
+          "libClang": "21.1.8",
+          "libClangSharp": "21.1.8.2"
+        }
+      },
+      "libClangSharp": {
+        "type": "Transitive",
+        "resolved": "21.1.8.2",
+        "contentHash": "Hh9ZESdTYDZTYvuIStJhgNW3C445TN4GWKRHSHznuo4eZ1g2zFrQiqcMO4pPkg6zKEI/c9lnsfQY6V26H29gGA=="
+      },
+      "Microsoft.Build.Tasks.Git": {
+        "type": "Transitive",
+        "resolved": "10.0.203",
+        "contentHash": "m56WtzvIcL6t7JR3c7ogYitHizNM2QnRSo8yqxrQi+m5E/GGyDEmqymP+2p6YsFXn0j/Tzz67s4FQnrTLC7GKQ==",
+        "dependencies": {
+          "System.IO.Hashing": "10.0.7"
+        }
+      },
+      "Microsoft.SourceLink.Common": {
+        "type": "Transitive",
+        "resolved": "10.0.203",
+        "contentHash": "QYAnhBCOkT3ZUT/fHag11+bamwlbZ3U9Vi/WfKrD9emdUf1t3aqjWv0V2KtEGHSRSC81aBc8Oy/mvyGpEYd9Pg=="
+      },
+      "System.IO.Hashing": {
+        "type": "Transitive",
+        "resolved": "10.0.7",
+        "contentHash": "6hsjdSr4VOXSOnhALkYplHpAxnTG1J33YN42IB6nH2fEg4QnJqrZ4Ft+qn7mkrKAOYC8pCSFYwVWw6rQbmwgLQ=="
+      },
+      "devbitslab.mcp.sourcegraph.core": {
+        "type": "Project"
+      },
+      "devbitslab.mcp.sourcegraph.sdk": {
+        "type": "Project"
+      }
+    }
+  }
+}

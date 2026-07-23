@@ -3,6 +3,7 @@
     <Project Path="src/DevBitsLab.Mcp.SourceGraph.Core/DevBitsLab.Mcp.SourceGraph.Core.csproj" />
     <Project Path="src/DevBitsLab.Mcp.SourceGraph.Embeddings/DevBitsLab.Mcp.SourceGraph.Embeddings.csproj" />
     <Project Path="src/DevBitsLab.Mcp.SourceGraph.Indexing/DevBitsLab.Mcp.SourceGraph.Indexing.csproj" />
+    <Project Path="src/DevBitsLab.Mcp.SourceGraph.Indexing.Clang/DevBitsLab.Mcp.SourceGraph.Indexing.Clang.csproj" />
     <Project Path="src/DevBitsLab.Mcp.SourceGraph.Indexing.TreeSitter/DevBitsLab.Mcp.SourceGraph.Indexing.TreeSitter.csproj" />
     <Project Path="src/DevBitsLab.Mcp.SourceGraph.Indexing.TypeScript/DevBitsLab.Mcp.SourceGraph.Indexing.TypeScript.csproj" />
     <Project Path="src/DevBitsLab.Mcp.SourceGraph.Indexing.Xaml/DevBitsLab.Mcp.SourceGraph.Indexing.Xaml.csproj" />
@@ -13,6 +14,7 @@
     <Project Path="src/DevBitsLab.Mcp.SourceGraph.Watcher/DevBitsLab.Mcp.SourceGraph.Watcher.csproj" />
   </Folder>
   <Folder Name="/tests/">
+    <Project Path="tests/DevBitsLab.Mcp.SourceGraph.Indexing.Clang.Tests/DevBitsLab.Mcp.SourceGraph.Indexing.Clang.Tests.csproj" />
     <Project Path="tests/DevBitsLab.Mcp.SourceGraph.Tests/DevBitsLab.Mcp.SourceGraph.Tests.csproj" />
     <Project Path="tests/DevBitsLab.Mcp.SourceGraph.IntegrationTests/DevBitsLab.Mcp.SourceGraph.IntegrationTests.csproj" />
   </Folder>
