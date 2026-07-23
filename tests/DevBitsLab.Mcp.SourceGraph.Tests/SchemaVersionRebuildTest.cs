@@ -12,20 +12,151 @@ using Xunit;
 namespace DevBitsLab.Mcp.SourceGraph.Tests;
 
 /// <summary>
-/// Coverage for the open-language-contract schema rebuild path: opening a SQLite DB whose
-/// <c>schema_version</c> is the previous value (v10) must trigger a drop-and-rebuild on next
-/// <c>EnsureSchemaAsync</c>, leaving the v11 layout in place and discarding any sentinel data
-/// from the prior schema.
+/// Coverage for destructive graph-schema boundaries. A v11 graph can contain rows indexed
+/// before the medical privacy policy existed, so upgrading it must purge every patient-derived
+/// graph artifact. Older layouts must still rebuild, while opening the current layout remains
+/// idempotent.
 /// </summary>
 public sealed class SchemaVersionRebuildTest
 {
+    private const string PatientDicomPath = "C:/repo/PatientData/Patient-0001/study.dcm";
+    private const string PatientImagePath = "C:/repo/Images/Patient-0001-preview.jpg";
+    private const long PatientSymbolId = 1001;
+    private const long PatientImageSymbolId = 1002;
+
     [Fact]
-    public async Task EnsureSchema_dropsV10Data_andRebuildsV11()
+    public async Task EnsureSchema_dropsV11PatientCanaries_andRebuildsCurrentSchema()
     {
-        // Path.Join over Path.Combine — Combine silently drops earlier args when a later one
-        // looks absolute; Join always concatenates with a separator regardless.
-        var tmp = Path.Join(Path.GetTempPath(), "sourcegraph-schemarebuild-tests-" + Guid.NewGuid().ToString("N"));
-        Directory.CreateDirectory(tmp);
+        var tmp = CreateTempDirectory("privacy-purge");
+        var dbPath = Path.Join(tmp, "graph.db");
+        try
+        {
+            // Create the full current layout through the public entry point. V12 intentionally
+            // has the same layout as v11; only the version boundary and destructive rebuild are
+            // new. Downgrading the marker after seeding therefore models a populated v11 DB.
+            await using (var store = new SqliteGraphStore(dbPath))
+            {
+                await store.EnsureSchemaAsync();
+            }
+
+            await using (var conn = new SqliteConnection($"Data Source={dbPath}"))
+            {
+                await conn.OpenAsync();
+                await conn.ExecuteAsync(
+                    """
+                    DELETE FROM schema_version;
+                    INSERT INTO schema_version(version) VALUES (11);
+
+                    INSERT INTO files(id, path, content_sha256, last_indexed_at, is_generated)
+                    VALUES
+                        (101, @DicomPath, X'01020304', 1700000000000, 0),
+                        (102, @ImagePath, X'05060708', 1700000000000, 1);
+
+                    INSERT INTO symbols(
+                        id, canonical_key, name, fqn, kind_name, file_id,
+                        start_line, start_col, end_line, end_col,
+                        signature, accessibility)
+                    VALUES
+                        (@PatientSymbolId, 'S:csharp:Patient0001Record', 'Patient0001Record',
+                         'Private.Patient0001Record', 'class', 101,
+                         1, 1, 20, 1, 'class Patient0001Record', 6),
+                        (@PatientImageSymbolId, 'S:csharp:Patient0001Preview', 'Patient0001Preview',
+                         'Private.Patient0001Preview', 'method', 102,
+                         4, 5, 8, 6, 'void Patient0001Preview()', 6);
+
+                    INSERT INTO refs(id, symbol_id, file_id, line, col, kind)
+                    VALUES (2001, @PatientImageSymbolId, 101, 12, 9, 2);
+
+                    INSERT INTO edges(src, dst, kind_name, payload)
+                    VALUES (
+                        @PatientSymbolId,
+                        @PatientImageSymbolId,
+                        'calls',
+                        '{"patient":"Patient-0001"}');
+
+                    INSERT INTO diagnostics(
+                        id, symbol_id, file_id, severity, code, message, line, col)
+                    VALUES (
+                        3001,
+                        @PatientSymbolId,
+                        101,
+                        2,
+                        'PHI001',
+                        'Patient-0001 DICOM metadata',
+                        3,
+                        2);
+
+                    -- embedding_meta is always present. The vec0-backed symbol_embeddings table
+                    -- is optional and only exists when the native extension loaded, so this is
+                    -- the deterministic embedding canary supported by every v11 graph.
+                    INSERT INTO embedding_meta(symbol_id, content_hash, model_version)
+                    VALUES
+                        (@PatientSymbolId, X'0A0B0C0D', 'patient-canary/v1'),
+                        (@PatientImageSymbolId, X'0E0F1011', 'patient-canary/v1');
+                    """,
+                    new
+                    {
+                        DicomPath = PatientDicomPath,
+                        ImagePath = PatientImagePath,
+                        PatientSymbolId,
+                        PatientImageSymbolId,
+                    });
+            }
+
+            await using (var store = new SqliteGraphStore(dbPath))
+            {
+                await store.EnsureSchemaAsync();
+
+                (await store.GetFileContentHashAsync(PatientDicomPath)).Should().BeNull();
+                (await store.GetFileContentHashAsync(PatientImagePath)).Should().BeNull();
+                (await store.FindSymbolsAsync("Patient0001")).Should().BeEmpty();
+                (await store.FindReferencesAsync(PatientImageSymbolId)).Should().BeEmpty();
+                (await store.ListCalleesAsync(PatientSymbolId)).Should().BeEmpty();
+                (await store.FindDiagnosticsAsync(
+                    severity: null,
+                    code: "PHI001",
+                    symbolId: null)).Should().BeEmpty();
+
+                (await store.GetStatsAsync()).Should().Be(new GraphStats(
+                    FileCount: 0,
+                    SymbolCount: 0,
+                    ReferenceCount: 0,
+                    EdgeCount: 0));
+            }
+
+            await using (var conn = new SqliteConnection($"Data Source={dbPath}"))
+            {
+                await conn.OpenAsync();
+
+                var version = await conn.ExecuteScalarAsync<int?>(
+                    "SELECT MAX(version) FROM schema_version;");
+                version.Should().Be(Schema.Version);
+
+                foreach (var table in new[]
+                         {
+                             "files",
+                             "symbols",
+                             "refs",
+                             "edges",
+                             "diagnostics",
+                             "embedding_meta",
+                         })
+                {
+                    var count = await conn.ExecuteScalarAsync<long>($"SELECT COUNT(*) FROM {table};");
+                    count.Should().Be(0, $"{table} must not retain pre-policy patient records");
+                }
+            }
+        }
+        finally
+        {
+            DeleteTempDirectory(tmp);
+        }
+    }
+
+    [Fact]
+    public async Task EnsureSchema_dropsV10Data_andRebuildsCurrentSchema()
+    {
+        var tmp = CreateTempDirectory("legacy-v10");
         var dbPath = Path.Join(tmp, "graph.db");
         try
         {
@@ -53,13 +184,13 @@ public sealed class SchemaVersionRebuildTest
             }
 
             // 2) Open via the SqliteGraphStore and ensure the schema. The store should detect
-            //    on-disk v10 < v11, run DropAll, then apply V1+V2 to land on v11.
+            //    the stale version, run DropAll, then apply V1+V2 to land on the current schema.
             await using (var store = new SqliteGraphStore(dbPath))
             {
                 await store.EnsureSchemaAsync();
             }
 
-            // 3) Verify: schema_version is v11, the legacy `attributes` table is gone, the new
+            // 3) Verify: schema_version is current, the legacy `attributes` table is gone, the
             //    `annotations` table exists, and the sentinel row from step 1 is no longer
             //    discoverable (DropAll discards it; EnsureSchemaAsync does not migrate data).
             await using (var conn = new SqliteConnection($"Data Source={dbPath}"))
@@ -68,7 +199,7 @@ public sealed class SchemaVersionRebuildTest
 
                 var version = await conn.ExecuteScalarAsync<int?>(
                     "SELECT MAX(version) FROM schema_version;");
-                version.Should().Be(11);
+                version.Should().Be(Schema.Version);
 
                 var hasLegacyAttributes = await conn.ExecuteScalarAsync<long>(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='attributes';");
@@ -93,9 +224,57 @@ public sealed class SchemaVersionRebuildTest
         }
         finally
         {
-            try { Directory.Delete(tmp, recursive: true); }
-            catch (IOException) { /* best-effort cleanup; another handle may still hold the file */ }
-            catch (UnauthorizedAccessException) { /* best-effort cleanup; readonly bit or ACL drift */ }
+            DeleteTempDirectory(tmp);
         }
+    }
+
+    [Fact]
+    public async Task EnsureSchema_preservesData_whenSchemaVersionIsCurrent()
+    {
+        var tmp = CreateTempDirectory("current-idempotent");
+        var dbPath = Path.Join(tmp, "graph.db");
+        var contentHash = new byte[] { 9, 8, 7, 6 };
+        const string sourcePath = "C:/repo/src/KeepIndexed.cs";
+        try
+        {
+            await using (var store = new SqliteGraphStore(dbPath))
+            {
+                await store.EnsureSchemaAsync();
+                await store.UpsertFileAsync(sourcePath, contentHash, DateTimeOffset.UtcNow);
+
+                await store.EnsureSchemaAsync();
+
+                (await store.GetFileContentHashAsync(sourcePath))
+                    .Should().BeEquivalentTo(contentHash);
+                (await store.GetStatsAsync()).FileCount.Should().Be(1);
+            }
+
+            await using var conn = new SqliteConnection($"Data Source={dbPath}");
+            await conn.OpenAsync();
+            (await conn.ExecuteScalarAsync<int?>("SELECT MAX(version) FROM schema_version;"))
+                .Should().Be(Schema.Version);
+        }
+        finally
+        {
+            DeleteTempDirectory(tmp);
+        }
+    }
+
+    private static string CreateTempDirectory(string scenario)
+    {
+        // Path.Join over Path.Combine — Combine silently drops earlier args when a later one
+        // looks absolute; Join always concatenates with a separator regardless.
+        var tmp = Path.Join(
+            Path.GetTempPath(),
+            $"sourcegraph-schemarebuild-{scenario}-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tmp);
+        return tmp;
+    }
+
+    private static void DeleteTempDirectory(string tmp)
+    {
+        try { Directory.Delete(tmp, recursive: true); }
+        catch (IOException) { /* best-effort cleanup; another handle may still hold the file */ }
+        catch (UnauthorizedAccessException) { /* best-effort cleanup; readonly bit or ACL drift */ }
     }
 }

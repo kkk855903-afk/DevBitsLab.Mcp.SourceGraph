@@ -16,9 +16,14 @@ public static class Schema
     /// drops all data tables when the on-disk version is below this, since the index can always be
     /// rebuilt from source.
     /// </summary>
-    public const int Version = 11;
+    public const int Version = 12;
 
     /// <summary>
+    /// V12 is an intentional destructive privacy boundary with no layout change: opening any
+    /// v11-or-older graph drops all indexed rows before rebuilding, so data captured before the
+    /// medical privacy path policy (including PatientData, DICOM, and image-derived records)
+    /// cannot survive an upgrade.
+    ///
     /// V11 (open-language-contract): kind columns flip from <c>INTEGER</c> to <c>TEXT NOT NULL</c>
     /// holding kebab-case identifiers (<c>"calls"</c>, <c>"class"</c>, …); <c>edges</c> gains a
     /// <c>payload TEXT NULL</c> column carrying JSON metadata for binding paths / event names /
@@ -33,9 +38,9 @@ public static class Schema
     /// test/history awareness, V8 added <c>files.is_generated</c> and <c>diagnostics</c>,
     /// V7 wired in <c>sqlite-vec</c>, V6 added <c>attributes</c> + <c>attributes_fts</c>,
     /// V5 enriched symbols with modifiers/accessibility/xml_summary, V3 dropped FK constraints
-    /// from refs/edges. V11 is the cumulative drop-and-rebuild target — there is no preserved
+    /// from refs/edges. V12 is the cumulative drop-and-rebuild target — there is no preserved
     /// data path; <see cref="SqliteGraphStore.EnsureSchemaAsync"/> calls <see cref="DropAll"/>
-    /// when the on-disk version is anything below 11.
+    /// when the on-disk version is anything below 12.
     /// </summary>
     internal const string V1 = """
         CREATE TABLE IF NOT EXISTS schema_version (
@@ -256,7 +261,8 @@ public static class Schema
     /// <see cref="Version"/>. The index always rebuilds from source on next pass.
     ///
     /// Includes drops for the legacy v10-and-earlier <c>attributes</c> / <c>attributes_fts</c>
-    /// names so a v10 DB cleanly rebuilds into the v11 <c>annotations</c> tables.
+    /// names so all supported prior DBs cleanly rebuild into the current <c>annotations</c>
+    /// tables.
     /// </summary>
     internal const string DropAll = """
         DROP VIEW    IF EXISTS vw_recent_changes;
