@@ -7,6 +7,7 @@ using DevBitsLab.Mcp.SourceGraph.Sdk;
 using DevBitsLab.Mcp.SourceGraph.Storage;
 using FluentAssertions;
 using Xunit;
+using CoreEvidenceConfidence = DevBitsLab.Mcp.SourceGraph.Core.EvidenceConfidence;
 
 namespace DevBitsLab.Mcp.SourceGraph.Tests;
 
@@ -109,5 +110,39 @@ public sealed class IndexFixtureTests : IAsyncLifetime
         // expand-edge-types; assert the foundational three are present and every member is public.
         members.Select(m => m.Name).Should().Contain(new[] { "Add", "Subtract", "Multiply" });
         members.Should().AllSatisfy(m => m.Accessibility.Should().Be((int)Microsoft.CodeAnalysis.Accessibility.Public));
+    }
+
+    [Fact]
+    public async Task RepeatedRoslynCalls_preserveExactCallSiteEvidence()
+    {
+        var caller = (await _store!.FindSymbolsAsync("AddManyNumbers"))
+            .Should().ContainSingle(hit =>
+                hit.Fqn.Contains("CalculatorTests.AddManyNumbers_isCommutative", StringComparison.Ordinal))
+            .Which;
+        var target = (await _store.FindSymbolsAsync("Calculator.Add"))
+            .Should().ContainSingle(hit =>
+                hit.Fqn.Contains("Sample.Domain.Calculator.Add", StringComparison.Ordinal))
+            .Which;
+
+        var evidence = await _store.ListEdgeEvidenceAsync(
+            caller.Id,
+            target.Id,
+            EdgeKinds.Calls);
+
+        evidence.Should().HaveCount(2, "the fixture calls Calculator.Add twice from one method");
+        evidence.Select(item => item.Location.StartLine).Should().Equal(28, 29);
+        evidence.Select(item => item.Location.FilePath)
+            .Should().OnlyContain(path =>
+                path.EndsWith("CalculatorTests.cs", StringComparison.OrdinalIgnoreCase));
+        evidence.Select(item => item.Confidence)
+            .Should().OnlyContain(confidence => confidence == CoreEvidenceConfidence.Exact);
+        evidence.Select(item => item.Producer)
+            .Should().OnlyContain(producer => producer == "roslyn");
+        evidence.Select(item => (
+                item.Location.StartLine,
+                item.Location.StartColumn,
+                item.Location.EndLine,
+                item.Location.EndColumn))
+            .Should().OnlyHaveUniqueItems("separate call sites must not collapse");
     }
 }

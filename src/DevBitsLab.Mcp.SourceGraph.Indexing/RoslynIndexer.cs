@@ -13,6 +13,8 @@ using Microsoft.CodeAnalysis.MSBuild;
 using Microsoft.CodeAnalysis.Text;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
+using CoreEvidenceConfidence = DevBitsLab.Mcp.SourceGraph.Core.EvidenceConfidence;
+using CoreSourceLocation = DevBitsLab.Mcp.SourceGraph.Core.SourceLocation;
 
 namespace DevBitsLab.Mcp.SourceGraph.Indexing;
 
@@ -822,17 +824,55 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                 var root = await tree.GetRootAsync(ct).ConfigureAwait(false);
                 var refBatch = new List<SymbolReference>(capacity: 256);
                 var edgeBatch = new List<Edge>(capacity: 64);
-                // Dedupe edges within this file's pass-2 to avoid bombarding SQLite with duplicates that
-                // INSERT OR IGNORE would just throw away. Tuple key keeps it allocation-light.
-                // Edge kind is now a kebab-case TEXT identifier rather than an int enum; comparing by
-                // ordinal is the cheapest stable form.
-                var emittedEdges = new HashSet<(long src, long dst, string kind)>();
-                void AddEdge(long src, long dst, string kind)
+                // Dedupe duplicate syntax visits while retaining distinct occurrences between the
+                // same logical endpoints. Roslyn can surface one generic/member-access name through
+                // more than one syntax-node case; the range-inclusive key collapses only those
+                // duplicate visits, never two separate call sites.
+                var emittedEvidence = new HashSet<(
+                    long Src,
+                    long Dst,
+                    string Kind,
+                    int StartLine,
+                    int StartColumn,
+                    int EndLine,
+                    int EndColumn,
+                    CoreEvidenceConfidence Confidence)>();
+                void AddEdge(
+                    long src,
+                    long dst,
+                    string kind,
+                    SyntaxNode evidenceNode,
+                    CoreEvidenceConfidence confidence)
                 {
                     if (src == dst) return;
-                    if (emittedEdges.Add((src, dst, kind)))
+                    var lineSpan = evidenceNode.GetLocation().GetLineSpan();
+                    var startLine = lineSpan.StartLinePosition.Line + 1;
+                    var startColumn = lineSpan.StartLinePosition.Character + 1;
+                    var endLine = lineSpan.EndLinePosition.Line + 1;
+                    var endColumn = lineSpan.EndLinePosition.Character + 1;
+                    if (emittedEvidence.Add((
+                            src,
+                            dst,
+                            kind,
+                            startLine,
+                            startColumn,
+                            endLine,
+                            endColumn,
+                            confidence)))
                     {
-                        edgeBatch.Add(new Edge(src, dst, kind));
+                        edgeBatch.Add(new Edge(src, dst, kind)
+                        {
+                            Evidence = new Evidence(
+                                fileId,
+                                new CoreSourceLocation(
+                                    path,
+                                    startLine,
+                                    startColumn,
+                                    endLine,
+                                    endColumn),
+                                confidence,
+                                "roslyn"),
+                        });
                     }
                 }
 
@@ -855,6 +895,10 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                         case GenericNameSyntax gn:
                             referenced = model.GetSymbolInfo(gn, ct).Symbol;
                             refNode = gn;
+                            kind = gn.Parent is InvocationExpressionSyntax invGn
+                                && invGn.Expression == gn
+                                    ? ReferenceKind.Call
+                                    : ReferenceKind.Reference;
                             break;
 
                         case MemberAccessExpressionSyntax mae:
@@ -869,6 +913,21 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                             referenced = model.GetSymbolInfo(oce, ct).Symbol;
                             refNode = oce;
                             kind = ReferenceKind.Call;
+                            break;
+
+                        case ImplicitObjectCreationExpressionSyntax ioce:
+                            referenced = model.GetSymbolInfo(ioce, ct).Symbol;
+                            refNode = ioce;
+                            kind = ReferenceKind.Call;
+                            break;
+
+                        case MemberBindingExpressionSyntax mbe:
+                            referenced = model.GetSymbolInfo(mbe.Name, ct).Symbol;
+                            refNode = mbe.Name;
+                            kind = mbe.Parent is InvocationExpressionSyntax invMb
+                                && invMb.Expression == mbe
+                                    ? ReferenceKind.Call
+                                    : ClassifyReadWrite(mbe, referenced) ?? ReferenceKind.Reference;
                             break;
                     }
 
@@ -902,7 +961,12 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                             var encKey = SymbolMapping.CanonicalKey(enclosing);
                             if (encKey is not null && _symbolIdByKey.TryGetValue(encKey, out var srcId))
                             {
-                                AddEdge(srcId, symId, EdgeKinds.Calls);
+                                AddEdge(
+                                    srcId,
+                                    symId,
+                                    EdgeKinds.Calls,
+                                    refNode,
+                                    CoreEvidenceConfidence.Exact);
                             }
                         }
                     }
@@ -911,7 +975,8 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                     // alongside the Calls edge to the constructor that the case above already emitted.
                     // We also emit a UsesType edge so kind=uses_type can answer "every consumer of T",
                     // including body-local instantiations (per design.md point 1).
-                    if (node is ObjectCreationExpressionSyntax oceNode && referenced is IMethodSymbol ctor)
+                    if (node is BaseObjectCreationExpressionSyntax creationNode
+                        && referenced is IMethodSymbol ctor)
                     {
                         var typeSym = ctor.ContainingType;
                         if (typeSym is not null)
@@ -919,14 +984,24 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                             var typeKey = SymbolMapping.CanonicalKey(typeSym);
                             if (typeKey is not null && _symbolIdByKey.TryGetValue(typeKey, out var dstId))
                             {
-                                var enclosing = FindEnclosingMember(model, oceNode.SpanStart, ct);
+                                var enclosing = FindEnclosingMember(model, creationNode.SpanStart, ct);
                                 if (enclosing is not null)
                                 {
                                     var encKey = SymbolMapping.CanonicalKey(enclosing);
                                     if (encKey is not null && _symbolIdByKey.TryGetValue(encKey, out var srcId))
                                     {
-                                        AddEdge(srcId, dstId, EdgeKinds.Instantiates);
-                                        AddEdge(srcId, dstId, EdgeKinds.UsesType);
+                                        AddEdge(
+                                            srcId,
+                                            dstId,
+                                            EdgeKinds.Instantiates,
+                                            creationNode,
+                                            CoreEvidenceConfidence.Exact);
+                                        AddEdge(
+                                            srcId,
+                                            dstId,
+                                            EdgeKinds.UsesType,
+                                            creationNode,
+                                            CoreEvidenceConfidence.Exact);
                                     }
                                 }
                             }
@@ -952,7 +1027,12 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                     if (enclosing is null) continue;
                     var encKey = SymbolMapping.CanonicalKey(enclosing);
                     if (encKey is null || !_symbolIdByKey.TryGetValue(encKey, out var srcId)) continue;
-                    AddEdge(srcId, dstId, EdgeKinds.Throws);
+                    AddEdge(
+                        srcId,
+                        dstId,
+                        EdgeKinds.Throws,
+                        node,
+                        CoreEvidenceConfidence.Exact);
                 }
 
                 // Inherits / Implements edges from BaseListSyntax + UsesType for the same targets.
@@ -975,15 +1055,25 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                             var ek = baseSym is INamedTypeSymbol nt && nt.TypeKind == TypeKind.Interface
                                 ? EdgeKinds.Implements
                                 : EdgeKinds.Inherits;
-                            AddEdge(srcId, dstId, ek);
+                            AddEdge(
+                                srcId,
+                                dstId,
+                                ek,
+                                baseTypeSyntax.Type,
+                                CoreEvidenceConfidence.Exact);
                             // Also a UsesType edge so kind=uses_type can answer "every consumer of B".
-                            AddEdge(srcId, dstId, EdgeKinds.UsesType);
+                            AddEdge(
+                                srcId,
+                                dstId,
+                                EdgeKinds.UsesType,
+                                baseTypeSyntax.Type,
+                                CoreEvidenceConfidence.Exact);
                         }
                     }
 
                     // Member-level ImplementsMember: walk every interface this type implements and ask
                     // Roslyn which member satisfies each interface member. Done once per type declaration.
-                    EmitMemberImplements(typeSym, AddEdge);
+                    EmitMemberImplements(typeSym, typeDecl, AddEdge, ct);
                 }
 
                 // Per-member emitters: UsesType from signatures, OverridesMember from Overridden*,
@@ -997,8 +1087,8 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                     var key = SymbolMapping.CanonicalKey(declSym);
                     if (key is null || !_symbolIdByKey.TryGetValue(key, out var memberId)) continue;
 
-                    EmitUsesTypeForSignature(declSym, memberId, AddEdge);
-                    EmitOverrides(declSym, memberId, AddEdge);
+                    EmitUsesTypeForSignature(declSym, memberId, node, AddEdge);
+                    EmitOverrides(declSym, memberId, node, AddEdge);
 
                     // Tests edge: the source is a test method (carries a recognised framework),
                     // the destination is the first non-trivial production call inside its body.
@@ -1359,7 +1449,11 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
     /// when those types are themselves indexed. BCL types are skipped by the
     /// <c>_symbolIdByKey</c> lookup.
     /// </summary>
-    private void EmitUsesTypeForSignature(ISymbol member, long memberId, Action<long, long, string> addEdge)
+    private void EmitUsesTypeForSignature(
+        ISymbol member,
+        long memberId,
+        SyntaxNode declarationNode,
+        Action<long, long, string, SyntaxNode, CoreEvidenceConfidence> addEdge)
     {
         IEnumerable<ITypeSymbol> types = member switch
         {
@@ -1374,7 +1468,12 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
             var key = SymbolMapping.CanonicalKey(t);
             if (key is null) continue;
             if (!_symbolIdByKey.TryGetValue(key, out var typeId)) continue;
-            addEdge(memberId, typeId, EdgeKinds.UsesType);
+            addEdge(
+                memberId,
+                typeId,
+                EdgeKinds.UsesType,
+                declarationNode,
+                CoreEvidenceConfidence.Semantic);
         }
 
         static IEnumerable<ITypeSymbol> SignatureTypes(IMethodSymbol m)
@@ -1411,7 +1510,12 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
     /// and calls into files under a <c>/tests/</c> path segment. We pick only the first such
     /// call to keep the edge focused and avoid noisy 1:N fanout per parametrised test.
     /// </summary>
-    private void EmitTestsEdge(SyntaxNode methodNode, SemanticModel model, long testMemberId, Action<long, long, string> addEdge, CancellationToken ct)
+    private void EmitTestsEdge(
+        SyntaxNode methodNode,
+        SemanticModel model,
+        long testMemberId,
+        Action<long, long, string, SyntaxNode, CoreEvidenceConfidence> addEdge,
+        CancellationToken ct)
     {
         // Methods we walk include MethodDeclarationSyntax but EnumerateDeclarations also yields
         // type/property/etc. nodes. Restrict ourselves to method bodies and expression-bodied
@@ -1426,7 +1530,12 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
             if (key is null) continue;
             if (!_symbolIdByKey.TryGetValue(key, out var dstId)) continue;
             if (dstId == testMemberId) continue;
-            addEdge(testMemberId, dstId, EdgeKinds.Tests);
+            addEdge(
+                testMemberId,
+                dstId,
+                EdgeKinds.Tests,
+                inv,
+                CoreEvidenceConfidence.Exact);
             return; // first non-trivial production call wins
         }
     }
@@ -1454,7 +1563,11 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
     /// Emits OverridesMember edges when <paramref name="member"/>'s Roslyn Overridden* property
     /// points at an indexed symbol.
     /// </summary>
-    private void EmitOverrides(ISymbol member, long memberId, Action<long, long, string> addEdge)
+    private void EmitOverrides(
+        ISymbol member,
+        long memberId,
+        SyntaxNode declarationNode,
+        Action<long, long, string, SyntaxNode, CoreEvidenceConfidence> addEdge)
     {
         ISymbol? overridden = member switch
         {
@@ -1466,14 +1579,23 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         if (overridden is null) return;
         var key = SymbolMapping.CanonicalKey(overridden);
         if (key is null || !_symbolIdByKey.TryGetValue(key, out var dstId)) return;
-        addEdge(memberId, dstId, EdgeKinds.OverridesMember);
+        addEdge(
+            memberId,
+            dstId,
+            EdgeKinds.OverridesMember,
+            declarationNode,
+            CoreEvidenceConfidence.Semantic);
     }
 
     /// <summary>
     /// Walks <paramref name="typeSymbol"/>'s implemented interfaces and emits ImplementsMember
     /// edges from each implementing member to the satisfied interface member.
     /// </summary>
-    private void EmitMemberImplements(INamedTypeSymbol typeSymbol, Action<long, long, string> addEdge)
+    private void EmitMemberImplements(
+        INamedTypeSymbol typeSymbol,
+        SyntaxNode typeDeclarationNode,
+        Action<long, long, string, SyntaxNode, CoreEvidenceConfidence> addEdge,
+        CancellationToken ct)
     {
         if (typeSymbol.TypeKind is TypeKind.Interface) return; // interface declarations don't implement
         foreach (var iface in typeSymbol.AllInterfaces)
@@ -1489,7 +1611,17 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                 if (srcKey is null || !_symbolIdByKey.TryGetValue(srcKey, out var srcId)) continue;
                 var dstKey = SymbolMapping.CanonicalKey(ifaceMember);
                 if (dstKey is null || !_symbolIdByKey.TryGetValue(dstKey, out var dstId)) continue;
-                addEdge(srcId, dstId, EdgeKinds.ImplementsMember);
+                var evidenceNode = impl.DeclaringSyntaxReferences
+                    .FirstOrDefault(reference =>
+                        reference.SyntaxTree == typeDeclarationNode.SyntaxTree)
+                    ?.GetSyntax(ct)
+                    ?? typeDeclarationNode;
+                addEdge(
+                    srcId,
+                    dstId,
+                    EdgeKinds.ImplementsMember,
+                    evidenceNode,
+                    CoreEvidenceConfidence.Semantic);
             }
         }
     }

@@ -187,7 +187,7 @@ The `edges` table SHALL include a `payload TEXT NULL` column that stores the JSO
 ### Requirement: Occurrence-level edge evidence
 The schema SHALL store one logical `edges` row per `(src, dst, kind_name)` and one
 `edge_evidence` row per independently attributable occurrence. Each evidence row SHALL
-carry the producing file id, the matching indexed file path, a valid 1-based source range,
+carry the producing file id, the matching indexed file path, a valid 1-based half-open source range,
 an ordered confidence (`0=inferred`, `1=semantic`, `2=exact`), a non-empty producer, and
 optional occurrence metadata. Duplicate evidence emissions SHALL be idempotent.
 

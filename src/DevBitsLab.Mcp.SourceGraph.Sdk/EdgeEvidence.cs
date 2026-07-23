@@ -14,8 +14,9 @@ public enum EvidenceConfidence
 }
 
 /// <summary>
-/// One 1-based source range supporting an edge occurrence. <see cref="FilePath"/> is the
-/// absolute path supplied to the indexer or analyzer for the current document.
+/// One 1-based, half-open source range supporting an edge occurrence. The end position is
+/// exclusive. <see cref="FilePath"/> is the absolute path supplied to the indexer or analyzer
+/// for the current document.
 /// </summary>
 public sealed record SourceLocation(
     string FilePath,

@@ -367,6 +367,26 @@ The Roslyn indexer SHALL emit edge and symbol kinds as the kebab-case string con
 - **WHEN** the indexer emits a `SymbolDeclared` for a class declaration
 - **THEN** the emitted `SymbolDeclared.Kind` (now `string`) equals `"class"` (the value of `SymbolKinds.Class`)
 
+### Requirement: Roslyn edges preserve occurrence evidence
+Every relationship emitted by the Roslyn indexing path SHALL include host-owned evidence
+whose producing file is the current document and whose source range is the relevant syntax.
+Call, construction, throw, and base-type syntax resolved to an indexed symbol SHALL be
+`exact`; relationships inferred through symbol semantics at a declaration (signature type,
+override, and interface-member implementation) SHALL be `semantic`. The producer SHALL be
+`roslyn`.
+
+Logical edge deduplication SHALL include the evidence range. Two invocations from the same
+caller to the same callee SHALL therefore produce one logical edge with two evidence rows,
+while duplicate visits to the same syntax node remain idempotent.
+
+#### Scenario: Repeated calls retain both locations
+- **WHEN** one method calls the same indexed target on two separate lines
+- **THEN** the store contains one `calls` edge and two `exact` evidence rows whose ranges point to the two call sites
+
+#### Scenario: Signature relationship is semantic
+- **WHEN** an indexed method's return or parameter signature names another indexed type
+- **THEN** its `uses-type` edge carries `semantic` evidence at the member declaration
+
 ### Requirement: XAML file discovery and dispatch
 The indexer dispatcher SHALL route every `.xaml` file in an indexed solution to the registered `XamlLanguageIndexer`. Documents are discovered via the same project-walking logic the C# pathway uses; XAML files appear in `.csproj` `<Page>`, `<ApplicationDefinition>`, or `<EmbeddedResource>` items and SHALL be enumerated alongside `.cs` documents during cold and live indexing.
 

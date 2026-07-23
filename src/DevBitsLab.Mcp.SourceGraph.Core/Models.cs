@@ -59,7 +59,8 @@ public enum EvidenceConfidence
 }
 
 /// <summary>
-/// One 1-based source range supporting a graph relationship.
+/// One 1-based, half-open source range supporting a graph relationship. The end position is
+/// exclusive, matching Roslyn and most parser span conventions.
 /// </summary>
 public sealed record SourceLocation(
     string FilePath,
