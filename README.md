@@ -73,13 +73,14 @@ calls with a single structured tool call:
 - **Optional code-aware semantic search.** ONNX embeddings (default model:
   `jinaai/jina-embeddings-v2-base-code`) stored in `sqlite-vec` for
   natural-language queries like *"find the rate-limiting code"*. The model
-  (~640 MB) is auto-fetched from Hugging Face on first start into a per-user cache
+  (~640 MB) is loaded from a per-user cache
   directory resolved by `ModelStore.DefaultCacheDir()` (honours `XDG_CACHE_HOME` /
   `LOCALAPPDATA` / `~/.cache` per platform — e.g. `~/.cache/devbitslab.sourcegraph/models/`
-  on Linux/macOS, `%LOCALAPPDATA%\devbitslab.sourcegraph\models\` on Windows); subsequent
-  starts use the cache.
-  Disable with `--no-embeddings` to skip the pipeline entirely, or
-  `--no-model-download` to stay offline once the cache is pre-populated.
+  on Linux/macOS, `%LOCALAPPDATA%\devbitslab.sourcegraph\models\` on Windows).
+  `serve` and `index` make no model-download network request by default. Populate the
+  cache explicitly with `embeddings pull`, or opt into first-run fetching with
+  `--allow-model-download`. Disable the pipeline entirely with `--no-embeddings`;
+  `--no-model-download` remains as an explicit/legacy fail-closed switch.
 - **Attribute search.** Find every symbol carrying a given attribute, optionally
   filtered by serialised argument substring.
 - **Roslyn diagnostics indexing.** Query analyzer warnings/errors captured at
@@ -665,7 +666,7 @@ sourcegraph-mcp <subcommand> [options]
 | `plugins list [--root <path>]` | List plugins declared in `.sourcegraph.json` with their version, status, registered contracts, and source path. |
 | `plugins info <name> [--root <path>]` | Show the full record for one plugin: status reason, declared interfaces, registered tool names. |
 | `vocabulary list [--root <path>] [--scope <id>] [--strict]` | Per-scope diagnostic over the soft-registry kind vocabulary. Lists `edge_kinds` / `symbol_kinds` / `annotation_flavors` with each entry tagged by source (`sdk` constant vs `plugin: <id>@<version>` vs `unknown`) and live emission count, plus a "Drift candidates" section flagging Levenshtein-near pairs (`bind-path` ~ `binds-path`) within the same scope. Default exit `0`; `--strict` exits `2` on any drift candidate so CI can wire it as a gate. |
-| `embeddings status [--model <id>]` | Inspect the embedding model cache: cache directory, active model + dimension, per-file presence/size/SHA-256, free disk on the cache volume. First stop when `--no-model-download` warned the cache was empty. |
+| `embeddings status [--model <id>]` | Inspect the embedding model cache: cache directory, active model + dimension, per-file presence/size/SHA-256, free disk on the cache volume. Useful when the default offline mode reports an empty cache. |
 | `embeddings pull [--model <id>]` | Synchronously download the active (or `--model`) manifest into the cache. Idempotent — a populated cache is a no-op. Useful as a pre-flight before air-gapping. |
 | `embeddings remove [--model <id>] [--all]` | Clear the cache for the active model (default), one specific `--model`, or every cached model with `--all`. Combining `--model` and `--all` is rejected. |
 | `embeddings verify [--model <id>]` | Recompute SHA-256 of every cached file and compare against the manifest. Default model has pinned SHAs — exits `2` on mismatch. Override `--model <id>` paths use a best-effort manifest with no pinned SHAs; in that case prints "informational only" beside each computed hash and exits `0`. |
@@ -679,7 +680,8 @@ Common flags:
 | `--root <path>` | Repository root used for `.sourcegraph.json` discovery and scope databases. Defaults to the directory holding `--solution`, then CWD. |
 | `--model <id>` | Override the embedding model identity (default `jinaai/jina-embeddings-v2-base-code`). Applies to `serve` and `index`. |
 | `--no-embeddings` | Skip the embedding pipeline entirely (no model download, no `vec0` writes). `semantic_search` returns a disabled message; every other tool works as before. |
-| `--no-model-download` | Disable auto-fetching the embedding model from Hugging Face. With this flag the pipeline runs only when the cache is already populated; otherwise it degrades to the same shape as `--no-embeddings`. Use in air-gapped environments where outbound network is denied. Equivalent to setting `SOURCEGRAPH_NO_MODEL_DOWNLOAD=1`. |
+| `--allow-model-download` | Explicitly allow `serve`/`index` to fetch the embedding model from Hugging Face when the local cache is empty. Automatic network access is disabled by default. Equivalent to `SOURCEGRAPH_ALLOW_MODEL_DOWNLOAD=1`. |
+| `--no-model-download` | Explicitly retain the default offline mode. A populated cache remains usable; an empty cache degrades to the same shape as `--no-embeddings`. `SOURCEGRAPH_NO_MODEL_DOWNLOAD=1` is retained as a fail-closed operator setting and takes precedence over the allow flag/environment variable. |
 | `--no-history` | Disable the git-blame history pipeline. Use in environments without `git` on `PATH` or in CI where per-symbol history isn't needed. |
 | `--no-instructions` | Don't publish server-side usage guidance in the MCP `initialize` response. By default the server tells the connected model to prefer source-graph tools over `Grep` + `Read` for symbol-level questions and to call `usage_stats` at end-of-turn to verify. Equivalent to setting `SOURCEGRAPH_NO_INSTRUCTIONS=1`. |
 | `--no-leaf` | Don't prefix the brand mark `🌿` onto any of the three surfaces the server stamps: per-call response prose (the first user-visible text block of every built-in tool's result), the published `ServerInstructions` string, and the per-tool catalog identity (`Tool.Title` becomes `🌿 <name>` and `Tool.Description` is prefixed with `🌿 ` in `tools/list`). By default the brand mark surfaces in all three places so the agent (and the human reading the chat) can tell at a glance that the answer came from this server. Use this knob if your terminal renders emoji as monospaced fallback boxes or if you simply prefer unbranded output. Equivalent to setting `SOURCEGRAPH_NO_LEAF=1`. Independent of `--no-instructions`. |
@@ -836,7 +838,7 @@ database per scope. The current limits are:
 | Default `SearchSymbols` / `find_references` / `list_members` result limit | 25 / 50 / 100 rows | Pass `limit` on the MCP tool call. A soft serialized-size cap (~50K chars) trims further if a larger `limit` would exceed Claude Code's per-call ceiling; trim is signalled via `omitted_size=N` in the audience-restricted `_meta:` block. |
 | `impact_of_change` max depth | 4 hops | Pass `maxDepth` on the tool call. |
 | `semantic_search` top-k default | 10 | Pass `k` on the tool call. |
-| Embedding model download | ~640 MB | Disable the pipeline with `--no-embeddings`, or stay offline against a pre-populated cache with `--no-model-download`. |
+| Embedding model download | ~640 MB, automatic download disabled by default | Populate deliberately with `embeddings pull`, or opt in with `--allow-model-download`; use `--no-embeddings` to disable the pipeline. |
 | Per-symbol `git blame` shellout | enabled | Disable with `--no-history`. |
 | MCP `initialize` instructions payload | enabled | Disable with `--no-instructions` or `SOURCEGRAPH_NO_INSTRUCTIONS=1`. |
 | Green-leaf brand mark on tool responses, `ServerInstructions`, and per-tool `Title`/`Description` in `tools/list` | enabled | Disable with `--no-leaf` or `SOURCEGRAPH_NO_LEAF=1`. |

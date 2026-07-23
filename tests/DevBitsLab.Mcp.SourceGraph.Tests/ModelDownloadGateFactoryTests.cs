@@ -83,11 +83,11 @@ public sealed class ModelDownloadGateFactoryTests : IDisposable
     }
 
     [Fact]
-    public async Task DefaultPath_emptyCache_downloadsAndPopulatesCache()
+    public async Task ExplicitOptInPath_emptyCache_downloadsAndPopulatesCache()
     {
         // Use a custom (non-default) model id so the resolved manifest has no pinned SHAs;
         // the stub handler's canned bytes can't match the production SHAs of the default model.
-        // The default-flow / fire-and-don't-await behaviour is unchanged regardless of model id.
+        // The explicitly authorized fire-and-don't-await behaviour is unchanged regardless of model id.
         var handler = new RecordingHandler();
         using var http = new HttpClient(handler);
         var ms = new ModelStore(overrideBaseDir: _tempDir, http: http);
@@ -109,7 +109,7 @@ public sealed class ModelDownloadGateFactoryTests : IDisposable
     }
 
     [Fact]
-    public async Task DefaultPath_populatedCache_skipsDownload()
+    public async Task ExplicitOptInPath_populatedCache_skipsDownload()
     {
         // Same custom-id rationale: stub bytes wouldn't match pinned SHAs, so a cache-hit on the
         // default model would fail SHA verification and re-fetch. With a custom id (no pinned SHA)
@@ -134,7 +134,7 @@ public sealed class ModelDownloadGateFactoryTests : IDisposable
     }
 
     [Fact]
-    public async Task DefaultPath_emptyCache_defaultModel_swallowsShaMismatch()
+    public async Task ExplicitOptInPath_emptyCache_defaultModel_swallowsShaMismatch()
     {
         // With pinned SHAs on the default model, the stub handler's canned bytes will fail
         // verification. The gate factory's contract is that ModelDownloadException is caught

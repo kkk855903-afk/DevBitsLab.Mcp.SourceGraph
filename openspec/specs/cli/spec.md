@@ -82,7 +82,7 @@ priority: `--db` if given, then `<solution-dir>/.sourcegraph/graph.db` if
 - **THEN** the DB lands at the per-user cache path; CWD is never used
 
 ### Requirement: Embedding-related CLI flags
-The CLI SHALL accept `--model <id>` to override the embedding model, `--no-embeddings` to disable the embedding pipeline entirely, and `--no-model-download` to disable the auto-download step while still using a pre-populated cache. All three flags apply to `serve` and `index`. The `--no-model-download` flag SHALL also be settable via the `SOURCEGRAPH_NO_MODEL_DOWNLOAD` environment variable.
+The CLI SHALL accept `--model <id>` to override the embedding model, `--no-embeddings` to disable the embedding pipeline entirely, `--allow-model-download` to authorize automatic download, and `--no-model-download` as an explicit/legacy fail-closed switch while still using a pre-populated cache. These flags apply to `serve` and `index`. Automatic model download SHALL be disabled by default. `SOURCEGRAPH_ALLOW_MODEL_DOWNLOAD=1` SHALL be equivalent to the allow flag; `SOURCEGRAPH_NO_MODEL_DOWNLOAD=1` SHALL force offline mode and take precedence.
 
 #### Scenario: Disable embeddings
 - **WHEN** `sourcegraph-mcp serve --solution <sln> --no-embeddings` is invoked
@@ -90,7 +90,15 @@ The CLI SHALL accept `--model <id>` to override the embedding model, `--no-embed
 
 #### Scenario: Override model
 - **WHEN** the user passes `--model nomic-ai/CodeRankEmbed`
-- **THEN** the server resolves and (if needed) downloads that model best-effort (no SHA-256 verification, atomic rename still in place), ignores any cached embeddings whose `model_version` is different, and re-embeds on next index
+- **THEN** the server selects that model identity without issuing an HTTP request, ignores cached embeddings whose `model_version` is different, and either uses an already-populated cache or leaves semantic search disabled until the model is explicitly pulled or download is explicitly allowed
+
+#### Scenario: Default empty cache stays offline
+- **WHEN** `serve` or `index` starts with an empty model cache and no model-download flag or environment variable
+- **THEN** no HTTP request is issued, non-embedding indexing continues, and semantic search is disabled for that session
+
+#### Scenario: Explicitly allow automatic download
+- **WHEN** the user passes `--allow-model-download` or sets `SOURCEGRAPH_ALLOW_MODEL_DOWNLOAD=1` and the model cache is empty
+- **THEN** the server downloads the selected model best-effort and starts the embedding pipeline when the files are ready
 
 #### Scenario: Disable auto-download with empty cache
 - **WHEN** the user passes `--no-model-download` and the cache directory has no `model.onnx` or `tokenizer.json`
@@ -103,6 +111,10 @@ The CLI SHALL accept `--model <id>` to override the embedding model, `--no-embed
 #### Scenario: Disable auto-download via environment variable
 - **WHEN** the user starts the server with `SOURCEGRAPH_NO_MODEL_DOWNLOAD=1` and no `--no-model-download` flag
 - **THEN** the server behaves identically to the `--no-model-download` flag form
+
+#### Scenario: Fail-closed environment variable wins
+- **WHEN** `SOURCEGRAPH_NO_MODEL_DOWNLOAD=1` is set together with `--allow-model-download` or `SOURCEGRAPH_ALLOW_MODEL_DOWNLOAD=1`
+- **THEN** no HTTP request is issued and the pre-populated-cache-only behavior is retained
 
 ### Requirement: Scope-management subcommands
 The CLI SHALL accept `sourcegraph-mcp scopes list`, `sourcegraph-mcp scopes add <name> ...`, and `sourcegraph-mcp scopes remove <name>` to inspect and edit `.sourcegraph.json`.

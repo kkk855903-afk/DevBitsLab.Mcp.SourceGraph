@@ -15,7 +15,7 @@ namespace DevBitsLab.Mcp.SourceGraph.Server;
 ///         so an operator can pre-populate it.</item>
 ///   <item><c>noModelDownload</c> + populated cache: pre-completed gate, no warning, the
 ///         existing cache is used as-is.</item>
-///   <item>Default path: spawn <c>EnsureAsync</c> as a fire-and-don't-await background task,
+///   <item>Explicit opt-in path: spawn <c>EnsureAsync</c> as a fire-and-don't-await background task,
 ///         wrapped in a gate that completes when the download settles. <c>ModelDownloadException</c>
 ///         is caught and logged at warning so the awaiter never observes a faulted task.</item>
 /// </list>
@@ -38,8 +38,8 @@ internal static class ModelDownloadGateFactory
             if (!store.IsCached(modelInfo.ModelId))
             {
                 logger.LogWarning(
-                    "--no-model-download is set and the cache at {Dir} is empty; embeddings disabled for this session. " +
-                    "Pre-populate the cache with {Files} and restart, or remove --no-model-download to enable auto-download.",
+                    "Automatic model downloads are disabled and the cache at {Dir} is empty; embeddings disabled for this session. " +
+                    "Run 'sourcegraph-mcp embeddings pull' for an explicit download, or restart with --allow-model-download. Expected files: {Files}.",
                     store.DirectoryFor(modelInfo.ModelId),
                     string.Join(", ", DefaultEmbeddingModel.Manifest.Select(f => f.ResolvedLocalName)));
             }

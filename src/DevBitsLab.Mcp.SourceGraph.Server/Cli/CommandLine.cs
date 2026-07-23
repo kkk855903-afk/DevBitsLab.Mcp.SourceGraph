@@ -11,10 +11,10 @@ internal sealed class CommandLine
     public string? Model { get; private init; }
     /// <summary>Disable the embedding pipeline (no model download, no vec0 writes, semantic_search returns disabled-message).</summary>
     public bool NoEmbeddings { get; private init; }
-    /// <summary>True when <c>--no-model-download</c> was passed (or <c>SOURCEGRAPH_NO_MODEL_DOWNLOAD=1</c>);
-    /// disables auto-fetching the embedding model. With this flag the pipeline runs only if the cache is
-    /// already populated; otherwise it degrades to the same shape as <c>--no-embeddings</c>.</summary>
-    public bool NoModelDownload { get; private init; }
+    /// <summary>Disables automatic model downloads. Defaults to <see langword="true"/>; callers
+    /// must opt in with <c>--allow-model-download</c> or
+    /// <c>SOURCEGRAPH_ALLOW_MODEL_DOWNLOAD=1</c>. A populated local cache remains usable.</summary>
+    public bool NoModelDownload { get; private init; } = true;
     /// <summary>True when <c>--no-history</c> was passed; disables the git-blame pipeline.</summary>
     public bool NoHistory { get; private init; }
     /// <summary>True when <c>--no-instructions</c> was passed; suppresses the server-published
@@ -70,7 +70,18 @@ internal sealed class CommandLine
 
     public static CommandLine Parse(string[] args)
     {
-        if (args.Length == 0) return new CommandLine();
+        var forceNoModelDownload = string.Equals(
+            Environment.GetEnvironmentVariable("SOURCEGRAPH_NO_MODEL_DOWNLOAD"), "1", StringComparison.Ordinal);
+        var allowModelDownload = string.Equals(
+            Environment.GetEnvironmentVariable("SOURCEGRAPH_ALLOW_MODEL_DOWNLOAD"), "1", StringComparison.Ordinal);
+
+        if (args.Length == 0)
+        {
+            return new CommandLine
+            {
+                NoModelDownload = forceNoModelDownload || !allowModelDownload,
+            };
+        }
         if (args[0] is "-h" or "--help") return new CommandLine { ShowHelp = true };
 
         var subcommand = args[0];
@@ -79,8 +90,9 @@ internal sealed class CommandLine
         string? model = null;
         string? root = null;
         var noEmbeddings = false;
-        var noModelDownload = string.Equals(
-            Environment.GetEnvironmentVariable("SOURCEGRAPH_NO_MODEL_DOWNLOAD"), "1", StringComparison.Ordinal);
+        var noModelDownload = forceNoModelDownload || !allowModelDownload;
+        var sawAllowModelDownload = false;
+        var sawNoModelDownload = false;
         var noHistory = false;
         var noInstructions = false;
         var noLeaf = false;
@@ -129,6 +141,11 @@ internal sealed class CommandLine
                     break;
                 case "--no-model-download":
                     noModelDownload = true;
+                    sawNoModelDownload = true;
+                    break;
+                case "--allow-model-download":
+                    noModelDownload = false;
+                    sawAllowModelDownload = true;
                     break;
                 case "--no-history":
                     noHistory = true;
@@ -215,6 +232,17 @@ internal sealed class CommandLine
         if (solution is not null) AssertExpanded(solution, "--solution");
         if (db is not null) AssertExpanded(db, "--db");
         if (root is not null) AssertExpanded(root, "--root");
+        if (sawAllowModelDownload && sawNoModelDownload)
+        {
+            throw new ArgumentException(
+                "--allow-model-download and --no-model-download cannot be used together.");
+        }
+        if (forceNoModelDownload)
+        {
+            // Preserve the legacy environment variable as an operator-controlled fail-closed
+            // boundary even when a lower-precedence command line attempts to opt in.
+            noModelDownload = true;
+        }
 
         return new CommandLine
         {
@@ -305,12 +333,12 @@ internal sealed class CommandLine
         sourcegraph-mcp — live code source graph MCP server for .NET
 
         Usage:
-          sourcegraph-mcp serve [--solution <path>] [--db <path>] [--root <repo>] [--model <id>] [--no-embeddings] [--no-model-download] [--no-history]
+          sourcegraph-mcp serve [--solution <path>] [--db <path>] [--root <repo>] [--model <id>] [--no-embeddings] [--allow-model-download|--no-model-download] [--no-history]
               Run the MCP stdio server. With --solution given, registers an implicit single-scope
               `default` mapped to that solution. Otherwise reads `.sourcegraph.json` from --root
               (or CWD) for multi-scope configuration.
 
-          sourcegraph-mcp index <solution-path> [--db <path>] [--model <id>] [--no-embeddings] [--no-model-download] [--no-history]
+          sourcegraph-mcp index <solution-path> [--db <path>] [--model <id>] [--no-embeddings] [--allow-model-download|--no-model-download] [--no-history]
               Build/refresh the graph database from the given .sln file, then exit.
 
           sourcegraph-mcp stats [--db <path>]
@@ -368,8 +396,8 @@ internal sealed class CommandLine
 
           sourcegraph-mcp embeddings status [--model <id>]
               Print the cache directory, active model id and dimension, per-file presence/size/
-              SHA-256, and the free disk on the cache volume. Useful as a first stop when
-              `--no-model-download` warned the cache was empty.
+              SHA-256, and the free disk on the cache volume. Useful as a first stop when the
+              default offline mode reports that the cache is empty.
 
           sourcegraph-mcp embeddings pull [--model <id>]
               Synchronously download the active (or --model) manifest into the cache. Idempotent:
@@ -392,12 +420,15 @@ internal sealed class CommandLine
                             jinaai/jina-embeddings-v2-base-code). Applies to serve/index.
           --no-embeddings   Skip the embedding pipeline entirely. semantic_search returns the
                             disabled-message; every other tool works as before.
+          --allow-model-download
+                            Explicitly allow serve/index to auto-fetch the embedding model from
+                            Hugging Face when the local cache is empty. Automatic network access is
+                            disabled by default. Equivalent to SOURCEGRAPH_ALLOW_MODEL_DOWNLOAD=1.
           --no-model-download
-                            Disable auto-fetching the embedding model from Hugging Face. With this
-                            flag the pipeline runs only when the cache is already populated;
-                            otherwise it degrades to the same shape as --no-embeddings. Use in
-                            air-gapped environments where outbound network is denied. Equivalent
-                            to setting SOURCEGRAPH_NO_MODEL_DOWNLOAD=1.
+                            Explicitly retain the default offline mode. The pipeline uses an
+                            already-populated cache or degrades to the same shape as
+                            --no-embeddings. SOURCEGRAPH_NO_MODEL_DOWNLOAD=1 is retained for
+                            backwards-compatible fail-closed deployments.
           --no-history      Disable the git-blame history pipeline. Use in environments without
                             git on PATH or in CI runs where per-symbol history isn't needed.
           --no-instructions Don't publish server-side usage guidance in the MCP `initialize`
