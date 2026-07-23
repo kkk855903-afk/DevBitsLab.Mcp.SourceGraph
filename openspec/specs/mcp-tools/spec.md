@@ -45,6 +45,28 @@ call-site locations before occurrence evidence is available.
 - **WHEN** an MCP client lists tools
 - **THEN** `find_reference`, `find_callers`, `find_callees`, and `impact_analysis` are registered alongside `find_references`, `list_callers`, `list_callees`, and `impact_of_change`
 
+### Requirement: Evidence-first bounded call-path tracing
+The server SHALL expose the exact Phase 1 tool name `trace_call_path`. It SHALL traverse
+directed `calls` edges by default and MAY traverse another validated kebab-case relation through
+its `kind` parameter. Traversal SHALL be breadth-first, path-cycle-safe, and bounded by validated
+`maxDepth` (1-12), `maxPaths` (1-25), and `maxNodes` (1-5000) inputs. Reaching any configured
+bound while unexplored work remains SHALL set `truncated = true`; the tool SHALL never silently
+return an unbounded or incomplete result.
+
+Every returned hop SHALL identify the source and target symbol, relation, and confidence, and
+SHALL include the stored occurrence evidence: producing file path, 1-based half-open start/end
+range, evidence confidence, producer, and metadata. The path confidence SHALL be the weakest
+confidence among its hops. A malformed logical edge with no stored evidence SHALL be skipped;
+the tool SHALL NOT invent a call site.
+
+#### Scenario: Every call-path hop is independently auditable
+- **WHEN** `A` calls `B` at one indexed source range and `B` calls `C` at another, and the agent invokes `trace_call_path(from = "A", to = "C")`
+- **THEN** the returned path contains both hops, each hop contains its own file/range evidence and relation, and the path confidence is the weaker of the two hop confidences
+
+#### Scenario: Cycles and resource limits remain bounded
+- **WHEN** the graph contains a cycle reachable from the source or traversal reaches a configured depth, path, node, or per-hop evidence cap
+- **THEN** traversal terminates without repeating a symbol within the same path and reports truncation whenever unexplored work or evidence may remain
+
 #### Scenario: List callers (default = calls)
 - **WHEN** the agent invokes `list_callers(symbol = "Calculator.Add")`
 - **THEN** the response lists every symbol with an outgoing edge whose `kind_name = 'calls'` and whose `dst` is the resolved id

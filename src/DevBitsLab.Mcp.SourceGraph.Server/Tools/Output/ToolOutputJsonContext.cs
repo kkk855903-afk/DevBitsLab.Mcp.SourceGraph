@@ -28,6 +28,7 @@ namespace DevBitsLab.Mcp.SourceGraph.Server.Tools.Output;
 [JsonSerializable(typeof(NeighborhoodResult))]
 [JsonSerializable(typeof(ModuleSummaryResult))]
 [JsonSerializable(typeof(ImpactOfChangeResult))]
+[JsonSerializable(typeof(TraceCallPathResult))]
 [JsonSerializable(typeof(SemanticSearchResult))]
 [JsonSerializable(typeof(FindDiagnosticsResult))]
 [JsonSerializable(typeof(RecentChangesResult))]

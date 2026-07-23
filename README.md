@@ -326,6 +326,7 @@ to the client at handshake time.
 | `module_summary` | Top symbols in a namespace or directory by inbound call count |
 | `impact_of_change` | Transitive upstream callers of X up to `maxDepth` |
 | `impact_analysis` | Phase 1 compatibility name for `impact_of_change`. |
+| `trace_call_path` | Bounded, cycle-safe directed paths from one symbol to another. Every hop includes its source and target symbols, edge relation, confidence, and occurrence-level file/range evidence; configurable depth, path, and node caps report truncation explicitly. |
 | `find_data_bindings` | Walks `binds-path` edges with payload-aware filters (`path`, `mode`, `converter`, plus optional `target` / `source` canonical keys). Answers "where does this property bind?", "find every TwoWay binding", "which views use this converter?". Soft-empty `note:` when the active scope hasn't loaded an indexer that emits `binds-path`. |
 | `find_event_handlers` | Walks `handles-event` edges with `event` / `command` payload filters and optional `handler` / `element` canonical keys. Answers "find all Click handlers", "where is OnSave wired up?". Same soft-empty pattern as `find_data_bindings`. |
 
