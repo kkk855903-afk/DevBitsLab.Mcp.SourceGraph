@@ -10,6 +10,7 @@ using DevBitsLab.Mcp.SourceGraph.Storage;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
+using Microsoft.CodeAnalysis.Diagnostics;
 using Microsoft.CodeAnalysis.MSBuild;
 using Microsoft.CodeAnalysis.Text;
 using Microsoft.Extensions.Logging;
@@ -86,6 +87,8 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
     private IReadOnlyDictionary<ProjectId, Compilation> _probedCompilations = new Dictionary<ProjectId, Compilation>();
     private IReadOnlyList<ProjectFailure> _probedFailures = Array.Empty<ProjectFailure>();
     private HashSet<ProjectId> _probedFailedProjectIds = new();
+    private IReadOnlyDictionary<ProjectId, bool> _analyzerReferenceLoadCompleteByProject =
+        new Dictionary<ProjectId, bool>();
 
     /// <summary>
     /// Fires once per (re)indexed file with <c>(fileId, fullPath, contentSha256)</c>. The Server
@@ -180,24 +183,38 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
     {
         var workspace = _workspace;
         var sanitized = _sanitizedSolution;
-        if (workspace is null || sanitized is null || _disposed) return false;
+        var analyzerReferenceState = _analyzerReferenceLoadCompleteByProject;
+        var requiresStructuralReload = _requiresStructuralReload;
+        if (workspace is null
+            || sanitized is null
+            || _disposed
+            || requiresStructuralReload)
+        {
+            return false;
+        }
 
         var complete = IsProjectSemanticInputComplete(
             workspace.CurrentSolution,
             sanitized,
-            projectFilePath);
+            projectFilePath,
+            analyzerReferenceState);
 
         // A structural reload can swap either snapshot while this read-only comparison runs.
         // Treat a mixed generation as incomplete and let the next dispatch retry.
         return complete
                && ReferenceEquals(workspace, _workspace)
-               && ReferenceEquals(sanitized, _sanitizedSolution);
+               && ReferenceEquals(sanitized, _sanitizedSolution)
+               && ReferenceEquals(
+                   analyzerReferenceState,
+                   _analyzerReferenceLoadCompleteByProject)
+               && requiresStructuralReload == _requiresStructuralReload;
     }
 
     internal static bool IsProjectSemanticInputComplete(
         Solution rawSolution,
         Solution sanitized,
-        string projectFilePath)
+        string projectFilePath,
+        IReadOnlyDictionary<ProjectId, bool>? analyzerReferenceLoadCompleteByProject = null)
     {
         ArgumentNullException.ThrowIfNull(rawSolution);
         ArgumentNullException.ThrowIfNull(sanitized);
@@ -233,6 +250,11 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
 
             var safeProject = sanitized.GetProject(rawProject.Id);
             if (safeProject is null
+                || (analyzerReferenceLoadCompleteByProject is not null
+                    && (!analyzerReferenceLoadCompleteByProject.TryGetValue(
+                            rawProject.Id,
+                            out var analyzerReferencesComplete)
+                        || !analyzerReferencesComplete))
                 || rawProject.Documents.Any(document =>
                     safeProject.GetDocument(document.Id) is null)
                 || rawProject.AdditionalDocuments.Any(document =>
@@ -330,6 +352,8 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                 previousWorkspace is not null && _requiresStructuralReload;
             _workspace = candidateWorkspace;
             _sanitizedSolution = candidateSolution;
+            _analyzerReferenceLoadCompleteByProject =
+                new Dictionary<ProjectId, bool>();
             _pathPolicy = candidatePathPolicy;
             _solutionPath = candidateSolutionPath;
             _requiresStructuralReload = preserveStructuralReload;
@@ -643,8 +667,12 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         var replacementPaths = RegularCSharpDocumentPaths(replacementSolution, pathPolicy);
         var previousWorkspace = _workspace!;
         var previousSolution = _sanitizedSolution!;
+        var previousAnalyzerReferenceState =
+            _analyzerReferenceLoadCompleteByProject;
         _workspace = replacementWorkspace;
         _sanitizedSolution = replacementSolution;
+        _analyzerReferenceLoadCompleteByProject =
+            new Dictionary<ProjectId, bool>();
         IndexResult result;
         try
         {
@@ -682,6 +710,8 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
             // next watcher batch and therefore force another reload + full reconciliation.
             _workspace = previousWorkspace;
             _sanitizedSolution = previousSolution;
+            _analyzerReferenceLoadCompleteByProject =
+                previousAnalyzerReferenceState;
             DisposeWorkspace(replacementWorkspace);
             throw;
         }
@@ -991,17 +1021,60 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
     /// </summary>
     [SuppressMessage("Design", "CA1031:DoNotCatchGeneralExceptionTypes",
         Justification = "A misbehaving project (unresolvable references, malformed csproj, source-generator throwing during compilation construction) must not abort the entire indexing pass. Each failure is logged and converted into a ProjectFailure record so the scope can settle to `partial` rather than `degraded`.")]
-    private async Task ProbeProjectCompilationsAsync(IEnumerable<Project> projects, CancellationToken ct)
+    private async Task ProbeProjectCompilationsAsync(
+        IEnumerable<Project> projects,
+        CancellationToken ct)
     {
         var ok = new Dictionary<ProjectId, Compilation>();
         var failed = new List<ProjectFailure>();
         var failedIds = new HashSet<ProjectId>();
+        var analyzerReferenceState =
+            _analyzerReferenceLoadCompleteByProject.ToDictionary(
+                pair => pair.Key,
+                pair => pair.Value);
         foreach (var project in projects)
         {
             if (project.Language != LanguageNames.CSharp) continue;
             ct.ThrowIfCancellationRequested();
+            var analyzerLoadFailed = false;
+            var generatorDiscoveryComplete = true;
+            EventHandler<AnalyzerLoadFailureEventArgs> loadFailureHandler =
+                (_, _) => analyzerLoadFailed = true;
+            var analyzerFileReferences = project.AnalyzerReferences
+                .OfType<AnalyzerFileReference>()
+                .ToArray();
+            foreach (var reference in analyzerFileReferences)
+            {
+                reference.AnalyzerLoadFailed += loadFailureHandler;
+            }
+
             try
             {
+                // This is the first generator-reference access in the production indexing flow.
+                // Capture AnalyzerFileReference failures before GetCompilationAsync can cache an
+                // empty per-language result and make a later WPF subscriber miss the one-shot
+                // AnalyzerLoadFailed event. Enumerating generator instances does not execute them.
+                foreach (var reference in project.AnalyzerReferences)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    try
+                    {
+                        _ = reference.GetGenerators(project.Language);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        throw;
+                    }
+                    catch (Exception ex)
+                    {
+                        generatorDiscoveryComplete = false;
+                        _logger.LogWarning(
+                            ex,
+                            "Project {Project} generator discovery threw",
+                            project.Name);
+                    }
+                }
+
                 var compilation = await project.GetCompilationAsync(ct).ConfigureAwait(false);
                 if (compilation is null)
                 {
@@ -1013,6 +1086,13 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                 {
                     ok[project.Id] = compilation;
                 }
+
+                RecordAnalyzerReferenceState(
+                    analyzerReferenceState,
+                    project.Id,
+                    generatorDiscoveryComplete
+                    && !analyzerLoadFailed
+                    && compilation is not null);
             }
             catch (OperationCanceledException) { throw; }
             catch (Exception ex)
@@ -1020,11 +1100,37 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                 _logger.LogWarning(ex, "Project {Project} compilation threw; skipping", project.Name);
                 failed.Add(new ProjectFailure(project.Name, FailureMessage.Truncate(ex.Message)));
                 failedIds.Add(project.Id);
+                RecordAnalyzerReferenceState(
+                    analyzerReferenceState,
+                    project.Id,
+                    isComplete: false);
+            }
+            finally
+            {
+                foreach (var reference in analyzerFileReferences)
+                {
+                    reference.AnalyzerLoadFailed -= loadFailureHandler;
+                }
             }
         }
         _probedCompilations = ok;
         _probedFailures = failed;
         _probedFailedProjectIds = failedIds;
+        _analyzerReferenceLoadCompleteByProject = analyzerReferenceState;
+
+        static void RecordAnalyzerReferenceState(
+            Dictionary<ProjectId, bool> states,
+            ProjectId projectId,
+            bool isComplete)
+        {
+            // AnalyzerFileReference caches a failed first load as an empty extension array and
+            // does not raise AnalyzerLoadFailed on later reads. Negative evidence must therefore
+            // be sticky for this workspace/reference generation. OpenAsync and structural reload
+            // replace the AnalyzerFileReference instances and explicitly clear this map.
+            states[projectId] =
+                (!states.TryGetValue(projectId, out var prior) || prior)
+                && isComplete;
+        }
     }
 
     private async Task<CSharpDocumentDiscovery> AllCSharpDocumentsAsync(
@@ -2747,6 +2853,8 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
             var workspace = _workspace;
             _workspace = null;
             _sanitizedSolution = null;
+            _analyzerReferenceLoadCompleteByProject =
+                new Dictionary<ProjectId, bool>();
             _pathPolicy = null;
             _solutionPath = null;
             _requiresStructuralReload = false;
