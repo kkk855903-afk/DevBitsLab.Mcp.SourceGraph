@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Collections.Immutable;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
@@ -38,6 +39,14 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
 {
     /// <summary>The single .cs extension this indexer claims.</summary>
     private static readonly IReadOnlyCollection<string> _fileExtensions = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { ".cs" };
+    private static readonly StringComparer _pathComparer =
+        OperatingSystem.IsWindows()
+            ? StringComparer.OrdinalIgnoreCase
+            : StringComparer.Ordinal;
+    private static readonly StringComparison _pathComparison =
+        OperatingSystem.IsWindows()
+            ? StringComparison.OrdinalIgnoreCase
+            : StringComparison.Ordinal;
     /// <inheritdoc />
     IReadOnlyCollection<string> ILanguageIndexer.FileExtensions => _fileExtensions;
 
@@ -47,14 +56,24 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
     private readonly SemaphoreSlim _lock = new(1, 1);
     private readonly string? _configuredPrivacyRoot;
     private readonly IReadOnlyList<string> _configuredExcludePatterns;
+    private readonly TestHooks? _testHooks;
+    private readonly ConcurrentDictionary<
+        MSBuildWorkspace,
+        ConcurrentQueue<WorkspaceDiagnostic>> _workspaceDiagnostics = new();
 
     private MSBuildWorkspace? _workspace;
     private Solution? _sanitizedSolution;
     private ScopePathPolicy? _pathPolicy;
     private string? _solutionPath;
+    private bool _requiresStructuralReload;
+    private bool _disposed;
+    private bool _mapsHydrated;
+    private readonly HashSet<string> _confirmedOutsideSolutionPaths =
+        new(_pathComparer);
 
     private readonly Dictionary<string, long> _symbolIdByKey = new(StringComparer.Ordinal);
-    private readonly Dictionary<string, long> _fileIdByPath = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, long> _fileIdByPath = new(_pathComparer);
+    private readonly Dictionary<long, string> _storedPathByFileId = new();
     private readonly Dictionary<long, List<string>> _keysByFileId = new();
 
     // Set fresh by ProbeProjectCompilationsAsync at the start of every indexing pass. Read by
@@ -75,6 +94,23 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
     /// </summary>
     public Func<long, string, byte[], Task>? OnFileIndexed { get; set; }
 
+    internal sealed record WorkspaceOpenResult(
+        Solution Solution,
+        IReadOnlyList<WorkspaceDiagnostic> Diagnostics);
+
+    internal sealed record TestHooks(
+        Func<
+            MSBuildWorkspace,
+            string,
+            CancellationToken,
+            Task<WorkspaceOpenResult>>? OpenWorkspaceAsync = null,
+        Func<string, CancellationToken, Task<byte[]>>? ReadIncrementalBytesAsync = null,
+        Func<string, CancellationToken, Task<byte[]>>? ReadIndexCoreBytesAsync = null,
+        Action<MSBuildWorkspace>? WorkspaceDisposed = null,
+        Func<Task>? DisposeAsyncEntered = null,
+        Func<SourceGeneratedDocument, string>? GeneratedOwnerIdentity = null,
+        Func<SourceGeneratedDocument, string>? GeneratedDisplayPath = null);
+
     public RoslynIndexer(
         IGraphStore store,
         ILogger<RoslynIndexer>? logger = null,
@@ -90,12 +126,30 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         IEmbeddingsRequestSink? embeddingsSink,
         string? privacyRoot,
         IReadOnlyList<string>? excludePatterns)
+        : this(
+            store,
+            logger,
+            embeddingsSink,
+            privacyRoot,
+            excludePatterns,
+            testHooks: null)
+    {
+    }
+
+    internal RoslynIndexer(
+        IGraphStore store,
+        ILogger<RoslynIndexer>? logger,
+        IEmbeddingsRequestSink? embeddingsSink,
+        string? privacyRoot,
+        IReadOnlyList<string>? excludePatterns,
+        TestHooks? testHooks)
     {
         _store = store;
         _logger = logger ?? NullLogger<RoslynIndexer>.Instance;
         _embeddingsSink = embeddingsSink ?? new NoOpEmbeddingsRequestSink();
         _configuredPrivacyRoot = privacyRoot is null ? null : Path.GetFullPath(privacyRoot);
         _configuredExcludePatterns = excludePatterns?.ToArray() ?? Array.Empty<string>();
+        _testHooks = testHooks;
     }
 
     public string? SolutionPath => _solutionPath;
@@ -117,53 +171,90 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
 
     public async Task OpenAsync(string solutionPath, CancellationToken ct = default)
     {
-        MSBuildHost.EnsureRegistered();
-        await _store.EnsureSchemaAsync(ct).ConfigureAwait(false);
-
-        _solutionPath = Path.GetFullPath(solutionPath);
-        var privacyRoot = _configuredPrivacyRoot ?? Path.GetDirectoryName(_solutionPath)
-            ?? throw new InvalidOperationException("The solution path has no containing directory.");
-        _pathPolicy = new ScopePathPolicy(privacyRoot, _configuredExcludePatterns);
-        if (_pathPolicy.IsExcluded(_solutionPath))
+        await _lock.WaitAsync(ct).ConfigureAwait(false);
+        try
         {
-            throw new InvalidOperationException("The solution path is outside the indexing privacy boundary.");
-        }
+            ThrowIfDisposed();
+            MSBuildHost.EnsureRegistered();
+            await _store.EnsureSchemaAsync(ct).ConfigureAwait(false);
 
-        _workspace = MSBuildWorkspace.Create();
-        _workspace.RegisterWorkspaceFailedHandler(e =>
-        {
-            if (e.Diagnostic.Kind == WorkspaceDiagnosticKind.Failure)
+            var candidateSolutionPath = Path.GetFullPath(solutionPath);
+            var privacyRoot = _configuredPrivacyRoot ?? Path.GetDirectoryName(candidateSolutionPath)
+                ?? throw new InvalidOperationException("The solution path has no containing directory.");
+            var candidatePathPolicy = new ScopePathPolicy(
+                privacyRoot,
+                _configuredExcludePatterns);
+            if (candidatePathPolicy.IsExcluded(candidateSolutionPath))
             {
-                _logger.LogWarning("Workspace failure: {Message}", e.Diagnostic.Message);
+                throw new InvalidOperationException("The solution path is outside the indexing privacy boundary.");
             }
-        });
 
-        var sw = Stopwatch.StartNew();
-        // MSBuildWorkspace evaluates project files before Roslyn gives us a Solution to filter.
-        // Sanitizing immediately after OpenSolutionAsync prevents excluded documents from reaching
-        // compilation, generators, diagnostics, or persistence, but it does not sandbox MSBuild
-        // evaluation itself. Untrusted solutions still need process/OS isolation.
-        var loadedSolution = await _workspace.OpenSolutionAsync(
-            _solutionPath,
-            cancellationToken: ct).ConfigureAwait(false);
-        _sanitizedSolution = SolutionPrivacySanitizer.SanitizeForScope(loadedSolution, _pathPolicy);
-        _logger.LogInformation("Opened {Path} ({ProjectCount} projects) in {Elapsed}",
-            _solutionPath, _sanitizedSolution.Projects.Count(), sw.Elapsed);
+            var sw = Stopwatch.StartNew();
+            // MSBuildWorkspace evaluates project files before Roslyn gives us a Solution to filter.
+            // Sanitizing immediately after OpenSolutionAsync prevents excluded documents from
+            // reaching compilation, generators, diagnostics, or persistence, but it does not
+            // sandbox MSBuild evaluation itself. Untrusted solutions still need process/OS
+            // isolation.
+            var candidateWorkspace = CreateWorkspace();
+            Solution candidateSolution;
+            try
+            {
+                var openResult = await OpenWorkspaceSolutionAsync(
+                    candidateWorkspace,
+                    candidateSolutionPath,
+                    ct).ConfigureAwait(false);
+                ThrowIfWorkspaceLoadFailed(
+                    openResult.Diagnostics,
+                    _workspace is null ? "Initial" : "Re-open");
+                candidateSolution = SolutionPrivacySanitizer.SanitizeForScope(
+                    openResult.Solution,
+                    candidatePathPolicy);
+            }
+            catch
+            {
+                DisposeWorkspace(candidateWorkspace);
+                throw;
+            }
+
+            var previousWorkspace = _workspace;
+            var preserveStructuralReload =
+                previousWorkspace is not null && _requiresStructuralReload;
+            _workspace = candidateWorkspace;
+            _sanitizedSolution = candidateSolution;
+            _pathPolicy = candidatePathPolicy;
+            _solutionPath = candidateSolutionPath;
+            _requiresStructuralReload = preserveStructuralReload;
+            _confirmedOutsideSolutionPaths.Clear();
+            if (previousWorkspace is not null)
+            {
+                DisposeWorkspace(previousWorkspace);
+            }
+
+            _logger.LogInformation(
+                "Opened {Path} ({ProjectCount} projects) in {Elapsed}",
+                candidateSolutionPath,
+                candidateSolution.Projects.Count(),
+                sw.Elapsed);
+        }
+        finally
+        {
+            _lock.Release();
+        }
     }
 
     public async Task<IndexResult> IndexAllAsync(CancellationToken ct = default)
     {
-        EnsureOpen();
         await _lock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
-            var solution = SolutionPrivacySanitizer.SanitizeForScope(
-                _sanitizedSolution!,
-                _pathPolicy!);
-            _sanitizedSolution = solution;
-            await ProbeProjectCompilationsAsync(solution.Projects, ct).ConfigureAwait(false);
-            var docs = (await AllCSharpDocumentsAsync(solution, ct).ConfigureAwait(false)).ToList();
-            return await IndexCoreAsync(docs, fullReset: false, ct).ConfigureAwait(false);
+            EnsureOpen();
+            if (_requiresStructuralReload)
+            {
+                return await ReloadAndIndexAllCoreAsync(
+                    structuralCandidates: null,
+                    ct).ConfigureAwait(false);
+            }
+            return await IndexAllCoreAsync(fullReset: false, ct).ConfigureAwait(false);
         }
         finally
         {
@@ -173,59 +264,97 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
 
     public async Task<IndexResult> IndexChangedFilesAsync(IReadOnlyCollection<string> paths, CancellationToken ct = default)
     {
-        EnsureOpen();
-        if (paths.Count == 0) return new IndexResult(0, 0, 0, TimeSpan.Zero);
-
         await _lock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
+            EnsureOpen();
             var pathPolicy = _pathPolicy!;
             // Build an updated Solution snapshot in memory. We do NOT call
             // _workspace.TryApplyChanges — MSBuildWorkspace refuses ChangeDocument by default and
             // would throw. The local `solution` value is what IndexCoreAsync walks.
             var solution = _sanitizedSolution!;
-            var pathSet = new HashSet<string>(
-                paths.Select(Path.GetFullPath).Where(path => !pathPolicy.IsExcluded(path)),
-                StringComparer.OrdinalIgnoreCase);
-            if (pathSet.Count == 0)
+            var pathSet = new HashSet<string>(_pathComparer);
+            var pathFailures = new List<FileFailure>();
+            foreach (var rawPath in paths)
             {
-                return new IndexResult(0, 0, 0, TimeSpan.Zero);
-            }
-            var docs = new List<Document>();
-            var deleted = new List<string>();
-
-            foreach (var p in pathSet)
-            {
-                if (pathPolicy.IsExcluded(p)) continue;
-                var docIds = solution.GetDocumentIdsWithFilePath(p);
-                if (docIds.IsEmpty)
-                {
-                    // not part of solution; ignore
-                    continue;
-                }
-                if (!File.Exists(p))
-                {
-                    deleted.Add(p);
-                    continue;
-                }
-                string content;
+                ct.ThrowIfCancellationRequested();
+                string fullPath;
                 try
                 {
-                    // Editor saves can briefly expose a 0-byte view of the file; treat read errors
-                    // as "skip this file for this batch". The watcher will fire again once the save
-                    // settles.
-                    content = await File.ReadAllTextAsync(p, ct).ConfigureAwait(false);
+                    fullPath = Path.GetFullPath(rawPath);
                 }
-                catch (IOException ex)
+                catch (Exception ex) when (
+                    ex is ArgumentException
+                        or NotSupportedException
+                        or PathTooLongException
+                        or System.Security.SecurityException)
                 {
-                    _logger.LogDebug(ex, "Skipping {Path} for this batch (read failed; will retry)", p);
+                    AddFileFailure(
+                        pathFailures,
+                        rawPath ?? "<null>",
+                        FailureMessage.Truncate(ex.Message));
                     continue;
                 }
-                var text = SourceText.From(content);
-                foreach (var did in docIds)
+
+                if (string.Equals(
+                        Path.GetExtension(fullPath),
+                        ".cs",
+                        StringComparison.OrdinalIgnoreCase)
+                    && !pathPolicy.IsExcluded(fullPath))
                 {
-                    solution = solution.WithDocumentText(did, text);
+                    pathSet.Add(fullPath);
                 }
+            }
+            if (pathSet.Count == 0)
+            {
+                return new IndexResult(0, 0, 0, TimeSpan.Zero)
+                {
+                    FailedFiles = pathFailures,
+                };
+            }
+
+            if (_requiresStructuralReload)
+            {
+                var retryResult = await ReloadAndIndexAllCoreAsync(
+                    pathSet,
+                    ct).ConfigureAwait(false);
+                return WithAdditionalFileFailures(retryResult, pathFailures);
+            }
+
+            // Roslyn's immutable Solution can accept new text for documents it already knows,
+            // but it cannot discover a newly included SDK-style Compile item, and retaining a
+            // deleted Document would keep stale declarations alive. Treat those changes (and a
+            // rename, which arrives as delete + create) as solution-structure changes. Reload
+            // while this method still owns _lock so no incremental pass can observe the gap
+            // between the new workspace snapshot and its full graph reconciliation.
+            var structuralPaths = pathSet
+                .Where(path => IsCSharpStructureChange(solution, path))
+                .ToArray();
+            if (structuralPaths.Length > 0)
+            {
+                _requiresStructuralReload = true;
+                var structuralResult = await ReloadAndIndexAllCoreAsync(
+                    structuralPaths,
+                    ct).ConfigureAwait(false);
+                return WithAdditionalFileFailures(structuralResult, pathFailures);
+            }
+
+            var docs = new List<Document>();
+            var preIndexFailures = new List<FileFailure>(pathFailures);
+            var snapshotPreparation = await PrepareRegularDocumentSnapshotsAsync(
+                solution,
+                pathSet,
+                incremental: true,
+                ct).ConfigureAwait(false);
+            solution = snapshotPreparation.Solution;
+            var projectsWithReadFailures = snapshotPreparation.FailedProjectIds;
+            foreach (var failure in snapshotPreparation.Failures)
+            {
+                AddFileFailure(preIndexFailures, failure.Path, failure.Reason);
+            }
+            if (projectsWithReadFailures.Count > 0)
+            {
+                _requiresStructuralReload = true;
             }
 
             _sanitizedSolution = solution;
@@ -234,12 +363,13 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
             var touchedProjects = new HashSet<ProjectId>();
             foreach (var p in pathSet)
             {
-                if (deleted.Contains(p, StringComparer.OrdinalIgnoreCase)) continue;
                 var docIds = solution.GetDocumentIdsWithFilePath(p);
                 foreach (var did in docIds)
                 {
                     var d = solution.GetDocument(did);
-                    if (d is not null && d.SourceCodeKind == SourceCodeKind.Regular)
+                    if (d is not null
+                        && d.SourceCodeKind == SourceCodeKind.Regular
+                        && !projectsWithReadFailures.Contains(d.Project.Id))
                     {
                         docs.Add(d);
                         touchedProjects.Add(d.Project.Id);
@@ -257,41 +387,31 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
             // For every project whose input files changed, also walk its source-generated docs.
             // The SHA gate inside IndexCoreAsync will skip generated docs whose synthesised text
             // hasn't changed (per design.md "SHA gate on generated content").
-            foreach (var pid in touchedProjects)
+            var touchedProjectInstances = touchedProjects
+                .Select(pid => solution.GetProject(pid))
+                .Where(project => project is not null)
+                .Cast<Project>()
+                .ToArray();
+            var generatedDiscovery = await DiscoverSourceGeneratedDocumentsAsync(
+                touchedProjectInstances.Where(project =>
+                    !_probedFailedProjectIds.Contains(project.Id)),
+                ct).ConfigureAwait(false);
+            docs.AddRange(generatedDiscovery.Documents);
+            foreach (var failure in generatedDiscovery.Failures)
             {
-                if (_probedFailedProjectIds.Contains(pid)) continue;
-                var project = solution.GetProject(pid);
-                if (project is null || project.Language != LanguageNames.CSharp) continue;
-                IEnumerable<SourceGeneratedDocument> sourceGenDocs;
-                try
-                {
-                    sourceGenDocs = await project.GetSourceGeneratedDocumentsAsync(ct).ConfigureAwait(false);
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning(ex, "Source generator failure for project {Project} during incremental reindex", project.Name);
-                    continue;
-                }
-                foreach (var d in sourceGenDocs)
-                {
-                    if (string.IsNullOrEmpty(d.FilePath)) continue;
-                    docs.Add(d);
-                }
+                AddFileFailure(preIndexFailures, failure.Path, failure.Reason);
+            }
+            if (!generatedDiscovery.IsComplete)
+            {
+                _requiresStructuralReload = true;
             }
 
-            // handle deletions: clear store and drop from maps
-            foreach (var p in deleted)
-            {
-                if (_fileIdByPath.TryGetValue(p, out var fid))
-                {
-                    await _store.ClearFileOutgoingAsync(fid, ct).ConfigureAwait(false);
-                    await _store.DeleteSymbolsForFileNotInAsync(fid, Array.Empty<string>(), ct).ConfigureAwait(false);
-                    DropFileFromMaps(fid);
-                    _fileIdByPath.Remove(p);
-                }
-            }
-
-            return await IndexCoreAsync(docs, fullReset: false, ct).ConfigureAwait(false);
+            return await IndexCoreAsync(
+                docs,
+                fullReset: false,
+                preIndexFailures,
+                snapshotPreparation.Snapshots,
+                ct).ConfigureAwait(false);
         }
         finally
         {
@@ -301,34 +421,450 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
 
     public async Task<IndexResult> ReloadAndIndexAllAsync(CancellationToken ct = default)
     {
-        EnsureOpen();
-        var slnPath = _solutionPath!;
         await _lock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
-            if (_pathPolicy!.IsExcluded(slnPath))
-            {
-                throw new InvalidOperationException(
-                    "The solution path is outside the indexing privacy boundary.");
-            }
-            _workspace!.CloseSolution();
-            var loadedSolution = await _workspace.OpenSolutionAsync(
-                slnPath,
-                cancellationToken: ct).ConfigureAwait(false);
-            _sanitizedSolution = SolutionPrivacySanitizer.SanitizeForScope(loadedSolution, _pathPolicy!);
+            EnsureOpen();
+            _confirmedOutsideSolutionPaths.Clear();
+            _requiresStructuralReload = true;
+            return await ReloadAndIndexAllCoreAsync(
+                structuralCandidates: null,
+                ct).ConfigureAwait(false);
         }
         finally
         {
             _lock.Release();
         }
-        return await IndexAllAsync(ct).ConfigureAwait(false);
+    }
+
+    private async Task<IndexResult> IndexAllCoreAsync(bool fullReset, CancellationToken ct)
+    {
+        var solution = SolutionPrivacySanitizer.SanitizeForScope(
+            _sanitizedSolution!,
+            _pathPolicy!);
+        var snapshotPreparation = await PrepareRegularDocumentSnapshotsAsync(
+            solution,
+            selectedPaths: null,
+            incremental: false,
+            ct).ConfigureAwait(false);
+        solution = snapshotPreparation.Solution;
+        _sanitizedSolution = solution;
+        await ProbeProjectCompilationsAsync(
+            solution.Projects.Where(project =>
+                !snapshotPreparation.FailedProjectIds.Contains(project.Id)),
+            ct).ConfigureAwait(false);
+        _probedFailedProjectIds.UnionWith(snapshotPreparation.FailedProjectIds);
+        var discovery = await AllCSharpDocumentsAsync(solution, ct).ConfigureAwait(false);
+        if (!discovery.IsComplete)
+        {
+            _requiresStructuralReload = true;
+        }
+        var initialFailures = snapshotPreparation.Failures.ToList();
+        foreach (var failure in discovery.Failures)
+        {
+            AddFileFailure(initialFailures, failure.Path, failure.Reason);
+        }
+        var result = await IndexCoreAsync(
+            discovery.Documents,
+            fullReset,
+            initialFailures,
+            snapshotPreparation.Snapshots,
+            ct).ConfigureAwait(false);
+        var passIsComplete =
+            discovery.IsComplete
+            && result.FailedProjects.Count == 0
+            && result.FailedFiles.Count == 0;
+        if (passIsComplete)
+        {
+            await ReconcileGeneratedFilesAsync(
+                discovery.GeneratedPaths,
+                ct).ConfigureAwait(false);
+        }
+        else
+        {
+            // Complete discovery only proves that we know the current owner set. A later
+            // phase may still have failed before it rebuilt an owner's symbols/references.
+            // Deleting prior-workspace owners in that state would turn a visible partial
+            // result into irreversible graph loss. Retain them until one complete pass has
+            // both discovered and indexed every current owner successfully.
+            _requiresStructuralReload = true;
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Reloads the solution and performs a forced full graph pass. The caller must own
+    /// <see cref="_lock"/>; keeping reload and indexing in one critical section prevents another
+    /// live batch from indexing against the replacement snapshot before stale files are removed.
+    /// </summary>
+    private async Task<IndexResult> ReloadAndIndexAllCoreAsync(
+        IReadOnlyCollection<string>? structuralCandidates,
+        CancellationToken ct)
+    {
+        _requiresStructuralReload = true;
+        var slnPath = _solutionPath!;
+        var pathPolicy = _pathPolicy!;
+        if (pathPolicy.IsExcluded(slnPath))
+        {
+            throw new InvalidOperationException(
+                "The solution path is outside the indexing privacy boundary.");
+        }
+
+        ct.ThrowIfCancellationRequested();
+        var previousPaths = RegularCSharpDocumentPaths(_sanitizedSolution!, pathPolicy);
+        var replacementWorkspace = CreateWorkspace();
+        Solution replacementSolution;
+        try
+        {
+            var openResult = await OpenWorkspaceSolutionAsync(
+                replacementWorkspace,
+                slnPath,
+                ct).ConfigureAwait(false);
+            ThrowIfWorkspaceLoadFailed(openResult.Diagnostics, "Replacement");
+            replacementSolution = SolutionPrivacySanitizer.SanitizeForScope(
+                openResult.Solution,
+                pathPolicy);
+        }
+        catch
+        {
+            DisposeWorkspace(replacementWorkspace);
+            throw;
+        }
+
+        var replacementPaths = RegularCSharpDocumentPaths(replacementSolution, pathPolicy);
+        var previousWorkspace = _workspace!;
+        var previousSolution = _sanitizedSolution!;
+        _workspace = replacementWorkspace;
+        _sanitizedSolution = replacementSolution;
+        IndexResult result;
+        try
+        {
+            if (!_mapsHydrated)
+            {
+                await HydrateMapsFromStoreAsync(ct).ConfigureAwait(false);
+            }
+            foreach (var removedPath in previousPaths.Except(
+                         replacementPaths,
+                         _pathComparer))
+            {
+                ct.ThrowIfCancellationRequested();
+                if (_fileIdByPath.TryGetValue(removedPath, out var removedFileId)
+                    && _storedPathByFileId.TryGetValue(removedFileId, out var storedPath))
+                {
+                    await _store.DeleteFileAsync(storedPath, ct).ConfigureAwait(false);
+                    DropFileFromMaps(removedFileId);
+                }
+                else
+                {
+                    await _store.DeleteFileAsync(removedPath, ct).ConfigureAwait(false);
+                }
+            }
+
+            // fullReset deliberately bypasses the SHA gate for every surviving document. That is
+            // required after a structural change because deleting one declaration can invalidate
+            // references and edges produced by otherwise byte-identical files.
+            result = await IndexAllCoreAsync(fullReset: true, ct).ConfigureAwait(false);
+        }
+        catch
+        {
+            // Keep the previous structural snapshot retryable. The graph pass can have made
+            // partial progress under its existing cancellation semantics, but restoring these
+            // fields means the same add/delete/rename paths still compare as structural on the
+            // next watcher batch and therefore force another reload + full reconciliation.
+            _workspace = previousWorkspace;
+            _sanitizedSolution = previousSolution;
+            DisposeWorkspace(replacementWorkspace);
+            throw;
+        }
+
+        DisposeWorkspace(previousWorkspace);
+        foreach (var includedPath in replacementPaths)
+        {
+            _confirmedOutsideSolutionPaths.Remove(includedPath);
+        }
+        if (structuralCandidates is not null)
+        {
+            foreach (var candidate in structuralCandidates)
+            {
+                if (File.Exists(candidate)
+                    && !replacementPaths.Contains(candidate))
+                {
+                    _confirmedOutsideSolutionPaths.Add(candidate);
+                }
+            }
+        }
+        _requiresStructuralReload =
+            result.FailedProjects.Count > 0 ||
+            result.FailedFiles.Count > 0;
+        return result;
+    }
+
+    private MSBuildWorkspace CreateWorkspace()
+    {
+        var workspace = MSBuildWorkspace.Create();
+        var diagnostics = new ConcurrentQueue<WorkspaceDiagnostic>();
+        _workspaceDiagnostics[workspace] = diagnostics;
+        workspace.RegisterWorkspaceFailedHandler(e =>
+        {
+            diagnostics.Enqueue(e.Diagnostic);
+            if (e.Diagnostic.Kind == WorkspaceDiagnosticKind.Failure)
+            {
+                _logger.LogWarning("Workspace failure: {Message}", e.Diagnostic.Message);
+            }
+            else
+            {
+                _logger.LogInformation("Workspace warning: {Message}", e.Diagnostic.Message);
+            }
+        });
+        return workspace;
+    }
+
+    private async Task<WorkspaceOpenResult> OpenWorkspaceSolutionAsync(
+        MSBuildWorkspace workspace,
+        string solutionPath,
+        CancellationToken ct)
+    {
+        WorkspaceOpenResult result;
+        if (_testHooks?.OpenWorkspaceAsync is { } testOpen)
+        {
+            result = await testOpen(workspace, solutionPath, ct).ConfigureAwait(false);
+        }
+        else
+        {
+            var solution = await workspace.OpenSolutionAsync(
+                solutionPath,
+                cancellationToken: ct).ConfigureAwait(false);
+            result = new WorkspaceOpenResult(
+                solution,
+                Array.Empty<WorkspaceDiagnostic>());
+        }
+
+        var combinedDiagnostics = result.Diagnostics
+            .Concat(SnapshotWorkspaceDiagnostics(workspace))
+            .DistinctBy(diagnostic => (diagnostic.Kind, diagnostic.Message))
+            .ToList();
+        return result with
+        {
+            Diagnostics = combinedDiagnostics,
+        };
+    }
+
+    private IReadOnlyList<WorkspaceDiagnostic> SnapshotWorkspaceDiagnostics(
+        MSBuildWorkspace workspace)
+    {
+        if (!_workspaceDiagnostics.TryGetValue(workspace, out var diagnostics))
+        {
+            return Array.Empty<WorkspaceDiagnostic>();
+        }
+        return diagnostics.ToArray();
+    }
+
+    private void DisposeWorkspace(MSBuildWorkspace workspace)
+    {
+        _workspaceDiagnostics.TryRemove(workspace, out _);
+        try
+        {
+            workspace.Dispose();
+        }
+        finally
+        {
+            _testHooks?.WorkspaceDisposed?.Invoke(workspace);
+        }
+    }
+
+    private static void ThrowIfWorkspaceLoadFailed(
+        IReadOnlyList<WorkspaceDiagnostic> diagnostics,
+        string phase)
+    {
+        var failureDiagnostics = diagnostics
+            .Where(diagnostic =>
+                diagnostic.Kind == WorkspaceDiagnosticKind.Failure)
+            .ToList();
+        if (failureDiagnostics.Count == 0)
+        {
+            return;
+        }
+        throw new InvalidOperationException(
+            $"{phase} workspace load was incomplete: " +
+            string.Join(
+                " | ",
+                failureDiagnostics.Select(diagnostic =>
+                    FailureMessage.Truncate(diagnostic.Message))));
+    }
+
+    private bool IsCSharpStructureChange(Solution solution, string path)
+    {
+        if (!string.Equals(Path.GetExtension(path), ".cs", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var isKnownDocument = !solution.GetDocumentIdsWithFilePath(path).IsEmpty;
+        if (isKnownDocument)
+        {
+            _confirmedOutsideSolutionPaths.Remove(path);
+            return !File.Exists(path);
+        }
+
+        if (!File.Exists(path))
+        {
+            _confirmedOutsideSolutionPaths.Remove(path);
+            return false;
+        }
+        return !_confirmedOutsideSolutionPaths.Contains(path);
+    }
+
+    private static HashSet<string> RegularCSharpDocumentPaths(
+        Solution solution,
+        ScopePathPolicy pathPolicy)
+    {
+        return solution.Projects
+            .Where(project => project.Language == LanguageNames.CSharp)
+            .SelectMany(project => project.Documents)
+            .Where(document =>
+                document.SourceCodeKind == SourceCodeKind.Regular &&
+                !string.IsNullOrEmpty(document.FilePath) &&
+                !pathPolicy.IsExcluded(document.FilePath))
+            .Select(document => Path.GetFullPath(document.FilePath!))
+            .ToHashSet(_pathComparer);
+    }
+
+    private async Task<RegularSnapshotPreparation> PrepareRegularDocumentSnapshotsAsync(
+        Solution solution,
+        IReadOnlySet<string>? selectedPaths,
+        bool incremental,
+        CancellationToken ct)
+    {
+        var snapshots = new Dictionary<string, RegularDocumentSnapshot>(
+            _pathComparer);
+        var failures = new List<FileFailure>();
+        var failedProjectIds = new HashSet<ProjectId>();
+        var documentGroups = solution.Projects
+            .Where(project => project.Language == LanguageNames.CSharp)
+            .SelectMany(project => project.Documents)
+            .Where(document =>
+                document.SourceCodeKind == SourceCodeKind.Regular
+                && !string.IsNullOrEmpty(document.FilePath)
+                && !_pathPolicy!.IsExcluded(document.FilePath)
+                && (selectedPaths is null
+                    || selectedPaths.Contains(document.FilePath)))
+            .GroupBy(
+                document => document.FilePath!,
+                _pathComparer)
+            .ToArray();
+
+        var updatedSolution = solution;
+        foreach (var documentsForPath in documentGroups)
+        {
+            ct.ThrowIfCancellationRequested();
+            var path = documentsForPath.Key;
+            var documents = documentsForPath.ToArray();
+            if (!File.Exists(path))
+            {
+                foreach (var document in documents)
+                {
+                    failedProjectIds.Add(document.Project.Id);
+                }
+                AddFileFailure(
+                    failures,
+                    path,
+                    "file disappeared before its content snapshot was captured");
+                continue;
+            }
+
+            byte[] bytes;
+            SourceText text;
+            try
+            {
+                bytes = await ReadRegularDocumentBytesAsync(
+                    path,
+                    incremental,
+                    ct).ConfigureAwait(false);
+                // Passing null lets Roslyn honor a BOM when present and otherwise use UTF-8.
+                // The exact original bytes remain alongside the decoded SourceText for hashing.
+                text = SourceText.From(
+                    bytes,
+                    bytes.Length,
+                    encoding: null);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex) when (IsRecoverableRegularSnapshotFailure(ex))
+            {
+                _logger.LogDebug(
+                    ex,
+                    "Skipping {Path} for this batch (snapshot read failed; will retry)",
+                    path);
+                foreach (var document in documents)
+                {
+                    failedProjectIds.Add(document.Project.Id);
+                }
+                AddFileFailure(
+                    failures,
+                    path,
+                    FailureMessage.Truncate(ex.Message));
+                continue;
+            }
+
+            foreach (var document in documents)
+            {
+                updatedSolution = updatedSolution.WithDocumentText(
+                    document.Id,
+                    text);
+            }
+            snapshots[path] = new RegularDocumentSnapshot(bytes, text);
+        }
+
+        return new RegularSnapshotPreparation(
+            updatedSolution,
+            snapshots,
+            failures,
+            failedProjectIds);
+    }
+
+    private async Task<byte[]> ReadRegularDocumentBytesAsync(
+        string path,
+        bool incremental,
+        CancellationToken ct)
+    {
+        if (incremental
+            && _testHooks?.ReadIncrementalBytesAsync is { } incrementalRead)
+        {
+            return await incrementalRead(path, ct).ConfigureAwait(false);
+        }
+        if (!incremental
+            && _testHooks?.ReadIndexCoreBytesAsync is { } indexCoreRead)
+        {
+            return await indexCoreRead(path, ct).ConfigureAwait(false);
+        }
+        return await File.ReadAllBytesAsync(path, ct).ConfigureAwait(false);
+    }
+
+    private static bool IsRecoverableRegularSnapshotFailure(Exception exception)
+    {
+        return exception is IOException
+            or InvalidDataException
+            or UnauthorizedAccessException
+            or System.Security.SecurityException
+            or System.Text.DecoderFallbackException;
     }
 
     private void EnsureOpen()
     {
+        ThrowIfDisposed();
         if (_workspace is null || _sanitizedSolution is null || _pathPolicy is null)
         {
             throw new InvalidOperationException("Call OpenAsync before indexing.");
+        }
+    }
+
+    private void ThrowIfDisposed()
+    {
+        if (_disposed)
+        {
+            throw new ObjectDisposedException(nameof(RoslynIndexer));
         }
     }
 
@@ -382,7 +918,7 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         _probedFailedProjectIds = failedIds;
     }
 
-    private async Task<IEnumerable<Document>> AllCSharpDocumentsAsync(
+    private async Task<CSharpDocumentDiscovery> AllCSharpDocumentsAsync(
         Solution solution,
         CancellationToken ct)
     {
@@ -391,73 +927,241 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         var regular = solution.Projects
             .Where(p => p.Language == LanguageNames.CSharp && !_probedFailedProjectIds.Contains(p.Id))
             .SelectMany(p => p.Documents)
-            .Where(d => d.SourceCodeKind == SourceCodeKind.Regular && !string.IsNullOrEmpty(d.FilePath));
+            .Where(d => d.SourceCodeKind == SourceCodeKind.Regular && !string.IsNullOrEmpty(d.FilePath))
+            .ToList();
 
         // Source-generated documents: per-project Project.GetSourceGeneratedDocumentsAsync drives
         // the source generators that ship with the project (regex source-gen, MVVM Toolkit, ASP.NET
-        // routing, etc.) and surfaces synthesised C# files. They have a stable Document.FilePath
-        // string from Roslyn that we can use as the unique key. Marking those rows is_generated = 1
-        // is what makes the find_references default-filter and the (generated) annotations work.
+        // routing, etc.) and surfaces synthesised C# files. Their display FilePath is not globally
+        // unique: separate projects/generators can report the same value, and a regular document
+        // can carry it too. GetGeneratedStoragePath creates a kind-namespaced owner path instead.
+        // Marking those rows is_generated = 1 is what makes the find_references default-filter and
+        // the (generated) annotations work.
         // Failed-probe projects are skipped here too — their generators would almost certainly
         // throw given the underlying compilation is unavailable.
-        var generatedList = new List<Document>();
-        foreach (var project in solution.Projects
-                     .Where(p => p.Language == LanguageNames.CSharp && !_probedFailedProjectIds.Contains(p.Id)))
-        {
-            ct.ThrowIfCancellationRequested();
-            IEnumerable<SourceGeneratedDocument> sourceGenDocs;
-            try
-            {
-                sourceGenDocs = await project.GetSourceGeneratedDocumentsAsync(ct).ConfigureAwait(false);
-            }
-            catch (Exception ex)
-            {
-                // A misbehaving generator can throw during synthesis. Log and skip this project's
-                // generated set rather than failing the whole index.
-                _logger.LogWarning(ex, "Source generator failure for project {Project}; skipping generated docs", project.Name);
-                continue;
-            }
-            foreach (var d in sourceGenDocs)
-            {
-                if (string.IsNullOrEmpty(d.FilePath)) continue;
-                generatedList.Add(d);
-            }
-        }
-        return regular.Concat(generatedList);
+        var projects = solution.Projects
+            .Where(p =>
+                p.Language == LanguageNames.CSharp &&
+                !_probedFailedProjectIds.Contains(p.Id))
+            .ToArray();
+        var generatedDiscovery = await DiscoverSourceGeneratedDocumentsAsync(
+            projects,
+            ct).ConfigureAwait(false);
+        var generated = generatedDiscovery.Documents
+            .Where(document =>
+                !_pathPolicy!.IsGeneratedDocumentExcluded(document.FilePath))
+            .ToList();
+        var generatedPaths = generated
+            .Select(GetGeneratedStoragePath)
+            .ToHashSet(_pathComparer);
+        return new CSharpDocumentDiscovery(
+            regular.Concat<Document>(generated).ToList(),
+            generatedDiscovery.Failures,
+            generatedPaths,
+            generatedDiscovery.IsComplete && _probedFailedProjectIds.Count == 0);
     }
 
+    private async Task<GeneratedDocumentDiscovery> DiscoverSourceGeneratedDocumentsAsync(
+        IEnumerable<Project> projects,
+        CancellationToken ct)
+    {
+        var generated = new List<SourceGeneratedDocument>();
+        var failures = new List<FileFailure>();
+        var complete = true;
+        foreach (var project in projects)
+        {
+            ct.ThrowIfCancellationRequested();
+            try
+            {
+                var sourceGenDocs = await project
+                    .GetSourceGeneratedDocumentsAsync(ct)
+                    .ConfigureAwait(false);
+                foreach (var document in sourceGenDocs)
+                {
+                    if (string.IsNullOrEmpty(document.FilePath))
+                    {
+                        complete = false;
+                        AddFileFailure(
+                            failures,
+                            project.FilePath ?? project.Name,
+                            "source-generated document has no file path");
+                        continue;
+                    }
+                    generated.Add(document);
+                }
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Source generator failure for project {Project}; skipping generated docs", project.Name);
+                complete = false;
+                AddFileFailure(
+                    failures,
+                    project.FilePath ?? project.Name,
+                    "source generator discovery failed: " +
+                    FailureMessage.Truncate(ex.Message));
+                continue;
+            }
+        }
+        return new GeneratedDocumentDiscovery(generated, failures, complete);
+    }
+
+    private string GetGeneratedStoragePath(SourceGeneratedDocument document)
+    {
+        var root = _configuredPrivacyRoot
+            ?? Path.GetDirectoryName(_solutionPath!)
+            ?? throw new InvalidOperationException(
+                "The solution directory is unavailable for generated-document identity.");
+        var projectPath = document.Project.FilePath is { Length: > 0 } path
+            ? Path.GetFullPath(path)
+            : document.Project.Name;
+        var ownerIdentity = _testHooks?.GeneratedOwnerIdentity?.Invoke(document)
+            ?? document.Id.Id.ToString("N");
+        // The digest is over identity metadata, never generated content: an edit keeps the same
+        // owner inside one workspace. DocumentId is authoritative only for that workspace; after
+        // a re-open it may churn, so every complete all-document discovery reconciles stale
+        // generated owners against the current set.
+        var identity = string.Join(
+            "\n",
+            "source-generated-v1",
+            projectPath,
+            document.Project.Name,
+            GetGeneratedDisplayPath(document),
+            document.HintName,
+            ownerIdentity);
+        var digest = Convert.ToHexString(
+            SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(identity)));
+        var displayName = Path.GetFileName(document.HintName);
+        if (string.IsNullOrWhiteSpace(displayName))
+        {
+            displayName = Path.GetFileName(document.FilePath);
+        }
+        if (string.IsNullOrWhiteSpace(displayName))
+        {
+            displayName = "generated.cs";
+        }
+
+        // Ordinary C# documents below obj/ are rejected by the privacy policy, while generated
+        // documents are explicitly allowed there. This reserved valid absolute path therefore
+        // cannot collide with a regular document and remains compatible with path-based tools.
+        return Path.Combine(
+            root,
+            "obj",
+            ".sourcegraph-generated",
+            "v1",
+            digest[..2],
+            digest,
+            displayName);
+    }
+
+    private string GetGeneratedDisplayPath(SourceGeneratedDocument document) =>
+        _testHooks?.GeneratedDisplayPath?.Invoke(document)
+        ?? document.FilePath
+        ?? document.HintName;
+
+    private string ResolveRegularStoragePath(string displayPath)
+    {
+        var fullPath = Path.GetFullPath(displayPath);
+        if (_fileIdByPath.TryGetValue(fullPath, out var fileId)
+            && _storedPathByFileId.TryGetValue(fileId, out var storedPath))
+        {
+            // On Windows, _pathComparer treats casing-only variants as the same physical path.
+            // Keep using the exact persisted spelling so SQLite's ordinal UNIQUE(path) upsert
+            // updates the existing row rather than creating a second file id.
+            return storedPath;
+        }
+        return fullPath;
+    }
+
+    private async Task ReconcileGeneratedFilesAsync(
+        IReadOnlySet<string> currentGeneratedPaths,
+        CancellationToken ct)
+    {
+        var persisted = await _store
+            .ListGeneratedFilesAsync(int.MaxValue, ct)
+            .ConfigureAwait(false);
+        foreach (var stale in persisted.Where(row =>
+                     !currentGeneratedPaths.Contains(row.FilePath)))
+        {
+            ct.ThrowIfCancellationRequested();
+            await _store.DeleteFileAsync(stale.FileId, ct).ConfigureAwait(false);
+            DropFileFromMaps(stale.FileId);
+        }
+    }
+
+    private sealed record CSharpDocumentDiscovery(
+        IReadOnlyList<Document> Documents,
+        IReadOnlyList<FileFailure> Failures,
+        IReadOnlySet<string> GeneratedPaths,
+        bool IsComplete);
+
+    private sealed record GeneratedDocumentDiscovery(
+        IReadOnlyList<SourceGeneratedDocument> Documents,
+        IReadOnlyList<FileFailure> Failures,
+        bool IsComplete);
+
+    private sealed record RegularDocumentSnapshot(
+        byte[] Bytes,
+        SourceText Text);
+
+    private sealed record RegularSnapshotPreparation(
+        Solution Solution,
+        IReadOnlyDictionary<string, RegularDocumentSnapshot> Snapshots,
+        IReadOnlyList<FileFailure> Failures,
+        IReadOnlySet<ProjectId> FailedProjectIds);
+
     /// <summary>
-    /// Best-effort post-failure clear of <paramref name="fileId"/>'s outgoing refs/edges.
-    /// Called from <see cref="IndexCoreAsync"/>'s pass-2 catch handler when a file's walk
-    /// threw partway through: a partial commit (refs done, edges throws) would leave the
-    /// integrity check satisfied (refs > 0) on the next index and strand the missing edges,
-    /// so we drop both halves here. A failure of the clear itself is logged but not rethrown
-    /// — letting it propagate would defeat the surrounding catch's "keep walking the rest"
-    /// purpose. The original walk failure is logged separately by the caller.
+    /// Marks <paramref name="fileId"/> as requiring a durable Pass-2 retry, then best-effort
+    /// clears its outgoing refs/edges. The marker is an empty content-hash blob, which can
+    /// never equal a real SHA-256 digest. Writing it before the clear means that even a process
+    /// crash between the two operations makes the next index bypass the SHA fast path.
     /// </summary>
     [SuppressMessage("Design", "CA1031:DoNotCatchGeneralExceptionTypes",
-        Justification = "Best-effort cleanup: a thrown exception here would propagate out of the catch handler in IndexCoreAsync and abort the entire pass-2 loop, defeating the surrounding catch's intent. The clear's failure is logged at warn so operators see secondary failures.")]
-    private async Task TryClearFileOutgoingAsync(long fileId, string path, CancellationToken ct)
+        Justification = "Best-effort persistent recovery runs with CancellationToken.None after the caller's token may already be cancelled; marker/clear failures are logged without hiding the original indexing failure or cancellation.")]
+    private async Task MarkPassTwoIncompleteAsync(
+        long fileId,
+        string path,
+        bool isGenerated)
     {
         try
         {
-            await _store.ClearFileOutgoingAsync(fileId, ct).ConfigureAwait(false);
+            await _store.UpsertFileAsync(
+                    path,
+                    Array.Empty<byte>(),
+                    DateTimeOffset.UtcNow,
+                    isGenerated,
+                    CancellationToken.None)
+                .ConfigureAwait(false);
         }
-        catch (OperationCanceledException) { throw; }
+        catch (Exception markerEx)
+        {
+            _logger.LogWarning(
+                markerEx,
+                "Could not persist Pass 2 retry marker for {Path}; file may retain partial refs/edges",
+                path);
+        }
+
+        try
+        {
+            await _store.ClearFileOutgoingAsync(fileId, CancellationToken.None).ConfigureAwait(false);
+        }
         catch (Exception clearEx)
         {
-            // The clear itself failed. Best-effort: log and move on. The file may hold
-            // partial state until the next clear+re-walk; an operator who notices repeated
-            // recoveries can wipe the .sourcegraph DB to recover fully.
-            _logger.LogWarning(clearEx,
-                "Pass 2's post-failure clear for {Path} also failed; file may have stale partial refs/edges",
+            _logger.LogWarning(
+                clearEx,
+                "Pass 2's recovery clear for {Path} failed; retry marker will force another walk",
                 path);
         }
     }
 
     [SuppressMessage("Design", "CA1031:DoNotCatchGeneralExceptionTypes",
         Justification = "IndexCoreAsync's per-file walks must not let one document's failure (a misbehaving source generator, a transient compile gap, an analyzer throwing inside Roslyn) bring the whole indexing pass down. Each catch logs the file path + exception and continues with the next file; OperationCanceledException is rethrown explicitly so user-driven cancellation surfaces.")]
-    private async Task<IndexResult> IndexCoreAsync(IReadOnlyList<Document> documents, bool fullReset, CancellationToken ct)
+    private async Task<IndexResult> IndexCoreAsync(
+        IReadOnlyList<Document> documents,
+        bool fullReset,
+        IReadOnlyCollection<FileFailure>? initialFailures,
+        IReadOnlyDictionary<string, RegularDocumentSnapshot> regularSnapshots,
+        CancellationToken ct)
     {
         var sw = Stopwatch.StartNew();
 
@@ -479,12 +1183,90 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         }
 
         // Track files whose Pass 1B walk completed end-to-end. The set gates Pass 1C reconcile,
-        // Pass 1D annotations, Pass 2 reference walk, and Pass 3 diagnostic reconcile so a
-        // partial Pass-1B walk does not corrupt the file's prior store state. Files absent from
-        // `walkedFileIds` keep their prior symbols/refs/edges/diagnostics until the next pass
-        // re-attempts them. `failedFiles` accumulates FileFailure records for IndexResult.
+        // Pass 1D annotations, Pass 2 reference walk, and Pass 3 diagnostic reconcile. Phase A
+        // may already have stored the new SHA and cleared outgoing facts, and a failed Phase 1B
+        // walk may have upserted some symbols, so failure does not mean the old graph is untouched.
+        // Skipping reconcile avoids deleting old declarations; FailedFiles makes the incomplete
+        // state visible so a later integrity/structural retry can repair it.
         var walkedFileIds = new HashSet<long>();
         var failedFiles = new List<FileFailure>();
+        if (initialFailures is not null)
+        {
+            foreach (var failure in initialFailures)
+            {
+                AddFileFailure(failedFiles, failure.Path, failure.Reason);
+            }
+        }
+
+        // Validate every multi-target/linked iteration before Phase A mutates storage. Each
+        // regular path must still expose the SourceText decoded from the exact byte snapshot
+        // captured for this pass; otherwise one iteration could hash one version and walk
+        // semantics from another.
+        var rejectedSnapshotPaths = new HashSet<string>(
+            _pathComparer);
+        var regularDocumentGroups = documents
+            .Where(document =>
+                document is not SourceGeneratedDocument
+                && !string.IsNullOrEmpty(document.FilePath))
+            .GroupBy(
+                document => document.FilePath!,
+                _pathComparer);
+        foreach (var documentsForPath in regularDocumentGroups)
+        {
+            ct.ThrowIfCancellationRequested();
+            var path = documentsForPath.Key;
+            if (!regularSnapshots.TryGetValue(path, out var snapshot))
+            {
+                rejectedSnapshotPaths.Add(path);
+                AddFileFailure(
+                    failedFiles,
+                    path,
+                    "regular document byte snapshot was unavailable");
+                _requiresStructuralReload = true;
+                continue;
+            }
+
+            try
+            {
+                foreach (var document in documentsForPath)
+                {
+                    var boundText = await document
+                        .GetTextAsync(ct)
+                        .ConfigureAwait(false);
+                    if (!boundText.ContentEquals(snapshot.Text))
+                    {
+                        throw new InvalidOperationException(
+                            "Roslyn document text did not match its captured byte snapshot.");
+                    }
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(
+                    ex,
+                    "Skipping {Path} (document snapshot validation failed; will retry)",
+                    path);
+                rejectedSnapshotPaths.Add(path);
+                AddFileFailure(
+                    failedFiles,
+                    path,
+                    FailureMessage.Truncate(ex.Message));
+                _requiresStructuralReload = true;
+            }
+        }
+        if (rejectedSnapshotPaths.Count > 0)
+        {
+            documents = documents
+                .Where(document =>
+                    document is SourceGeneratedDocument
+                    || string.IsNullOrEmpty(document.FilePath)
+                    || !rejectedSnapshotPaths.Contains(document.FilePath))
+                .ToList();
+        }
 
         // Hydrate in-memory maps from store on first run (or after a fullReset). This means
         // unchanged files don't need any DB hits — we already know their symbol ids.
@@ -493,8 +1275,10 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
             _symbolIdByKey.Clear();
             _keysByFileId.Clear();
             _fileIdByPath.Clear();
+            _storedPathByFileId.Clear();
+            _mapsHydrated = false;
         }
-        if (_symbolIdByKey.Count == 0)
+        if (!_mapsHydrated)
         {
             await HydrateMapsFromStoreAsync(ct).ConfigureAwait(false);
         }
@@ -504,52 +1288,98 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         // linked-project iteration of the same path before reconciling.
         var changedFileIds = new HashSet<long>();
         var docsByChangedFile = new Dictionary<long, List<Document>>();
-        var changedFileMeta = new Dictionary<long, (string Path, byte[] Sha)>();
-        // Memoize HasOutgoingReferencesAsync per fileId for the lifetime of this pass: in
-        // multi-target / linked-project solutions the same fileId enumerates once per TFM,
-        // and the integrity check answer is invariant within a single pass. Caching also
-        // collapses the recovery log line to one entry per zombied file rather than N.
-        var hasOutgoingRefsCache = new Dictionary<long, bool>();
+        var changedFileMeta = new Dictionary<long, (string Path, byte[] Sha, bool IsGenerated)>();
         var symbolsIndexed = 0;
 
-        foreach (var document in documents)
+        var documentGroups = new List<(
+            string StoragePath,
+            string DisplayPath,
+            bool IsGenerated,
+            List<Document> Documents)>();
+        foreach (var regularDocuments in documents
+                     .Where(document =>
+                         document is not SourceGeneratedDocument
+                         && document.FilePath is not null)
+                     .GroupBy(document => document.FilePath!, _pathComparer))
+        {
+            var displayPath = Path.GetFullPath(regularDocuments.Key);
+            documentGroups.Add((
+                ResolveRegularStoragePath(displayPath),
+                displayPath,
+                IsGenerated: false,
+                regularDocuments.ToList()));
+        }
+
+        var generatedOwners = documents
+            .OfType<SourceGeneratedDocument>()
+            .Select(document => (
+                Document: document,
+                StoragePath: GetGeneratedStoragePath(document)))
+            .GroupBy(owner => owner.StoragePath, _pathComparer);
+        foreach (var generatedOwner in generatedOwners)
+        {
+            var owners = generatedOwner.ToList();
+            if (owners.Count > 1)
+            {
+                var displayPath = GetGeneratedDisplayPath(owners[0].Document);
+                AddFileFailure(
+                    failedFiles,
+                    displayPath,
+                    "multiple source-generated documents resolved to the same stable owner");
+                _requiresStructuralReload = true;
+                continue;
+            }
+
+            var owner = owners[0];
+            documentGroups.Add((
+                owner.StoragePath,
+                GetGeneratedDisplayPath(owner.Document),
+                IsGenerated: true,
+                [owner.Document]));
+        }
+
+        foreach (var documentsForOwner in documentGroups)
         {
             ct.ThrowIfCancellationRequested();
-            var path = document.FilePath;
-            if (path is null) continue;
+            var path = documentsForOwner.StoragePath;
+            var displayPath = documentsForOwner.DisplayPath;
+            var groupedDocuments = documentsForOwner.Documents;
+            var representative = groupedDocuments[0];
 
             // Source-generated documents don't exist on disk; their bytes come from the document's
             // SourceText. Same SHA gate either way — same hash on identical generator output means
             // we skip the file entirely (per design.md "SHA gate on generated content").
-            var isGenerated = document is SourceGeneratedDocument;
+            var isGenerated = documentsForOwner.IsGenerated;
             byte[] bytes;
             if (isGenerated)
             {
                 try
                 {
-                    var text = await document.GetTextAsync(ct).ConfigureAwait(false);
+                    var text = await representative.GetTextAsync(ct).ConfigureAwait(false);
                     bytes = System.Text.Encoding.UTF8.GetBytes(text.ToString());
                 }
+                catch (OperationCanceledException) { throw; }
                 catch (Exception ex)
                 {
-                    _logger.LogDebug(ex, "Skipping generated doc {Path} (text fetch failed)", path);
+                    _logger.LogDebug(ex, "Skipping generated doc {Path} (text fetch failed)", displayPath);
+                    AddFileFailure(failedFiles, displayPath, FailureMessage.Truncate(ex.Message));
+                    _requiresStructuralReload = true;
                     continue;
                 }
             }
             else
             {
-                if (_pathPolicy!.IsExcluded(path)) continue;
-                if (!File.Exists(path)) continue;
-                try
+                if (_pathPolicy!.IsExcluded(displayPath)) continue;
+                if (!regularSnapshots.TryGetValue(displayPath, out var snapshot))
                 {
-                    bytes = await File.ReadAllBytesAsync(path, ct).ConfigureAwait(false);
-                }
-                catch (IOException ex)
-                {
-                    // Editor save in progress, antivirus, etc. Skip; the watcher will fire again.
-                    _logger.LogDebug(ex, "Skipping {Path} (read failed; will retry on next event)", path);
+                    AddFileFailure(
+                        failedFiles,
+                        displayPath,
+                        "regular document byte snapshot was unavailable during Phase A");
+                    _requiresStructuralReload = true;
                     continue;
                 }
+                bytes = snapshot.Bytes;
             }
             var sha = SHA256.HashData(bytes);
             var stored = await _store.GetFileContentHashAsync(path, ct).ConfigureAwait(false);
@@ -557,6 +1387,11 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
 
             var fileId = await _store.UpsertFileAsync(path, sha, DateTimeOffset.UtcNow, isGenerated, ct).ConfigureAwait(false);
             _fileIdByPath[path] = fileId;
+            if (!isGenerated)
+            {
+                _fileIdByPath[displayPath] = fileId;
+            }
+            _storedPathByFileId[fileId] = path;
 
             if (unchanged && !fullReset && _keysByFileId.TryGetValue(fileId, out var keysForFile))
             {
@@ -575,24 +1410,14 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                 {
                     continue;
                 }
-                bool hasOutgoingRefs;
-                if (hasOutgoingRefsCache.TryGetValue(fileId, out var cached))
+                var hasOutgoingRefs =
+                    await _store.HasOutgoingReferencesAsync(fileId, ct).ConfigureAwait(false);
+                if (!hasOutgoingRefs)
                 {
-                    hasOutgoingRefs = cached;
-                }
-                else
-                {
-                    hasOutgoingRefs = await _store.HasOutgoingReferencesAsync(fileId, ct).ConfigureAwait(false);
-                    hasOutgoingRefsCache[fileId] = hasOutgoingRefs;
-                    // Log once per zombied fileId on first detection — subsequent TFM
-                    // iterations of the same path hit the cache branch and stay quiet.
-                    if (!hasOutgoingRefs)
-                    {
-                        _logger.LogInformation(
-                            "Re-walking references for {Path}: file SHA matches but no outgoing references in store " +
-                            "(likely zombied by a prior incomplete indexing pass; recovering)",
-                            path);
-                    }
+                    _logger.LogInformation(
+                        "Re-walking references for {Path}: file SHA matches but no outgoing references in store " +
+                        "(likely zombied by a prior incomplete indexing pass; recovering)",
+                        path);
                 }
                 if (hasOutgoingRefs)
                 {
@@ -604,14 +1429,9 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
             if (changedFileIds.Add(fileId))
             {
                 await _store.ClearFileOutgoingAsync(fileId, ct).ConfigureAwait(false);
-                changedFileMeta[fileId] = (path, sha);
+                changedFileMeta[fileId] = (path, sha, isGenerated);
             }
-            if (!docsByChangedFile.TryGetValue(fileId, out var list))
-            {
-                list = new List<Document>();
-                docsByChangedFile[fileId] = list;
-            }
-            list.Add(document);
+            docsByChangedFile[fileId] = groupedDocuments;
         }
 
         // PASS 1 — phase B: walk every iteration of each changed file (one path may have N
@@ -628,6 +1448,8 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         var parentKeyByChildKey = new Dictionary<string, string>(StringComparer.Ordinal);
         var pendingAttrsByFile = new Dictionary<long, List<PendingAnnotation>>();
         var seenSymbolForAttr = new Dictionary<long, HashSet<string>>();
+        var fileIdBySyntaxTree = new Dictionary<SyntaxTree, long>(
+            ReferenceEqualityComparer.Instance);
         // Test framework detection: keyed by symbol id, value = "xunit"/"nunit"/"mstest".
         // Populated as we walk method symbols in pass 1; flushed in a single batch update once
         // pass-1 completes. Doing it as a separate update lets us avoid clobbering the value
@@ -638,7 +1460,8 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
             // Per-file locals — only published into the shared dictionaries (newKeysForFile /
             // pendingAttrsByFile / seenSymbolForAttr) on the success path. If the inner walk
             // throws, these locals are dropped on the floor and Pass 1C/1D iterate without an
-            // entry for this fileId, leaving the file's prior reconciled state intact.
+            // entry for this fileId. That leaves prior declarations unreconciled, although Phase A
+            // has already updated the file row and cleared its outgoing facts.
             var fileKeys = new HashSet<string>(StringComparer.Ordinal);
             var pendingAttrs = new List<PendingAnnotation>();
             var attrSeen = new HashSet<string>(StringComparer.Ordinal);
@@ -650,8 +1473,13 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                 {
                     var tree = await document.GetSyntaxTreeAsync(ct).ConfigureAwait(false);
                     var model = await document.GetSemanticModelAsync(ct).ConfigureAwait(false);
-                    if (tree is null || model is null) continue;
+                    if (tree is null || model is null)
+                    {
+                        throw new InvalidOperationException(
+                            "Roslyn returned no syntax tree or semantic model.");
+                    }
 
+                    fileIdBySyntaxTree[tree] = fileId;
                     var root = await tree.GetRootAsync(ct).ConfigureAwait(false);
                     foreach (var node in EnumerateDeclarations(root))
                     {
@@ -730,15 +1558,15 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
             catch (OperationCanceledException) { throw; }
             catch (Exception ex)
             {
-                // One file's Pass-1B walk threw — log it and let the next file proceed. The
-                // file's prior store state (symbols, refs, edges, annotations, diagnostics) is
-                // preserved because we never wrote to newKeysForFile/pendingAttrsByFile, so
-                // Pass 1C's DeleteSymbolsForFileNotInAsync skips it. Pass 2 and Pass 3 also
-                // gate on walkedFileIds. The next index will re-attempt this file.
+                // One file's Pass-1B walk threw — log it and let the next file proceed.
+                // Pass 1C's declaration reconcile and the later annotation/reference/diagnostic
+                // phases skip it, but Phase A's SHA/outgoing mutations and any symbol upserts
+                // completed before the throw remain. The result therefore reports an explicitly
+                // incomplete file for a later integrity or structural retry to repair.
                 _logger.LogWarning(ex,
-                    "Pass 1 walk failed for {Path}; preserving prior symbol state, file will be re-attempted on the next index",
+                    "Pass 1 walk failed for {Path}; graph state is incomplete and will be re-attempted",
                     path);
-                failedFiles.Add(new FileFailure(path, FailureMessage.Truncate(ex.Message)));
+                AddFileFailure(failedFiles, path, FailureMessage.Truncate(ex.Message));
             }
         }
 
@@ -816,24 +1644,35 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         var refsIndexed = 0;
         var docsToIndexRefs = docsByChangedFile
             .Where(kv => walkedFileIds.Contains(kv.Key))
-            .Select(kv => kv.Value[0])
+            .Select(kv => (
+                FileId: kv.Key,
+                Document: kv.Value[0],
+                Path: changedFileMeta[kv.Key].Path))
             .ToList();
         var filesIndexed = walkedFileIds.Count;
-        foreach (var document in docsToIndexRefs)
+        var completedPassTwoFileIds = new HashSet<long>();
+        try
         {
-            ct.ThrowIfCancellationRequested();
-            var path = document.FilePath;
-            if (path is null || !_fileIdByPath.TryGetValue(path, out var fileId)) continue;
-
-            try
+            foreach (var item in docsToIndexRefs)
             {
-                var tree = await document.GetSyntaxTreeAsync(ct).ConfigureAwait(false);
-                var model = await document.GetSemanticModelAsync(ct).ConfigureAwait(false);
-                if (tree is null || model is null) continue;
+                ct.ThrowIfCancellationRequested();
+                var fileId = item.FileId;
+                var document = item.Document;
+                var path = item.Path;
 
-                var root = await tree.GetRootAsync(ct).ConfigureAwait(false);
-                var refBatch = new List<SymbolReference>(capacity: 256);
-                var edgeBatch = new List<Edge>(capacity: 64);
+                try
+                {
+                    var tree = await document.GetSyntaxTreeAsync(ct).ConfigureAwait(false);
+                    var model = await document.GetSemanticModelAsync(ct).ConfigureAwait(false);
+                    if (tree is null || model is null)
+                    {
+                        throw new InvalidOperationException(
+                            "Roslyn returned no syntax tree or semantic model during reference walk.");
+                    }
+
+                    var root = await tree.GetRootAsync(ct).ConfigureAwait(false);
+                    var refBatch = new List<SymbolReference>(capacity: 256);
+                    var edgeBatch = new List<Edge>(capacity: 64);
                 // Dedupe duplicate syntax visits while retaining distinct occurrences between the
                 // same logical endpoints. Roslyn can surface one generic/member-access name through
                 // more than one syntax-node case; the range-inclusive key collapses only those
@@ -1108,35 +1947,57 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                     }
                 }
 
-                if (refBatch.Count > 0)
-                {
-                    await _store.BulkInsertReferencesAsync(refBatch, ct).ConfigureAwait(false);
+                    if (refBatch.Count > 0)
+                    {
+                        await _store.BulkInsertReferencesAsync(refBatch, ct).ConfigureAwait(false);
+                    }
+                    if (edgeBatch.Count > 0)
+                    {
+                        await _store.BulkInsertEdgesAsync(edgeBatch, ct).ConfigureAwait(false);
+                    }
                     refsIndexed += refBatch.Count;
+                    completedPassTwoFileIds.Add(fileId);
                 }
-                if (edgeBatch.Count > 0)
+                catch (OperationCanceledException)
                 {
-                    await _store.BulkInsertEdgesAsync(edgeBatch, ct).ConfigureAwait(false);
+                    // The outer catch persistently marks this and every not-yet-completed
+                    // changed file before cancellation escapes to the caller.
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    var isGenerated = changedFileMeta.TryGetValue(fileId, out var meta)
+                        && meta.IsGenerated;
+                    await MarkPassTwoIncompleteAsync(fileId, path, isGenerated).ConfigureAwait(false);
+                    completedPassTwoFileIds.Add(fileId);
+                    _requiresStructuralReload = true;
+
+                    _logger.LogWarning(
+                        ex,
+                        "Pass 2 walk failed for {Path}; persisted a retry marker and cleared partial refs/edges",
+                        path);
+                    AddFileFailure(failedFiles, path, FailureMessage.Truncate(ex.Message));
                 }
             }
-            catch (OperationCanceledException)
+        }
+        catch (OperationCanceledException)
+        {
+            _requiresStructuralReload = true;
+            foreach (var fileId in walkedFileIds)
             {
-                // User-driven cancellation must propagate so the caller learns the run aborted.
-                throw;
-            }
-            catch (Exception ex)
-            {
-                // One file's walk threw — log it and let the next file's walk proceed. Pass 2
-                // calls BulkInsertReferencesAsync first then BulkInsertEdgesAsync; each is
-                // atomic but they aren't sequenced under one outer transaction, so a throw on
-                // edges would leave refs committed. That state is invisible to the next
-                // index's integrity check (refs > 0 → SHA-skip → edges stranded forever), so
-                // re-clear here to drop any partial commit and force a full re-walk next time.
-                await TryClearFileOutgoingAsync(fileId, path, ct).ConfigureAwait(false);
+                if (completedPassTwoFileIds.Contains(fileId)
+                    || !changedFileMeta.TryGetValue(fileId, out var meta))
+                {
+                    continue;
+                }
 
-                _logger.LogWarning(ex,
-                    "Pass 2 walk failed for {Path}; cleared partial refs/edges, will re-attempt on the next index",
-                    path);
+                await MarkPassTwoIncompleteAsync(
+                        fileId,
+                        meta.Path,
+                        meta.IsGenerated)
+                    .ConfigureAwait(false);
             }
+            throw;
         }
 
         // PASS 3 — diagnostics. compilation.GetDiagnostics(ct) returns every diagnostic the workspace
@@ -1181,10 +2042,16 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
             {
                 diags = compilation.GetDiagnostics(ct);
             }
+            catch (OperationCanceledException) { throw; }
             catch (Exception ex)
             {
                 var project = _sanitizedSolution!.GetProject(pid);
                 _logger.LogWarning(ex, "Failed to read diagnostics for {Project}", project?.Name ?? pid.ToString());
+                AddFileFailure(
+                    failedFiles,
+                    project?.FilePath ?? project?.Name ?? pid.ToString(),
+                    "diagnostic discovery failed: " +
+                    FailureMessage.Truncate(ex.Message));
                 continue;
             }
 
@@ -1197,7 +2064,7 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                 if (tree is null) continue;
                 var path = tree.FilePath;
                 if (string.IsNullOrEmpty(path)) continue;
-                if (!_fileIdByPath.TryGetValue(path, out var fileId)) continue;
+                if (!fileIdBySyntaxTree.TryGetValue(tree, out var fileId)) continue;
                 if (!changedFileIds.Contains(fileId)) continue; // only touch files we re-indexed
                 if (!walkedFileIds.Contains(fileId)) continue;  // skip files whose Pass 1B threw
 
@@ -1219,6 +2086,7 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                         }
                     }
                 }
+                catch (OperationCanceledException) { throw; }
                 catch
                 {
                     // Best-effort symbol attribution. If lookup fails, leave the diagnostic
@@ -1264,10 +2132,18 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         {
             foreach (var (fileId, meta) in changedFileMeta)
             {
+                // Generated owner paths are deliberately virtual and have no disk/git object to
+                // blame. Do not enqueue them into the history pipeline, whose contract is a
+                // physical repository path.
+                if (meta.IsGenerated)
+                {
+                    continue;
+                }
                 try
                 {
                     await OnFileIndexed(fileId, meta.Path, meta.Sha).ConfigureAwait(false);
                 }
+                catch (OperationCanceledException) { throw; }
                 catch (Exception ex)
                 {
                     _logger.LogDebug(ex, "OnFileIndexed callback threw for {Path}; continuing", meta.Path);
@@ -1314,6 +2190,11 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
 
     private async Task HydrateMapsFromStoreAsync(CancellationToken ct)
     {
+        _symbolIdByKey.Clear();
+        _keysByFileId.Clear();
+        _fileIdByPath.Clear();
+        _storedPathByFileId.Clear();
+
         var symbolRows = await _store.GetAllSymbolKeysAsync(ct).ConfigureAwait(false);
         var hydrated = 0;
         foreach (var row in symbolRows)
@@ -1342,6 +2223,7 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         foreach (var fr in fileRows)
         {
             _fileIdByPath[fr.Path] = fr.Id;
+            _storedPathByFileId[fr.Id] = fr.Path;
             // Seed `_keysByFileId` with an empty list for files that didn't contribute any
             // symbol rows above (usings-only files, files containing only `[assembly:]` /
             // `[module:]` attributes, etc.). Without this, the pass-1 SHA-skip path's
@@ -1356,6 +2238,7 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         {
             _logger.LogInformation("Hydrated {Symbols} csharp symbol(s) and {Files} file(s) from graph store", hydrated, fileRows.Count);
         }
+        _mapsHydrated = true;
     }
 
     private static ISymbol? FindEnclosingMember(SemanticModel model, int position, CancellationToken ct)
@@ -1640,9 +2523,60 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
     {
         if (_keysByFileId.TryGetValue(fileId, out var keys))
         {
-            foreach (var k in keys) _symbolIdByKey.Remove(k);
             _keysByFileId.Remove(fileId);
+            foreach (var key in keys)
+            {
+                // A generated owner can churn across workspace re-open. Pass 1 upserts its
+                // canonical symbols onto the new file id before stale-owner reconciliation
+                // deletes the old row; retain map entries now owned by another file.
+                if (!_keysByFileId.Values.Any(otherKeys =>
+                        otherKeys.Contains(key, StringComparer.Ordinal)))
+                {
+                    _symbolIdByKey.Remove(key);
+                }
+            }
         }
+        foreach (var path in _fileIdByPath
+                     .Where(entry => entry.Value == fileId)
+                     .Select(entry => entry.Key)
+                     .ToArray())
+        {
+            _fileIdByPath.Remove(path);
+        }
+        _storedPathByFileId.Remove(fileId);
+    }
+
+    private static void AddFileFailure(
+        ICollection<FileFailure> failures,
+        string path,
+        string reason)
+    {
+        if (failures.Any(existing =>
+                string.Equals(existing.Path, path, _pathComparison)))
+        {
+            return;
+        }
+        failures.Add(new FileFailure(path, reason));
+    }
+
+    private static IndexResult WithAdditionalFileFailures(
+        IndexResult result,
+        IReadOnlyCollection<FileFailure> additionalFailures)
+    {
+        if (additionalFailures.Count == 0)
+        {
+            return result;
+        }
+
+        var mergedFailures = result.FailedFiles.ToList();
+        foreach (var failure in additionalFailures)
+        {
+            AddFileFailure(mergedFailures, failure.Path, failure.Reason);
+        }
+        return result with
+        {
+            FailedFiles = mergedFailures,
+        };
     }
 
     private static IEnumerable<SyntaxNode> EnumerateDeclarations(SyntaxNode root)
@@ -1686,11 +2620,44 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         return await indexer.IndexAllAsync(ct).ConfigureAwait(false);
     }
 
-    public ValueTask DisposeAsync()
+    public async ValueTask DisposeAsync()
     {
-        _workspace?.Dispose();
-        _lock.Dispose();
-        return ValueTask.CompletedTask;
+        await _lock.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            _disposed = true;
+            if (_testHooks?.DisposeAsyncEntered is { } disposeAsyncEntered)
+            {
+                await disposeAsyncEntered().ConfigureAwait(false);
+            }
+            var workspace = _workspace;
+            _workspace = null;
+            _sanitizedSolution = null;
+            _pathPolicy = null;
+            _solutionPath = null;
+            _requiresStructuralReload = false;
+            _confirmedOutsideSolutionPaths.Clear();
+            try
+            {
+                if (workspace is not null)
+                {
+                    DisposeWorkspace(workspace);
+                }
+            }
+            finally
+            {
+                _workspaceDiagnostics.Clear();
+            }
+        }
+        finally
+        {
+            _lock.Release();
+        }
     }
 
     /// <summary>
@@ -1832,9 +2799,9 @@ public sealed record IndexResult(int FilesIndexed, int SymbolsIndexed, int Refer
     public IReadOnlyList<ProjectFailure> FailedProjects { get; init; } = Array.Empty<ProjectFailure>();
 
     /// <summary>
-    /// Files whose Pass 1 symbol walk threw during the index pass. Empty for healthy installs.
-    /// The pass 1B per-document try/catch in <see cref="RoslynIndexer"/> populates this list;
-    /// failed files retain their prior store state until the next successful walk.
+    /// Files whose discovery, content read, symbol walk, reference walk, or diagnostic discovery
+    /// did not complete during the index pass. Empty for healthy installs. Entries are
+    /// deduplicated by path; cancellation is never converted into a failure entry.
     /// </summary>
     public IReadOnlyList<FileFailure> FailedFiles { get; init; } = Array.Empty<FileFailure>();
 }

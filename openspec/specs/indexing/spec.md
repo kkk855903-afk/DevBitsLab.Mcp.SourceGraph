@@ -40,6 +40,254 @@ responsible for translating the failure lists into a scope status.
   the cold index returns successfully so other projects' documents are
   indexed normally
 
+### Requirement: Registered-language cold and live lifecycle
+`LiveIndexService` SHALL derive its watched source-extension set from the
+current `LanguageIndexerRegistry`; adding an `ILanguageIndexer` claim SHALL
+NOT require a corresponding hard-coded watcher edit. `.cs` remains routed to
+the workspace-aware Roslyn path. Every other registered extension SHALL be
+discovered from the scope's resolved project set and routed through
+`LanguageIndexerDispatcher` during cold indexing and for live
+create/change/delete/rename batches. The same behavior SHALL apply when the
+scope has no resolvable solution and when its solution resides below the
+scope root.
+
+For a `paths` scope, each configured glob SHALL select `.csproj` anchors using
+the same matching rules as scope excludes; non-C# files are eligible only
+below a matched project directory. For a `projects` scope, only directories
+of explicit, existing, scope-approved `.csproj` anchors are eligible. If no
+configured project can be resolved, discovery and watching SHALL fail closed
+with no eligible source files. A `solutions` scope retains repository-wide
+registered-language discovery so sibling native/protobuf sources that
+intentionally participate in the solution's interop boundary are not hidden
+merely because they have no project anchor.
+
+Anchor discovery for a `paths` glob SHALL NOT traverse any directory reparse
+point. A candidate project root reached through a symlink, junction, or other
+directory reparse point SHALL be rejected even when its resolved target is an
+in-repository sibling; the same rule applies when the target is outside the
+repository.
+
+Project factories SHALL be invoked only at the selected project directories
+for `projects` and `paths` scopes; they SHALL NOT receive the repository root
+or an unselected sibling as a discovery root. Discovery SHALL invoke only
+`IExclusionAwareLanguageProjectFactory` implementations and SHALL pass both
+rebased scope excludes and the mandatory privacy patterns so the factory can
+prune before reading. Discovery SHALL build a temporary file-to-project map.
+If any factory/root pair fails, the old live map and all file graphs SHALL be
+retained, the failure SHALL be returned as `ProjectFailure`, cold/live scope
+status SHALL surface it, and the one-shot command SHALL exit non-zero.
+Factories SHALL propagate any non-cancellation directory enumeration, project
+read, source read, or parse failure that makes discovery incomplete; an
+incomplete result SHALL NOT be published as a successful replacement map or
+resource snapshot. Excluded paths SHALL still be pruned before any such read.
+
+A successful map SHALL be reused for ordinary source edits so heavyweight
+language-project instances and their immutable caches are retained. Project
+control events SHALL rebuild the map. A failed rebuild SHALL mark discovery
+pending; the next ordinary source event SHALL retry discovery before dispatch
+while the last successful map remains queryable.
+
+Positive project membership SHALL require both lexical descent from a selected
+project directory and physical descent from that same project's resolved
+directory. Cold walkers SHALL prune unrelated directories and SHALL NOT follow
+an in-project symlink or junction to an unselected sibling project.
+
+Before reading or mutating a live path, the dispatcher SHALL apply the
+scope's lexical excludes, mandatory privacy policy, repository containment,
+and resolved physical-path containment. Invalid, inaccessible, excluded,
+privacy-sensitive, and physically escaped paths SHALL fail closed. A path
+confirmed missing SHALL be removed via the graph store's transactional file
+deletion so the file row, declared symbols, inbound/outbound edges, and
+occurrence evidence disappear together. Re-indexing an existing file SHALL
+replace its file hash, outgoing facts, annotations, references, and complete
+symbol set in one storage transaction even when the indexer returns zero
+events. Removing declarations SHALL also sever surviving container and
+attribute-symbol links and remove their history and embedding metadata.
+Indexer, evidence-validation, canonical-key resolution, cancellation, and
+storage failures SHALL leave the last successful file hash and graph intact.
+If a stale-file deletion fails, that file SHALL produce a `FileFailure` while
+deletion and indexing of other files continue. If a file disappears after cold
+enumeration but before its byte read, it SHALL count as exactly one skip and
+not as indexed or failed.
+
+For registered non-C# files, each analyzer SHALL emit into its own private
+event buffer. Only a successfully completed analyzer's events SHALL be combined
+with the language indexer's events and committed in the same atomic file
+replacement. A throwing or cooperatively timed-out analyzer SHALL lose all of
+its partial events while later analyzers continue. Caller cancellation SHALL
+propagate without marking the plugin failed. Cold and one-shot post-index
+analyzer scans SHALL process only `.cs`, because registered non-C# analyzer
+facts are already part of their atomic dispatcher replacement.
+An analyzer that throws a bare or self-cancelled
+`OperationCanceledException` while the caller token remains active SHALL be
+treated as an analyzer failure, discard its private buffer, and allow later
+analyzers to run. Only cancellation requested by the caller token SHALL
+propagate out of the pipeline.
+
+The watcher SHALL treat a scope-valid `.csproj` as a project-control event even
+when no language indexer claims that extension. Create/change/delete SHALL
+refresh the watcher's positive project matcher before subsequent source events,
+rebuild the temporary project map, and run a full registered-language
+reconciliation: project deletion removes the old graph and project creation
+indexes the new subtree. A solution-backed scope SHALL additionally reload and
+fully index its Roslyn workspace so compile items and cached non-membership are
+reconciled. Roslyn reload and registered-language reconciliation SHALL be
+independent failure channels: a non-cancellation failure in either SHALL remain
+visible and leave the scope `partial`, but SHALL NOT prevent the other channel
+from reconciling. Caller cancellation SHALL propagate and stop the second
+channel.
+
+Each dispatch result SHALL report successful replacements, replacements that
+produced usable graph output, deletions, skips, and per-file failures
+separately. A caught non-cancellation failure SHALL produce `FileFailure`
+rather than count as indexed or usable. Cold scope status SHALL be `degraded`
+when failures exist and neither Roslyn nor a registered language produced
+usable graph output, `partial` when failures coexist with usable output, and
+`ok` when there are no failures. The one-shot index command SHALL surface
+registered-language failures and return a non-zero exit code.
+
+On cold discovery failure, already persisted usable facts (symbols,
+references, edges, or annotations) SHALL keep the scope queryable and
+watchable with status `partial` and an explicit stale-graph/discovery-failure
+message. File rows or diagnostics alone SHALL NOT count as a usable graph. If
+neither the current pass nor the store contains usable facts, status SHALL be
+`degraded`.
+
+If a file's project implements
+`IDeclarationFirstLanguageProject`, cold and live batches SHALL dispatch its
+declared `DeclarationFilePaths` before consumer files; each priority group
+SHALL use normalized-path order. The dispatcher SHALL still enumerate only
+scope-approved files and SHALL NOT special-case a concrete language.
+
+#### Scenario: Paths-only scope cold-indexes without a solution
+- **GIVEN** a scope root containing `contracts/Contracts.csproj` and
+  `contracts/service.proto`, a paths glob `contracts/**/*.csproj`, no `.sln`
+  or `.slnx`, and a registered indexer claiming `.proto`
+- **WHEN** `LiveIndexService` performs initial indexing
+- **THEN** it skips only the Roslyn workspace phase, discovers the file from
+  the matched project directory through `LanguageIndexerDispatcher`, persists its emitted
+  graph facts, settles the scope to `ok`, and starts a watcher for `.proto`
+
+#### Scenario: Paths scope cannot escape its matched projects
+- **GIVEN** a paths scope whose glob matches `src/App/App.csproj`, plus a
+  registered-language file at `vendor/Other.proto`
+- **WHEN** cold discovery and live watcher events are processed
+- **THEN** `vendor/Other.proto` is neither opened nor persisted
+
+#### Scenario: Selected project links to an unselected sibling
+- **GIVEN** only `src/App/App.csproj` is selected and
+  `src/App/LinkedVendor` physically targets `src/Vendor`
+- **WHEN** cold discovery walks registered-language sources
+- **THEN** it does not traverse the link and opens no Vendor file
+
+#### Scenario: Paths anchor is reachable only through a directory link
+- **GIVEN** a paths scope selects `selected/**/*.csproj` and
+  `selected/link` targets either an in-repository sibling or an outside
+  directory containing a project
+- **WHEN** anchor discovery evaluates the glob
+- **THEN** neither linked project is selected, entered, opened, or watched
+
+#### Scenario: Factory fails during a live edit
+- **GIVEN** a scope has a last successful project map and graph
+- **WHEN** one selected-root factory throws during the next discovery pass
+- **THEN** the dispatcher returns a `ProjectFailure`, retains the old map and
+  graph, and the live scope reports the failure
+
+#### Scenario: Cold factory failure retains a usable stored graph
+- **GIVEN** the graph store contains symbols, references, edges, or annotations
+  from the last successful pass
+- **WHEN** cold project discovery fails before producing a replacement map
+- **THEN** the scope is `partial`, queryable, and watchable with an explicit
+  stale-graph message; the map remains pending and the next ordinary source
+  event retries discovery
+
+#### Scenario: Cold factory failure has no usable stored facts
+- **GIVEN** the store contains at most file rows or diagnostics
+- **WHEN** cold project discovery fails without usable current-pass output
+- **THEN** the scope is `degraded` and the unusable rows do not make it
+  watchable
+
+#### Scenario: Project anchor lifecycle refreshes membership
+- **GIVEN** a paths scope selects `src/**/*.csproj`
+- **WHEN** `src/New/New.csproj` is created and then a registered source below
+  it changes
+- **THEN** the control event refreshes the matcher first and the source is
+  indexed; deleting the anchor later removes its stored file graph and blocks
+  subsequent source events from that subtree
+
+#### Scenario: Roslyn reload fails while a project anchor is deleted
+- **GIVEN** a solution-backed scope with both C# and registered non-C# facts
+- **WHEN** a `.csproj` delete event makes Roslyn reload throw
+- **THEN** registered-language reconciliation still deletes stale non-C# facts,
+  the Roslyn failure remains visible, and the scope is `partial`
+
+#### Scenario: Solution below the scope root does not hide another language
+- **GIVEN** a solution at `src/App.sln`, a registered `.cpp` indexer, and a
+  native file at `native/bridge.cpp` under the same scope root
+- **WHEN** cold indexing and live watching start
+- **THEN** `native/bridge.cpp` is discovered and watched even though it is
+  outside the solution directory
+
+#### Scenario: Registered extension changes without watcher hard-coding
+- **GIVEN** an `ILanguageIndexer` registered for a previously unknown
+  extension `.foo`
+- **WHEN** the scope watcher is constructed and `src/new.foo` is created or
+  changed
+- **THEN** `.foo` is present in the watch filters and the file is routed to
+  that registered indexer through `LanguageIndexerDispatcher`
+
+#### Scenario: Rename is delete plus create
+- **GIVEN** `old.proto` has indexed symbols and edge evidence
+- **WHEN** it is renamed to `new.proto`
+- **THEN** the old path is transactionally deleted before the new path is
+  indexed; no file, symbol, edge, or evidence owned by `old.proto` remains
+
+#### Scenario: Empty successful result removes stale declarations
+- **GIVEN** a registered-language file previously emitted symbols and edges
+- **WHEN** a subsequent successful `IndexAsync` call returns zero events
+- **THEN** the file row remains with its new content hash while all prior
+  symbols, outgoing facts, and evidence for that file are removed, surviving
+  cross-file container and attribute joins are severed, and metadata for the
+  removed declarations is deleted
+
+#### Scenario: Replacement fails after storage mutation begins
+- **GIVEN** a registered-language file has a last successful hash and graph
+- **WHEN** its next replacement encounters invalid evidence or another
+  storage failure after the transaction has begun
+- **THEN** the dispatch result contains a `FileFailure`, reports neither an
+  indexed nor usable file, and the prior hash and complete graph remain
+  unchanged
+
+#### Scenario: Analyzer emits then times out
+- **GIVEN** an analyzer emits a synthetic symbol and then cooperatively waits
+  until its per-document token is cancelled, followed by another analyzer
+- **WHEN** the first analyzer times out
+- **THEN** none of its partial facts are committed, the later analyzer still
+  commits with the language facts, and caller cancellation remains distinct
+  from analyzer timeout
+
+#### Scenario: Analyzer cancels itself without caller cancellation
+- **GIVEN** an analyzer emits a synthetic symbol and then throws a bare
+  `OperationCanceledException`, followed by another analyzer
+- **WHEN** the caller token remains active
+- **THEN** the first analyzer is reported failed, none of its partial facts are
+  committed, and the later analyzer still commits; a requested caller token
+  instead propagates and leaves analyzer state loaded
+
+#### Scenario: Live path escapes through a directory link
+- **GIVEN** `src/external` is a symlink or junction whose physical target is
+  outside the scope root
+- **WHEN** a watcher path below that link has a registered extension
+- **THEN** the dispatcher rejects it before reading bytes or changing the
+  graph
+
+#### Scenario: Declaration path sorts after its consumer by name
+- **GIVEN** one language project marks `ZResources.foo` as a declaration
+  file and `AView.foo` as a consumer
+- **WHEN** either cold discovery or one live batch contains both files
+- **THEN** the dispatcher invokes the registered indexer for
+  `ZResources.foo` first, then dispatches remaining files by normalized path
+
 ### Requirement: Per-project compilation failure isolation
 The indexer SHALL probe each C# project's `Compilation` once before Pass 1 begins. Projects whose `GetCompilationAsync` throws or returns `null` SHALL be recorded as `ProjectFailure(name, reason)` entries in `IndexResult.FailedProjects` and their documents SHALL be excluded from Pass 1, Pass 2, and Pass 3. The indexer SHALL emit one warn-level log entry per failed project; subsequent passes SHALL NOT re-attempt the project's documents in the same indexing pass.
 
@@ -60,19 +308,28 @@ The probe's per-project scope is the unit of attribution: a single project failu
 - **THEN** `IndexResult.FailedProjects` lists every project, `IndexResult.FilesIndexed` is `0`, and the result is returned successfully (the indexer does not throw); the calling layer (`LiveIndexService`) is responsible for translating "zero files indexed but failures present" into the `degraded` scope status
 
 ### Requirement: Per-document failure isolation in Pass 1
-The indexer SHALL wrap each per-changed-file body of Pass 1's symbol-walk loop in try/catch so that an exception walking one file does not abort Pass 1 for the remaining files. Cancellation (`OperationCanceledException`) SHALL still propagate. Other exceptions SHALL be logged at warn level with the file path; the file SHALL be added to `IndexResult.FailedFiles` as `FileFailure(path, reason)` and SHALL be excluded from Pass 1's reconcile (`DeleteSymbolsForFileNotInAsync`), Pass 1's annotation insert, Pass 1's test-framework flush, Pass 2, and Pass 3.
+The indexer SHALL wrap each per-changed-file body of Pass 1's symbol-walk loop in try/catch so that an exception walking one file does not abort Pass 1 for the remaining files. Cancellation (`OperationCanceledException`) SHALL still propagate. Other exceptions SHALL be logged at warn level with the file path; the file SHALL be added to `IndexResult.FailedFiles` as `FileFailure(path, reason)` and SHALL be excluded from Pass 1's reconcile (`DeleteSymbolsForFileNotInAsync`), Pass 1's annotation insert, Pass 2, and Pass 3. Symbol and test-framework metadata written before the exception MAY remain as part of the explicitly incomplete state.
 
-A file in `FailedFiles` SHALL retain its prior store state (symbols, refs, edges, annotations, diagnostics) untouched until the next indexing pass. The indexer SHALL NOT delete-then-fail-to-repopulate any file's data — partial walks SHALL leave the prior good state intact.
+`FailedFiles` signals an incomplete graph, not an atomic rollback. Pass 1 phase A
+MAY already have stored the new content hash and cleared the file's outgoing
+references and edges, and symbol upserts performed before a phase-B exception
+MAY remain. Skipping reconcile prevents declarations from the prior successful
+pass from being deleted merely because the failed walk did not rediscover them,
+but queries MAY be temporarily incomplete. A later successful pass SHALL
+reconcile the file. When the failure occurs during a structural forced pass, the
+persistent structural-reload flag SHALL remain set; otherwise the unchanged-SHA
+integrity check SHALL re-walk a previously symbol-bearing file whose outgoing
+facts were cleared.
 
 #### Scenario: One file's Pass 1 walk throws; other files complete
 - **GIVEN** a Pass-1 batch of three changed files where the second file's `GetSemanticModelAsync` (or any subsequent call inside the per-file walk) throws
 - **WHEN** Pass 1 iterates the three files
 - **THEN** the first and third files are walked, their symbols upserted, and they appear in `walkedFileIds`; the second file is logged at warn level with its path, added to `FailedFiles`, and absent from `walkedFileIds`; reconcile (`DeleteSymbolsForFileNotInAsync`) is NOT called for the second file; Pass 2 walks the first and third files but skips the second; the indexing pass returns successfully
 
-#### Scenario: Failed file preserves prior state
+#### Scenario: Failed file exposes partial state and self-heals
 - **GIVEN** a file `F` that successfully indexed in a prior pass (symbols, refs, and edges present in the store) and whose Pass 1 walk now throws on a re-index
 - **WHEN** Pass 1 catches the exception and skips reconcile for `F`
-- **THEN** `F`'s prior symbols, refs, and edges remain in the store; `find_definition` and `find_references` against symbols in `F` continue to return the prior results until the next successful Pass-1 walk reconciles fresh state
+- **THEN** `F` is returned in `FailedFiles`; prior declarations are not reconciled away, but phase A's new hash and cleared outgoing facts plus any symbol upserts completed before the throw may remain; queries may be incomplete until the next structural retry or unchanged-SHA integrity repair completes a successful walk
 
 #### Scenario: Cancellation propagates from Pass 1
 - **WHEN** Pass 1 is iterating files and the supplied `CancellationToken` is signaled, raising `OperationCanceledException` in a per-file body
@@ -96,10 +353,166 @@ incoming refs from other files do not get orphaned.
 - **THEN** `DeleteSymbolsForFileNotInAsync` removes that symbol row and the
   refs/edges that targeted it in the same transaction
 
+### Requirement: C# structural changes reload under the single-pass lock
+For an allowed `.cs` watcher batch, a path that exists on disk but has no
+`DocumentId` in the sanitized solution SHALL be treated as an addition, and a
+known document that no longer exists SHALL be treated as a deletion. Either
+condition, including both halves of a rename, SHALL reload the solution and
+force a full C# graph pass while holding the indexer's single-pass lock.
+Files that leave the reloaded solution SHALL be transactionally deleted before
+the full pass. Byte-identical surviving files SHALL still be re-walked so
+semantic edges affected by an added or removed declaration are reconciled.
+Ordinary edits to existing documents SHALL retain the document-text incremental
+path. Excluded or privacy-sensitive paths SHALL trigger neither reload nor
+storage mutation, and cancellation SHALL propagate. If stale-file deletion or
+the forced full pass throws or is cancelled, the indexer SHALL restore its
+previous workspace and sanitized-solution fields. A persistent structural-
+reload flag SHALL be set before the first reload attempt and SHALL remain set
+after exceptions, cancellation, project/file failures, or incomplete source-
+generator discovery. While set, the next allowed C# `IndexChangedFilesAsync`
+batch or `IndexAllAsync` call SHALL retry reload plus the forced full pass
+before attempting an ordinary incremental update. A non-throwing partial pass
+MAY retain its replacement workspace, but only a pass with no project or file
+failures SHALL clear the flag.
+
+Every initial or replacement `OpenSolutionAsync` SHALL collect
+`WorkspaceFailed` diagnostics emitted while the candidate workspace opens.
+Warnings SHALL be logged but SHALL NOT block the candidate. Any diagnostic with
+kind `Failure` SHALL reject the candidate before privacy sanitization is
+published, before workspace fields are swapped, and (for replacement reloads)
+before previous-only files are deleted. A failed initial open SHALL dispose the
+candidate and leave the indexer unopened so the same instance can retry. A
+failed re-open or replacement reload SHALL dispose the candidate and retain the
+previous usable workspace and sanitized solution. A failed re-open SHALL retain
+the prior structural-reload state; a failed replacement reload SHALL keep
+structural reload pending. A successful re-open SHALL atomically publish the new
+workspace and then dispose the previous workspace.
+
+`OpenAsync`, `IndexAllAsync`, `IndexChangedFilesAsync`,
+`ReloadAndIndexAllAsync`, and `DisposeAsync` SHALL share the same single-pass
+lock. Candidate workspace opening MAY be slow, but publication and disposal of
+the previous workspace SHALL be serialized so concurrent opens cannot mix
+workspace, solution, path-policy, or diagnostics fields or dispose the same
+workspace twice. A successful re-open SHALL preserve an already-set structural-
+reload flag; only a complete forced index pass may clear it. `DisposeAsync`
+SHALL wait for an active open/index pass, atomically mark the indexer disposed,
+clear its workspace/solution/path and diagnostic references, and cause queued
+operations to fail as disposed after they acquire the lock.
+
+Read/GetText failures, null Roslyn syntax trees or semantic models, and Pass 2
+failures SHALL produce one deduplicated `FileFailure` per affected path.
+`OperationCanceledException` SHALL never be converted into a file or generator
+failure. Source-generator discovery failure SHALL be visible in the result and
+shall keep structural reload pending.
+
+After complete source-generator discovery during any complete all-document
+pass, the indexer SHALL compare `ListGeneratedFilesAsync(int.MaxValue)` with
+the current privacy-approved generated-owner storage paths and delete persisted
+generated files missing from the current set. Current-workspace generated
+document identities are authoritative: reopening a solution MAY assign new
+Roslyn `DocumentId` values, and a subsequent complete pass SHALL remove the
+prior owner rows after indexing the current owners. Reconciliation SHALL run
+only when discovery is complete and `IndexResult.FailedProjects` and
+`IndexResult.FailedFiles` are both empty. If discovery or any later indexing
+phase is incomplete, the indexer SHALL retain every prior generated owner and
+its graph, keep structural reload pending, and retry before stale deletion.
+
+#### Scenario: SDK-style compile item is added
+- **GIVEN** an SDK-style project whose current sanitized solution does not
+  contain `Added.cs`
+- **WHEN** `Added.cs` is created inside the allowed project and its path is
+  passed to `IndexChangedFilesAsync`
+- **THEN** the solution is reloaded, symbols from `Added.cs` are indexed, and
+  unchanged callers are re-walked so newly resolvable references and edges
+  appear
+
+#### Scenario: C# file is deleted or renamed
+- **WHEN** a known C# document is deleted, or renamed as an old-path plus
+  new-path batch
+- **THEN** the old file row, declarations, references, edges, and evidence are
+  removed; the replacement document (if any) is discovered; surviving files
+  are fully re-indexed against the replacement solution snapshot
+
+#### Scenario: Excluded new C# file is observed
+- **WHEN** a newly created `.cs` path is outside the privacy boundary or matches
+  a scope exclude
+- **THEN** the batch returns without opening a replacement workspace or
+  changing the graph
+
+#### Scenario: Partial forced pass retries on a different file event
+- **GIVEN** a structural reload reached Pass 2 but one file's edge write failed
+- **WHEN** the pass returns that file in `FailedFiles`, followed by an allowed
+  event for a different existing C# document
+- **THEN** the replacement snapshot may remain active, but the pending flag
+  forces another solution reload and complete full pass before processing the
+  different document incrementally
+
+#### Scenario: Workspace returns a partial solution with a failure diagnostic
+- **GIVEN** an existing indexed graph and a replacement workspace whose
+  `OpenSolutionAsync` returns a partial `Solution` while emitting one warning and
+  one `Failure` diagnostic
+- **WHEN** a structural reload attempts to open that replacement
+- **THEN** the warning does not appear as the rejection reason, the failure
+  diagnostic causes a controlled exception, no previous-only file is deleted,
+  the prior workspace and graph remain available, and the next allowed C# event
+  retries the structural reload
+
+#### Scenario: Initial partial workspace open is retryable
+- **WHEN** the first `OpenAsync` returns a partial solution with a `Failure`
+  diagnostic
+- **THEN** the candidate workspace is disposed, `Workspace` and
+  `SanitizedSolution` remain null, and a later `OpenAsync` on the same indexer
+  can succeed
+
+#### Scenario: Successful re-open preserves a pending forced repair
+- **GIVEN** an incremental content read failed and set structural reload pending
+- **WHEN** product retry successfully calls `OpenAsync` again, followed by
+  `IndexAllAsync` or an event for a different existing C# file
+- **THEN** publishing the new workspace does not clear the flag; the next index
+  call performs a forced full repair, and only its complete result clears the
+  flag
+
+#### Scenario: Generated output disappears
+- **GIVEN** the store contains an `is_generated` row from the prior complete
+  pass and complete generator discovery no longer returns that path
+- **WHEN** a complete all-document pass succeeds
+- **THEN** the stale generated file, its symbols, references, edges, and
+  evidence are deleted; if generator discovery was incomplete, the row is
+  retained
+
+#### Scenario: Reopen changes generated document owners
+- **GIVEN** a completed pass persisted generated-owner rows and reopening the
+  same solution assigns different current-workspace generated `DocumentId`
+  values
+- **WHEN** the next complete all-document pass succeeds
+- **THEN** current generated owners are indexed, prior owner rows are deleted
+  as stale, and canonical symbols and their current references remain
+  queryable
+
+#### Scenario: Current generated-owner indexing fails after owner churn
+- **GIVEN** prior generated owners have usable rows, symbols, and references,
+  and current discovery returns a different owner set
+- **WHEN** the current pass reports a generated-owner collision or another
+  project/file indexing failure
+- **THEN** none of the prior generated owners are stale-reconciled, their
+  existing graph remains queryable, and structural reload stays pending
+- **AND** the first later pass with complete discovery and no project/file
+  failures indexes the unique current owners before deleting the prior owners
+
+#### Scenario: Existing C# file is outside the loaded solution
+- **GIVEN** an allowed existing `.cs` path that remains outside the solution
+  after a successful reload
+- **WHEN** the same path is observed again without an explicit reload
+- **THEN** the cached non-membership prevents another structural reload; an
+  explicit `ReloadAndIndexAllAsync` invalidates this cache so membership can be
+  evaluated again
+
 ### Requirement: Hydrate in-memory maps from the store on startup
 The indexer SHALL populate `_symbolIdByKey`, `_keysByFileId`, and
 `_fileIdByPath` from the existing graph DB on the first `IndexCoreAsync` call
-in a process (or after `fullReset`).
+in a process (or after `fullReset`). It SHALL also retain each file row's exact
+persisted path spelling so later path-identity matches can mutate or delete the
+existing row rather than inserting a differently spelled alias.
 
 #### Scenario: Server restart with an existing DB
 - **WHEN** `sourcegraph-mcp serve` starts against a solution whose
@@ -114,10 +527,51 @@ in a process (or after `fullReset`).
   symbols with zero outgoing refs AND zero outgoing edges are bypassed
   and re-walked
 
+### Requirement: Physical source-path identity follows the host OS
+Regular source paths SHALL use case-insensitive identity on Windows and
+case-sensitive identity on Linux. Every path-keyed in-memory set and map used
+for discovery, SHA gating, structural reload, and incremental dispatch SHALL
+use the same host-OS rule. On Windows, when a differently cased path matches a
+hydrated or current file row, the indexer SHALL reuse that row's integer id and
+exact persisted path spelling for storage operations. Structural deletion SHALL
+likewise resolve a watcher spelling to the exact persisted spelling before
+deleting. Linux SHALL continue to treat differently cased paths as distinct.
+
+#### Scenario: Windows casing-only reload reuses the file row
+- **GIVEN** a Windows index contains `CaseConsumer.cs` with file id `F`
+- **WHEN** the file is renamed through a casing-only change to
+  `CASECONSUMER.cs` and the old/new watcher paths trigger structural reload
+- **THEN** exactly one case-equivalent file row remains, its id is still `F`,
+  its hash and outgoing evidence describe the new bytes, and evidence from the
+  old content is absent
+
+#### Scenario: Windows casing variant survives hydration and incremental edit
+- **GIVEN** a Windows process restarts with one persisted mixed-case file row
+- **WHEN** an incremental watcher event supplies another casing of that path
+- **THEN** hydrated identity resolves the exact persisted row, the edit updates
+  that same id without creating an alias row, and a later restart remains
+  stable
+
+#### Scenario: Linux paths remain case-sensitive
+- **GIVEN** a Linux solution legitimately contains both `Consumer.cs` and
+  `consumer.cs`
+- **WHEN** both documents are indexed
+- **THEN** they retain distinct file rows and file ids
+
 ### Requirement: Multi-target and linked-file iterations don't double-count
-The indexer SHALL emit refs and edges from at most one document per fileId
-even when the loaded solution exposes the same source path multiple times
-(multi-target frameworks, linked files, shared projects).
+For regular documents, Phase A SHALL group documents by host-OS source-path
+identity and make the stored-SHA changed/unchanged decision exactly once per
+path/fileId. When the file changed, every document iteration for that path
+SHALL be added to Pass 1 before reconciliation so declarations visible only
+under a later target framework or linked-project parse configuration are
+retained. Generated documents SHALL instead be grouped by generated-owner
+storage identity and SHALL never be merged merely because their display
+`FilePath` values match. The indexer SHALL emit refs and edges from at most one
+document per fileId even when the loaded solution exposes the same regular
+source path multiple times (multi-target frameworks, linked files, shared
+projects). Pass 2 SHALL carry the selected document's resolved file id
+directly; it SHALL NOT reverse-map `Document.FilePath`, because display paths
+are not unique for generated documents.
 
 #### Scenario: A file targeted by multiple TFMs
 - **WHEN** the solution multi-targets such that path `P` produces N
@@ -126,17 +580,62 @@ even when the loaded solution exposes the same source path multiple times
   all N iterations before reconciling, and pass 2 walks exactly one of the N
   documents
 
+#### Scenario: Declaration exists only in a later target framework
+- **GIVEN** a previously indexed path with no declarations, whose first target
+  framework does not define `SECOND_TFM` and whose later target framework does
+- **WHEN** the path is edited to declare `OnlyInSecondTarget` inside
+  `#if SECOND_TFM`
+- **THEN** Phase A decides that the path changed once, Pass 1 walks both
+  document iterations even though the first discovers no declaration, and the
+  stored symbol set contains `OnlyInSecondTarget`
+
 ### Requirement: Robust file reads against editor save races
-The indexer SHALL skip a file gracefully and rely on the next watcher event
-when a transient `IOException` interrupts the file read (e.g., a 0-byte view
-during an editor save).
+Before compilation probing or graph mutation, the indexer SHALL capture each
+regular source path selected for the pass once as an exact byte snapshot. It
+SHALL decode that same buffer into a BOM-aware `SourceText`, bind the same text
+to every `DocumentId`
+for that path (including linked and multi-target iterations), and pass both the
+text and original bytes to Phase A. Phase A SHALL validate that every regular
+document iteration still has equivalent bound text and SHALL hash the captured
+bytes without reading the disk again. Thus the stored SHA and semantic graph
+always describe the same version and preserve the original encoding/BOM in the
+hash.
+
+`IOException`, `InvalidDataException`,
+`UnauthorizedAccessException`, `SecurityException`, and
+`DecoderFallbackException` SHALL be converted into one deduplicated
+`FileFailure`; `OperationCanceledException` SHALL propagate. The failed file's
+owning projects SHALL be excluded from regular-document indexing, touched
+project probing, and source-generator discovery for that batch. The indexer
+SHALL leave the stored graph and content hash for those projects unchanged and
+keep structural reload pending so the next allowed C# event, even for a
+different path, retries a complete snapshot.
+
+Invalid path strings SHALL be rejected independently as `FileFailure` entries;
+one malformed path SHALL NOT abort valid paths in the same watcher batch.
 
 #### Scenario: Read fails mid-batch
-- **WHEN** `File.ReadAllBytesAsync` or `File.ReadAllTextAsync` throws
-  `IOException` while building the changed-file batch
-- **THEN** the path is logged at debug, omitted from the current batch, and
-  no partial state is committed; the next FSW event for that path retries
-  the read
+- **GIVEN** a known changed file whose prior graph and content hash are stored
+- **WHEN** its byte-snapshot read or decode fails transiently
+- **THEN** the path is logged at debug and returned in `FailedFiles`, its owning
+  project contributes no regular or generated documents to the batch, its graph
+  and hash remain unchanged, and the next allowed C# event forces a full reload
+  that repairs the file once it is readable
+
+#### Scenario: Disk changes after the snapshot is captured
+- **GIVEN** an incremental read captures version A, including a UTF BOM, and
+  the editor replaces the on-disk file with version B before Phase A begins
+- **WHEN** the current batch indexes the already-bound document
+- **THEN** Phase A performs no second disk read, stores the exact hash and
+  semantics of A, and a subsequent watcher event reads and replaces the graph
+  with B
+
+#### Scenario: Full-pass snapshot read fails
+- **WHEN** snapshot acquisition for one regular path fails during a full pass
+- **THEN** the path is returned once in `FailedFiles`, all projects owning that
+  path are excluded from regular and generated indexing for the pass, structural
+  reload remains pending, and an event for a different allowed C# path retries
+  the full snapshot
 
 ### Requirement: Symbol modifiers and accessibility recorded
 The indexer SHALL capture every Roslyn modifier (`static`, `async`, `virtual`, `abstract`, `sealed`, `override`, `extern`, `readonly`, `partial`) and the `DeclaredAccessibility` of every indexed symbol, and SHALL persist both via `UpsertSymbolAsync`.
@@ -266,7 +765,26 @@ For every `ThrowStatementSyntax` and `ThrowExpressionSyntax`, the indexer SHALL 
 - **THEN** an edge `(method.id, MyDomainException.id, Throws)` is written
 
 ### Requirement: Source-generated documents indexed
-The indexer SHALL include source-generated documents (`Project.GetSourceGeneratedDocumentsAsync()`) alongside regular documents, marking the corresponding `files.is_generated` row to `1`.
+The indexer SHALL include source-generated documents
+(`Project.GetSourceGeneratedDocumentsAsync()`) alongside regular documents,
+marking the corresponding `files.is_generated` row to `1`.
+
+A generated file's persisted identity SHALL be independent of its display
+`Document.FilePath` and its content hash. The indexer SHALL derive a
+privacy-approved, absolute synthetic storage path below the solution's reserved
+`obj/.sourcegraph-generated/v1` area from project identity, generator/document
+owner identity, and hint/display metadata. The current workspace's generated
+`DocumentId` SHALL distinguish owners within that workspace. Consequently,
+different projects or generators that report the same display path and hint
+SHALL retain separate file rows, and a regular source whose physical path
+matches that display path SHALL remain a separate non-generated row.
+
+If two current generated documents resolve to the same generated-owner storage
+identity, the indexer SHALL fail that owner group once as a `FileFailure`, skip
+merging its documents, and keep structural reload pending. Generated synthetic
+paths SHALL not be sent to disk/git history callbacks. Their stored SHA SHALL
+still be computed from the generated `SourceText` encoded as UTF-8, so the hash,
+symbols, references, and edges describe the same generated content.
 
 #### Scenario: Generated document indexed
 - **WHEN** a project uses a source generator producing a `*.g.cs` document with a real `class GeneratedFoo`
@@ -276,8 +794,30 @@ The indexer SHALL include source-generated documents (`Project.GetSourceGenerate
 - **WHEN** the same source-gen run produces byte-identical output to last time
 - **THEN** the file row's `content_sha256` is unchanged and no symbol/edge work happens for that file
 
+#### Scenario: Projects, generators, and a regular file share a display path
+- **GIVEN** two projects each produce generated documents from multiple
+  generators using the same display path and hint, and a regular source file
+  also has that physical display path
+- **WHEN** a complete pass indexes the solution
+- **THEN** every generated owner has a distinct synthetic `is_generated = 1`
+  row, the regular source has one separate `is_generated = 0` row, each stored
+  hash matches that owner's bytes, and each project's symbols and references
+  retain their own semantics
+
+#### Scenario: Generated owner collision fails closed
+- **GIVEN** two current generated documents resolve to the same synthetic owner
+  identity
+- **WHEN** Phase A groups the documents
+- **THEN** it records one file failure for that owner, performs no merged
+  symbol reconciliation for the group, and leaves structural reload pending
+
 ### Requirement: Roslyn diagnostics captured per file
-The indexer SHALL run `compilation.GetDiagnostics(ct)` after pass 2 and persist every diagnostic with a non-empty `Location.SourceSpan` into the `diagnostics` table; on reindex, prior diagnostics for the file SHALL be deleted before reinserting.
+The indexer SHALL run `compilation.GetDiagnostics(ct)` after pass 2 and persist
+every diagnostic with a non-empty `Location.SourceSpan` into the `diagnostics`
+table; on reindex, prior diagnostics for the file SHALL be deleted before
+reinserting. Diagnostic ownership SHALL be resolved by exact Roslyn
+`SyntaxTree` object identity captured during Phase A, not by source/display
+path, so equal generated display paths cannot cross-attribute diagnostics.
 
 #### Scenario: Warning attached to a symbol
 - **WHEN** a method calls an `[Obsolete("Use Foo")]`-tagged member and Roslyn emits `CS0618`
@@ -442,6 +982,19 @@ For every project that contains XAML files, the `XamlLanguageProjectFactory` SHA
 
 Discovery SHALL use two passes: first parse every scope-approved project XAML file into resource declarations and merge links, then walk the project-global cascade roots. The implementation SHALL NOT open a file excluded by the scope/privacy policy, reached through a reparse point outside the physical scope, or not owned by the project. Duplicate visible declarations SHALL be retained as an ambiguous candidate set; filesystem enumeration order SHALL NOT silently choose one.
 
+Any non-excluded directory enumeration, project/XAML read, or XML parse failure
+SHALL make XAML discovery incomplete and propagate to the dispatcher; the
+factory SHALL NOT return a partial project list or publish a partial resource
+snapshot. Scope/privacy exclusions SHALL still be checked before each read.
+Explicit `Include` and `Update` items SHALL be unioned with a complete,
+policy-pruned `*.xaml` scan and SHALL NOT suppress discovery of SDK-default or
+otherwise implicit XAML files. A safely identified lexical scope/privacy
+exclusion MAY be pruned, but a non-excluded root, directory, or file whose
+physical identity cannot be resolved SHALL fail discovery rather than appear
+as an empty or partial result. Caller cancellation SHALL be checked at the
+factory entry and around each synchronous enumeration, read, XML parse, and
+per-project build boundary; it SHALL propagate without publishing a result.
+
 The snapshot SHALL be reused for every `.xaml` file in the project so resource-resolution lookups (`{StaticResource AccentBrush}` → declaration site) do not re-walk the cascade per file. `XamlLanguageProject` SHALL implement `IDeclarationFirstLanguageProject`; its `DeclarationFilePaths` SHALL be the deterministic, duplicate-free set of real files that own the snapshot's resource declarations. A capable host dispatches that subset before consuming XAML files, so a cold index never depends on filesystem enumeration order. `XamlLanguageProject.RebuildResourceCache()` SHALL atomically replace the snapshot from the same scope-filtered project file set after an incremental resource edit; callers already using the prior immutable snapshot may finish against it.
 
 #### Scenario: Resource resolved from App.xaml
@@ -507,16 +1060,50 @@ The integrity check SHALL be implemented via a new storage method `IGraphStore.H
 - **THEN** the indexer emits an info-level log entry of the form `"Re-walking references for {Path}: file SHA matches but no outgoing references in store …"` so operators can observe recoveries; healthy installs never see this line
 
 ### Requirement: Pass 2 file-walk failures don't abort the loop
-The indexer SHALL wrap each per-file body of pass 2's reference walk in a try/catch so that an exception thrown while walking one file does not abort pass 2 for the remaining files. Cancellation (`OperationCanceledException`) SHALL still propagate. Other exceptions SHALL be logged at warn level with the file path and exception detail; the failed file's outgoing edges remain cleared this round and will be re-walked on the next index via the integrity check above.
+The indexer SHALL wrap each per-file body of pass 2's reference walk in a
+try/catch so that an exception thrown while walking one file does not abort
+pass 2 for the remaining files. Cancellation (`OperationCanceledException`)
+SHALL still propagate. Other exceptions SHALL be logged at warn level with the
+file path and exception detail.
+
+Because reference and edge batches are separate store transactions, any Pass 2
+failure or cancellation SHALL first persist an impossible content-hash marker
+(an empty blob, which cannot equal a SHA-256 digest) using
+`CancellationToken.None`, then clear the affected file's outgoing references
+and edges using `CancellationToken.None`. The marker SHALL be written before
+the clear so a process exit between the operations still forces a later walk.
+A non-cancellation failure SHALL mark and clear that file, keep structural
+reload pending, and continue. On cancellation, every changed file that
+completed Pass 1 but has not completed both Pass 2 commits SHALL be marked and
+cleared before the exception propagates. Reference counts SHALL be credited
+only after both reference and edge writes complete. A subsequent index,
+including one in a new process with the same database and unchanged source
+bytes, SHALL observe the marker/SHA mismatch and rebuild the file even when it
+declares zero symbols.
 
 #### Scenario: One file's walk throws; other files' walks complete
 - **GIVEN** a pass-2 batch of three changed files where the second file's syntax tree triggers an exception during the descendant-node walk (e.g. a transient compilation gap, a symbol-resolution failure)
 - **WHEN** pass 2 iterates the three files
-- **THEN** the first file's references are inserted, the second file's exception is caught and logged at warn level with the file path, and the third file's references are inserted; pass 2 completes without rethrowing
+- **THEN** the first file's references are inserted, the second file's exception
+  is caught and logged at warn level with the file path, its retry marker is
+  persisted and partial outgoing facts are cleared, and the third file's
+  references are inserted; pass 2 completes without rethrowing
 
 #### Scenario: Cancellation propagates
 - **WHEN** pass 2 is iterating files and the supplied `CancellationToken` is signaled, raising `OperationCanceledException` in a per-file body
-- **THEN** the catch handler rethrows so the cancellation surfaces to the caller; partial state from earlier files in the batch is left as-is
+- **THEN** files that already completed both Pass 2 commits remain intact;
+  the current and remaining Pass-1-complete files receive the durable retry
+  marker and have partial outgoing facts cleared with a non-cancelled cleanup
+  token; then the catch handler rethrows so cancellation surfaces to the caller
+
+#### Scenario: Cancellation after references commit self-heals after restart
+- **GIVEN** a changed file whose reference batch commits and whose caller token
+  is cancelled before its edge batch commits
+- **WHEN** the cancelled indexer is disposed and a new indexer opens the same
+  database against identical source bytes
+- **THEN** the file row holds the empty retry marker and has no partial outgoing
+  references before restart; the new index bypasses the SHA fast path, restores
+  the real SHA, references, and edges, and reports no file failure
 
 ### Requirement: TypeScript / JavaScript file dispatch
 The indexer SHALL register `TypeScriptLanguageIndexer` for the file extensions `.ts`, `.tsx`, `.js`, and `.jsx`. Each extension dispatches to the appropriate tree-sitter grammar (TypeScript / TSX / JavaScript). The indexer SHALL emit `IndexEvent`s for declarations, references, JSX usages, and the standard `FileScanned` sentinel.

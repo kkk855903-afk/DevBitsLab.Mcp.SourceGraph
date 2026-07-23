@@ -1,5 +1,7 @@
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.Text;
+using System;
+using System.Linq;
 using System.Text;
 
 namespace Sample.Generators
@@ -28,6 +30,89 @@ namespace Sample.Generators
             {
                 ctx.AddSource("GeneratedHello.g.cs", SourceText.From(Source, Encoding.UTF8));
             });
+        }
+    }
+
+    /// <summary>
+    /// Test-only generator used by Roslyn structural identity tests. Its hint is intentionally
+    /// shared with <see cref="SecondStorageIdentityGenerator"/>; the output varies per consuming
+    /// project and marker text so incremental generated-owner updates can be asserted.
+    /// </summary>
+    [Generator(LanguageNames.CSharp)]
+    public sealed class StorageIdentityGenerator : IIncrementalGenerator
+    {
+        public void Initialize(IncrementalGeneratorInitializationContext context)
+        {
+            context.RegisterSourceOutput(
+                context.CompilationProvider,
+                static (productionContext, compilation) =>
+                {
+                    var assemblyName = ToIdentifier(
+                        compilation.AssemblyName ?? "Unknown");
+                    var isVersionTwo = compilation.SyntaxTrees.Any(tree =>
+                        tree.GetText().ToString().IndexOf(
+                            "GEN_VERSION_2",
+                            StringComparison.Ordinal) >= 0);
+                    var version = isVersionTwo ? "V2" : "V1";
+                    var source = $@"namespace Generated.{assemblyName};
+
+public static class GeneratedState{version}
+{{
+    public const int Version = {(isVersionTwo ? 2 : 1)};
+    public static int ReadSecond() => SecondGeneratedState.Value;
+}}
+";
+                    productionContext.AddSource(
+                        "SharedOwner.g.cs",
+                        SourceText.From(source, Encoding.UTF8));
+                });
+        }
+
+        private static string ToIdentifier(string value)
+        {
+            var chars = value
+                .Select(character =>
+                    char.IsLetterOrDigit(character) || character == '_'
+                        ? character
+                        : '_')
+                .ToArray();
+            return chars.Length == 0 || char.IsDigit(chars[0])
+                ? "_" + new string(chars)
+                : new string(chars);
+        }
+    }
+
+    /// <summary>
+    /// Second owner with the same hint name, proving generator identity cannot be reduced to a
+    /// display path or hint.
+    /// </summary>
+    [Generator(LanguageNames.CSharp)]
+    public sealed class SecondStorageIdentityGenerator : IIncrementalGenerator
+    {
+        public void Initialize(IncrementalGeneratorInitializationContext context)
+        {
+            context.RegisterSourceOutput(
+                context.CompilationProvider,
+                static (productionContext, compilation) =>
+                {
+                    var assemblyName = new string(
+                        (compilation.AssemblyName ?? "Unknown")
+                        .Select(character =>
+                            char.IsLetterOrDigit(character) || character == '_'
+                                ? character
+                                : '_')
+                        .ToArray());
+                    var source = $@"namespace Generated.{assemblyName};
+
+public static class SecondGeneratedState
+{{
+    public const int Value = 7;
+}}
+";
+                    productionContext.AddSource(
+                        "SharedOwner.g.cs",
+                        SourceText.From(source, Encoding.UTF8));
+                });
         }
     }
 }
