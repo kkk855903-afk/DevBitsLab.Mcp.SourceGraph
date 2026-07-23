@@ -472,6 +472,31 @@ static async Task<int> RunIndexAsync(CommandLine cli)
         return 2;
     }
     var solutionFull = Path.GetFullPath(cli.SolutionPath);
+    var repoRootForIndex = cli.ResolvedRepoRoot();
+    ScopeConfig indexScopeConfig;
+    OneShotScopeSelection indexScopeSelection;
+    try
+    {
+        indexScopeConfig = ScopeConfigLoader.Load(repoRootForIndex, [solutionFull]);
+        indexScopeSelection = OneShotScopeResolver.Resolve(
+            indexScopeConfig,
+            solutionFull,
+            cli.ScopeId);
+    }
+    catch (ScopeConfigException ex)
+    {
+        await Console.Error.WriteLineAsync($"error: {ex.Message}").ConfigureAwait(false);
+        return 2;
+    }
+    catch (ArgumentException ex)
+    {
+        await Console.Error.WriteLineAsync($"error: {ex.Message}").ConfigureAwait(false);
+        return 2;
+    }
+
+    var selectedScope = indexScopeSelection.Scope;
+    var selectedScopeId = selectedScope.Id;
+    var excludePatterns = selectedScope.ProjectSet.Exclude;
     if (!File.Exists(solutionFull))
     {
         await Console.Error.WriteLineAsync($"error: solution not found: {solutionFull}").ConfigureAwait(false);
@@ -540,7 +565,6 @@ static async Task<int> RunIndexAsync(CommandLine cli)
     var blamer = new GitBlameRunner(loggerFactory.CreateLogger<GitBlameRunner>());
     // Respect an explicit --root so history and source indexing share the same fail-closed
     // repository boundary even when the solution lives in a subdirectory.
-    var repoRootForIndex = cli.ResolvedRepoRoot();
     var historyTask = historyDisabled
         ? Task.CompletedTask
         : RunHistoryPipelineAsync(
@@ -554,11 +578,12 @@ static async Task<int> RunIndexAsync(CommandLine cli)
         store,
         loggerFactory.CreateLogger<RoslynIndexer>(),
         sink,
-        privacyRoot: repoRootForIndex);
+        repoRootForIndex,
+        excludePatterns);
     if (!historyDisabled)
     {
         indexer.OnFileIndexed = (fileId, path, sha) =>
-            historyQueue.Writer.WriteAsync(new HistoryRequest(fileId, path, sha, "default")).AsTask();
+            historyQueue.Writer.WriteAsync(new HistoryRequest(fileId, path, sha, selectedScopeId)).AsTask();
     }
     await indexer.OpenAsync(solutionFull).ConfigureAwait(false);
     var result = await indexer.IndexAllAsync().ConfigureAwait(false);
@@ -570,21 +595,15 @@ static async Task<int> RunIndexAsync(CommandLine cli)
     // here so a CI / smoke-test invocation produces the same per-scope graph the live server
     // would. Skipped silently when no plugins are declared in `.sourcegraph.json`, preserving
     // the v0.5.0 zero-config single-solution path.
-    DevBitsLab.Mcp.SourceGraph.Storage.ScopeConfig? indexScopeConfig = null;
-    try
-    {
-        indexScopeConfig = DevBitsLab.Mcp.SourceGraph.Storage.ScopeConfigLoader.Load(repoRootForIndex);
-    }
-    catch (DevBitsLab.Mcp.SourceGraph.Storage.ScopeConfigException ex)
-    {
-        await Console.Error.WriteLineAsync($"[sourcegraph-mcp] {ex.Message}").ConfigureAwait(false);
-    }
     // Plugin host always runs on the one-shot CLI path so the in-tree XAML indexer dispatches
     // .xaml files alongside the C# bulk index. Skipping the plugin host loop is fine when no
     // plugins are declared (LoadAllAsync is a no-op then) — but the langRegistry below still
     // gets the built-in C# stub + XAML indexer so the dispatcher pass actually runs.
     {
-        var pluginHost = new PluginHost(repoRootForIndex, indexScopeConfig?.Plugins ?? Array.Empty<PluginRef>(), loggerFactory.CreateLogger<PluginHost>());
+        var pluginHost = new PluginHost(
+            repoRootForIndex,
+            indexScopeConfig.Plugins,
+            loggerFactory.CreateLogger<PluginHost>());
         try
         {
             await pluginHost.LoadAllAsync().ConfigureAwait(false);
@@ -629,7 +648,17 @@ static async Task<int> RunIndexAsync(CommandLine cli)
         foreach (var factory in projectFactoryRegistry.All())
         {
             IReadOnlyList<ILanguageProject> projects;
-            try { projects = await factory.DiscoverAsync(repoRootForIndex, default).ConfigureAwait(false); }
+            try
+            {
+                projects = factory is IExclusionAwareLanguageProjectFactory exclusionAware
+                    ? await exclusionAware.DiscoverAsync(
+                        repoRootForIndex,
+                        excludePatterns,
+                        CancellationToken.None).ConfigureAwait(false)
+                    : await factory.DiscoverAsync(
+                        repoRootForIndex,
+                        CancellationToken.None).ConfigureAwait(false);
+            }
             catch (Exception ex)
             {
                 await Console.Error.WriteLineAsync($"[sourcegraph-mcp] factory `{factory.GetType().FullName}` failed DiscoverAsync: {ex.Message}").ConfigureAwait(false);
@@ -639,22 +668,39 @@ static async Task<int> RunIndexAsync(CommandLine cli)
             {
                 foreach (var path in p.FilePaths)
                 {
+                    if (string.IsNullOrWhiteSpace(path)
+                        || indexScopeSelection.PathPolicy.IsExcluded(path))
+                    {
+                        continue;
+                    }
                     if (!oneShotProjectMap.ContainsKey(path)) oneShotProjectMap[path] = p;
                 }
             }
         }
-        var dispatched = await dispatcher.DispatchAllForTestAsync(store, "default", repoRootForIndex, oneShotProjectMap).ConfigureAwait(false);
+        var dispatched = await dispatcher.DispatchAllForTestAsync(
+            store,
+            selectedScopeId,
+            repoRootForIndex,
+            oneShotProjectMap,
+            excludePatterns,
+            CancellationToken.None).ConfigureAwait(false);
         if (dispatched > 0)
         {
             Console.WriteLine($"non-C# dispatch: indexed {dispatched} files");
         }
 
-        if (indexScopeConfig is { Plugins.Count: > 0 })
+        if (indexScopeConfig.Plugins.Count > 0)
         {
             var analyzerPipeline = new AnalyzerPipeline(pluginHost, loggerFactory.CreateLogger<AnalyzerPipeline>());
             if (analyzerPipeline.HasAnalyzers)
             {
-                await DispatchAnalyzersForOneShotAsync(store, "default", repoRootForIndex, analyzerPipeline, loggerFactory.CreateLogger<Program>()).ConfigureAwait(false);
+                await DispatchAnalyzersForOneShotAsync(
+                    store,
+                    selectedScopeId,
+                    repoRootForIndex,
+                    indexScopeSelection.PathPolicy,
+                    analyzerPipeline,
+                    loggerFactory.CreateLogger<Program>()).ConfigureAwait(false);
             }
             var loadedCount = pluginHost.Plugins.Count(p => p.Status == PluginStatus.Loaded);
             var failedCount = pluginHost.Plugins.Count(p => p.Status == PluginStatus.Failed);
@@ -688,6 +734,7 @@ static async Task DispatchAnalyzersForOneShotAsync(
     DevBitsLab.Mcp.SourceGraph.Storage.IGraphStore store,
     string scopeId,
     string repoRoot,
+    ScopePathPolicy pathPolicy,
     AnalyzerPipeline analyzerPipeline,
     ILogger<Program> logger)
 {
@@ -709,6 +756,8 @@ static async Task DispatchAnalyzersForOneShotAsync(
 
     foreach (var file in files)
     {
+        if (pathPolicy.IsExcluded(file.Path)) continue;
+
         byte[] contents;
         try
         {

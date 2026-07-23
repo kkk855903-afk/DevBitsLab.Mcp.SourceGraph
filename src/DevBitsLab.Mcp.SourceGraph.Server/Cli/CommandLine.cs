@@ -32,8 +32,8 @@ internal sealed class CommandLine
     /// <summary>True when <c>--all</c> was passed; consumed by <c>embeddings remove</c> to wipe
     /// every cached model directory rather than just the active one.</summary>
     public bool All { get; private init; }
-    /// <summary>The scope id passed via <c>--scope &lt;id&gt;</c>; consumed by <c>vocabulary list</c>
-    /// to filter the output to a single scope. Null means every scope.</summary>
+    /// <summary>The scope id passed via <c>--scope &lt;id&gt;</c>; consumed by commands that need
+    /// one configured scope, including <c>index</c>, <c>demo</c>, and <c>vocabulary list</c>.</summary>
     public string? ScopeId { get; private init; }
     /// <summary>Statement timeout (seconds) for the <c>query_graph</c> tool. Null when not set;
     /// resolution falls back to <c>SOURCEGRAPH_QUERY_TIMEOUT_SECONDS</c> then the built-in default.</summary>
@@ -338,8 +338,9 @@ internal sealed class CommandLine
               `default` mapped to that solution. Otherwise reads `.sourcegraph.json` from --root
               (or CWD) for multi-scope configuration.
 
-          sourcegraph-mcp index <solution-path> [--db <path>] [--model <id>] [--no-embeddings] [--allow-model-download|--no-model-download] [--no-history]
-              Build/refresh the graph database from the given .sln file, then exit.
+          sourcegraph-mcp index <solution-path> [--scope <id>] [--db <path>] [--model <id>] [--no-embeddings] [--allow-model-download|--no-model-download] [--no-history]
+              Build/refresh the graph database from the given .sln file, then exit. When multiple
+              configured scopes contain the solution, --scope is required.
 
           sourcegraph-mcp stats [--db <path>]
               Print counts of files / symbols / references / edges in the graph database.
@@ -441,8 +442,8 @@ internal sealed class CommandLine
                             tools/list. Saves upfront tokens at the cost of less guidance
                             for agents picking between tools. Equivalent to setting
                             SOURCEGRAPH_NO_TOOL_TRIGGERS=1.
-          --scope <id>      Restrict the operation to a single scope. Currently consumed by
-                            `vocabulary list`; ignored elsewhere.
+          --scope <id>      Restrict the operation to a single scope. Used by `index`, `demo`,
+                            and `vocabulary list`.
           --strict          Treat warnings as errors. Currently consumed by `vocabulary list`,
                             which exits 2 on drift candidates when set.
           --query-timeout-seconds <int>
