@@ -13,6 +13,20 @@ public interface IGraphStore : IAsyncDisposable
     /// left with no evidence. Does NOT delete symbols — they retain stable ids across edits.</summary>
     Task ClearFileOutgoingAsync(long fileId, CancellationToken ct = default);
 
+    /// <summary>
+    /// Transactionally removes only edge evidence produced by the exact
+    /// <paramref name="producingFileId"/> + <paramref name="producer"/> pair. Compatibility
+    /// payloads on surviving logical edges are resynchronised to their earliest remaining
+    /// evidence; logical edges whose final evidence is removed are deleted. Returns the number
+    /// of evidence occurrences removed.
+    /// </summary>
+    Task<int> ClearEdgeEvidenceAsync(
+        long producingFileId,
+        string producer,
+        CancellationToken ct = default) =>
+        throw new NotSupportedException(
+            "This graph-store implementation predates producer-specific edge-evidence cleanup.");
+
     /// <summary>Delete every symbol declared in <paramref name="fileId"/> whose canonical key is not in
     /// <paramref name="keysToKeep"/>, plus all refs/edges that touch those removed symbols.</summary>
     Task DeleteSymbolsForFileNotInAsync(long fileId, IReadOnlyCollection<string> keysToKeep, CancellationToken ct = default);

@@ -82,6 +82,43 @@ public sealed class GraphStoreEmitter : IGraphEmitter
             _symbolIdByCanonicalKey[s.CanonicalKey] = id;
         }
 
+        // Container keys can point forward or backward within the current emission batch. Resolve
+        // them only after every declaration has an id, then use the store's transactional
+        // reconciliation API. An unknown key is deliberately left unresolved — lexical-name
+        // guessing would turn an uncertain relationship into a false graph fact.
+        if (_symbols.Count > 0)
+        {
+            var containers = new List<(long ChildId, long ParentId)>();
+            foreach (var s in _symbols)
+            {
+                if (s.ContainerCanonicalKey is null)
+                {
+                    continue;
+                }
+                if (!_symbolIdByCanonicalKey.TryGetValue(s.CanonicalKey, out var childId))
+                {
+                    _logger.LogDebug(
+                        "Container skipped: unknown child canonical key `{Key}`",
+                        s.CanonicalKey);
+                    continue;
+                }
+                if (!_symbolIdByCanonicalKey.TryGetValue(
+                        s.ContainerCanonicalKey,
+                        out var parentId))
+                {
+                    _logger.LogDebug(
+                        "Container skipped: unknown parent canonical key `{Key}`",
+                        s.ContainerCanonicalKey);
+                    continue;
+                }
+                containers.Add((childId, parentId));
+            }
+            if (containers.Count > 0)
+            {
+                await _store.BatchUpdateContainerIdsAsync(containers, ct).ConfigureAwait(false);
+            }
+        }
+
         // Edges. We resolve canonical keys defensively; an unmapped key produces a debug log and
         // the edge is skipped so analyzers that emit speculatively don't poison the graph.
         if (_edges.Count > 0)

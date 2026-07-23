@@ -34,6 +34,20 @@ that share the same canonical key, updating the other columns in place.
   row's other columns reflect the latest call (last-write-wins on
   `name`, `fqn`, `kind`, `file_id`, `start_line`, etc.)
 
+### Requirement: Producer-specific edge-evidence cleanup
+The graph store SHALL expose a transactional cleanup operation keyed by the exact
+`(producing_file_id, producer)` pair. It SHALL delete only matching `edge_evidence` rows,
+resynchronise each touched surviving logical edge's compatibility payload from its earliest
+remaining evidence, and delete a touched logical edge when its final evidence disappears.
+
+#### Scenario: Two analyzers produced the same edge from one file
+- **WHEN** producer `native-a` and producer `native-b` both support one logical edge from file `F`, and cleanup runs for `(F, native-a)`
+- **THEN** only `native-a` evidence is removed, the logical edge survives on `native-b` evidence, and its payload reflects that surviving occurrence
+
+#### Scenario: Exact pair supplied the final evidence
+- **WHEN** every evidence occurrence for a touched logical edge matches the cleanup pair
+- **THEN** both those occurrences and the unsupported logical edge are deleted in one transaction
+
 ### Requirement: FTS5 trigram index over symbol text
 The schema SHALL maintain a `symbols_fts` virtual table over
 `symbols.{name, fqn, signature}` using the trigram tokenizer, kept in sync

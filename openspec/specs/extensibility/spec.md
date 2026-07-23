@@ -86,7 +86,7 @@ When a tool is added via the 4-arg overload, the host SHALL append `Use when: <t
 - **THEN** the host throws `ArgumentException` (the 4-arg overload's contract is "trigger is required and non-empty"; plugins that don't have a trigger should call the 3-arg overload instead)
 
 ### Requirement: Open kind vocabularies on the SDK
-The SDK SHALL expose edge kinds and symbol kinds as `string` values at the plugin contract boundary, NOT as closed enums. Static `EdgeKinds` and `SymbolKinds` classes SHALL provide kebab-case constants for the values defined by the host (`"calls"`, `"inherits"`, `"implements"`, `"uses-type"`, `"overrides-member"`, `"implements-member"`, `"instantiates"`, `"throws"`, `"tests"` for edges; `"namespace"`, `"class"`, `"interface"`, `"struct"`, `"enum"`, `"delegate"`, `"method"`, `"constructor"`, `"property"`, `"field"`, `"event"`, `"enum-member"`, `"operator"`, `"record"` for symbols). Plugins MAY emit any kebab-case identifier; the host stores the kind as TEXT and does NOT reject unknown kebab-case kinds.
+The SDK SHALL expose edge kinds and symbol kinds as `string` values at the plugin contract boundary, NOT as closed enums. Static `EdgeKinds` and `SymbolKinds` classes SHALL provide kebab-case constants for the values defined by the host (`"calls"`, `"inherits"`, `"implements"`, `"uses-type"`, `"overrides-member"`, `"implements-member"`, `"instantiates"`, `"throws"`, `"tests"`, `"references"`, `"reads"`, `"writes"`, `"binds-to"`, `"handles-event"`, `"grpc-calls"`, `"implements-rpc"`, `"pinvoke-maps-to"`, `"struct-maps-to"` for edges; `"namespace"`, `"class"`, `"interface"`, `"struct"`, `"enum"`, `"delegate"`, `"method"`, `"constructor"`, `"property"`, `"field"`, `"event"`, `"enum-member"`, `"operator"`, `"record"`, `"function"`, `"type-alias"`, `"native-export"`, `"rpc"`, `"message"`, `"proto-field"` for symbols). Plugins MAY emit any kebab-case identifier; the host stores the kind as TEXT and does NOT reject unknown kebab-case kinds.
 
 #### Scenario: Built-in indexer emits a known kind via constants
 - **WHEN** the C# Roslyn indexer emits an edge between two methods at a call site
@@ -135,7 +135,7 @@ that does not match that file.
 - **THEN** the host rejects the emission transactionally before an edge or proof is persisted
 
 ### Requirement: Canonical-key URI convention
-Every canonical key emitted by an `ILanguageIndexer` SHALL match the format `<scheme>:<rest>`, where `<scheme>` is one of the reserved-and-enforced schemes at this SDK version (`csharp`, `xaml`, `js`, `ts`, `jsx`, `tsx`). Schemes `vbnet`, `fsharp`, `razor`, `vue`, `svelte`, `python`, `go`, `rust` are documented as reserved-for-future-use but are NOT yet accepted by the host; emissions using those schemes SHALL be rejected.
+Every canonical key emitted by an `ILanguageIndexer` SHALL match the format `<scheme>:<rest>`, where `<scheme>` is one of the reserved-and-enforced schemes at this SDK version (`csharp`, `xaml`, `js`, `ts`, `jsx`, `tsx`, `c`, `cpp`, `proto`). Schemes `vbnet`, `fsharp`, `razor`, `vue`, `svelte`, `python`, `go`, `rust` are documented as reserved-for-future-use but are NOT yet accepted by the host; emissions using those schemes SHALL be rejected.
 
 `<rest>` SHALL be plugin-defined, but any path component embedded in `<rest>` SHALL be repo-relative (resolved against `Scope.Root`) and SHALL use forward slashes regardless of operating system.
 
@@ -310,6 +310,51 @@ The keys produced by these helpers SHALL be byte-for-byte equal to those emitted
 #### Scenario: Method with no parameter list provided
 - **WHEN** the helper is called as `CanonicalKeys.ForMethod("MyApp.Foo", "Bar", parameterTypeFullyQualifiedNames: null)`
 - **THEN** the returned key is `"csharp:M:MyApp.Foo.Bar"` (no parentheses; downstream resolver matches every overload)
+
+### Requirement: Native and protobuf canonical-key helpers
+SDK 2.4 SHALL expose `NativeCanonicalKeys` and `ProtoCanonicalKeys` so native and protobuf
+adapters share deterministic identities without exposing Clang or protobuf descriptor objects.
+
+Native keys SHALL use
+`<c|cpp>:<F|T|A|E>:<repo-relative-path>::<qualified-name>`, where paths are normalised to
+forward slashes, `F` covers free/member functions, `T` named types, `A` type aliases, and `E`
+native exports. C++ member function identities SHALL include the declaring type and SHOULD include
+parameter types to distinguish overloads.
+
+Protobuf keys SHALL use descriptor full names and omit source paths:
+`proto:M:<message-full-name>`, `proto:R:<service-full-name>.<rpc-name>`, and
+`proto:F:<message-full-name>.<field-name>`. Field numbers are facts used for compatibility
+analysis, not part of field canonical identity.
+
+#### Scenario: Windows native path is normalised
+- **WHEN** `NativeCanonicalKeys.ForFunction("c", @".\src\native\device.c", "device_open")` is called
+- **THEN** it returns `"c:F:src/native/device.c::device_open"`
+
+#### Scenario: C++ member carries its declaring type
+- **WHEN** `NativeCanonicalKeys.ForMethod("src/algorithm.cpp", "medical::Algorithm::Run(int)")` is called
+- **THEN** it returns `"cpp:F:src/algorithm.cpp::medical::Algorithm::Run(int)"`
+
+#### Scenario: RPC identity contains service and method
+- **WHEN** `ProtoCanonicalKeys.ForRpc(".medical.v1.Scanner", "StartScan")` is called
+- **THEN** it returns `"proto:R:medical.v1.Scanner.StartScan"`
+
+#### Scenario: Field identity excludes its number
+- **WHEN** `ProtoCanonicalKeys.ForField("medical.v1.ScanRequest", "patient_position")` is called for field number `7`
+- **THEN** it returns `"proto:F:medical.v1.ScanRequest.patient_position"` and the number `7` is carried separately by the analyzer
+
+### Requirement: Plugin symbol containers resolve after the whole batch
+`GraphStoreEmitter` SHALL persist `SymbolDeclared.ContainerCanonicalKey` as
+`symbols.container_id` only when the canonical key resolves to an existing symbol id. It SHALL
+resolve both earlier and later declarations in the same emission batch and SHALL leave unknown or
+stale container keys as `NULL` rather than guessing from names.
+
+#### Scenario: Child precedes its parent in one batch
+- **WHEN** a plugin emits a child symbol before its parent and the child names the parent's canonical key
+- **THEN** `FlushAsync` inserts both symbols and sets the child's `container_id` to the parent's id
+
+#### Scenario: Container key cannot be resolved
+- **WHEN** a symbol names a container canonical key that was neither previously mapped nor emitted in the batch
+- **THEN** the symbol is stored with `container_id IS NULL`
 
 ### Requirement: TreeSitterLanguageIndexer abstract base
 The Indexing.TreeSitter package SHALL expose a `TreeSitterLanguageIndexer<TGrammarConfig>` abstract class that implements `ILanguageIndexer` and provides the parse + walk + emit boilerplate. Concrete per-language indexers SHALL subclass this base and supply their grammar, node-kind mapper, and (optionally) module resolver. The base SHALL emit exactly one `IndexEvent.FileScanned` per indexed file.

@@ -220,6 +220,104 @@ public sealed class SqliteGraphStore : IGraphStore
         }
     }
 
+    public async Task<int> ClearEdgeEvidenceAsync(
+        long producingFileId,
+        string producer,
+        CancellationToken ct = default)
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThan(producingFileId, 1);
+        ArgumentException.ThrowIfNullOrWhiteSpace(producer);
+
+        var parameters = new
+        {
+            ProducingFileId = producingFileId,
+            Producer = producer,
+        };
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            using var tx = _connection.BeginTransaction();
+
+            // Keep the legacy edges.payload projection aligned with the earliest occurrence that
+            // will survive this exact producer cleanup.
+            await _connection.ExecuteAsync(new CommandDefinition(
+                """
+                UPDATE edges AS edge
+                SET payload = (
+                    SELECT NULLIF(survivor.payload, '')
+                    FROM edge_evidence survivor
+                    WHERE survivor.src = edge.src
+                      AND survivor.dst = edge.dst
+                      AND survivor.kind_name = edge.kind_name
+                      AND NOT (
+                          survivor.producing_file_id = @ProducingFileId
+                          AND survivor.producer = @Producer
+                      )
+                    ORDER BY survivor.id
+                    LIMIT 1
+                )
+                WHERE EXISTS (
+                    SELECT 1
+                    FROM edge_evidence owned
+                    WHERE owned.src = edge.src
+                      AND owned.dst = edge.dst
+                      AND owned.kind_name = edge.kind_name
+                      AND owned.producing_file_id = @ProducingFileId
+                      AND owned.producer = @Producer
+                );
+                """,
+                parameters,
+                transaction: tx,
+                cancellationToken: ct)).ConfigureAwait(false);
+
+            // Delete only logical edges touched by this cleanup and left with no other evidence.
+            // This avoids sweeping unrelated legacy rows that may predate occurrence evidence.
+            await _connection.ExecuteAsync(new CommandDefinition(
+                """
+                DELETE FROM edges
+                WHERE EXISTS (
+                    SELECT 1
+                    FROM edge_evidence owned
+                    WHERE owned.src = edges.src
+                      AND owned.dst = edges.dst
+                      AND owned.kind_name = edges.kind_name
+                      AND owned.producing_file_id = @ProducingFileId
+                      AND owned.producer = @Producer
+                )
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM edge_evidence survivor
+                    WHERE survivor.src = edges.src
+                      AND survivor.dst = edges.dst
+                      AND survivor.kind_name = edges.kind_name
+                      AND NOT (
+                          survivor.producing_file_id = @ProducingFileId
+                          AND survivor.producer = @Producer
+                      )
+                );
+                """,
+                parameters,
+                transaction: tx,
+                cancellationToken: ct)).ConfigureAwait(false);
+
+            var removed = await _connection.ExecuteAsync(new CommandDefinition(
+                """
+                DELETE FROM edge_evidence
+                WHERE producing_file_id = @ProducingFileId
+                  AND producer = @Producer;
+                """,
+                parameters,
+                transaction: tx,
+                cancellationToken: ct)).ConfigureAwait(false);
+            tx.Commit();
+            return removed;
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
     public async Task DeleteSymbolsForFileNotInAsync(long fileId, IReadOnlyCollection<string> keysToKeep, CancellationToken ct = default)
     {
         await _writeLock.WaitAsync(ct).ConfigureAwait(false);
@@ -500,12 +598,12 @@ public sealed class SqliteGraphStore : IGraphStore
     {
         // Stable id by canonical_key. On conflict we update the location/signature/etc but the
         // integer id is preserved, so refs/edges from other files that point to this symbol stay
-        // correct across edits. NOTE: container_id is intentionally NOT included in the conflict
-        // update path — it's set separately by BatchUpdateContainerIdsAsync after pass-1 inserts
-        // every symbol, so the parent row exists by the time the lookup happens. test_framework
-        // is also set separately by UpdateTestFrameworksAsync after attribute walk so we don't
-        // race on first-insert vs. attribute-extraction ordering; the conflict path therefore
-        // does NOT clobber an already-detected framework on re-upserts of the same symbol.
+        // correct across edits. container_id is reset to the caller's value on conflict, then
+        // reconciled by BatchUpdateContainerIdsAsync after pass-1 inserts every symbol. Resetting
+        // prevents a declaration moved to the top level (or carrying an unresolved container key)
+        // from retaining a stale parent. test_framework is set separately by
+        // UpdateTestFrameworksAsync after attribute walk, so the conflict path does NOT clobber an
+        // already-detected framework on re-upserts of the same symbol.
         const string sql = """
             INSERT INTO symbols(canonical_key, name, fqn, kind_name, file_id, start_line, start_col, end_line, end_col, signature, container_id, modifiers, accessibility, xml_summary, test_framework)
             VALUES (@Key, @Name, @Fqn, @Kind, @FileId, @StartLine, @StartCol, @EndLine, @EndCol, @Signature, @ContainerId, @Modifiers, @Accessibility, @XmlSummary, @TestFramework)
@@ -519,6 +617,7 @@ public sealed class SqliteGraphStore : IGraphStore
                 end_line      = excluded.end_line,
                 end_col       = excluded.end_col,
                 signature     = excluded.signature,
+                container_id  = excluded.container_id,
                 modifiers     = excluded.modifiers,
                 accessibility = excluded.accessibility,
                 xml_summary   = excluded.xml_summary
@@ -577,7 +676,12 @@ public sealed class SqliteGraphStore : IGraphStore
     public async Task BatchUpdateContainerIdsAsync(IReadOnlyList<(long ChildId, long ParentId)> pairs, CancellationToken ct = default)
     {
         if (pairs.Count == 0) return;
-        const string sql = "UPDATE symbols SET container_id = @ParentId WHERE id = @ChildId;";
+        const string sql = """
+            UPDATE symbols
+            SET container_id = @ParentId
+            WHERE id = @ChildId
+              AND EXISTS (SELECT 1 FROM symbols WHERE id = @ParentId);
+            """;
         await _writeLock.WaitAsync(ct).ConfigureAwait(false);
         try
         {

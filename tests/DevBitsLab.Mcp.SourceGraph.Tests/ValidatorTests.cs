@@ -84,6 +84,9 @@ public sealed class CanonicalKeyValidatorTests
     [InlineData("tsx:M:src/page.tsx::Page")]
     [InlineData("js:M:src/foo.js::greet")]
     [InlineData("jsx:M:src/page.jsx::Page")]
+    [InlineData("c:F:src/native/device.c::device_open")]
+    [InlineData("cpp:F:src/native/algorithm.cpp::medical::Algorithm::Run(int)")]
+    [InlineData("proto:R:medical.v1.Scanner.Start")]
     public void IsValid_returnsTrue_forReservedSchemes(string key)
     {
         CanonicalKeyValidator.IsValid(key).Should().BeTrue();
@@ -165,7 +168,8 @@ public sealed class CanonicalKeyValidatorTests
         // Surface property is documented; assert the current scheme set. A future SDK release
         // expands this when a new language indexer ships; a deliberate update of the test set is
         // the trip-wire for that. add-typescript-language-indexer lifted js / ts / jsx / tsx.
-        CanonicalKeyValidator.EnforcedSchemes.Should().BeEquivalentTo(new[] { "csharp", "xaml", "js", "ts", "jsx", "tsx" });
+        CanonicalKeyValidator.EnforcedSchemes.Should().BeEquivalentTo(
+            new[] { "csharp", "xaml", "js", "ts", "jsx", "tsx", "c", "cpp", "proto" });
     }
 
     [Fact]

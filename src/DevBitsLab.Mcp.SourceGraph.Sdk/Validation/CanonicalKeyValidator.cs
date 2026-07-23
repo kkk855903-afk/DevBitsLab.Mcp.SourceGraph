@@ -12,7 +12,8 @@ namespace DevBitsLab.Mcp.SourceGraph.Sdk.Validation;
 /// slashes regardless of OS, so cross-platform identity is preserved).</para>
 ///
 /// <para>Reserved-and-enforced schemes at this SDK version: <c>csharp</c>, <c>xaml</c>,
-/// <c>js</c>, <c>ts</c>, <c>jsx</c>, <c>tsx</c>.</para>
+/// <c>js</c>, <c>ts</c>, <c>jsx</c>, <c>tsx</c>, <c>c</c>, <c>cpp</c>, and
+/// <c>proto</c>.</para>
 ///
 /// <para>Reserved-but-not-yet-enforced (documented for cross-language joins; emissions using these
 /// schemes are rejected by the host until the corresponding language indexer ships): <c>vbnet</c>,
@@ -30,6 +31,12 @@ public static class CanonicalKeyValidator
         "ts",
         "jsx",
         "tsx",
+        // Added for the MedInteropLens native/protobuf analyzer contracts. The schemes are
+        // accepted before the analyzers themselves ship so third-party adapters can emit the
+        // same stable cross-language identities.
+        "c",
+        "cpp",
+        "proto",
     };
 
     private static readonly HashSet<string> _reservedFutureSchemes = new(StringComparer.Ordinal)
