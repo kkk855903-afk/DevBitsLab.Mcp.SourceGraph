@@ -33,6 +33,27 @@ public interface ILanguageProject
 }
 
 /// <summary>
+/// Optional project capability for languages whose cross-file edges require declaration symbols
+/// to exist before consuming files are flushed. Hosts that recognise this interface SHALL
+/// schedule the absolute paths in <see cref="DeclarationFilePaths"/> before the remaining
+/// <see cref="ILanguageProject.FilePaths"/> for the same indexing pass.
+/// </summary>
+/// <remarks>
+/// The collection is an ordering hint, not an expanded read boundary: every entry MUST also
+/// appear in <see cref="ILanguageProject.FilePaths"/>, and hosts still apply their scope/privacy
+/// policy before opening it. Projects that do not implement this interface retain ordinary host
+/// ordering.
+/// </remarks>
+public interface IDeclarationFirstLanguageProject : ILanguageProject
+{
+    /// <summary>
+    /// Absolute, project-owned source paths that declare symbols targeted by other project files.
+    /// Entries SHOULD be deterministic and duplicate-free.
+    /// </summary>
+    IReadOnlyCollection<string> DeclarationFilePaths { get; }
+}
+
+/// <summary>
 /// Plugin-supplied factory that discovers <see cref="ILanguageProject"/> instances under a repo
 /// root. The host invokes <see cref="DiscoverAsync"/> once per scope at startup and again when
 /// <c>.sourcegraph.json</c> changes.

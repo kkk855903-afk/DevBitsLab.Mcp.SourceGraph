@@ -3,6 +3,9 @@
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
     <Application.Resources>
         <ResourceDictionary>
+            <ResourceDictionary.MergedDictionaries>
+                <ResourceDictionary Source="SharedResources.xaml" />
+            </ResourceDictionary.MergedDictionaries>
             <SolidColorBrush x:Key="AccentBrush" Color="Blue" />
             <Style x:Key="PrimaryButtonStyle" TargetType="Button">
                 <Setter Property="Background" Value="LightSkyBlue" />

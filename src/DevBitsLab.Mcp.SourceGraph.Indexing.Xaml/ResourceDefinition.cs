@@ -30,4 +30,24 @@ public sealed class ResourceDefinition
 
     /// <summary>Local name of the element that carries the <c>x:Key</c> (e.g. <c>SolidColorBrush</c>, <c>Style</c>).</summary>
     public string ElementName { get; }
+
+    /// <summary>
+    /// Returns the canonical key of the real XAML declaration represented by this definition.
+    /// The path portion is repository-relative and uses forward slashes so it matches the
+    /// symbol declaration emitted when the declaring document is indexed.
+    /// </summary>
+    public string ToCanonicalKey(string repoRoot)
+    {
+        var relativePath = Path.GetRelativePath(
+                Path.GetFullPath(repoRoot),
+                Path.GetFullPath(FilePath))
+            .Replace('\\', '/');
+        var schemeRest = ElementName switch
+        {
+            "Style" => "style",
+            "DataTemplate" or "ControlTemplate" or "ItemsPanelTemplate" or "ControlTheme" => "template",
+            _ => "resource",
+        };
+        return $"xaml:{schemeRest}:{relativePath}#{Key}";
+    }
 }

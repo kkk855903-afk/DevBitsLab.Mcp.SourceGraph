@@ -22,8 +22,9 @@ namespace DevBitsLab.Mcp.SourceGraph.Indexing.Xaml;
 /// <see cref="XamlProfileDetector"/> and dispatches markup-extension handling through the
 /// matching <see cref="IXamlDialect"/>. The per-project resource cascade lives on the
 /// <see cref="XamlLanguageProject"/> instance the host attaches via
-/// <see cref="IndexContext.Project"/>; when the host has no project mapping, resource resolution
-/// degrades to "unresolved" and the indexer emits the <c>uses-resource</c> edge with no target.
+/// <see cref="IndexContext.Project"/>. Missing and ambiguous resource keys emit a structured
+/// <c>xaml-resource-finding</c> annotation on the consuming element and no edge; the indexer never
+/// manufactures an unresolved target symbol.
 /// </summary>
 public sealed class XamlLanguageIndexer : ILanguageIndexer
 {
@@ -72,8 +73,14 @@ public sealed class XamlLanguageIndexer : ILanguageIndexer
             ct).ConfigureAwait(false);
         var emission = new EmissionContext(ctx, doc, dialect, semanticResolver);
 
-        // Pass 1: collect every named element so binds-element can resolve targets later.
-        XamlReader.Walk(doc.Root, (element, _) => emission.RegisterNamedElement(element));
+        // Pass 1: collect named elements and this document's resource declarations. The second
+        // pass can then resolve both ElementName bindings and local resource references without
+        // depending on declaration order.
+        XamlReader.Walk(doc.Root, (element, ancestors) =>
+        {
+            emission.RegisterNamedElement(element);
+            emission.RegisterResource(element, ancestors);
+        });
 
         // Pass 2: emit all symbol declarations, edges, and annotations.
         XamlReader.Walk(doc.Root, (element, ancestors) => emission.Emit(element, ancestors));
@@ -97,6 +104,8 @@ public sealed class XamlLanguageIndexer : ILanguageIndexer
         private readonly string? _xClass;
         private readonly string _viewKey;
         private readonly Dictionary<string, string> _namedElementKeysByName = new(StringComparer.Ordinal);
+        private readonly Dictionary<string, List<ResourceDefinition>> _localResources =
+            new(StringComparer.Ordinal);
         private int _anonymousCounter;
 
         public List<IndexEvent> Events { get; } = new();
@@ -123,6 +132,33 @@ public sealed class XamlLanguageIndexer : ILanguageIndexer
             if (name is null) return;
             var key = $"xaml:element:{_relativePath}#{name}";
             _namedElementKeysByName[name] = key;
+        }
+
+        public void RegisterResource(
+            XamlElement element,
+            IReadOnlyList<XamlElement> ancestors)
+        {
+            var keyAttribute = element.FindAttribute(
+                XamlReader.XamlNamespace,
+                "Key");
+            if (keyAttribute is null
+                || (!AnyAncestorIsResources(ancestors)
+                    && !IsStyleOrTemplate(element)))
+            {
+                return;
+            }
+
+            if (!_localResources.TryGetValue(keyAttribute.Value, out var candidates))
+            {
+                candidates = new List<ResourceDefinition>();
+                _localResources[keyAttribute.Value] = candidates;
+            }
+            candidates.Add(new ResourceDefinition(
+                keyAttribute.Value,
+                _ctx.FilePath,
+                element.Line,
+                element.Column,
+                element.LocalName));
         }
 
         public void Emit(XamlElement element, IReadOnlyList<XamlElement> ancestors)
@@ -358,12 +394,12 @@ public sealed class XamlLanguageIndexer : ILanguageIndexer
                 case "x:Bind":
                     EmitBindingEdge(element, attr, hostKey, ext);
                     break;
-                case "StaticResource":
-                case "DynamicResource":
-                case "ThemeResource":
-                    EmitUsesResourceEdge(attr, hostKey, ext);
-                    break;
             }
+
+            // Resource extensions may be the top-level value or nested inside another extension
+            // (for example Binding.Converter). Walk the parsed tree once so both shapes preserve
+            // the same exact attribute evidence.
+            EmitResourceExtensions(attr, hostKey, ext);
         }
 
         private void EmitBindingEdge(
@@ -452,69 +488,150 @@ public sealed class XamlLanguageIndexer : ILanguageIndexer
             });
         }
 
-        private void EmitUsesResourceEdge(XamlAttribute attr, string hostKey, MarkupExtensionValue ext)
+        private void EmitResourceExtensions(
+            XamlAttribute attr,
+            string hostKey,
+            MarkupExtensionValue extension)
+        {
+            if (extension.Name is "StaticResource" or "DynamicResource" or "ThemeResource")
+            {
+                EmitUsesResourceEdge(attr, hostKey, extension);
+            }
+            foreach (var positional in extension.PositionalArgs)
+            {
+                if (!positional.IsLiteral)
+                {
+                    EmitResourceExtensions(attr, hostKey, positional);
+                }
+            }
+            foreach (var named in extension.NamedArgs.Values)
+            {
+                if (!named.IsLiteral)
+                {
+                    EmitResourceExtensions(attr, hostKey, named);
+                }
+            }
+        }
+
+        private void EmitUsesResourceEdge(
+            XamlAttribute attr,
+            string hostKey,
+            MarkupExtensionValue ext)
         {
             var key = ext.PositionalArgs.Count > 0 && ext.PositionalArgs[0].IsLiteral
                 ? ext.PositionalArgs[0].Literal
                 : ResolveNamedAsLiteral(ext, "ResourceKey");
             if (string.IsNullOrEmpty(key)) return;
 
-            string targetKey;
-            string targetKind;
-            string edgeKind;
-            if (_project is not null && _project.ResourceCache.TryGetValue(key!, out var resource))
+            var lookupKind = ext.Name switch
             {
-                // Resolve the target to the kind matching the resource (style/template/resource).
-                var schemeRest = ClassifyResourceFromElementName(resource.ElementName);
-                var resourcePath = ToRepoRelative(_ctx.RepoRoot, resource.FilePath);
-                targetKey = $"xaml:{schemeRest}:{resourcePath}#{key}";
-                targetKind = SymbolKindFromSchemeRest(schemeRest);
-                edgeKind = string.Equals(schemeRest, "style", StringComparison.Ordinal) ? EdgeAppliesStyle : EdgeUsesResource;
-            }
-            else
+                "StaticResource" => "static",
+                "DynamicResource" => "dynamic",
+                _ => "theme",
+            };
+            var resolution = ResolveResource(key!);
+            if (resolution.Status != ResourceResolutionStatus.Resolved
+                || resolution.Definition is null)
             {
-                targetKey = $"xaml:resource:{_relativePath}#__unresolved:{key}";
-                targetKind = KindXamlResource;
-                edgeKind = EdgeUsesResource;
+                EmitResourceFinding(
+                    attr,
+                    hostKey,
+                    key!,
+                    lookupKind,
+                    resolution);
+                return;
             }
 
-            // Synthesise a placeholder so the emitter has both endpoints; the unresolved case is
-            // distinguished by the `__unresolved:` prefix in the canonical key. Crucially, the
-            // declared `kind` matches the canonical-key scheme — emitting an `xaml:style:…` key
-            // with `kind=xaml-resource` would produce stored rows whose kind disagrees with
-            // their key prefix and break `kind`-filtered queries on `xaml-style` / `xaml-template`.
-            Events.Add(new IndexEvent.SymbolDeclared(
-                canonicalKey: targetKey,
-                name: key!,
-                fqn: targetKey.Substring(targetKey.IndexOf(':') + 1),
-                kind: targetKind,
-                startLine: attr.Line,
-                startColumn: attr.Column,
-                endLine: attr.Line,
-                endColumn: attr.Column,
-                containerCanonicalKey: _viewKey));
-
-            var meta = new Dictionary<string, string>(StringComparer.Ordinal) { [PayloadKeys.Key] = key! };
+            var resource = resolution.Definition;
+            var targetKey = resource.ToCanonicalKey(_ctx.RepoRoot);
+            var schemeRest = ClassifyResourceFromElementName(resource.ElementName);
+            var edgeKind = string.Equals(
+                schemeRest,
+                "style",
+                StringComparison.Ordinal)
+                ? EdgeAppliesStyle
+                : EdgeUsesResource;
+            var meta = new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                [PayloadKeys.Key] = key!,
+                ["resource-lookup"] = lookupKind,
+            };
             Events.Add(new IndexEvent.EdgeEmitted(
                 sourceCanonicalKey: hostKey,
                 targetCanonicalKey: targetKey,
                 edgeKindName: edgeKind,
-                metadata: meta));
+                metadata: meta)
+            {
+                Evidence = CreateAttributeEvidence(
+                    attr,
+                    EvidenceConfidence.Exact,
+                    meta,
+                    producer: "xaml-resource"),
+            });
         }
 
-        /// <summary>
-        /// Map the scheme-rest fragment used in the canonical key (<c>style</c> / <c>template</c>
-        /// / <c>resource</c>) back to the corresponding kebab-case symbol kind constant. Pairs
-        /// with <see cref="ClassifyResourceFromElementName"/>; keeping the two in lockstep means
-        /// the placeholder emitted for a resolved style carries kind <c>xaml-style</c> not
-        /// <c>xaml-resource</c>.
-        /// </summary>
-        private static string SymbolKindFromSchemeRest(string schemeRest) => schemeRest switch
+        private ResourceResolution ResolveResource(string key)
         {
-            "style" => KindXamlStyle,
-            "template" => KindXamlTemplate,
-            _ => KindXamlResource,
-        };
+            if (_localResources.TryGetValue(key, out var localCandidates)
+                && localCandidates.Count > 0)
+            {
+                return localCandidates.Count == 1
+                    ? new ResourceResolution(
+                        ResourceResolutionStatus.Resolved,
+                        localCandidates)
+                    : new ResourceResolution(
+                        ResourceResolutionStatus.Ambiguous,
+                        localCandidates);
+            }
+            return _project?.ResolveResource(key) ?? ResourceResolution.Missing;
+        }
+
+        private void EmitResourceFinding(
+            XamlAttribute attribute,
+            string hostKey,
+            string key,
+            string lookupKind,
+            ResourceResolution resolution)
+        {
+            var missing = resolution.Status == ResourceResolutionStatus.Missing;
+            var code = missing ? "XAMLRESOURCE001" : "XAMLRESOURCE002";
+            var name = missing ? "Resource不存在" : "Resource不明确";
+            var finding = new Dictionary<string, object?>(StringComparer.Ordinal)
+            {
+                ["code"] = code,
+                ["severity"] = "warning",
+                ["message"] = name,
+                ["key"] = key,
+                ["resourceLookup"] = lookupKind,
+                ["candidateCount"] = resolution.Candidates.Count,
+                ["file"] = _ctx.FilePath,
+                ["startLine"] = attribute.Line,
+                ["startColumn"] = attribute.Column,
+                ["endLine"] = attribute.Line,
+                ["endColumn"] = attribute.Column
+                    + Math.Max(1, QualifiedAttributeNameLength(attribute)),
+                ["confidence"] = "exact",
+                ["producer"] = "xaml-resource",
+            };
+            if (resolution.Candidates.Count > 0)
+            {
+                finding["candidates"] = resolution.Candidates
+                    .Select(candidate => new Dictionary<string, object?>
+                    {
+                        ["canonicalKey"] = candidate.ToCanonicalKey(_ctx.RepoRoot),
+                        ["file"] = candidate.FilePath,
+                        ["line"] = candidate.Line,
+                        ["column"] = candidate.Column,
+                    })
+                    .ToArray();
+            }
+            Events.Add(new IndexEvent.AnnotationAttached(
+                symbolCanonicalKey: hostKey,
+                annotationName: name,
+                flavor: "xaml-resource-finding",
+                fullName: code,
+                argsJson: System.Text.Json.JsonSerializer.Serialize(finding)));
+        }
 
         private void EmitPossibleEventHandlerEdge(XamlAttribute attr, string hostKey)
         {
@@ -671,12 +788,10 @@ public sealed class XamlLanguageIndexer : ILanguageIndexer
         private EdgeEvidence CreateAttributeEvidence(
             XamlAttribute attribute,
             EvidenceConfidence confidence,
-            IReadOnlyDictionary<string, string>? metadata)
+            IReadOnlyDictionary<string, string>? metadata,
+            string producer = "xaml-semantic")
         {
-            var qualifiedNameLength = attribute.LocalName.Length
-                + (string.IsNullOrEmpty(attribute.Prefix)
-                    ? 0
-                    : attribute.Prefix.Length + 1);
+            var qualifiedNameLength = QualifiedAttributeNameLength(attribute);
             return new EdgeEvidence(
                 new SourceLocation(
                     _ctx.FilePath,
@@ -685,9 +800,15 @@ public sealed class XamlLanguageIndexer : ILanguageIndexer
                     attribute.Line,
                     attribute.Column + Math.Max(1, qualifiedNameLength)),
                 confidence,
-                "xaml-semantic",
+                producer,
                 metadata);
         }
+
+        private static int QualifiedAttributeNameLength(XamlAttribute attribute) =>
+            attribute.LocalName.Length
+            + (string.IsNullOrEmpty(attribute.Prefix)
+                ? 0
+                : attribute.Prefix.Length + 1);
 
         private static bool IsBareIdentifier(string value)
         {

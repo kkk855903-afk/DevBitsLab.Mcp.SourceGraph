@@ -16,6 +16,12 @@
                 Background="{StaticResource AccentBrush}"
                 Command="{Binding SaveCommand}"
                 Click="OnSave" />
+        <Border x:Name="DynamicResourceConsumer"
+                Background="{DynamicResource AccentBrush}" />
+        <Border x:Name="MergedResourceConsumer"
+                Background="{StaticResource SharedBrush}" />
+        <Border x:Name="MissingResourceConsumer"
+                Background="{StaticResource ResourceThatDoesNotExist}" />
         <TextBlock Grid.Row="2"
                    Text="{Binding ElementName=UserNameBox, Path=Text}" />
         <TextBlock x:Name="BrokenBinding"

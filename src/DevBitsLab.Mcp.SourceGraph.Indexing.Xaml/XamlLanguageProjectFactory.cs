@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Collections.ObjectModel;
 using System.IO;
 using System.Linq;
 using System.Threading;
@@ -17,17 +18,11 @@ namespace DevBitsLab.Mcp.SourceGraph.Indexing.Xaml;
 /// <c>.csproj</c> under the repo root, locates the <c>.xaml</c> files belonging to each project
 /// (via <c>&lt;Page&gt;</c> / <c>&lt;ApplicationDefinition&gt;</c> / <c>&lt;EmbeddedResource&gt;</c>
 /// / <c>&lt;Resource&gt;</c> items, falling back to a directory scan when the items aren't
-/// present), and builds a per-project resource cache from <c>App.xaml</c>'s
-/// <c>Application.Resources</c> plus a theme <c>Generic.xaml</c> if present under <c>Themes/</c>.
-///
-/// <para><b>v1 simplification — no MergedDictionaries Source-URI dereferencing.</b> The cache
-/// includes any <c>x:Key</c>-bearing element nested inside <c>App.xaml</c>'s own
-/// <c>MergedDictionaries</c> declarations, but the <c>Source=</c> URIs that point at separate
-/// <c>.xaml</c> files are NOT followed: their resources are not pulled into the cache.
-/// References to those keys fall through to the unresolved sentinel
-/// (<c>xaml:resource:&lt;file&gt;#__unresolved:&lt;key&gt;</c>) rather than confidently resolving
-/// to the wrong target. The cross-project cascade is the design.md open question; v1 ships the
-/// honest answer and revisits if usage data shows it hurts.</para>
+/// present), and builds a two-pass per-project resource catalog. Pass one parses every allowed
+/// project XAML document into declarations plus merged-dictionary links; pass two walks the
+/// cascades rooted at <c>App.xaml</c> and <c>Themes/Generic.xaml</c>. Relative
+/// <c>MergedDictionaries Source=</c> links are followed only when their physical target is an
+/// allowed XAML file owned by the same project.
 /// </summary>
 public sealed class XamlLanguageProjectFactory : IExclusionAwareLanguageProjectFactory
 {
@@ -142,6 +137,7 @@ public sealed class XamlLanguageProjectFactory : IExclusionAwareLanguageProjectF
                 fullProjectPath,
                 xamlFiles,
                 resourceCache,
+                () => BuildResourceCache(xamlFiles, pathPolicy),
                 roslynProjectProvider);
         }
         catch (IOException) { return null; }
@@ -270,71 +266,216 @@ public sealed class XamlLanguageProjectFactory : IExclusionAwareLanguageProjectF
         string.Equals(localName, "Resource", StringComparison.OrdinalIgnoreCase);
 
     /// <summary>
-    /// Build the per-project resource cache from the actual cascade roots — the project's
-    /// <c>App.xaml</c> (its <c>Application.Resources</c>, including any <c>x:Key</c>s declared
-    /// inside the merged-dictionary collection itself) and a <c>Themes/Generic.xaml</c> if
-    /// present. View-local resources (<c>&lt;Window.Resources&gt;</c>, etc.) are NOT added — they
-    /// are not globally visible at runtime, so adding them would emit false-positive
-    /// <c>uses-resource</c> / <c>applies-style</c> edges from elements that can't actually see
-    /// them. v1 does NOT follow <c>MergedDictionaries</c> <c>Source=</c> URIs (the open
-    /// cross-project cascade question lives in design.md); references to keys declared in a
-    /// dereferenced dictionary fall through to "unresolved" rather than confidently wrong.
+    /// Build an immutable project-level resource snapshot. Pass one parses every allowed XAML
+    /// file exactly once. Pass two follows relative merged-dictionary links from App.xaml and
+    /// Themes/Generic.xaml, collecting all reachable keyed declarations. Duplicate keys retain
+    /// every declaration so lookup can report ambiguity rather than depending on enumeration
+    /// order.
     /// </summary>
-    private static Dictionary<string, ResourceDefinition> BuildResourceCache(
+    private static IReadOnlyDictionary<string, IReadOnlyList<ResourceDefinition>> BuildResourceCache(
         IReadOnlyList<string> xamlFiles,
         ScopePathPolicy pathPolicy)
     {
-        var cache = new Dictionary<string, ResourceDefinition>(StringComparer.Ordinal);
+        var documents = new Dictionary<string, ResourceDocument>(
+            StringComparer.OrdinalIgnoreCase);
 
-        // Restrict to App.xaml + Themes/Generic.xaml — the two cascade roots WPF / WinUI /
-        // Avalonia / Uno actually treat as project-globally-visible. App.xaml first so its keys
-        // win on collision with a same-named theme key.
-        var roots = new List<string>(2);
-        foreach (var path in xamlFiles)
+        // Pass 1: parse all project-owned, policy-approved files into an in-memory catalog.
+        foreach (var candidate in xamlFiles
+                     .Select(Path.GetFullPath)
+                     .Distinct(StringComparer.OrdinalIgnoreCase)
+                     .OrderBy(path => path, StringComparer.OrdinalIgnoreCase))
         {
-            var fileName = Path.GetFileName(path);
-            if (string.Equals(fileName, "App.xaml", StringComparison.OrdinalIgnoreCase))
-            {
-                roots.Insert(0, path);
-            }
-            else if (string.Equals(fileName, "Generic.xaml", StringComparison.OrdinalIgnoreCase))
-            {
-                // Only count it if it lives under a Themes/ folder — the WPF themed-controls
-                // convention. A loose Generic.xaml elsewhere isn't auto-cascaded.
-                var parentDir = Path.GetFileName(Path.GetDirectoryName(path) ?? string.Empty);
-                if (string.Equals(parentDir, "Themes", StringComparison.OrdinalIgnoreCase))
-                {
-                    roots.Add(path);
-                }
-            }
-        }
-
-        foreach (var path in roots)
-        {
-            if (pathPolicy.IsExcluded(path)) continue;
+            if (pathPolicy.IsExcluded(candidate)) continue;
 
             byte[] bytes;
-            try { bytes = File.ReadAllBytes(path); }
+            try { bytes = File.ReadAllBytes(candidate); }
             catch (IOException) { continue; }
             catch (UnauthorizedAccessException) { continue; }
 
-            XamlDocument doc;
-            try { doc = XamlReader.Parse(bytes); }
+            XamlDocument document;
+            try { document = XamlReader.Parse(bytes); }
             catch (XmlException) { continue; }
 
-            XamlReader.Walk(doc.Root, (element, _) =>
+            var definitions = new List<ResourceDefinition>();
+            var mergedSources = new List<string>();
+            XamlReader.Walk(document.Root, (element, ancestors) =>
             {
-                var keyAttr = element.FindAttribute(XamlReader.XamlNamespace, "Key");
-                if (keyAttr is null) return;
-                if (cache.ContainsKey(keyAttr.Value)) return; // App.xaml wins, see ordering above.
-                cache[keyAttr.Value] = new ResourceDefinition(
-                    key: keyAttr.Value,
-                    filePath: path,
-                    line: element.Line,
-                    column: element.Column,
-                    elementName: element.LocalName);
+                var keyAttribute = element.FindAttribute(
+                    XamlReader.XamlNamespace,
+                    "Key");
+                if (keyAttribute is not null && IsInResourceScope(ancestors))
+                {
+                    definitions.Add(new ResourceDefinition(
+                        keyAttribute.Value,
+                        candidate,
+                        element.Line,
+                        element.Column,
+                        element.LocalName));
+                }
+
+                if (!string.Equals(
+                        element.LocalName,
+                        "ResourceDictionary",
+                        StringComparison.Ordinal))
+                {
+                    return;
+                }
+                var sourceAttribute = element.FindAttributeByLocalName("Source");
+                if (sourceAttribute is not null
+                    && !string.IsNullOrWhiteSpace(sourceAttribute.Value))
+                {
+                    mergedSources.Add(sourceAttribute.Value.Trim());
+                }
             });
+            documents[candidate] = new ResourceDocument(definitions, mergedSources);
         }
-        return cache;
+
+        // Pass 2: walk only the project-global cascade roots and their same-project merges.
+        var roots = documents.Keys
+            .Where(IsProjectResourceRoot)
+            .OrderBy(
+                path => string.Equals(
+                    Path.GetFileName(path),
+                    "App.xaml",
+                    StringComparison.OrdinalIgnoreCase)
+                    ? 0
+                    : 1)
+            .ThenBy(path => path, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        var visible = new Dictionary<string, List<ResourceDefinition>>(
+            StringComparer.Ordinal);
+        var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var root in roots)
+        {
+            Visit(root);
+        }
+
+        return new ReadOnlyDictionary<string, IReadOnlyList<ResourceDefinition>>(
+            visible.ToDictionary(
+                pair => pair.Key,
+                pair => (IReadOnlyList<ResourceDefinition>)pair.Value
+                    .OrderBy(definition => definition.FilePath, StringComparer.OrdinalIgnoreCase)
+                    .ThenBy(definition => definition.Line)
+                    .ThenBy(definition => definition.Column)
+                    .ToArray(),
+                StringComparer.Ordinal));
+
+        void Visit(string path)
+        {
+            if (!visited.Add(path)) return;
+            if (!documents.TryGetValue(path, out var document)) return;
+
+            foreach (var definition in document.Definitions)
+            {
+                if (!visible.TryGetValue(definition.Key, out var candidates))
+                {
+                    candidates = new List<ResourceDefinition>();
+                    visible[definition.Key] = candidates;
+                }
+                if (!candidates.Any(existing =>
+                        string.Equals(
+                            existing.FilePath,
+                            definition.FilePath,
+                            StringComparison.OrdinalIgnoreCase)
+                        && existing.Line == definition.Line
+                        && existing.Column == definition.Column))
+                {
+                    candidates.Add(definition);
+                }
+            }
+
+            foreach (var source in document.MergedSources)
+            {
+                var mergedPath = ResolveMergedDictionaryPath(
+                    path,
+                    source,
+                    documents,
+                    pathPolicy);
+                if (mergedPath is not null) Visit(mergedPath);
+            }
+        }
     }
+
+    private static bool IsInResourceScope(IReadOnlyList<XamlElement> ancestors)
+    {
+        foreach (var ancestor in ancestors)
+        {
+            if (string.Equals(
+                    ancestor.LocalName,
+                    "ResourceDictionary",
+                    StringComparison.Ordinal)
+                || ancestor.LocalName.EndsWith(
+                    ".Resources",
+                    StringComparison.Ordinal))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static bool IsProjectResourceRoot(string path)
+    {
+        if (string.Equals(
+                Path.GetFileName(path),
+                "App.xaml",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+        if (!string.Equals(
+                Path.GetFileName(path),
+                "Generic.xaml",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+        return string.Equals(
+            Path.GetFileName(Path.GetDirectoryName(path) ?? string.Empty),
+            "Themes",
+            StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string? ResolveMergedDictionaryPath(
+        string containingFile,
+        string source,
+        IReadOnlyDictionary<string, ResourceDocument> documents,
+        ScopePathPolicy pathPolicy)
+    {
+        var clean = source;
+        var suffix = clean.IndexOfAny(new[] { '?', '#' });
+        if (suffix >= 0) clean = clean.Substring(0, suffix);
+        if (string.IsNullOrWhiteSpace(clean)
+            || clean.Contains("://", StringComparison.Ordinal)
+            || clean.StartsWith("pack:", StringComparison.OrdinalIgnoreCase)
+            || clean.Contains(";component/", StringComparison.OrdinalIgnoreCase)
+            || Path.IsPathRooted(clean))
+        {
+            return null;
+        }
+
+        try
+        {
+            clean = Uri.UnescapeDataString(clean)
+                .Replace('/', Path.DirectorySeparatorChar)
+                .Replace('\\', Path.DirectorySeparatorChar);
+            var containingDirectory = Path.GetDirectoryName(containingFile);
+            if (string.IsNullOrEmpty(containingDirectory)) return null;
+            var candidate = Path.GetFullPath(Path.Combine(containingDirectory, clean));
+            if (pathPolicy.IsExcluded(candidate)) return null;
+            return documents.ContainsKey(candidate) ? candidate : null;
+        }
+        catch (Exception ex) when (ex is ArgumentException
+                                   or NotSupportedException
+                                   or PathTooLongException
+                                   or UriFormatException)
+        {
+            return null;
+        }
+    }
+
+    private sealed record ResourceDocument(
+        IReadOnlyList<ResourceDefinition> Definitions,
+        IReadOnlyList<string> MergedSources);
 }

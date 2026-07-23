@@ -232,7 +232,86 @@ public sealed class XamlIndexFixtureTests : IAsyncLifetime
         var saveButton = (await _wpfStore!.FindSymbolsAsync("SaveButton"))
             .First(h => h.Kind == "xaml-element");
         var callees = await _wpfStore.ListCalleesAsync(saveButton.Id, limit: 50, edgeKind: "uses-resource");
-        callees.Should().Contain(c => c.Fqn.Contains("AccentBrush", StringComparison.Ordinal));
+        var brush = callees.Should().ContainSingle(c =>
+            c.CanonicalKey == "xaml:resource:App.xaml#AccentBrush").Subject;
+        brush.FilePath.Replace('\\', '/').Should().EndWith("/App.xaml");
+
+        var evidence = await _wpfStore.ListEdgeEvidenceAsync(
+            saveButton.Id,
+            brush.Id,
+            "uses-resource");
+        evidence.Should().ContainSingle();
+        evidence[0].Confidence.Should().Be(CoreEvidenceConfidence.Exact);
+        evidence[0].Producer.Should().Be("xaml-resource");
+        evidence[0].Metadata.Should().ContainKey("resource-lookup")
+            .WhoseValue.Should().Be("static");
+        evidence[0].Metadata.Should().ContainKey("key")
+            .WhoseValue.Should().Be("AccentBrush");
+    }
+
+    [Fact]
+    public async Task SampleWpf_dynamicResourceIsDistinguishedFromStaticResource()
+    {
+        var consumer = (await _wpfStore!.FindSymbolsAsync("DynamicResourceConsumer"))
+            .First(h => h.Kind == "xaml-element");
+        var brush = (await _wpfStore.ListCalleesAsync(
+                consumer.Id,
+                limit: 50,
+                edgeKind: "uses-resource"))
+            .Should().ContainSingle(c =>
+                c.CanonicalKey == "xaml:resource:App.xaml#AccentBrush").Subject;
+
+        var evidence = await _wpfStore.ListEdgeEvidenceAsync(
+            consumer.Id,
+            brush.Id,
+            "uses-resource");
+        evidence.Should().ContainSingle();
+        evidence[0].Confidence.Should().Be(CoreEvidenceConfidence.Exact);
+        evidence[0].Metadata.Should().ContainKey("resource-lookup")
+            .WhoseValue.Should().Be("dynamic");
+    }
+
+    [Fact]
+    public async Task SampleWpf_mergedDictionaryResolvesToRealDeclarationSymbol()
+    {
+        var consumer = (await _wpfStore!.FindSymbolsAsync("MergedResourceConsumer"))
+            .First(h => h.Kind == "xaml-element");
+        var target = (await _wpfStore.ListCalleesAsync(
+                consumer.Id,
+                limit: 50,
+                edgeKind: "uses-resource"))
+            .Should().ContainSingle(c =>
+                c.CanonicalKey == "xaml:resource:SharedResources.xaml#SharedBrush").Subject;
+
+        target.FilePath.Replace('\\', '/').Should().EndWith("/SharedResources.xaml");
+        target.StartLine.Should().Be(3);
+    }
+
+    [Fact]
+    public async Task SampleWpf_missingResourceCreatesQueryableFindingWithoutTarget()
+    {
+        var consumer = (await _wpfStore!.FindSymbolsAsync("MissingResourceConsumer"))
+            .First(h => h.Kind == "xaml-element");
+        (await _wpfStore.ListCalleesAsync(
+            consumer.Id,
+            limit: 50,
+            edgeKind: "uses-resource")).Should().BeEmpty();
+
+        var findings = await _wpfStore.GetAnnotationsForSymbolAsync(consumer.Id);
+        var finding = findings.Should().ContainSingle(annotation =>
+            annotation.Flavor == "xaml-resource-finding"
+            && annotation.Name == "Resource不存在"
+            && annotation.FullName == "XAMLRESOURCE001").Subject;
+        using var json = JsonDocument.Parse(finding.ArgsJson!);
+        json.RootElement.GetProperty("key").GetString().Should()
+            .Be("ResourceThatDoesNotExist");
+        json.RootElement.GetProperty("resourceLookup").GetString().Should()
+            .Be("static");
+        json.RootElement.GetProperty("confidence").GetString().Should()
+            .Be("exact");
+
+        (await _wpfStore.FindSymbolsAsync("__unresolved")).Should().BeEmpty(
+            "missing resources must not manufacture target symbols");
     }
 
     [Fact]

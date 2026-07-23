@@ -434,21 +434,53 @@ The detected profile selects an `IXamlDialect` strategy that handles markup-exte
 - **AND** until the code-behind source type and full path can be resolved semantically, the indexer emits no inherited-`DataContext` edge and no synthetic target
 
 ### Requirement: Per-project resource cascade cache
-For every project that contains XAML files, the `XamlLanguageProjectFactory` SHALL build a per-project `XamlLanguageProject` instance whose private `ResourceCache` indexes every `x:Key` declared in:
+For every project that contains XAML files, the `XamlLanguageProjectFactory` SHALL build a per-project `XamlLanguageProject` instance whose resource snapshot indexes every `x:Key` visible from:
 
 - The project's `App.xaml` `Application.Resources`
-- Any `MergedDictionaries` referenced from `App.xaml`
+- Any same-project, relative-URI `MergedDictionaries` transitively referenced from `App.xaml`
 - A theme `Generic.xaml` if present in the project's `Themes/` folder
 
-The cache SHALL be populated once at project discovery and reused for every `.xaml` file in the project so resource-resolution lookups (`{StaticResource AccentBrush}` → declaration site) do not re-walk the cascade per file.
+Discovery SHALL use two passes: first parse every scope-approved project XAML file into resource declarations and merge links, then walk the project-global cascade roots. The implementation SHALL NOT open a file excluded by the scope/privacy policy, reached through a reparse point outside the physical scope, or not owned by the project. Duplicate visible declarations SHALL be retained as an ambiguous candidate set; filesystem enumeration order SHALL NOT silently choose one.
+
+The snapshot SHALL be reused for every `.xaml` file in the project so resource-resolution lookups (`{StaticResource AccentBrush}` → declaration site) do not re-walk the cascade per file. `XamlLanguageProject` SHALL implement `IDeclarationFirstLanguageProject`; its `DeclarationFilePaths` SHALL be the deterministic, duplicate-free set of real files that own the snapshot's resource declarations. A capable host dispatches that subset before consuming XAML files, so a cold index never depends on filesystem enumeration order. `XamlLanguageProject.RebuildResourceCache()` SHALL atomically replace the snapshot from the same scope-filtered project file set after an incremental resource edit; callers already using the prior immutable snapshot may finish against it.
 
 #### Scenario: Resource resolved from App.xaml
 - **WHEN** the indexer encounters `<Button Background="{StaticResource AccentBrush}"/>` in `Views/Main.xaml`, and `App.xaml` declares `<SolidColorBrush x:Key="AccentBrush" Color="Blue"/>`
-- **THEN** the indexer emits a `uses-resource` edge from the button element to the resource declaration site (resolved via the cache, no re-walk), and the resource's symbol carries kind `xaml-resource`
+- **THEN** the indexer emits a `uses-resource` edge from the button element to the real resource declaration symbol (resolved via the snapshot, no re-walk), and the resource's symbol carries kind `xaml-resource`
+- **AND** the indexer does not synthesize another declaration in `Views/Main.xaml`
+- **AND** the edge carries `resource-lookup=static` plus `exact` evidence at the consuming attribute with producer `xaml-resource`
+
+#### Scenario: Resource resolved from a merged dictionary
+- **WHEN** `App.xaml` merges `Resources/Palette.xaml` and that dictionary declares `AccentBrush`
+- **THEN** a resource use in `Views/Main.xaml` targets canonical key `xaml:resource:Resources/Palette.xaml#AccentBrush`
+- **AND** the target symbol's declaration file and range are those of `Resources/Palette.xaml`, not the consuming view
+
+#### Scenario: Dynamic resource remains distinguishable
+- **WHEN** an element uses `{DynamicResource AccentBrush}`
+- **THEN** its resolved edge carries `resource-lookup=dynamic`
+- **AND** the exact evidence retains the consuming attribute range
+
+#### Scenario: Local forward resource reference
+- **WHEN** a view-local resource and a consuming element occur in the same document, in either declaration order
+- **THEN** the indexer's first document pass collects the declaration and its second pass resolves the use to that real local resource symbol
 
 #### Scenario: Resource not found
 - **WHEN** the indexer encounters `<Button Background="{StaticResource NonExistent}"/>` and the cache contains no entry for `NonExistent`
-- **THEN** the indexer emits the `uses-resource` edge with an unresolved target and logs a debug-level note (does not error; the binding may be resolved by a runtime mechanism the indexer does not see)
+- **THEN** the indexer emits no `uses-resource` edge and creates no target symbol
+- **AND** it attaches a queryable annotation finding to the consuming element with flavor `xaml-resource-finding`, name `Resource不存在`, code `XAMLRESOURCE001`, key, lookup kind, exact source range, confidence, and producer in its structured JSON payload
+
+#### Scenario: Resource key is ambiguous
+- **WHEN** two reachable merged dictionaries declare the same key and no narrower local declaration disambiguates the use
+- **THEN** the indexer emits no resource edge and creates no target symbol
+- **AND** it attaches a `xaml-resource-finding` annotation with name `Resource不明确`, code `XAMLRESOURCE002`, and every candidate declaration in its structured payload
+
+#### Scenario: Resource snapshot rebuild
+- **WHEN** an allowed merged dictionary changes and the host invokes `RebuildResourceCache()`
+- **THEN** subsequent lookups see one atomically rebuilt snapshot in which removed keys are missing and new keys are resolvable
+
+#### Scenario: Privacy-excluded merged dictionary
+- **WHEN** `App.xaml` names `PatientData/Secret.xaml` as a merged dictionary source
+- **THEN** that target is neither opened nor included in the resource snapshot, and its keys remain unresolved
 
 ### Requirement: Self-heal stranded reference edges
 The indexer SHALL detect and recover from a "zombie" file state where pass 1's `ClearFileOutgoingAsync` cleared a file's outgoing refs/edges but pass 2's reference walk did not repopulate them. On every `IndexCoreAsync` call, the pass-1 unchanged-file skip path SHALL bypass the skip when the file declares one or more symbols but the store reports zero outgoing pass-2 artifacts (refs AND edges) for that file. The bypassed file SHALL be re-walked in pass 2 so its refs/edges are regenerated.

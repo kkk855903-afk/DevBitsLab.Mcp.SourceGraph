@@ -185,6 +185,14 @@ The SDK SHALL expose two interfaces. `ILanguageProject` SHALL declare `string Id
 
 The host SHALL load `ILanguageProjectFactory` instances from registered plugins, invoke `DiscoverAsync` once per scope at startup (and again on `.sourcegraph.json` changes), and route `IndexAsync` calls so the resulting `IndexContext.Project` references the project that owns the file.
 
+The SDK SHALL also expose the additive optional capability `IDeclarationFirstLanguageProject`.
+It extends `ILanguageProject` with
+`IReadOnlyCollection<string> DeclarationFilePaths { get; }`. Every declared-first path SHALL be
+an absolute path already present in `FilePaths`; it is an ordering hint and never expands the
+host's scope/privacy boundary. A host that recognizes the capability SHALL dispatch these files
+before the remaining files in the same project so cross-file edges can resolve real declaration
+symbols without placeholder targets. Projects that do not implement it retain ordinary ordering.
+
 #### Scenario: Built-in C# pathway exposes a MSBuildLanguageProject
 - **WHEN** the host opens a solution with two `.csproj` projects
 - **THEN** the C# `ILanguageProjectFactory.DiscoverAsync` returns two `MSBuildLanguageProject` instances (one per `.csproj`), each wrapping the existing `MSBuildWorkspace`-loaded project, and `IndexContext.Project` for any `.cs` file in those projects references the matching one
@@ -196,6 +204,11 @@ The host SHALL load `ILanguageProjectFactory` instances from registered plugins,
 #### Scenario: Plugin owns project state
 - **WHEN** a plugin's `ILanguageProject` subclass holds plugin-private state (e.g. a parsed resource cache)
 - **THEN** the same `ILanguageProject` instance is passed via `IndexContext.Project` for every file in that project across the same indexing pass, so the plugin can reuse the cached state
+
+#### Scenario: Optional declaration-first ordering
+- **WHEN** a discovered project implements `IDeclarationFirstLanguageProject` and returns two allowed project-owned paths
+- **THEN** the host dispatches those two files before other files owned by that project
+- **AND** duplicate, outside-scope, excluded, or non-project paths do not expand the dispatch set
 
 ### Requirement: IndexContext exposes the language project
 `IndexContext` SHALL expose `ILanguageProject? Project { get; }`. The constructor SHALL accept the project as an additional parameter. When the host has no project mapping for the file, `Project` SHALL be `null`.
