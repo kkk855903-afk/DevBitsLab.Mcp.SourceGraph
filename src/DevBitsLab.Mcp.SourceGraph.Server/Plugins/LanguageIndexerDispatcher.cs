@@ -5,6 +5,7 @@ using System.Linq;
 using System.Security.Cryptography;
 using System.Threading;
 using System.Threading.Tasks;
+using DevBitsLab.Mcp.SourceGraph.Core;
 using DevBitsLab.Mcp.SourceGraph.Sdk;
 using DevBitsLab.Mcp.SourceGraph.Server.Scoping;
 using DevBitsLab.Mcp.SourceGraph.Storage;
@@ -75,6 +76,7 @@ public sealed class LanguageIndexerDispatcher
     public async Task BuildProjectMapAsync(ScopeHost host, CancellationToken ct = default)
     {
         host.ProjectByFilePath.Clear();
+        var privacyPolicy = new PrivacyPathPolicy(Path.GetFullPath(host.Scope.Root));
         foreach (var factory in _factories.All())
         {
             ct.ThrowIfCancellationRequested();
@@ -94,6 +96,7 @@ public sealed class LanguageIndexerDispatcher
                 foreach (var path in project.FilePaths)
                 {
                     if (string.IsNullOrEmpty(path)) continue;
+                    if (privacyPolicy.IsExcluded(path)) continue;
                     // First-write-wins: the project that claims a file first owns it. Cross-factory
                     // overlap is rare today (MSBuild doesn't claim .xaml; XAML doesn't claim .cs)
                     // but the rule keeps behaviour predictable when a future factory pair overlaps.
@@ -234,6 +237,9 @@ public sealed class LanguageIndexerDispatcher
         Dictionary<string, long> symbolIdByKey,
         CancellationToken ct)
     {
+        var privacyPolicy = new PrivacyPathPolicy(Path.GetFullPath(repoRoot));
+        if (privacyPolicy.IsExcluded(filePath)) return;
+
         byte[] contents;
         try
         {
@@ -301,17 +307,21 @@ public sealed class LanguageIndexerDispatcher
     }
 
     /// <summary>
-    /// Walk <paramref name="root"/> for files matching any of <paramref name="extensions"/>. Skips
-    /// <c>bin/</c>, <c>obj/</c>, <c>node_modules/</c>, and <c>.git/</c> wholesale to keep the walk
-    /// proportional to source-tree size, not build-output size.
+    /// Walk <paramref name="root"/> for files matching any of <paramref name="extensions"/>.
+    /// <see cref="PrivacyPathPolicy"/> prunes excluded subtrees before enumeration and rejects
+    /// excluded files before they can be opened by <see cref="DispatchOneCoreAsync"/>.
     /// </summary>
     private static IEnumerable<string> EnumerateFiles(string root, HashSet<string> extensions)
     {
+        var normalizedRoot = Path.GetFullPath(root);
+        var privacyPolicy = new PrivacyPathPolicy(normalizedRoot);
         var stack = new Stack<string>();
-        stack.Push(root);
+        stack.Push(normalizedRoot);
         while (stack.Count > 0)
         {
             var dir = stack.Pop();
+            if (privacyPolicy.IsExcluded(dir)) continue;
+
             IEnumerable<string> children;
             try { children = Directory.EnumerateDirectories(dir); }
             catch (UnauthorizedAccessException) { continue; }
@@ -319,13 +329,7 @@ public sealed class LanguageIndexerDispatcher
 
             foreach (var child in children)
             {
-                var name = Path.GetFileName(child);
-                if (string.Equals(name, "bin", StringComparison.OrdinalIgnoreCase)) continue;
-                if (string.Equals(name, "obj", StringComparison.OrdinalIgnoreCase)) continue;
-                if (string.Equals(name, "node_modules", StringComparison.OrdinalIgnoreCase)) continue;
-                if (string.Equals(name, ".git", StringComparison.OrdinalIgnoreCase)) continue;
-                if (string.Equals(name, ".sourcegraph", StringComparison.OrdinalIgnoreCase)) continue;
-                stack.Push(child);
+                if (!privacyPolicy.IsExcluded(child)) stack.Push(child);
             }
 
             IEnumerable<string> files;
@@ -335,6 +339,7 @@ public sealed class LanguageIndexerDispatcher
 
             foreach (var f in files)
             {
+                if (privacyPolicy.IsExcluded(f)) continue;
                 var ext = Path.GetExtension(f);
                 if (extensions.Contains(ext)) yield return f;
             }
