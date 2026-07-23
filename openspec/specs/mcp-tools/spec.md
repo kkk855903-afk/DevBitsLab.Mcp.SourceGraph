@@ -8,14 +8,21 @@ symbol-level questions via one structured call instead of dozens of
 `Grep` + `Read` operations.
 ## Requirements
 ### Requirement: Definition lookup
-The server SHALL expose a `find_definition` tool that returns the location, kind, signature, accessibility, modifiers, and (when present) one-line XML summary for every symbol matching a name or fully-qualified name.
+The server SHALL expose a `find_definition` tool that returns the symbol id/FQN, exact
+1-based half-open declaration range, `defines` relation, confidence, kind, signature,
+accessibility, modifiers, and (when present) one-line XML summary for every symbol matching a
+name or fully-qualified name.
 
 #### Scenario: Look up a class
 - **WHEN** the agent invokes `find_definition(symbol = "Calculator")` against an indexed solution that contains `Sample.Domain.Calculator`
-- **THEN** the response lists the class with file, line, column, signature, accessibility, modifiers, and (if any) the first sentence of its XML summary
+- **THEN** the response lists the class with symbol id/FQN, exact file range, `defines` relation, `exact` confidence, signature, accessibility, modifiers, and (if any) the first sentence of its XML summary
 
 ### Requirement: Reference lookup
-The server SHALL expose a `find_references` tool that returns every reference site for a symbol, surfacing the resolved `ReferenceKind` (`def`, `ref`, `call`, `read`, `write`, `impl`, `inherit`) per row, with an optional `include_generated` parameter (default `false`) that filters out references coming from source-generated files.
+The server SHALL expose a `find_references` tool that returns every reference site for a symbol,
+surfacing the resolved target symbol id/FQN, relation/`ReferenceKind` (`def`, `ref`, `call`,
+`read`, `write`, `impl`, `inherit`), semantic confidence, and file/line/column per row, with an
+optional `include_generated` parameter (default `false`) that filters out references coming from
+source-generated files.
 
 #### Scenario: Distinguish reads and writes
 - **WHEN** the agent invokes `find_references(symbol = "_state")` against a graph where `_state` is read in one place and written in two

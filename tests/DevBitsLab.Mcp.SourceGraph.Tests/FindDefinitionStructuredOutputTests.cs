@@ -183,8 +183,12 @@ public sealed class FindDefinitionStructuredOutputTests : IAsyncLifetime, IDispo
             h.Kind.Should().NotBeNullOrEmpty();
             h.FilePath.Should().NotBeNullOrEmpty();
             h.Line.Should().BeGreaterThan(0);
-            // Column may legitimately be 0 (column origin is 0-based in our storage).
-            h.Column.Should().BeGreaterThanOrEqualTo(0);
+            h.Column.Should().BeGreaterThan(0);
+            h.EndLine.Should().BeGreaterThanOrEqualTo(h.Line);
+            h.EndColumn.Should().BeGreaterThan(0);
+            h.Relation.Should().Be("defines");
+            h.Confidence.Should().Be("exact");
+            h.SymbolId.Should().BeGreaterThan(0);
         }
     }
 

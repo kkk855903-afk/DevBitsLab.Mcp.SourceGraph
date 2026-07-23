@@ -269,6 +269,11 @@ public sealed class StructuredContentInvariantTests : IAsyncLifetime, IDisposabl
         var dto = JsonSerializer.Deserialize(json, ToolOutputJsonContext.Default.FindReferencesResult);
         dto.Should().NotBeNull();
         dto!.References.Count.Should().Be(proseCount, "structured array length equals prose row count");
+        dto.References.Should().OnlyContain(reference =>
+            reference.SymbolId == dto.TargetSymbolId
+            && reference.TargetFqn == dto.TargetFqn
+            && reference.Relation == reference.Kind
+            && reference.Confidence == "semantic");
     }
 
     [Fact]

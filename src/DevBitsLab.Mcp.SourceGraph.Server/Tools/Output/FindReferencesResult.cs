@@ -23,7 +23,11 @@ public sealed record FindReferencesResult(
 /// kebab-token string here so the wire shape doesn't leak the storage enum's ordinals.
 /// </summary>
 public sealed record FindReferenceHit(
+    [property: JsonPropertyName("symbol_id")] long SymbolId,
+    [property: JsonPropertyName("target_fqn")] string TargetFqn,
     string Kind,
+    string Relation,
+    string Confidence,
     [property: JsonPropertyName("file_path")] string FilePath,
     int Line,
     int Column,

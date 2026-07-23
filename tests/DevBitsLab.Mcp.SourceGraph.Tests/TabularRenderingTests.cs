@@ -107,7 +107,7 @@ public sealed class TabularRenderingTests : IAsyncLifetime, IDisposable
         // Multiply (`result = Add(result, a)`) and the call from Sample.App's Program.cs.
         var output = CallToolResultHelpers.ProseText(await GraphTools.FindReferencesAsync(_router!, "Calculator.Add"));
         output.Should().Contain("References to **");
-        output.Should().Contain("| Kind | Location |");
+        output.Should().Contain("| Relation | Confidence | Location |");
         // Separator row.
         output.Should().Contain("|---|---|");
         // The substantive prose lead-in stays on line 1 so the leaf chokepoint can prefix it.

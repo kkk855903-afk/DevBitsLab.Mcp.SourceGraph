@@ -30,10 +30,15 @@ public sealed record FindDefinitionResult(IReadOnlyList<FindDefinitionHit> Hits)
 /// branching on sentinel strings.
 /// </summary>
 public sealed record FindDefinitionHit(
+    [property: JsonPropertyName("symbol_id")] long SymbolId,
     string Fqn,
     string Kind,
     [property: JsonPropertyName("file_path")] string FilePath,
     int Line,
     int Column,
+    [property: JsonPropertyName("end_line")] int EndLine,
+    [property: JsonPropertyName("end_column")] int EndColumn,
+    string Relation,
+    string Confidence,
     string? Signature,
     [property: JsonPropertyName("xml_summary")] string? XmlSummary);

@@ -313,8 +313,8 @@ to the client at handshake time.
 
 | Tool | Question it answers |
 |---|---|
-| `find_definition` | Where is X defined? |
-| `find_references` | Who uses or calls X? (file:line list, optionally including source-generated files) |
+| `find_definition` | Where is X defined? Each hit carries the symbol id/FQN, exact declaration range, `defines` relation, and confidence. |
+| `find_references` | Who uses or calls X? Each occurrence carries its resolved target symbol, relation kind, semantic confidence, and file:line (optionally including source-generated files). |
 | `find_reference` | Phase 1 compatibility name for `find_references` (same structured result and limits). |
 | `list_callers` | Inbound edges into X — default `kind=calls`; also `uses_type`, `overrides`, `implements_member`, `instantiates`, `throws`, `all`. When an edge carries per-edge metadata (e.g. a future XAML `binds-path` edge with `path`, `mode`, `converter` fields), the markdown shows an indented `payload: { … }` sub-line under the row, capped at 5 keys with `(N more)` if elided. |
 | `list_callees` | Outbound edges from X (same `kind` taxonomy; same `payload:` sub-line behaviour as `list_callers`). |

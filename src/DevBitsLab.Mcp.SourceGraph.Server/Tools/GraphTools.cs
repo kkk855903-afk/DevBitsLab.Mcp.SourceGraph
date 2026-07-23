@@ -33,7 +33,7 @@ public static class GraphTools
 
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(FindDefinitionResult))]
     [ToolTrigger("\"where is X defined?\"")]
-    [Description("Find the definition of a symbol by name or fully-qualified name. Returns location, kind, signature, accessibility, modifiers, and one-line XML summary for each match.")]
+    [Description("Find the definition of a symbol by name or fully-qualified name. Returns symbol id, exact declaration range, defines relation, confidence, kind, signature, accessibility, modifiers, and one-line XML summary for each match.")]
     public static Task<CallToolResult> FindDefinitionAsync(
         ScopeRouter router,
         [Description("Symbol name (e.g. 'Calculator', 'Divide') or FQN suffix (e.g. 'Calculator.Add', 'Sample.Domain.Calculator')")] string symbol,
@@ -70,7 +70,9 @@ public static class GraphTools
                 foreach (var h in hits)
                 {
                     sb.AppendLine($"- **{h.Fqn}** ({Format.KindWithAttrs(h)})");
-                    sb.AppendLine($"  - {Format.Location(h.FilePath, h.StartLine, h.StartCol)}");
+                    sb.AppendLine(
+                        $"  - defines at {Format.Location(h.FilePath, h.StartLine, h.StartCol)} " +
+                        $"→ {h.EndLine}:{h.EndCol} [exact]");
                     if (!string.IsNullOrEmpty(h.Signature)) sb.AppendLine($"  - `{h.Signature}`");
                     var oneLine = Format.OneLineSummary(h.XmlSummary);
                     if (!string.IsNullOrEmpty(oneLine)) sb.AppendLine($"  - _{oneLine}_");
@@ -83,11 +85,16 @@ public static class GraphTools
                         if (line is not null) sb.AppendLine($"  - {line}");
                     }
                     structuredHits.Add(new FindDefinitionHit(
+                        SymbolId: h.Id,
                         Fqn: h.Fqn,
                         Kind: h.Kind,
                         FilePath: h.FilePath,
                         Line: h.StartLine,
                         Column: h.StartCol,
+                        EndLine: h.EndLine,
+                        EndColumn: h.EndCol,
+                        Relation: "defines",
+                        Confidence: "exact",
                         Signature: string.IsNullOrEmpty(h.Signature) ? null : h.Signature,
                         XmlSummary: string.IsNullOrEmpty(h.XmlSummary) ? null : h.XmlSummary));
                 }
@@ -295,7 +302,7 @@ public static class GraphTools
 
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(FindReferencesResult))]
     [ToolTrigger("\"who uses X?\" or \"who calls X?\"")]
-    [Description("Find every place that references a symbol. Resolves the symbol by name/FQN, then lists each call site or type-use as file:line. By default skips refs from source-generated files; pass includeGenerated=true to surface them.")]
+    [Description("Find every place that references a symbol. Resolves the symbol by name/FQN, then lists each occurrence with target symbol id/FQN, relation kind, semantic confidence, and file:line. By default skips refs from source-generated files; pass includeGenerated=true to surface them.")]
     public static Task<CallToolResult> FindReferencesAsync(
         ScopeRouter router,
         [Description("Symbol name or FQN, same matching rules as find_definition")] string symbol,
@@ -353,16 +360,20 @@ public static class GraphTools
                         rows.Add(new[]
                         {
                             RefKindLabel(r.Kind),
+                            "semantic",
                             Format.Location(r.FilePath, r.Line, r.Col) + GeneratedSuffix(r.IsGenerated),
                         });
                     }
-                    Format.AppendTable(sb, new[] { "Kind", "Location" }, rows);
+                    Format.AppendTable(sb, new[] { "Relation", "Confidence", "Location" }, rows);
                 }
                 else
                 {
                     foreach (var r in refs)
                     {
-                        sb.AppendLine($"- {RefKindLabel(r.Kind)} at {Format.Location(r.FilePath, r.Line, r.Col)}{GeneratedSuffix(r.IsGenerated)}");
+                        sb.AppendLine(
+                            $"- {RefKindLabel(r.Kind)} at " +
+                            $"{Format.Location(r.FilePath, r.Line, r.Col)}{GeneratedSuffix(r.IsGenerated)} " +
+                            "[semantic]");
                     }
                 }
                 return BuildFindReferencesResult(
@@ -423,7 +434,11 @@ public static class GraphTools
 
         var structuredReferences = refs
             .Select(r => new FindReferenceHit(
+                SymbolId: target.Id,
+                TargetFqn: target.Fqn,
                 Kind: RefKindLabel(r.Kind),
+                Relation: RefKindLabel(r.Kind),
+                Confidence: "semantic",
                 FilePath: r.FilePath,
                 Line: r.Line,
                 Column: r.Col,
