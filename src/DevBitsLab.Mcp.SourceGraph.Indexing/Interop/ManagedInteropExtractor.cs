@@ -132,7 +132,7 @@ internal static class ManagedInteropExtractor
             location);
     }
 
-    private static AbiTypeRef MapType(
+    internal static AbiTypeRef MapType(
         ITypeSymbol type,
         MarshalInfo? marshal,
         string? characterSet,
@@ -447,7 +447,7 @@ internal static class ManagedInteropExtractor
             alignmentBytes: target.PointerSizeBytes,
             stringEncoding: encoding);
 
-    private static MarshalInfo? FindMarshalInfo(
+    internal static MarshalInfo? FindMarshalInfo(
         IEnumerable<AttributeData> attributes)
     {
         var matches = attributes
@@ -645,7 +645,7 @@ internal static class ManagedInteropExtractor
         return null;
     }
 
-    private sealed record MarshalInfo(
+    internal sealed record MarshalInfo(
         string UnmanagedType,
         int? SizeConst,
         string? ArraySubType);
