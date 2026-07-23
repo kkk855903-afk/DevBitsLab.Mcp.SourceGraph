@@ -315,14 +315,17 @@ to the client at handshake time.
 |---|---|
 | `find_definition` | Where is X defined? |
 | `find_references` | Who uses or calls X? (file:line list, optionally including source-generated files) |
+| `find_reference` | Phase 1 compatibility name for `find_references` (same structured result and limits). |
 | `list_callers` | Inbound edges into X — default `kind=calls`; also `uses_type`, `overrides`, `implements_member`, `instantiates`, `throws`, `all`. When an edge carries per-edge metadata (e.g. a future XAML `binds-path` edge with `path`, `mode`, `converter` fields), the markdown shows an indented `payload: { … }` sub-line under the row, capped at 5 keys with `(N more)` if elided. |
 | `list_callees` | Outbound edges from X (same `kind` taxonomy; same `payload:` sub-line behaviour as `list_callers`). |
+| `find_callers` / `find_callees` | Phase 1 compatibility names for `list_callers` / `list_callees`. |
 | `list_symbols_in_file` | What's in this file? (kind, accessibility, modifiers, XML summary) |
 | `list_members` | Direct members of a class / struct / interface / namespace by FQN, optionally filtered by accessibility |
 | `find_implementations` | Concrete members satisfying an interface member |
 | `neighborhood` | Inbound + outbound edges around X for one `kind` layer at a time (default `calls`; pass `kind=uses_type`, `overrides`, `implements_member`, `instantiates`, `throws`, or `all` to inspect other layers) |
 | `module_summary` | Top symbols in a namespace or directory by inbound call count |
 | `impact_of_change` | Transitive upstream callers of X up to `maxDepth` |
+| `impact_analysis` | Phase 1 compatibility name for `impact_of_change`. |
 | `find_data_bindings` | Walks `binds-path` edges with payload-aware filters (`path`, `mode`, `converter`, plus optional `target` / `source` canonical keys). Answers "where does this property bind?", "find every TwoWay binding", "which views use this converter?". Soft-empty `note:` when the active scope hasn't loaded an indexer that emits `binds-path`. |
 | `find_event_handlers` | Walks `handles-event` edges with `event` / `command` payload filters and optional `handler` / `element` canonical keys. Answers "find all Click handlers", "where is OnSave wired up?". Same soft-empty pattern as `find_data_bindings`. |
 

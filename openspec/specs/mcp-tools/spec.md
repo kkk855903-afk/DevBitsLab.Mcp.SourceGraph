@@ -35,6 +35,16 @@ The server SHALL expose a `list_symbols_in_file` tool that lists every symbol de
 ### Requirement: Caller and callee enumeration
 The server SHALL expose `list_callers` and `list_callees` tools that walk `calls` edges by default, with an optional `kind` parameter that accepts a kebab-case edge kind name (`calls | uses-type | overrides-member | implements-member | instantiates | throws | tests | code-behind | binds-path | binds-element | handles-event | uses-resource | instantiates-type | merges | applies-style | all`) or any future kind exposed by the active scope's plugins, to filter the edge kind walked. The XAML edge kinds (`code-behind`, `binds-path`, `binds-element`, `handles-event`, `uses-resource`, `instantiates-type`, `merges`, `applies-style`) are part of the enumerable vocabulary on every scope that loads the XAML indexer. When an edge row carries a non-null `payload` JSON value, the rendered markdown SHALL include an indented `payload:` sub-line under the edge row, displaying up to the first five key/value pairs from the payload object; if more than five pairs are present, an `(N more)` suffix SHALL indicate the elision count.
 
+The Phase 1 MedInteropLens contract SHALL additionally register the exact compatibility
+names `find_reference`, `find_callers`, `find_callees`, and `impact_analysis`. Each SHALL
+delegate to the established plural/list/impact implementation with the same input defaults,
+structured output schema, scope semantics, and errors. These aliases SHALL NOT fabricate
+call-site locations before occurrence evidence is available.
+
+#### Scenario: Phase 1 compatibility names are discoverable
+- **WHEN** an MCP client lists tools
+- **THEN** `find_reference`, `find_callers`, `find_callees`, and `impact_analysis` are registered alongside `find_references`, `list_callers`, `list_callees`, and `impact_of_change`
+
 #### Scenario: List callers (default = calls)
 - **WHEN** the agent invokes `list_callers(symbol = "Calculator.Add")`
 - **THEN** the response lists every symbol with an outgoing edge whose `kind_name = 'calls'` and whose `dst` is the resolved id
