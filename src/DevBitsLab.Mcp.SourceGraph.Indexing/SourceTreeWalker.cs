@@ -1,4 +1,5 @@
 using System.Security.Cryptography;
+using DevBitsLab.Mcp.SourceGraph.Core;
 
 namespace DevBitsLab.Mcp.SourceGraph.Indexing;
 
@@ -7,11 +8,11 @@ namespace DevBitsLab.Mcp.SourceGraph.Indexing;
 /// non-ignored file under it. Used by the <c>reconcile_drift</c> tool to compute a comparison
 /// set against the per-scope <c>files</c> table without re-implementing path filtering.
 ///
-/// The exclusion list mirrors <c>SolutionWatcher.ShouldIgnore</c> (<c>obj/</c>, <c>bin/</c>,
-/// <c>.git/</c>, <c>.sourcegraph/</c>) so a watcher-driven scan and an agent-driven drift
-/// reconcile see the same file set. Reads each file as bytes and computes SHA-256 in-process; an
-/// I/O failure on a single file is swallowed (the file is silently skipped) so a permission
-/// hiccup on one entry doesn't poison the whole walk.
+/// <see cref="PrivacyPathPolicy"/> is applied before a directory is enumerated or a file is
+/// opened, so medical images, patient data, databases, logs, and build output never enter the
+/// drift comparison set. Reads each allowed file as bytes and computes SHA-256 in-process; an I/O
+/// failure on a single file is swallowed (the file is silently skipped) so a permission hiccup on
+/// one entry doesn't poison the whole walk.
 /// </summary>
 public static class SourceTreeWalker
 {
@@ -39,18 +40,21 @@ public static class SourceTreeWalker
             return new WalkOutcome(entries, HitLimit: false);
         }
 
+        var normalizedRoot = Path.GetFullPath(root);
+        var privacyPolicy = new PrivacyPathPolicy(normalizedRoot);
+
         // Stack-based DFS so an unreadable subtree fails locally (per-directory catch) instead
         // of aborting the whole traversal — `Directory.EnumerateFiles(SearchOption.AllDirectories)`
         // throws on the offending directory and there's no clean recovery point inside the
         // outer foreach. Stack-based version isolates the failure to the directory that owns it.
         var stack = new Stack<string>();
-        stack.Push(root);
+        stack.Push(normalizedRoot);
 
         while (stack.Count > 0)
         {
             ct.ThrowIfCancellationRequested();
             var dir = stack.Pop();
-            if (ShouldIgnoreDirectory(dir)) continue;
+            if (privacyPolicy.IsExcluded(dir)) continue;
 
             IEnumerable<string> children;
             try
@@ -71,11 +75,11 @@ public static class SourceTreeWalker
 
                 if (isDir)
                 {
-                    stack.Push(child);
+                    if (!privacyPolicy.IsExcluded(child)) stack.Push(child);
                     continue;
                 }
 
-                if (ShouldIgnore(child)) continue;
+                if (privacyPolicy.IsExcluded(child)) continue;
 
                 // Cap probe: we've encountered a non-ignored file we WOULD yield. If we've
                 // already produced maxFiles entries, this proves the tree has more than the cap
@@ -99,33 +103,6 @@ public static class SourceTreeWalker
         }
 
         return new WalkOutcome(entries, HitLimit: false);
-    }
-
-    /// <summary>
-    /// Path filter for individual files. Mirrors <c>SolutionWatcher.ShouldIgnore</c>; kept inline
-    /// (rather than imported) so the walker doesn't take a dependency on the Watcher project.
-    /// </summary>
-    private static bool ShouldIgnore(string path)
-    {
-        var sep = Path.DirectorySeparatorChar;
-        if (path.Contains($"{sep}obj{sep}", StringComparison.Ordinal)) return true;
-        if (path.Contains($"{sep}bin{sep}", StringComparison.Ordinal)) return true;
-        if (path.Contains($"{sep}.git{sep}", StringComparison.Ordinal)) return true;
-        if (path.Contains($"{sep}.sourcegraph{sep}", StringComparison.Ordinal)) return true;
-        return false;
-    }
-
-    /// <summary>
-    /// Directory-level prune so we don't even enumerate excluded subtrees. The file-level
-    /// <see cref="ShouldIgnore"/> remains the authoritative filter (it catches cases where the
-    /// excluded segment is deeper than the directory we just descended into); this is purely an
-    /// optimisation that saves enumerating large <c>obj/</c> / <c>.git/</c> / <c>.sourcegraph/</c>
-    /// subtrees we'd reject anyway.
-    /// </summary>
-    private static bool ShouldIgnoreDirectory(string dir)
-    {
-        var name = Path.GetFileName(dir);
-        return name == "obj" || name == "bin" || name == ".git" || name == ".sourcegraph";
     }
 }
 

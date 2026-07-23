@@ -53,6 +53,26 @@ public sealed class SourceTreeWalkerTests : IDisposable
     }
 
     [Fact]
+    public async Task Walk_appliesMedicalPrivacyPolicy_beforeHashingOrCountingFiles()
+    {
+        var (kept, keptSha) = await Plant(Path.Join(_root, "src", "Allowed.cs"), "class Allowed {}");
+        await Plant(Path.Join(_root, "pAtIeNtDaTa", "patient-canary.cs"), "PATIENT-CANARY");
+        await Plant(Path.Join(_root, "Images", "scan.cs"), "IMAGE-CANARY");
+        await Plant(Path.Join(_root, "Database", "records.sql"), "DATABASE-CANARY");
+        await Plant(Path.Join(_root, "Logs", "device.log"), "LOG-CANARY");
+        await Plant(Path.Join(_root, "src", "scan.DCM"), "DICOM-CANARY");
+        await Plant(Path.Join(_root, "src", "photo.JpG"), "IMAGE-CANARY");
+
+        var outcome = await SourceTreeWalker.WalkAsync(_root, maxFiles: 1);
+
+        outcome.HitLimit.Should().BeFalse(
+            "privacy-excluded files must not count toward the traversal cap");
+        outcome.Entries.Should().ContainSingle();
+        outcome.Entries[0].Path.Should().Be(kept);
+        outcome.Entries[0].Sha256.Should().Equal(keptSha);
+    }
+
+    [Fact]
     public async Task Walk_respects_maxFiles_cap_and_setsHitLimit()
     {
         for (var i = 0; i < 5; i++)
