@@ -360,7 +360,10 @@ public static class HistoryTools
     {
         try
         {
-            return !new PrivacyPathPolicy(Path.GetFullPath(host.Scope.Root)).IsExcluded(path);
+            return !new ScopePathPolicy(
+                    Path.GetFullPath(host.Scope.Root),
+                    host.Scope.ProjectSet.Exclude)
+                .IsExcluded(path);
         }
         catch (ArgumentException)
         {

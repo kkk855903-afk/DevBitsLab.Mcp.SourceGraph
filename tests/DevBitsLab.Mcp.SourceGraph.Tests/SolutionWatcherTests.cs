@@ -241,6 +241,40 @@ public sealed class SolutionWatcherTests
         }
     }
 
+    [SkippableFact]
+    public async Task DirectoryLinkOutsideRepository_neverEmitsSourcePath()
+    {
+        var root = MakeTempRoot();
+        var outside = MakeTempRoot();
+        try
+        {
+            var linkedDirectory = Path.Join(root, "src", "External");
+            Directory.CreateDirectory(Path.GetDirectoryName(linkedDirectory)!);
+            Skip.IfNot(
+                PhysicalPathTestSupport.TryCreateDirectoryLink(linkedDirectory, outside),
+                "This environment does not permit symbolic-link or junction creation.");
+            var linkedPath = Path.Join(linkedDirectory, "Outside.cs");
+            var allowedPath = CreateParentedPath(root, "src", "Allowed.cs");
+
+            await using var watcher = new SolutionWatcher(root, debounce: _shortDebounce);
+            await File.WriteAllTextAsync(linkedPath, "outside");
+            await Task.Delay(_shortDebounce * 3);
+            await File.WriteAllTextAsync(allowedPath, "allowed");
+
+            var observed = await ReadPathsUntilAsync(
+                watcher,
+                paths => paths.Contains(allowedPath),
+                _eventTimeout);
+
+            observed.Should().BeEquivalentTo([allowedPath]);
+        }
+        finally
+        {
+            DeleteTempRoot(root);
+            DeleteTempRoot(outside);
+        }
+    }
+
     [Fact]
     public async Task ConfiguredExtensions_replaceDefaults_butCannotBypassPrivacyPolicy()
     {

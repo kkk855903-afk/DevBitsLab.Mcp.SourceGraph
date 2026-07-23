@@ -8,12 +8,20 @@ namespace DevBitsLab.Mcp.SourceGraph.Core;
 /// Configured excludes can only narrow the indexable set. The privacy policy is evaluated first
 /// and cannot be negated by a scope include, a registered file extension, or an exclude pattern.
 /// Glob matching is case-insensitive and supports <c>*</c>, <c>?</c>, and a complete
-/// <c>**</c> path segment.
+/// <c>**</c> path segment. Existing symlink, junction, and reparse-point components are resolved
+/// before the same containment and exclusion rules are applied to their physical target.
 /// </remarks>
 public sealed class ScopePathPolicy
 {
+    private static readonly StringComparer _pathComparer =
+        OperatingSystem.IsWindows()
+            ? StringComparer.OrdinalIgnoreCase
+            : StringComparer.Ordinal;
+
     private readonly string _repoRoot;
     private readonly PrivacyPathPolicy _privacyPathPolicy;
+    private readonly string? _physicalRepoRoot;
+    private readonly PrivacyPathPolicy? _physicalPrivacyPathPolicy;
     private readonly IReadOnlyList<GlobPattern> _excludePatterns;
 
     public ScopePathPolicy(string repoRoot, IReadOnlyList<string>? excludePatterns = null)
@@ -27,6 +35,11 @@ public sealed class ScopePathPolicy
         _repoRoot = Path.TrimEndingDirectorySeparator(
             Path.GetFullPath(NormalizeSeparators(repoRoot)));
         _privacyPathPolicy = new PrivacyPathPolicy(_repoRoot);
+        if (TryResolvePhysicalPath(_repoRoot, out var physicalRepoRoot))
+        {
+            _physicalRepoRoot = physicalRepoRoot;
+            _physicalPrivacyPathPolicy = new PrivacyPathPolicy(physicalRepoRoot);
+        }
         var configuredPatterns = excludePatterns ?? Array.Empty<string>();
         var parsedPatterns = new List<GlobPattern>(configuredPatterns.Count);
         for (var i = 0; i < configuredPatterns.Count; i++)
@@ -54,7 +67,8 @@ public sealed class ScopePathPolicy
     public bool IsExcluded(string? path)
     {
         if (_privacyPathPolicy.IsExcluded(path)) return true;
-        return MatchesConfiguredExclude(path);
+        if (MatchesConfiguredExclude(path, _repoRoot)) return true;
+        return IsPhysicalPathExcluded(path, allowGeneratedDocumentBuildOutput: false);
     }
 
     /// <summary>
@@ -65,7 +79,8 @@ public sealed class ScopePathPolicy
     public bool IsGeneratedDocumentExcluded(string? path)
     {
         if (_privacyPathPolicy.IsGeneratedDocumentExcluded(path)) return true;
-        return MatchesConfiguredExclude(path);
+        if (MatchesConfiguredExclude(path, _repoRoot)) return true;
+        return IsPhysicalPathExcluded(path, allowGeneratedDocumentBuildOutput: true);
     }
 
     /// <summary>
@@ -73,7 +88,10 @@ public sealed class ScopePathPolicy
     /// <see cref="IsExcluded"/>; generated Roslyn documents use
     /// <see cref="IsGeneratedDocumentExcluded"/>.
     /// </summary>
-    public bool MatchesConfiguredExclude(string? path)
+    public bool MatchesConfiguredExclude(string? path) =>
+        MatchesConfiguredExclude(path, _repoRoot);
+
+    private bool MatchesConfiguredExclude(string? path, string root)
     {
         if (_excludePatterns.Count == 0) return false;
         if (string.IsNullOrWhiteSpace(path)) return true;
@@ -84,8 +102,8 @@ public sealed class ScopePathPolicy
             var normalizedPath = NormalizeSeparators(path);
             var fullPath = Path.IsPathFullyQualified(normalizedPath)
                 ? Path.GetFullPath(normalizedPath)
-                : Path.GetFullPath(normalizedPath, _repoRoot);
-            relativePath = Path.GetRelativePath(_repoRoot, fullPath)
+                : Path.GetFullPath(normalizedPath, root);
+            relativePath = Path.GetRelativePath(root, fullPath)
                 .Replace('\\', '/');
         }
         catch (ArgumentException)
@@ -103,6 +121,253 @@ public sealed class ScopePathPolicy
 
         if (relativePath == ".") relativePath = string.Empty;
         return _excludePatterns.Any(pattern => pattern.IsMatch(relativePath));
+    }
+
+    private bool IsPhysicalPathExcluded(
+        string? path,
+        bool allowGeneratedDocumentBuildOutput)
+    {
+        if (_physicalRepoRoot is null
+            || _physicalPrivacyPathPolicy is null
+            || string.IsNullOrWhiteSpace(path))
+        {
+            return true;
+        }
+
+        string fullPath;
+        try
+        {
+            var normalizedPath = NormalizeSeparators(path);
+            fullPath = Path.IsPathFullyQualified(normalizedPath)
+                ? Path.GetFullPath(normalizedPath)
+                : Path.GetFullPath(normalizedPath, _repoRoot);
+        }
+        catch (ArgumentException)
+        {
+            return true;
+        }
+        catch (NotSupportedException)
+        {
+            return true;
+        }
+        catch (PathTooLongException)
+        {
+            return true;
+        }
+
+        if (!TryResolvePhysicalPath(fullPath, out var physicalPath))
+        {
+            return true;
+        }
+        if (!IsContainedByPhysicalRoot(physicalPath))
+        {
+            return true;
+        }
+
+        var violatesPrivacy = allowGeneratedDocumentBuildOutput
+            ? _physicalPrivacyPathPolicy.IsGeneratedDocumentExcluded(physicalPath)
+            : _physicalPrivacyPathPolicy.IsExcluded(physicalPath);
+        return violatesPrivacy
+            || MatchesConfiguredExclude(physicalPath, _physicalRepoRoot);
+    }
+
+    private bool IsContainedByPhysicalRoot(string physicalPath)
+    {
+        try
+        {
+            var relativePath = Path.GetRelativePath(_physicalRepoRoot!, physicalPath);
+            if (relativePath == ".") return true;
+            if (Path.IsPathFullyQualified(relativePath)) return false;
+            var firstSegmentEnd = relativePath.IndexOfAny(
+                [Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar]);
+            var firstSegment = firstSegmentEnd < 0
+                ? relativePath
+                : relativePath[..firstSegmentEnd];
+            return firstSegment != "..";
+        }
+        catch (ArgumentException)
+        {
+            return false;
+        }
+        catch (NotSupportedException)
+        {
+            return false;
+        }
+        catch (PathTooLongException)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Resolves every existing reparse-point component in a path. Once a missing component is
+    /// reached, the unresolved suffix is appended lexically; this keeps deleted watcher paths and
+    /// in-memory source-generated document paths usable without weakening checks on existing
+    /// ancestors. An unreadable or unresolvable reparse point fails closed.
+    /// </summary>
+    private static bool TryResolvePhysicalPath(string path, out string physicalPath)
+    {
+        var visitedLinks = new HashSet<string>(_pathComparer);
+        return TryResolvePhysicalPath(path, visitedLinks, depth: 0, out physicalPath);
+    }
+
+    private static bool TryResolvePhysicalPath(
+        string path,
+        HashSet<string> visitedLinks,
+        int depth,
+        out string physicalPath)
+    {
+        physicalPath = string.Empty;
+        if (depth > 64) return false;
+
+        string fullPath;
+        try
+        {
+            fullPath = Path.GetFullPath(NormalizeSeparators(path));
+        }
+        catch (ArgumentException)
+        {
+            return false;
+        }
+        catch (NotSupportedException)
+        {
+            return false;
+        }
+        catch (PathTooLongException)
+        {
+            return false;
+        }
+
+        var pathRoot = Path.GetPathRoot(fullPath);
+        if (string.IsNullOrEmpty(pathRoot)) return false;
+
+        var segments = fullPath[pathRoot.Length..].Split(
+            [Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar],
+            StringSplitOptions.RemoveEmptyEntries);
+        var current = pathRoot;
+
+        for (var i = 0; i < segments.Length; i++)
+        {
+            var candidate = Path.Join(current, segments[i]);
+            FileAttributes attributes;
+            try
+            {
+                attributes = File.GetAttributes(candidate);
+            }
+            catch (FileNotFoundException)
+            {
+                if (!IsOrdinaryMissingPath(candidate)) return false;
+                physicalPath = AppendMissingSuffix(candidate, segments, i + 1);
+                return true;
+            }
+            catch (DirectoryNotFoundException)
+            {
+                if (!IsOrdinaryMissingPath(candidate)) return false;
+                physicalPath = AppendMissingSuffix(candidate, segments, i + 1);
+                return true;
+            }
+            catch (UnauthorizedAccessException)
+            {
+                return false;
+            }
+            catch (IOException)
+            {
+                return false;
+            }
+            catch (NotSupportedException)
+            {
+                return false;
+            }
+            catch (System.Security.SecurityException)
+            {
+                return false;
+            }
+
+            if ((attributes & FileAttributes.ReparsePoint) == 0)
+            {
+                current = candidate;
+                continue;
+            }
+
+            if (!visitedLinks.Add(candidate)) return false;
+
+            FileSystemInfo? target;
+            try
+            {
+                FileSystemInfo link = (attributes & FileAttributes.Directory) != 0
+                    ? new DirectoryInfo(candidate)
+                    : new FileInfo(candidate);
+                target = link.ResolveLinkTarget(returnFinalTarget: false);
+            }
+            catch (UnauthorizedAccessException)
+            {
+                return false;
+            }
+            catch (IOException)
+            {
+                return false;
+            }
+            catch (NotSupportedException)
+            {
+                return false;
+            }
+            catch (System.Security.SecurityException)
+            {
+                return false;
+            }
+
+            if (target is null
+                || !target.Exists
+                || !TryResolvePhysicalPath(
+                    target.FullName,
+                    visitedLinks,
+                    depth + 1,
+                    out current))
+            {
+                return false;
+            }
+        }
+
+        physicalPath = Path.TrimEndingDirectorySeparator(current);
+        return true;
+    }
+
+    private static bool IsOrdinaryMissingPath(string path)
+    {
+        try
+        {
+            return new DirectoryInfo(path).LinkTarget is null
+                && new FileInfo(path).LinkTarget is null;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return false;
+        }
+        catch (IOException)
+        {
+            return false;
+        }
+        catch (NotSupportedException)
+        {
+            return false;
+        }
+        catch (System.Security.SecurityException)
+        {
+            return false;
+        }
+    }
+
+    private static string AppendMissingSuffix(
+        string firstMissingPath,
+        IReadOnlyList<string> segments,
+        int startIndex)
+    {
+        var result = firstMissingPath;
+        for (var i = startIndex; i < segments.Count; i++)
+        {
+            result = Path.Join(result, segments[i]);
+        }
+        return Path.TrimEndingDirectorySeparator(result);
     }
 
     private static string NormalizeSeparators(string path) =>

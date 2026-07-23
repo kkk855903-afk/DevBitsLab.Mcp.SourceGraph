@@ -83,6 +83,48 @@ public sealed class PrivacyDispatcherTests : IDisposable
         indexer.Paths.Should().Equal(allowed);
     }
 
+    [SkippableFact]
+    public async Task ColdDispatch_neverFollowsDirectoryLinkOutsideRepository()
+    {
+        var outside = Path.Join(
+            Path.GetTempPath(),
+            "sourcegraph-dispatch-outside-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(outside);
+        try
+        {
+            var allowed = await PlantAsync(
+                Path.Join(_root, "src", "Allowed.privacytest"),
+                "allowed");
+            await PlantAsync(Path.Join(outside, "Outside.privacytest"), "OUTSIDE-CANARY");
+            var link = Path.Join(_root, "src", "External");
+            Skip.IfNot(
+                PhysicalPathTestSupport.TryCreateDirectoryLink(link, outside),
+                "This environment does not permit symbolic-link or junction creation.");
+
+            var indexer = new RecordingIndexer();
+            var indexers = new LanguageIndexerRegistry();
+            indexers.Register(indexer);
+            var dispatcher = new LanguageIndexerDispatcher(
+                indexers,
+                new LanguageProjectFactoryRegistry());
+
+            await using var store = new SqliteGraphStore(Path.Join(_root, "link-graph.db"));
+            await store.EnsureSchemaAsync();
+            var dispatched = await dispatcher.DispatchAllForTestAsync(
+                store,
+                "test",
+                _root,
+                new Dictionary<string, ILanguageProject>(StringComparer.OrdinalIgnoreCase));
+
+            dispatched.Should().Be(1);
+            indexer.Paths.Should().Equal(allowed);
+        }
+        finally
+        {
+            try { Directory.Delete(outside, recursive: true); } catch { }
+        }
+    }
+
     [Fact]
     public async Task ProjectMap_forwardsAndEnforcesEveryScopeExclude()
     {

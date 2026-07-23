@@ -203,7 +203,7 @@ public class GitBlameRunner
                 ? Path.GetPathRoot(fullPath)
                 : Path.GetFullPath(repositoryRoot);
             return string.IsNullOrWhiteSpace(privacyRoot)
-                || new PrivacyPathPolicy(privacyRoot).IsExcluded(fullPath);
+                || new ScopePathPolicy(privacyRoot).IsExcluded(fullPath);
         }
         catch (ArgumentException)
         {

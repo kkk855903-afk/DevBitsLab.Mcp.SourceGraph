@@ -364,7 +364,7 @@ public sealed class LanguageIndexerDispatcher
 
     /// <summary>
     /// Walk <paramref name="root"/> for files matching any of <paramref name="extensions"/>.
-    /// <see cref="PrivacyPathPolicy"/> prunes excluded subtrees before enumeration and rejects
+    /// <see cref="ScopePathPolicy"/> prunes excluded subtrees before enumeration and rejects
     /// excluded files before they can be opened by <see cref="DispatchOneCoreAsync"/>.
     /// </summary>
     private static IEnumerable<string> EnumerateFiles(

@@ -4,6 +4,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using Dapper;
+using DevBitsLab.Mcp.SourceGraph.Core;
 using DevBitsLab.Mcp.SourceGraph.Server.Observability;
 using DevBitsLab.Mcp.SourceGraph.Server.Scoping;
 using DevBitsLab.Mcp.SourceGraph.Server.Tools.Output;
@@ -288,14 +289,20 @@ public static class ScopeTools
         }
 
         var files = await host.Store.SampleFileShasAsync(sampled, ct).ConfigureAwait(false);
+        var pathPolicy = new ScopePathPolicy(
+            Path.GetFullPath(host.Scope.Root),
+            host.Scope.ProjectSet.Exclude);
 
         var changedPaths = new List<string>(capacity: 5);
         var changedCount = 0;
+        var comparedCount = 0;
         foreach (var fileRow in files)
         {
             var path = fileRow.Path;
             var dbSha = fileRow.ContentSha256;
             ct.ThrowIfCancellationRequested();
+            if (pathPolicy.IsExcluded(path)) continue;
+            comparedCount++;
             byte[] onDiskSha;
             try
             {
@@ -321,7 +328,7 @@ public static class ScopeTools
             }
         }
 
-        return new VerifyScopeDriftSample(sampled, (int)totalFiles, changedCount, changedPaths);
+        return new VerifyScopeDriftSample(comparedCount, (int)totalFiles, changedCount, changedPaths);
     }
 
     private static bool ByteArrayEquals(byte[] a, byte[] b)

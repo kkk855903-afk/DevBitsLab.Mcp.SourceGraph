@@ -75,6 +75,44 @@ public sealed class HistoryPrivacyTests
         }
     }
 
+    [SkippableFact]
+    public async Task BlameAsync_outOfRepositoryDirectoryLinkNeverStartsGit()
+    {
+        var root = CreateTempDirectory();
+        var outside = CreateTempDirectory();
+        try
+        {
+            var linkedDirectory = Path.Join(root, "src", "External");
+            Directory.CreateDirectory(Path.GetDirectoryName(linkedDirectory)!);
+            Skip.IfNot(
+                PhysicalPathTestSupport.TryCreateDirectoryLink(linkedDirectory, outside),
+                "This environment does not permit symbolic-link or junction creation.");
+            var linkedPath = Path.Join(linkedDirectory, "Secret.cs");
+            await File.WriteAllTextAsync(Path.Join(outside, "Secret.cs"), Canary);
+
+            var starts = 0;
+            var runner = new GitBlameRunner(
+                logger: null,
+                timeout: TimeSpan.FromSeconds(1),
+                startProcess: _ =>
+                {
+                    starts++;
+                    return null;
+                });
+
+            var result = await runner.BlameAsync(linkedPath, root);
+
+            result.IsSuccess.Should().BeFalse();
+            result.FailureReason.Should().Be("path excluded by privacy policy");
+            starts.Should().Be(0);
+        }
+        finally
+        {
+            DeleteDirectoryBestEffort(root);
+            DeleteDirectoryBestEffort(outside);
+        }
+    }
+
     [Fact]
     public async Task IncrementalHistoryRequests_forExcludedPathsNeverReachBlameRunner()
     {
@@ -89,7 +127,11 @@ public sealed class HistoryPrivacyTests
                 queue,
                 store,
                 runner,
-                new HistoryOptions(Disabled: false) { RepositoryRoot = root },
+                new HistoryOptions(Disabled: false)
+                {
+                    RepositoryRoot = root,
+                    ExcludePatterns = ["**/generated/**"],
+                },
                 Microsoft.Extensions.Logging.Abstractions.NullLogger<HistoryHostedService>.Instance);
 
             var excludedPaths = _excludedRelativePaths
@@ -98,6 +140,7 @@ public sealed class HistoryPrivacyTests
                     Path.GetDirectoryName(root)!,
                     "outside-history-root-" + Guid.NewGuid().ToString("N"),
                     "secret.cs"))
+                .Append(Path.Join(root, "src", "Generated", "secret.cs"))
                 .ToList();
             var symbolIds = new List<long>(excludedPaths.Count);
             for (var i = 0; i < excludedPaths.Count; i++)
@@ -127,15 +170,21 @@ public sealed class HistoryPrivacyTests
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task PublicHistoryTools_filterExcludedCachedRowsAndCanaries()
     {
         var root = CreateTempDirectory();
+        var outside = CreateTempDirectory();
         var store = new SqliteGraphStore(Path.Join(root, "history-tools.db"));
         ScopeHost? host = null;
         try
         {
             await store.EnsureSchemaAsync();
+            var linkedDirectory = Path.Join(root, "src", "ExternalAlias");
+            Directory.CreateDirectory(Path.GetDirectoryName(linkedDirectory)!);
+            Skip.IfNot(
+                PhysicalPathTestSupport.TryCreateDirectoryLink(linkedDirectory, outside),
+                "This environment does not permit symbolic-link or junction creation.");
 
             var excludedFileId = await store.UpsertFileAsync(
                 Path.Join(root, "PatientData", $"{Canary}.cs"),
@@ -171,11 +220,47 @@ public sealed class HistoryPrivacyTests
                 2,
                 new byte[32]));
 
+            var scopeExcludedFileId = await store.UpsertFileAsync(
+                Path.Join(root, "src", "Generated", $"{Canary}.cs"),
+                new byte[32],
+                DateTimeOffset.UtcNow);
+            var scopeExcludedSymbolId = await SeedSymbolAsync(
+                store,
+                scopeExcludedFileId,
+                "SharedOperation",
+                $"Generated.{Canary}.SharedOperation");
+            await store.UpsertSymbolHistoryAsync(new SymbolHistory(
+                scopeExcludedSymbolId,
+                $"cafebabe{Canary}",
+                $"generated-author-{Canary}",
+                DateTimeOffset.UtcNow.AddMinutes(-30),
+                4,
+                new byte[32]));
+
+            var physicallyExcludedFileId = await store.UpsertFileAsync(
+                Path.Join(linkedDirectory, $"{Canary}.cs"),
+                new byte[32],
+                DateTimeOffset.UtcNow);
+            var physicallyExcludedSymbolId = await SeedSymbolAsync(
+                store,
+                physicallyExcludedFileId,
+                "SharedOperation",
+                $"External.{Canary}.SharedOperation");
+            await store.UpsertSymbolHistoryAsync(new SymbolHistory(
+                physicallyExcludedSymbolId,
+                $"feedface{Canary}",
+                $"external-author-{Canary}",
+                DateTimeOffset.UtcNow.AddMinutes(-15),
+                5,
+                new byte[32]));
+
             var scope = new Scope(
                 "default",
                 "default",
                 root,
-                new ScopeProjectSet.Solutions(Array.Empty<string>(), Array.Empty<string>()),
+                new ScopeProjectSet.Solutions(
+                    Array.Empty<string>(),
+                    ["**/generated/**"]),
                 Isolated: false,
                 LastIndexedAt: DateTimeOffset.UtcNow);
             var indexer = new RoslynIndexer(store);
@@ -207,6 +292,7 @@ public sealed class HistoryPrivacyTests
                 await store.DisposeAsync();
             }
             DeleteDirectoryBestEffort(root);
+            DeleteDirectoryBestEffort(outside);
         }
     }
 

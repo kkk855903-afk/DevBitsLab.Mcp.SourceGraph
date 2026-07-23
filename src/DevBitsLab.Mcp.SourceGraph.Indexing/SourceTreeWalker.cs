@@ -8,7 +8,7 @@ namespace DevBitsLab.Mcp.SourceGraph.Indexing;
 /// non-ignored file under it. Used by the <c>reconcile_drift</c> tool to compute a comparison
 /// set against the per-scope <c>files</c> table without re-implementing path filtering.
 ///
-/// <see cref="PrivacyPathPolicy"/> is applied before a directory is enumerated or a file is
+/// <see cref="ScopePathPolicy"/> is applied before a directory is enumerated or a file is
 /// opened, so medical images, patient data, databases, logs, and build output never enter the
 /// drift comparison set. Reads each allowed file as bytes and computes SHA-256 in-process; an I/O
 /// failure on a single file is swallowed (the file is silently skipped) so a permission hiccup on

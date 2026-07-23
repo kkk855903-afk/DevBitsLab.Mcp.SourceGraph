@@ -17,6 +17,7 @@ namespace DevBitsLab.Mcp.SourceGraph.Tests;
 public sealed class SourceTreeWalkerTests : IDisposable
 {
     private readonly string _root;
+    private readonly List<string> _externalDirectories = [];
 
     public SourceTreeWalkerTests()
     {
@@ -27,6 +28,10 @@ public sealed class SourceTreeWalkerTests : IDisposable
     public void Dispose()
     {
         try { Directory.Delete(_root, recursive: true); } catch { }
+        foreach (var path in _externalDirectories)
+        {
+            try { Directory.Delete(path, recursive: true); } catch { }
+        }
     }
 
     [Fact]
@@ -91,6 +96,32 @@ public sealed class SourceTreeWalkerTests : IDisposable
         outcome.Entries[0].Sha256.Should().Equal(keptSha);
     }
 
+    [SkippableFact]
+    public async Task Walk_neverFollowsDirectoryLinkOutsideRepository()
+    {
+        var (kept, keptSha) = await Plant(
+            Path.Join(_root, "src", "Allowed.cs"),
+            "class Allowed {}");
+        var outside = Path.Join(
+            Path.GetTempPath(),
+            "sourcegraph-walker-outside-" + Guid.NewGuid().ToString("N"));
+        _externalDirectories.Add(outside);
+        await Plant(Path.Join(outside, "Outside.cs"), "OUTSIDE-CANARY");
+
+        var link = Path.Join(_root, "src", "External");
+        Skip.IfNot(
+            PhysicalPathTestSupport.TryCreateDirectoryLink(link, outside),
+            "This environment does not permit symbolic-link creation.");
+
+        var outcome = await SourceTreeWalker.WalkAsync(_root, maxFiles: 1);
+
+        outcome.HitLimit.Should().BeFalse(
+            "a file reachable only through an out-of-repository link must not count toward the cap");
+        outcome.Entries.Should().ContainSingle();
+        outcome.Entries[0].Path.Should().Be(kept);
+        outcome.Entries[0].Sha256.Should().Equal(keptSha);
+    }
+
     [Fact]
     public async Task Walk_respects_maxFiles_cap_and_setsHitLimit()
     {
@@ -142,4 +173,5 @@ public sealed class SourceTreeWalkerTests : IDisposable
         await File.WriteAllBytesAsync(path, bytes);
         return (path, SHA256.HashData(bytes));
     }
+
 }

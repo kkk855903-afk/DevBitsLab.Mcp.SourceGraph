@@ -82,6 +82,47 @@ public sealed class XamlPrivacyDiscoveryTests : IDisposable
         projects[0].FilePaths.Should().Equal(mainView);
     }
 
+    [SkippableFact]
+    public async Task Discover_neverFollowsDirectoryLinkOutsideRepository()
+    {
+        var outside = Path.Join(
+            Path.GetTempPath(),
+            "sourcegraph-xaml-outside-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(outside);
+        try
+        {
+            var projectDir = Path.Join(_root, "ManagedApp");
+            var projectPath = await PlantAsync(
+                Path.Join(projectDir, "ManagedApp.csproj"),
+                """<Project Sdk="Microsoft.NET.Sdk"></Project>""");
+            var mainView = await PlantAsync(
+                Path.Join(projectDir, "MainWindow.xaml"),
+                """<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" />""");
+            await PlantAsync(
+                Path.Join(outside, "Hidden.csproj"),
+                """<Project Sdk="Microsoft.NET.Sdk"></Project>""");
+            await PlantAsync(
+                Path.Join(outside, "Hidden.xaml"),
+                """<Window Tag="OUTSIDE-CANARY" />""");
+            var link = Path.Join(_root, "External");
+            Skip.IfNot(
+                PhysicalPathTestSupport.TryCreateDirectoryLink(link, outside),
+                "This environment does not permit symbolic-link or junction creation.");
+
+            var projects = await new XamlLanguageProjectFactory().DiscoverAsync(
+                _root,
+                CancellationToken.None);
+
+            projects.Should().ContainSingle();
+            projects[0].Id.Should().Be(projectPath);
+            projects[0].FilePaths.Should().Equal(mainView);
+        }
+        finally
+        {
+            try { Directory.Delete(outside, recursive: true); } catch { }
+        }
+    }
+
     private static async Task<string> PlantAsync(string path, string contents)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);

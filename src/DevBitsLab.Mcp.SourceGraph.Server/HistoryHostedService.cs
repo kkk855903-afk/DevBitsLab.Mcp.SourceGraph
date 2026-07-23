@@ -50,6 +50,12 @@ public sealed record HistoryOptions(bool Disabled)
     /// rejects every mandatory directory/extension exclusion against the path's volume root.
     /// </summary>
     public string? RepositoryRoot { get; init; }
+
+    /// <summary>
+    /// Scope excludes for the single-store, one-shot index path. Multi-scope requests obtain the
+    /// effective excludes from their registered <see cref="ScopeHost"/>.
+    /// </summary>
+    public IReadOnlyList<string> ExcludePatterns { get; init; } = Array.Empty<string>();
 }
 
 /// <summary>
@@ -112,22 +118,26 @@ public sealed class HistoryHostedService : BackgroundService
     private bool TryResolveContext(
         string scopeId,
         out IGraphStore? store,
-        out string? repositoryRoot)
+        out string? repositoryRoot,
+        out IReadOnlyList<string> excludePatterns)
     {
         if (_legacyStore is not null)
         {
             store = _legacyStore;
             repositoryRoot = _options.RepositoryRoot;
+            excludePatterns = _options.ExcludePatterns;
             return true;
         }
         if (_router is not null && _router.TryGet(scopeId, out var host))
         {
             store = host.Store;
             repositoryRoot = host.Scope.Root;
+            excludePatterns = host.Scope.ProjectSet.Exclude;
             return true;
         }
         store = null;
         repositoryRoot = null;
+        excludePatterns = Array.Empty<string>();
         return false;
     }
 
@@ -170,7 +180,12 @@ public sealed class HistoryHostedService : BackgroundService
 
     private async Task ProcessAsync(HistoryRequest req, CancellationToken ct)
     {
-        if (!TryResolveContext(req.ScopeId, out var store, out var repositoryRoot) || store is null)
+        if (!TryResolveContext(
+                req.ScopeId,
+                out var store,
+                out var repositoryRoot,
+                out var excludePatterns)
+            || store is null)
         {
             _logger.LogDebug("History request for unknown scope `{Scope}`; dropping", req.ScopeId);
             return;
@@ -179,7 +194,7 @@ public sealed class HistoryHostedService : BackgroundService
         // This is the queue choke-point shared by cold indexing and changed/incremental paths.
         // Apply the policy before any store lookup and before the git runner receives the path.
         // The runner repeats the same check as defense in depth for direct callers.
-        if (IsExcluded(req.Path, repositoryRoot)) return;
+        if (IsExcluded(req.Path, repositoryRoot, excludePatterns)) return;
 
         var spans = await store.GetSymbolSpansForFileAsync(req.FileId, ct).ConfigureAwait(false);
         if (spans.Count == 0) return;
@@ -241,7 +256,10 @@ public sealed class HistoryHostedService : BackgroundService
         }
     }
 
-    private static bool IsExcluded(string? path, string? repositoryRoot)
+    private static bool IsExcluded(
+        string? path,
+        string? repositoryRoot,
+        IReadOnlyList<string> excludePatterns)
     {
         try
         {
@@ -251,7 +269,7 @@ public sealed class HistoryHostedService : BackgroundService
                 ? Path.GetPathRoot(fullPath)
                 : Path.GetFullPath(repositoryRoot);
             return string.IsNullOrWhiteSpace(privacyRoot)
-                || new PrivacyPathPolicy(privacyRoot).IsExcluded(fullPath);
+                || new ScopePathPolicy(privacyRoot, excludePatterns).IsExcluded(fullPath);
         }
         catch (ArgumentException)
         {

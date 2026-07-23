@@ -572,6 +572,7 @@ static async Task<int> RunIndexAsync(CommandLine cli)
             store,
             blamer,
             repoRootForIndex,
+            excludePatterns,
             loggerFactory.CreateLogger<HistoryHostedService>());
 
     await using var indexer = new RoslynIndexer(
@@ -818,13 +819,18 @@ static async Task RunHistoryPipelineAsync(
     DevBitsLab.Mcp.SourceGraph.Storage.IGraphStore store,
     GitBlameRunner blamer,
     string repositoryRoot,
+    IReadOnlyList<string> excludePatterns,
     ILogger<HistoryHostedService> logger)
 {
     var svc = new HistoryHostedService(
         queue,
         store,
         blamer,
-        new HistoryOptions(false) { RepositoryRoot = repositoryRoot },
+        new HistoryOptions(false)
+        {
+            RepositoryRoot = repositoryRoot,
+            ExcludePatterns = excludePatterns,
+        },
         logger);
     var runner = svc.ExecuteAsyncForOneShot(CancellationToken.None);
     await runner.ConfigureAwait(false);

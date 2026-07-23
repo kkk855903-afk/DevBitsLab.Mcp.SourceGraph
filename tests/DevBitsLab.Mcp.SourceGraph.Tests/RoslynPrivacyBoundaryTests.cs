@@ -219,6 +219,49 @@ public sealed class RoslynPrivacyBoundaryTests : IAsyncLifetime
         allowedProject.AnalyzerConfigDocuments.Should().BeEmpty();
     }
 
+    [SkippableFact]
+    public void ScopeSanitizer_removesDocumentReachedThroughOutOfRepositoryDirectoryLink()
+    {
+        var root = Path.Join(_tempDir, "linked-repo");
+        var outside = Path.Join(_tempDir, "linked-outside");
+        Directory.CreateDirectory(Path.Join(root, "src"));
+        Directory.CreateDirectory(outside);
+        var link = Path.Join(root, "src", "External");
+        Skip.IfNot(
+            PhysicalPathTestSupport.TryCreateDirectoryLink(link, outside),
+            "This environment does not permit symbolic-link or junction creation.");
+
+        using var workspace = new AdhocWorkspace();
+        var projectId = ProjectId.CreateNewId();
+        var allowedPath = Path.Join(root, "src", "Allowed.cs");
+        var linkedPath = Path.Join(link, "Secret.cs");
+        var solution = workspace.CurrentSolution
+            .AddProject(ProjectInfo.Create(
+                projectId,
+                VersionStamp.Create(),
+                "Allowed",
+                "Allowed",
+                LanguageNames.CSharp,
+                filePath: Path.Join(root, "Allowed.csproj")))
+            .AddDocument(
+                DocumentId.CreateNewId(projectId),
+                "Allowed.cs",
+                SourceText.From("internal sealed class Allowed {}"),
+                filePath: allowedPath)
+            .AddDocument(
+                DocumentId.CreateNewId(projectId),
+                "Secret.cs",
+                SourceText.From($"internal sealed class {SymbolCanary} {{}}"),
+                filePath: linkedPath);
+
+        var sanitized = SolutionPrivacySanitizer.SanitizeForScope(
+            solution,
+            new ScopePathPolicy(root));
+
+        sanitized.GetProject(projectId)!.Documents
+            .Should().ContainSingle(document => document.FilePath == allowedPath);
+    }
+
     private static string LocateSolution()
     {
         for (var dir = new DirectoryInfo(AppContext.BaseDirectory);

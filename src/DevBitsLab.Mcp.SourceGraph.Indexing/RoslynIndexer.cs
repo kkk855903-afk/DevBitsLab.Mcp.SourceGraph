@@ -157,7 +157,10 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         await _lock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
-            var solution = _sanitizedSolution!;
+            var solution = SolutionPrivacySanitizer.SanitizeForScope(
+                _sanitizedSolution!,
+                _pathPolicy!);
+            _sanitizedSolution = solution;
             await ProbeProjectCompilationsAsync(solution.Projects, ct).ConfigureAwait(false);
             var docs = (await AllCSharpDocumentsAsync(solution, ct).ConfigureAwait(false)).ToList();
             return await IndexCoreAsync(docs, fullReset: false, ct).ConfigureAwait(false);
@@ -193,6 +196,7 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
 
             foreach (var p in pathSet)
             {
+                if (pathPolicy.IsExcluded(p)) continue;
                 var docIds = solution.GetDocumentIdsWithFilePath(p);
                 if (docIds.IsEmpty)
                 {
@@ -302,6 +306,11 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         await _lock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
+            if (_pathPolicy!.IsExcluded(slnPath))
+            {
+                throw new InvalidOperationException(
+                    "The solution path is outside the indexing privacy boundary.");
+            }
             _workspace!.CloseSolution();
             var loadedSolution = await _workspace.OpenSolutionAsync(
                 slnPath,
@@ -529,6 +538,7 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
             }
             else
             {
+                if (_pathPolicy!.IsExcluded(path)) continue;
                 if (!File.Exists(path)) continue;
                 try
                 {

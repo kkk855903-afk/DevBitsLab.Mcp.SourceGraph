@@ -33,6 +33,14 @@ medical privacy exclusions or repository containment boundary. Blank, rooted, pa
 traversing, and otherwise malformed exclude patterns SHALL fail closed with an error that
 identifies the pattern index.
 
+Before an indexer-controlled directory enumeration, file read, drift hash, or git-history
+operation, the effective policy SHALL resolve every existing symlink, junction, or other
+reparse-point component. A physical target outside the scope root, or inside a mandatory or
+scope-configured excluded path, SHALL fail closed. An unreadable or unresolvable reparse point
+SHALL also fail closed. A missing suffix SHALL remain eligible for lexical evaluation so deleted
+watcher paths and in-memory source-generated documents with legal synthetic paths continue to
+work.
+
 #### Scenario: One exclude applies across cold and live paths
 - **WHEN** a scope configures `exclude: [ "**/generated" ]`
 - **THEN** files in any matching directory are omitted by cold discovery and ignored by incremental watcher/dispatcher paths
@@ -44,6 +52,14 @@ identifies the pattern index.
 #### Scenario: Narrow file glob does not disable an extension globally
 - **WHEN** a scope excludes only the root file `source.cs`
 - **THEN** the watcher ignores that file but continues to report allowed `.cs` files in subdirectories
+
+#### Scenario: Directory link cannot escape or disguise an excluded target
+- **WHEN** an allowed-looking path below the scope root traverses a symlink or Windows junction whose physical target is outside the root, under `PatientData`, or under a configured `**/generated/**` exclusion
+- **THEN** cold discovery, incremental dispatch, drift sampling, and history processing reject it before reading bytes or starting git
+
+#### Scenario: Missing generated document remains valid
+- **WHEN** Roslyn reports a non-existent synthetic path such as `src/obj/Debug/net10.0/View.g.cs` and every existing ancestor resolves inside the scope
+- **THEN** the generated-document build-output exception still applies and the document is not rejected merely because it has no disk entry
 
 ### Requirement: Per-scope physical isolation
 Each scope SHALL persist its graph in `<repo>/.sourcegraph/scopes/<id>.db`; a separate `<repo>/.sourcegraph/_meta.db` SHALL hold the `scopes` registry. A new scope's per-scope DB SHALL be created on its first index, whether the scope was added at startup or live via a `.sourcegraph.json` edit.

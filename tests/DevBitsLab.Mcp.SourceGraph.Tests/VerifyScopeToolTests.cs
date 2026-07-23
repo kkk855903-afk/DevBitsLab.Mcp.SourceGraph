@@ -32,6 +32,7 @@ public sealed class VerifyScopeToolTests : IAsyncLifetime
     private SqliteGraphStore? _store;
     private ScopeHost? _host;
     private ScopeRouter? _router;
+    private readonly List<string> _externalDirectories = [];
 
     public async Task InitializeAsync()
     {
@@ -68,6 +69,12 @@ public sealed class VerifyScopeToolTests : IAsyncLifetime
         try { if (Directory.Exists(_tempDir)) Directory.Delete(_tempDir, recursive: true); }
         catch (IOException) { }
         catch (UnauthorizedAccessException) { }
+        foreach (var path in _externalDirectories)
+        {
+            try { if (Directory.Exists(path)) Directory.Delete(path, recursive: true); }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+        }
     }
 
     [Fact]
@@ -137,6 +144,41 @@ public sealed class VerifyScopeToolTests : IAsyncLifetime
         var row = dto.Scopes.Single();
         row.DriftSample!.Changed.Should().Be(1);
         row.DriftSample.ChangedPaths.Should().ContainSingle().Which.Should().Be(srcPath);
+    }
+
+    [SkippableFact]
+    public async Task Drift_sample_neverReadsFileThroughOutOfRepositoryDirectoryLink()
+    {
+        var outside = Path.Join(
+            Path.GetTempPath(),
+            "verify-scope-outside-" + Guid.NewGuid().ToString("N"));
+        _externalDirectories.Add(outside);
+        Directory.CreateDirectory(outside);
+        var outsidePath = Path.Join(outside, "Outside.cs");
+        var originalBytes = Encoding.UTF8.GetBytes("class Outside { /* v1 */ }");
+        await File.WriteAllBytesAsync(outsidePath, originalBytes);
+
+        var link = Path.Join(_tempDir, "External");
+        Skip.IfNot(
+            PhysicalPathTestSupport.TryCreateDirectoryLink(link, outside),
+            "This environment does not permit symbolic-link or junction creation.");
+        var linkedPath = Path.Join(link, "Outside.cs");
+        await _store!.UpsertFileAsync(
+            linkedPath,
+            SHA256.HashData(originalBytes),
+            DateTimeOffset.UtcNow);
+
+        await File.WriteAllTextAsync(outsidePath, "class Outside { /* v2 */ }");
+
+        var result = await ScopeTools.VerifyScopeAsync(_router!, "default");
+        var dto = JsonSerializer.Deserialize(
+            result.StructuredContent!.Value.GetRawText(),
+            ToolOutputJsonContext.Default.VerifyScopeResult)!;
+
+        var row = dto.Scopes.Single();
+        row.DriftSample!.Sampled.Should().Be(0);
+        row.DriftSample.Changed.Should().Be(0);
+        row.DriftSample.ChangedPaths.Should().BeEmpty();
     }
 
     [Fact]
