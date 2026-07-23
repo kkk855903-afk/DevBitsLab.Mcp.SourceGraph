@@ -1,21 +1,26 @@
 using System.Diagnostics;
 using System.Threading.Channels;
+using DevBitsLab.Mcp.SourceGraph.Core;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
 namespace DevBitsLab.Mcp.SourceGraph.Watcher;
 
 /// <summary>
-/// Watches a solution directory for .cs file changes and the git HEAD ref for branch switches.
+/// Watches a solution directory for source file changes and the git HEAD ref for branch switches.
 /// Coalesces raw events with a debounce window and emits batched <see cref="FileChangeBatch"/>
 /// values via <see cref="ReadAllAsync"/>.
 /// </summary>
 public sealed class SolutionWatcher : IAsyncDisposable
 {
+    private static readonly string[] _defaultSourceExtensions = [".cs", ".xaml"];
+
     private readonly string _root;
     private readonly TimeSpan _debounce;
     private readonly ILogger<SolutionWatcher> _logger;
-    private readonly FileSystemWatcher _csWatcher;
+    private readonly PrivacyPathPolicy _privacyPathPolicy;
+    private readonly HashSet<string> _sourceExtensions;
+    private readonly FileSystemWatcher _sourceWatcher;
     private readonly FileSystemWatcher? _gitHeadWatcher;
     private readonly Channel<RawEvent> _raw = Channel.CreateUnbounded<RawEvent>(new UnboundedChannelOptions
     {
@@ -30,23 +35,41 @@ public sealed class SolutionWatcher : IAsyncDisposable
     private readonly CancellationTokenSource _cts = new();
     private readonly Task _processor;
 
-    public SolutionWatcher(string solutionDirectory, TimeSpan? debounce = null, ILogger<SolutionWatcher>? logger = null)
+    public SolutionWatcher(
+        string solutionDirectory,
+        TimeSpan? debounce = null,
+        ILogger<SolutionWatcher>? logger = null,
+        IEnumerable<string>? sourceExtensions = null)
     {
         _root = Path.GetFullPath(solutionDirectory);
         _debounce = debounce ?? TimeSpan.FromMilliseconds(200);
         _logger = logger ?? NullLogger<SolutionWatcher>.Instance;
+        _privacyPathPolicy = new PrivacyPathPolicy(_root);
+        _sourceExtensions = NormalizeSourceExtensions(sourceExtensions);
+        _sourceExtensions.RemoveWhere(extension =>
+            _privacyPathPolicy.IsExcluded(Path.Join(_root, $"source{extension}")));
+        if (_sourceExtensions.Count == 0)
+        {
+            throw new ArgumentException(
+                "At least one source extension not excluded by the privacy policy is required.",
+                nameof(sourceExtensions));
+        }
 
-        _csWatcher = new FileSystemWatcher(_root)
+        _sourceWatcher = new FileSystemWatcher(_root)
         {
             IncludeSubdirectories = true,
             NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.FileName | NotifyFilters.Size,
-            Filter = "*.cs",
         };
-        _csWatcher.Changed += OnFileEvent;
-        _csWatcher.Created += OnFileEvent;
-        _csWatcher.Deleted += OnFileEvent;
-        _csWatcher.Renamed += OnFileRenamed;
-        _csWatcher.EnableRaisingEvents = true;
+        _sourceWatcher.Filters.Clear();
+        foreach (var extension in _sourceExtensions)
+        {
+            _sourceWatcher.Filters.Add($"*{extension}");
+        }
+        _sourceWatcher.Changed += OnFileEvent;
+        _sourceWatcher.Created += OnFileEvent;
+        _sourceWatcher.Deleted += OnFileEvent;
+        _sourceWatcher.Renamed += OnFileRenamed;
+        _sourceWatcher.EnableRaisingEvents = true;
 
         var gitHeadDir = ResolveGitHeadDir(_root, _logger);
         if (gitHeadDir is not null)
@@ -105,14 +128,20 @@ public sealed class SolutionWatcher : IAsyncDisposable
 
     private void OnFileEvent(object sender, FileSystemEventArgs e)
     {
-        if (ShouldIgnore(e.FullPath)) return;
+        if (!IsTrackedSourcePath(e.FullPath)) return;
         _raw.Writer.TryWrite(new RawEvent(e.FullPath, FileChangeReason.FileSystemEvent));
     }
 
     private void OnFileRenamed(object sender, RenamedEventArgs e)
     {
-        if (!ShouldIgnore(e.OldFullPath)) _raw.Writer.TryWrite(new RawEvent(e.OldFullPath, FileChangeReason.FileSystemEvent));
-        if (!ShouldIgnore(e.FullPath)) _raw.Writer.TryWrite(new RawEvent(e.FullPath, FileChangeReason.FileSystemEvent));
+        if (IsTrackedSourcePath(e.OldFullPath))
+        {
+            _raw.Writer.TryWrite(new RawEvent(e.OldFullPath, FileChangeReason.FileSystemEvent));
+        }
+        if (IsTrackedSourcePath(e.FullPath))
+        {
+            _raw.Writer.TryWrite(new RawEvent(e.FullPath, FileChangeReason.FileSystemEvent));
+        }
     }
 
     private void OnGitHeadEvent(object sender, FileSystemEventArgs e)
@@ -120,13 +149,41 @@ public sealed class SolutionWatcher : IAsyncDisposable
         _raw.Writer.TryWrite(new RawEvent(string.Empty, FileChangeReason.GitHeadChanged));
     }
 
-    private static bool ShouldIgnore(string path)
+    private bool IsTrackedSourcePath(string path) =>
+        !_privacyPathPolicy.IsExcluded(path)
+        && _sourceExtensions.Contains(Path.GetExtension(path));
+
+    private static HashSet<string> NormalizeSourceExtensions(IEnumerable<string>? sourceExtensions)
     {
-        if (path.Contains($"{Path.DirectorySeparatorChar}obj{Path.DirectorySeparatorChar}", StringComparison.Ordinal)) return true;
-        if (path.Contains($"{Path.DirectorySeparatorChar}bin{Path.DirectorySeparatorChar}", StringComparison.Ordinal)) return true;
-        if (path.Contains($"{Path.DirectorySeparatorChar}.git{Path.DirectorySeparatorChar}", StringComparison.Ordinal)) return true;
-        if (path.Contains($"{Path.DirectorySeparatorChar}.sourcegraph{Path.DirectorySeparatorChar}", StringComparison.Ordinal)) return true;
-        return false;
+        var extensions = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var value in sourceExtensions ?? _defaultSourceExtensions)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                throw new ArgumentException("Source extensions cannot contain blank values.", nameof(sourceExtensions));
+            }
+
+            var extension = value.Trim();
+            if (!extension.StartsWith('.'))
+            {
+                extension = $".{extension}";
+            }
+            if (extension.IndexOfAny(['*', '?', Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar]) >= 0)
+            {
+                throw new ArgumentException(
+                    $"Source extension '{value}' must be an extension such as '.cs'.",
+                    nameof(sourceExtensions));
+            }
+
+            extensions.Add(extension);
+        }
+
+        if (extensions.Count == 0)
+        {
+            throw new ArgumentException("At least one source extension is required.", nameof(sourceExtensions));
+        }
+
+        return extensions;
     }
 
     private async Task ProcessAsync(CancellationToken ct)
@@ -201,8 +258,8 @@ public sealed class SolutionWatcher : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
-        _csWatcher.EnableRaisingEvents = false;
-        _csWatcher.Dispose();
+        _sourceWatcher.EnableRaisingEvents = false;
+        _sourceWatcher.Dispose();
         _gitHeadWatcher?.Dispose();
         _cts.Cancel();
         try { await _processor.ConfigureAwait(false); } catch { /* shutting down */ }
