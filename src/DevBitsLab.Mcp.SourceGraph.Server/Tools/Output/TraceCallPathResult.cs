@@ -38,11 +38,14 @@ public sealed record TraceCallPathHop(
 
 public sealed record TraceCallPathSymbol(
     [property: JsonPropertyName("symbol_id")] long SymbolId,
+    [property: JsonPropertyName("canonical_key")] string? CanonicalKey,
     string Fqn,
     string Kind,
     [property: JsonPropertyName("file_path")] string FilePath,
     int Line,
-    int Column);
+    int Column,
+    [property: JsonPropertyName("end_line")] int EndLine,
+    [property: JsonPropertyName("end_column")] int EndColumn);
 
 public sealed record TraceCallPathEvidence(
     [property: JsonPropertyName("file_path")] string FilePath,

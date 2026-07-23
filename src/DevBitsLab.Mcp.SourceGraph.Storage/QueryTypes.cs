@@ -67,3 +67,14 @@ public sealed record GeneratedFileRow(long FileId, string FilePath, int SymbolCo
 /// target symbols on hand without a second round-trip.
 /// </summary>
 public sealed record EdgeWithPayload(SymbolHit Source, SymbolHit Target, string? PayloadJson);
+
+/// <summary>
+/// One side of a logical edge returned by an evidence-first traversal query.
+/// <see cref="Relation"/> is the edge's actual stored kind, including when the caller requested
+/// every kind. Storage only returns rows whose logical edge has at least one matching
+/// <c>edge_evidence</c> occurrence; the tool layer loads and renders those occurrences.
+/// </summary>
+public sealed record EdgeTraversalHit(
+    SymbolHit Symbol,
+    string Relation,
+    string? PayloadJson);

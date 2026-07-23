@@ -1256,6 +1256,43 @@ public sealed class SqliteGraphStore : IGraphStore
         return rows.Select(r => r.ToHit()).ToList();
     }
 
+    public async Task<IReadOnlyList<EdgeTraversalHit>> ListAuditableInboundEdgesAsync(
+        long symbolId,
+        int limit = 50,
+        string? edgeKind = "calls",
+        CancellationToken ct = default)
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThan(limit, 1);
+        var kindClause = edgeKind is null ? "" : "AND e.kind_name = @kind";
+        var sql = $"""
+            SELECT s.id, s.name, s.fqn, s.kind_name AS Kind, f.path AS FilePath,
+                   s.start_line AS StartLine, s.start_col AS StartCol,
+                   s.end_line AS EndLine, s.end_col AS EndCol, s.signature,
+                   s.modifiers AS Modifiers, s.accessibility AS Accessibility,
+                   s.xml_summary AS XmlSummary, f.is_generated AS IsGenerated,
+                   s.test_framework AS TestFramework, s.canonical_key AS CanonicalKey,
+                   e.kind_name AS Relation, e.payload AS PayloadJson
+            FROM edges e
+            JOIN symbols s ON s.id = e.src
+            JOIN files   f ON f.id = s.file_id
+            WHERE e.dst = @id {kindClause}
+              AND EXISTS (
+                  SELECT 1
+                  FROM edge_evidence ee
+                  WHERE ee.src = e.src
+                    AND ee.dst = e.dst
+                    AND ee.kind_name = e.kind_name
+              )
+            ORDER BY e.kind_name, f.path, s.start_line, s.start_col, s.id
+            LIMIT @limit;
+            """;
+        var rows = await _connection.QueryAsync<RawAuditableEdgeHit>(new CommandDefinition(
+            sql,
+            new { id = symbolId, limit, kind = edgeKind },
+            cancellationToken: ct)).ConfigureAwait(false);
+        return rows.Select(row => row.ToHit()).ToList();
+    }
+
     public async Task<IReadOnlyList<SymbolHit>> ListCalleesAsync(long symbolId, int limit = 50, string? edgeKind = "calls", CancellationToken ct = default)
     {
         // payload column is projected through to SymbolHit.PayloadJson so the markdown renderer
@@ -1278,6 +1315,43 @@ public sealed class SqliteGraphStore : IGraphStore
         var rows = await _connection.QueryAsync<RawEdgeHit>(new CommandDefinition(
             sql, new { id = symbolId, limit, kind = edgeKind }, cancellationToken: ct)).ConfigureAwait(false);
         return rows.Select(r => r.ToHit()).ToList();
+    }
+
+    public async Task<IReadOnlyList<EdgeTraversalHit>> ListAuditableOutboundEdgesAsync(
+        long symbolId,
+        int limit = 50,
+        string? edgeKind = "calls",
+        CancellationToken ct = default)
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThan(limit, 1);
+        var kindClause = edgeKind is null ? "" : "AND e.kind_name = @kind";
+        var sql = $"""
+            SELECT s.id, s.name, s.fqn, s.kind_name AS Kind, f.path AS FilePath,
+                   s.start_line AS StartLine, s.start_col AS StartCol,
+                   s.end_line AS EndLine, s.end_col AS EndCol, s.signature,
+                   s.modifiers AS Modifiers, s.accessibility AS Accessibility,
+                   s.xml_summary AS XmlSummary, f.is_generated AS IsGenerated,
+                   s.test_framework AS TestFramework, s.canonical_key AS CanonicalKey,
+                   e.kind_name AS Relation, e.payload AS PayloadJson
+            FROM edges e
+            JOIN symbols s ON s.id = e.dst
+            JOIN files   f ON f.id = s.file_id
+            WHERE e.src = @id {kindClause}
+              AND EXISTS (
+                  SELECT 1
+                  FROM edge_evidence ee
+                  WHERE ee.src = e.src
+                    AND ee.dst = e.dst
+                    AND ee.kind_name = e.kind_name
+              )
+            ORDER BY e.kind_name, f.path, s.start_line, s.start_col, s.id
+            LIMIT @limit;
+            """;
+        var rows = await _connection.QueryAsync<RawAuditableEdgeHit>(new CommandDefinition(
+            sql,
+            new { id = symbolId, limit, kind = edgeKind },
+            cancellationToken: ct)).ConfigureAwait(false);
+        return rows.Select(row => row.ToHit()).ToList();
     }
 
     public Task<IReadOnlyList<SymbolHit>> ListImplementationsAsync(long symbolId, int limit = 50, CancellationToken ct = default)
@@ -1482,6 +1556,50 @@ public sealed class SqliteGraphStore : IGraphStore
             (int)StartLine, (int)StartCol, (int)EndLine, (int)EndCol, Signature,
             Modifiers, (int)Accessibility, XmlSummary, IsGenerated != 0, TestFramework, CanonicalKey,
             PayloadJson);
+    }
+
+    private sealed record RawAuditableEdgeHit(
+        long Id,
+        string Name,
+        string Fqn,
+        string Kind,
+        string FilePath,
+        long StartLine,
+        long StartCol,
+        long EndLine,
+        long EndCol,
+        string? Signature,
+        string? Modifiers,
+        long Accessibility,
+        string? XmlSummary,
+        long IsGenerated,
+        string? TestFramework,
+        string? CanonicalKey,
+        string Relation,
+        string? PayloadJson)
+    {
+        public EdgeTraversalHit ToHit() =>
+            new(
+                new SymbolHit(
+                    Id,
+                    Name,
+                    Fqn,
+                    Kind,
+                    FilePath,
+                    (int)StartLine,
+                    (int)StartCol,
+                    (int)EndLine,
+                    (int)EndCol,
+                    Signature,
+                    Modifiers,
+                    (int)Accessibility,
+                    XmlSummary,
+                    IsGenerated != 0,
+                    TestFramework,
+                    CanonicalKey,
+                    PayloadJson),
+                Relation,
+                PayloadJson);
     }
 
     private sealed record RawEvidenceSource(

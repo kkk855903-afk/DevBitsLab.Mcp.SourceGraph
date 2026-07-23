@@ -32,7 +32,7 @@ public static class Phase1CompatibilityTools
 
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(ListCallersResult))]
     [ToolTrigger("\"find callers of X\"")]
-    [Description("Find symbols with inbound call-graph edges to a target. Compatibility name for list_callers; locations are caller declaration locations, not fabricated call sites.")]
+    [Description("Find evidence-backed inbound relations to a target. Compatibility name for list_callers; each row includes canonical source/target identities, the actual relation and confidence, plus stored occurrence file/range evidence.")]
     public static Task<CallToolResult> FindCallersAsync(
         ScopeRouter router,
         [Description("Target symbol name or FQN")] string symbol,
@@ -44,7 +44,7 @@ public static class Phase1CompatibilityTools
 
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(ListCalleesResult))]
     [ToolTrigger("\"find callees of X\"")]
-    [Description("Find symbols reached by outbound call-graph edges from a source. Compatibility name for list_callees; locations are callee declaration locations, not fabricated call sites.")]
+    [Description("Find evidence-backed outbound relations from a source. Compatibility name for list_callees; each row includes canonical source/target identities, the actual relation and confidence, plus stored occurrence file/range evidence.")]
     public static Task<CallToolResult> FindCalleesAsync(
         ScopeRouter router,
         [Description("Source symbol name or FQN")] string symbol,
@@ -56,7 +56,7 @@ public static class Phase1CompatibilityTools
 
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(ImpactOfChangeResult))]
     [ToolTrigger("\"analyze the impact of changing X\"")]
-    [Description("Compute the transitive upstream symbols affected by a change. Compatibility name for impact_of_change; returns the same relation filter, depth, symbol, and declaration-location data.")]
+    [Description("Compute bounded evidence-backed upstream impact. Compatibility name for impact_of_change; every row includes its BFS predecessor and a source-to-target path whose hops carry real occurrence evidence.")]
     public static Task<CallToolResult> ImpactAnalysisAsync(
         ScopeRouter router,
         [Description("Symbol name or FQN")] string symbol,

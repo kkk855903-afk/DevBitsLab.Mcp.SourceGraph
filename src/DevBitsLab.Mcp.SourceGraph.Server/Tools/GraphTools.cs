@@ -573,7 +573,7 @@ public static class GraphTools
 
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(ListCallersResult))]
     [ToolTrigger("\"who calls X?\" or \"who consumes type X?\"")]
-    [Description("List inbound edges into a target symbol. Default kind=calls (i.e. callers). Use kind=uses-type to find consumers of a type, kind=overrides-member for derived implementations, kind=implements-member for members satisfying an interface, kind=instantiates for `new T()` sites, kind=throws for throw sites, kind=tests for inbound test edges, or any XAML kind (code-behind, binds-path, binds-element, handles-event, uses-resource, instantiates-type, merges, applies-style) on a scope that loaded the XAML indexer; kind=all walks every edge kind. Plugin-defined kinds (any kebab-case identifier) are accepted as-is.")]
+    [Description("List evidence-backed inbound edges into a target symbol. Every row includes canonical source/target identities, actual relation, confidence, and stored occurrence file/range evidence; malformed edges without evidence are skipped. Default kind=calls; kind=all preserves each actual edge kind. Plugin-defined kebab-case kinds are accepted.")]
     public static Task<CallToolResult> ListCallersAsync(
         ScopeRouter router,
         [Description("Target symbol name or FQN")] string symbol,
@@ -585,6 +585,10 @@ public static class GraphTools
             ScopedExecution.RunAsync(router, scope, async host =>
             {
                 var sw = System.Diagnostics.Stopwatch.StartNew();
+                if (limit is < 1 or > 1000)
+                {
+                    return DiagnosticResult.Error("list_callers `limit` must be between 1 and 1000.");
+                }
                 var (edgeKind, label, isAll) = NormaliseEdgeKindParam(kind);
                 if (!isAll && edgeKind is not null)
                 {
@@ -595,7 +599,13 @@ public static class GraphTools
                 var hits = await host.Store.FindSymbolsAsync(symbol, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
                 if (hits.Count == 0) return DiagnosticResult.Build($"No matches for '{symbol}'.");
                 var top = hits[0];
-                var callers = await host.Store.ListCallersAsync(top.Id, limit, edgeKind, ct).ConfigureAwait(false);
+                var traversal = await EvidenceTraversal.LoadInboundAsync(
+                    host.Store,
+                    top,
+                    limit,
+                    edgeKind,
+                    ct).ConfigureAwait(false);
+                var callers = traversal.Relations;
                 var sb = new StringBuilder();
                 sb.AppendLine($"Inbound `{label}` to **{top.Fqn}** ({KindLabel(top.Kind)}):");
                 if (callers.Count == 0)
@@ -604,16 +614,18 @@ public static class GraphTools
                     return BuildListCallersResult(
                         prose: sb.ToString(),
                         target: top,
-                        callers: Array.Empty<SymbolHit>(),
+                        callers: Array.Empty<AuditableRelation>(),
                         edgeKindLabel: label,
+                        truncated: traversal.Truncated,
                         scopeId: host.Scope.Id,
                         elapsedMs: sw.ElapsedMilliseconds);
                 }
                 if (callers.Count >= 2)
                 {
                     var rows = new List<IReadOnlyList<string>>(callers.Count);
-                    foreach (var c in callers)
+                    foreach (var relation in callers)
                     {
+                        var c = relation.Source;
                         rows.Add(new[]
                         {
                             $"**{c.Fqn}**",
@@ -626,8 +638,9 @@ public static class GraphTools
                     // for any rows that carry one. Most C# call edges have no payload and produce
                     // nothing here; future edge kinds with metadata surface their detail without
                     // bloating the table cells.
-                    foreach (var c in callers)
+                    foreach (var relation in callers)
                     {
+                        var c = relation.Source;
                         var payloadLine = Format.PayloadSubLine(c.PayloadJson);
                         if (payloadLine is null) continue;
                         sb.AppendLine($"- **{c.Fqn}**");
@@ -636,18 +649,26 @@ public static class GraphTools
                 }
                 else
                 {
-                    foreach (var c in callers)
+                    foreach (var relation in callers)
                     {
+                        var c = relation.Source;
                         sb.AppendLine($"- **{c.Fqn}** ({KindLabel(c.Kind)}) at {Format.Location(c.FilePath, c.StartLine, c.StartCol)}");
                         var payloadLine = Format.PayloadSubLine(c.PayloadJson);
                         if (payloadLine is not null) sb.AppendLine(payloadLine);
                     }
+                }
+                EvidenceTraversal.AppendRelations(sb, callers);
+                if (traversal.Truncated)
+                {
+                    sb.AppendLine();
+                    sb.AppendLine("note: results were truncated by the validated relation limit.");
                 }
                 return BuildListCallersResult(
                     prose: sb.ToString(),
                     target: top,
                     callers: callers,
                     edgeKindLabel: label,
+                    truncated: traversal.Truncated,
                     scopeId: host.Scope.Id,
                     elapsedMs: sw.ElapsedMilliseconds);
             }, ct));
@@ -655,8 +676,9 @@ public static class GraphTools
     private static CallToolResult BuildListCallersResult(
         string prose,
         SymbolHit target,
-        IReadOnlyList<SymbolHit> callers,
+        IReadOnlyList<AuditableRelation> callers,
         string edgeKindLabel,
+        bool truncated,
         string scopeId,
         long elapsedMs)
     {
@@ -665,8 +687,9 @@ public static class GraphTools
             new TextContentBlock { Text = prose },
         };
 
-        foreach (var c in callers)
+        foreach (var relation in callers)
         {
+            var c = relation.Source;
             content.Add(new ResourceLinkBlock
             {
                 Uri = GraphResourceUris.Symbol(c.Id),
@@ -684,20 +707,29 @@ public static class GraphTools
             ("callers", callers.Count.ToString())));
 
         var structuredCallers = callers
-            .Select(c => new ListCallersRow(
-                SymbolId: c.Id,
-                Fqn: c.Fqn,
-                Kind: c.Kind,
-                FilePath: c.FilePath,
-                Line: c.StartLine,
-                Column: c.StartCol,
-                PayloadJson: string.IsNullOrEmpty(c.PayloadJson) ? null : c.PayloadJson))
+            .Select(relation => new ListCallersRow(
+                SymbolId: relation.Source.Id,
+                CanonicalKey: relation.Source.CanonicalKey,
+                Fqn: relation.Source.Fqn,
+                Kind: relation.Source.Kind,
+                FilePath: relation.Source.FilePath,
+                Line: relation.Source.StartLine,
+                Column: relation.Source.StartCol,
+                Source: relation.Hop.From,
+                Target: relation.Hop.To,
+                Relation: relation.Hop.Relation,
+                Confidence: relation.Hop.Confidence,
+                Evidence: relation.Hop.Evidence,
+                EvidenceTruncated: relation.Hop.EvidenceTruncated,
+                PayloadJson: string.IsNullOrEmpty(relation.PayloadJson) ? null : relation.PayloadJson))
             .ToList();
         var dto = new ListCallersResult(
             TargetFqn: target.Fqn,
             TargetKind: target.Kind,
             TargetSymbolId: target.Id,
+            TargetCanonicalKey: target.CanonicalKey,
             EdgeKind: edgeKindLabel,
+            Truncated: truncated,
             Callers: structuredCallers);
         return new CallToolResult
         {
@@ -710,7 +742,7 @@ public static class GraphTools
 
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(ListCalleesResult))]
     [ToolTrigger("\"what does X call?\" or \"what types does X use?\"")]
-    [Description("List outbound edges from the target symbol. Default kind=calls (callees). Use kind=uses-type for types touched in this member's signature/body, kind=overrides-member for the base it overrides, kind=implements-member for the interface member it satisfies, kind=instantiates for types it constructs, kind=throws for exception types it throws, kind=tests for outbound test edges, or any XAML kind (code-behind, binds-path, binds-element, handles-event, uses-resource, instantiates-type, merges, applies-style) on a scope that loaded the XAML indexer; kind=all walks every edge kind. Plugin-defined kinds (any kebab-case identifier) are accepted as-is.")]
+    [Description("List evidence-backed outbound edges from a source symbol. Every row includes canonical source/target identities, actual relation, confidence, and stored occurrence file/range evidence; malformed edges without evidence are skipped. Default kind=calls; kind=all preserves each actual edge kind. Plugin-defined kebab-case kinds are accepted.")]
     public static Task<CallToolResult> ListCalleesAsync(
         ScopeRouter router,
         [Description("Source symbol name or FQN")] string symbol,
@@ -722,6 +754,10 @@ public static class GraphTools
             ScopedExecution.RunAsync(router, scope, async host =>
             {
                 var sw = System.Diagnostics.Stopwatch.StartNew();
+                if (limit is < 1 or > 1000)
+                {
+                    return DiagnosticResult.Error("list_callees `limit` must be between 1 and 1000.");
+                }
                 var (edgeKind, label, isAll) = NormaliseEdgeKindParam(kind);
                 if (!isAll && edgeKind is not null)
                 {
@@ -732,7 +768,13 @@ public static class GraphTools
                 var hits = await host.Store.FindSymbolsAsync(symbol, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
                 if (hits.Count == 0) return DiagnosticResult.Build($"No matches for '{symbol}'.");
                 var top = hits[0];
-                var callees = await host.Store.ListCalleesAsync(top.Id, limit, edgeKind, ct).ConfigureAwait(false);
+                var traversal = await EvidenceTraversal.LoadOutboundAsync(
+                    host.Store,
+                    top,
+                    limit,
+                    edgeKind,
+                    ct).ConfigureAwait(false);
+                var callees = traversal.Relations;
                 var sb = new StringBuilder();
                 sb.AppendLine($"Outbound `{label}` from **{top.Fqn}** ({KindLabel(top.Kind)}):");
                 if (callees.Count == 0)
@@ -741,16 +783,18 @@ public static class GraphTools
                     return BuildListCalleesResult(
                         prose: sb.ToString(),
                         target: top,
-                        callees: Array.Empty<SymbolHit>(),
+                        callees: Array.Empty<AuditableRelation>(),
                         edgeKindLabel: label,
+                        truncated: traversal.Truncated,
                         scopeId: host.Scope.Id,
                         elapsedMs: sw.ElapsedMilliseconds);
                 }
                 if (callees.Count >= 2)
                 {
                     var rows = new List<IReadOnlyList<string>>(callees.Count);
-                    foreach (var c in callees)
+                    foreach (var relation in callees)
                     {
+                        var c = relation.Target;
                         rows.Add(new[]
                         {
                             $"**{c.Fqn}**",
@@ -759,8 +803,9 @@ public static class GraphTools
                         });
                     }
                     Format.AppendTable(sb, new[] { "Symbol", "Kind", "Location" }, rows);
-                    foreach (var c in callees)
+                    foreach (var relation in callees)
                     {
+                        var c = relation.Target;
                         var payloadLine = Format.PayloadSubLine(c.PayloadJson);
                         if (payloadLine is null) continue;
                         sb.AppendLine($"- **{c.Fqn}**");
@@ -769,18 +814,26 @@ public static class GraphTools
                 }
                 else
                 {
-                    foreach (var c in callees)
+                    foreach (var relation in callees)
                     {
+                        var c = relation.Target;
                         sb.AppendLine($"- **{c.Fqn}** ({KindLabel(c.Kind)}) at {Format.Location(c.FilePath, c.StartLine, c.StartCol)}");
                         var payloadLine = Format.PayloadSubLine(c.PayloadJson);
                         if (payloadLine is not null) sb.AppendLine(payloadLine);
                     }
+                }
+                EvidenceTraversal.AppendRelations(sb, callees);
+                if (traversal.Truncated)
+                {
+                    sb.AppendLine();
+                    sb.AppendLine("note: results were truncated by the validated relation limit.");
                 }
                 return BuildListCalleesResult(
                     prose: sb.ToString(),
                     target: top,
                     callees: callees,
                     edgeKindLabel: label,
+                    truncated: traversal.Truncated,
                     scopeId: host.Scope.Id,
                     elapsedMs: sw.ElapsedMilliseconds);
             }, ct));
@@ -788,8 +841,9 @@ public static class GraphTools
     private static CallToolResult BuildListCalleesResult(
         string prose,
         SymbolHit target,
-        IReadOnlyList<SymbolHit> callees,
+        IReadOnlyList<AuditableRelation> callees,
         string edgeKindLabel,
+        bool truncated,
         string scopeId,
         long elapsedMs)
     {
@@ -798,8 +852,9 @@ public static class GraphTools
             new TextContentBlock { Text = prose },
         };
 
-        foreach (var c in callees)
+        foreach (var relation in callees)
         {
+            var c = relation.Target;
             content.Add(new ResourceLinkBlock
             {
                 Uri = GraphResourceUris.Symbol(c.Id),
@@ -817,20 +872,29 @@ public static class GraphTools
             ("callees", callees.Count.ToString())));
 
         var structuredCallees = callees
-            .Select(c => new ListCalleesRow(
-                SymbolId: c.Id,
-                Fqn: c.Fqn,
-                Kind: c.Kind,
-                FilePath: c.FilePath,
-                Line: c.StartLine,
-                Column: c.StartCol,
-                PayloadJson: string.IsNullOrEmpty(c.PayloadJson) ? null : c.PayloadJson))
+            .Select(relation => new ListCalleesRow(
+                SymbolId: relation.Target.Id,
+                CanonicalKey: relation.Target.CanonicalKey,
+                Fqn: relation.Target.Fqn,
+                Kind: relation.Target.Kind,
+                FilePath: relation.Target.FilePath,
+                Line: relation.Target.StartLine,
+                Column: relation.Target.StartCol,
+                Source: relation.Hop.From,
+                Target: relation.Hop.To,
+                Relation: relation.Hop.Relation,
+                Confidence: relation.Hop.Confidence,
+                Evidence: relation.Hop.Evidence,
+                EvidenceTruncated: relation.Hop.EvidenceTruncated,
+                PayloadJson: string.IsNullOrEmpty(relation.PayloadJson) ? null : relation.PayloadJson))
             .ToList();
         var dto = new ListCalleesResult(
             TargetFqn: target.Fqn,
             TargetKind: target.Kind,
             TargetSymbolId: target.Id,
+            TargetCanonicalKey: target.CanonicalKey,
             EdgeKind: edgeKindLabel,
+            Truncated: truncated,
             Callees: structuredCallees);
         return new CallToolResult
         {
@@ -1778,7 +1842,7 @@ public static class GraphTools
 
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(ImpactOfChangeResult))]
     [ToolTrigger("\"what would change if I edit X?\" — transitive callers")]
-    [Description("Compute the transitive set of upstream callers for a symbol (impact of changing it). Walks the call graph backward up to maxDepth. Default kind=calls; pass kind=uses-type, overrides-member, implements-member, instantiates, throws, tests, all, or any plugin-defined kebab-case kind to traverse other edge layers.")]
+    [Description("Compute bounded evidence-backed upstream impact with breadth-first, cycle-safe traversal. Every row includes its canonical identity, BFS predecessor, path confidence, and a source-to-target path whose hops carry real occurrence evidence. maxDepth is 1-12 and limit is 1-1000; truncation is explicit.")]
     public static Task<CallToolResult> ImpactOfChangeAsync(
         ScopeRouter router,
         [Description("Symbol name or FQN")] string symbol,
@@ -1792,6 +1856,14 @@ public static class GraphTools
             ScopedExecution.RunAsync(router, scope, async host =>
             {
                 var sw = System.Diagnostics.Stopwatch.StartNew();
+                if (maxDepth is < 1 or > 12)
+                {
+                    return DiagnosticResult.Error("impact_of_change `maxDepth` must be between 1 and 12.");
+                }
+                if (limit is < 1 or > 1000)
+                {
+                    return DiagnosticResult.Error("impact_of_change `limit` must be between 1 and 1000.");
+                }
                 var (edgeKind, label, isAll) = NormaliseEdgeKindParam(kind);
                 if (!isAll && edgeKind is not null)
                 {
@@ -1803,7 +1875,14 @@ public static class GraphTools
                 if (hits.Count == 0) return DiagnosticResult.Build($"No matches for '{symbol}'.");
                 var top = hits[0];
                 progress?.Report(Format.Progress(0.0, "querying"));
-                var rows = await host.Store.ImpactOfChangeAsync(top.Id, maxDepth, limit, edgeKind, ct).ConfigureAwait(false);
+                var traversal = await EvidenceTraversal.TraceImpactAsync(
+                    host.Store,
+                    top,
+                    maxDepth,
+                    limit,
+                    edgeKind,
+                    ct).ConfigureAwait(false);
+                var rows = traversal.Rows;
                 var sb = new StringBuilder();
                 sb.AppendLine($"Upstream impact of **{top.Fqn}** ({KindLabel(top.Kind)}) [kind={label}] up to depth {maxDepth}:");
                 if (rows.Count == 0)
@@ -1812,9 +1891,11 @@ public static class GraphTools
                     return BuildImpactOfChangeResult(
                         prose: sb.ToString(),
                         target: top,
-                        rows: Array.Empty<ImpactedSymbol>(),
+                        rows: Array.Empty<AuditableImpact>(),
                         edgeKindLabel: label,
                         maxDepth: maxDepth,
+                        truncated: traversal.Truncated,
+                        expandedNodes: traversal.ExpandedNodes,
                         scopeId: host.Scope.Id,
                         elapsedMs: sw.ElapsedMilliseconds);
                 }
@@ -1844,12 +1925,20 @@ public static class GraphTools
                         sb.AppendLine($"- d{r.Depth}: **{r.Symbol.Fqn}** ({KindLabel(r.Symbol.Kind)}) at {Format.Location(r.Symbol.FilePath, r.Symbol.StartLine, r.Symbol.StartCol)}");
                     }
                 }
+                EvidenceTraversal.AppendImpactPaths(sb, rows);
+                if (traversal.Truncated)
+                {
+                    sb.AppendLine();
+                    sb.AppendLine("note: traversal was truncated by maxDepth or the validated result limit.");
+                }
                 return BuildImpactOfChangeResult(
                     prose: sb.ToString(),
                     target: top,
                     rows: rows,
                     edgeKindLabel: label,
                     maxDepth: maxDepth,
+                    truncated: traversal.Truncated,
+                    expandedNodes: traversal.ExpandedNodes,
                     scopeId: host.Scope.Id,
                     elapsedMs: sw.ElapsedMilliseconds);
             }, ct, progress));
@@ -1857,9 +1946,11 @@ public static class GraphTools
     private static CallToolResult BuildImpactOfChangeResult(
         string prose,
         SymbolHit target,
-        IReadOnlyList<ImpactedSymbol> rows,
+        IReadOnlyList<AuditableImpact> rows,
         string edgeKindLabel,
         int maxDepth,
+        bool truncated,
+        int expandedNodes,
         string scopeId,
         long elapsedMs)
     {
@@ -1891,18 +1982,25 @@ public static class GraphTools
             .Select(r => new ImpactOfChangeRow(
                 Depth: r.Depth,
                 SymbolId: r.Symbol.Id,
+                CanonicalKey: r.Symbol.CanonicalKey,
                 Fqn: r.Symbol.Fqn,
                 Kind: r.Symbol.Kind,
                 FilePath: r.Symbol.FilePath,
                 Line: r.Symbol.StartLine,
-                Column: r.Symbol.StartCol))
+                Column: r.Symbol.StartCol,
+                Predecessor: TraceCallPathTools.MapSymbol(r.Predecessor),
+                Confidence: r.Confidence,
+                Path: r.Path))
             .ToList();
         var dto = new ImpactOfChangeResult(
             TargetFqn: target.Fqn,
             TargetKind: target.Kind,
             TargetSymbolId: target.Id,
+            TargetCanonicalKey: target.CanonicalKey,
             EdgeKind: edgeKindLabel,
             MaxDepth: maxDepth,
+            Truncated: truncated,
+            ExpandedNodes: expandedNodes,
             Upstream: structuredRows);
         return new CallToolResult
         {

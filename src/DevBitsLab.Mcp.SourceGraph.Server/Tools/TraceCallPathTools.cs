@@ -240,8 +240,12 @@ public static class TraceCallPathTools
         }
 
         var targetsById = targets.ToDictionary(target => target.Id);
+        var orderedSources = sources
+            .OrderBy(item => item.Fqn, StringComparer.Ordinal)
+            .ThenBy(item => item.Id)
+            .ToList();
         var queue = new Queue<PathState>();
-        foreach (var source in sources.OrderBy(item => item.Fqn, StringComparer.Ordinal))
+        foreach (var source in orderedSources.Take(maxNodes))
         {
             queue.Enqueue(new PathState(
                 source,
@@ -253,67 +257,79 @@ public static class TraceCallPathTools
         var emittedPathKeys = new HashSet<string>(StringComparer.Ordinal);
         var expandedNodes = 0;
         var scheduledStates = queue.Count;
-        var truncated = false;
+        var truncated = orderedSources.Count > maxNodes;
         var branchLimit = Math.Min(maxNodes, 1000);
+        var stop = false;
 
-        while (queue.Count > 0 && paths.Count < maxPaths)
+        while (queue.Count > 0 && !stop)
         {
             ct.ThrowIfCancellationRequested();
             var state = queue.Dequeue();
             if (targetsById.TryGetValue(state.Current.Id, out var reachedTarget))
             {
                 AddCompletedPath(state, reachedTarget);
+                if (paths.Count >= maxPaths)
+                {
+                    truncated |= queue.Count > 0;
+                    break;
+                }
                 continue;
             }
             if (state.Hops.Count >= maxDepth)
             {
-                truncated = true;
+                truncated |= await HasUnexploredOutboundAsync(
+                    host.Store,
+                    state,
+                    edgeKind,
+                    ct).ConfigureAwait(false);
                 continue;
             }
             if (expandedNodes >= maxNodes)
             {
-                truncated = true;
+                truncated |= await HasUnexploredOutboundAsync(
+                    host.Store,
+                    state,
+                    edgeKind,
+                    ct).ConfigureAwait(false);
+                truncated |= queue.Count > 0;
                 break;
             }
 
             expandedNodes++;
-            var callees = await host.Store.ListCalleesAsync(
+            // A fixed relation has at most one edge per target. Fetch enough extra rows to cover
+            // every path-local visited target plus one unvisited sentinel, so cycle edges cannot
+            // consume the branch cap or cause a false truncation report.
+            var storedEdges = await host.Store.ListAuditableOutboundEdgesAsync(
                 state.Current.Id,
-                branchLimit,
+                checked(branchLimit + state.Visited.Count + 1),
                 edgeKind,
                 ct).ConfigureAwait(false);
-            if (callees.Count == branchLimit) truncated = true;
+            var unvisitedEdges = storedEdges
+                .Where(edge => !state.Visited.Contains(edge.Symbol.Id))
+                .Take(branchLimit + 1)
+                .ToList();
+            var branchTruncated = unvisitedEdges.Count > branchLimit;
+            if (branchTruncated) truncated = true;
+            var visibleEdges = unvisitedEdges.Take(branchLimit).ToList();
 
-            foreach (var callee in callees
-                         .OrderBy(item => item.Fqn, StringComparer.Ordinal)
-                         .ThenBy(item => item.Id))
+            for (var edgeIndex = 0; edgeIndex < visibleEdges.Count; edgeIndex++)
             {
-                if (state.Visited.Contains(callee.Id)) continue;
+                var edge = visibleEdges[edgeIndex];
+                var callee = edge.Symbol;
 
-                var storedEvidence = await host.Store.ListEdgeEvidenceAsync(
-                    state.Current.Id,
-                    callee.Id,
-                    edgeKind,
-                    EvidenceLimitPerHop,
+                var hop = await BuildAuditableHopAsync(
+                    host.Store,
+                    state.Current,
+                    callee,
+                    edge.Relation,
                     ct).ConfigureAwait(false);
-                if (storedEvidence.Count == 0)
+                if (hop is null)
                 {
-                    // V13's invariant requires evidence for every logical edge. Skipping a
-                    // malformed raw row is safer than inventing a location in an evidence tool.
+                    // Evidence may disappear between the auditable edge query and this detail
+                    // lookup during an incremental update. Never invent a fallback location.
                     continue;
                 }
 
-                var hopEvidence = storedEvidence
-                    .Select(MapEvidence)
-                    .ToList();
-                var hopConfidence = storedEvidence.Max(item => item.Confidence);
-                var hop = new TraceCallPathHop(
-                    MapSymbol(state.Current),
-                    MapSymbol(callee),
-                    edgeKind,
-                    ConfidenceName(hopConfidence),
-                    hopEvidence,
-                    EvidenceTruncated: storedEvidence.Count == EvidenceLimitPerHop);
                 var nextHops = new List<TraceCallPathHop>(state.Hops.Count + 1);
                 nextHops.AddRange(state.Hops);
                 nextHops.Add(hop);
@@ -325,7 +341,10 @@ public static class TraceCallPathTools
                     AddCompletedPath(next, reachedTarget);
                     if (paths.Count >= maxPaths)
                     {
-                        truncated = true;
+                        truncated |= branchTruncated
+                            || edgeIndex + 1 < visibleEdges.Count
+                            || queue.Count > 0;
+                        stop = true;
                         break;
                     }
                 }
@@ -341,7 +360,6 @@ public static class TraceCallPathTools
                 }
             }
         }
-        if (queue.Count > 0 && paths.Count >= maxPaths) truncated = true;
 
         return new TraceCallPathScopeResult(
             host.Scope.Id,
@@ -351,6 +369,20 @@ public static class TraceCallPathTools
             paths.Count == 0
                 ? $"No `{edgeKind}` path found within depth {maxDepth}."
                 : null);
+
+        async Task<bool> HasUnexploredOutboundAsync(
+            IGraphStore store,
+            PathState state,
+            string relation,
+            CancellationToken cancellationToken)
+        {
+            var probe = await store.ListAuditableOutboundEdgesAsync(
+                state.Current.Id,
+                checked(state.Visited.Count + 1),
+                relation,
+                cancellationToken).ConfigureAwait(false);
+            return probe.Any(edge => !state.Visited.Contains(edge.Symbol.Id));
+        }
 
         void AddCompletedPath(PathState state, SymbolHit target)
         {
@@ -373,16 +405,46 @@ public static class TraceCallPathTools
         }
     }
 
-    private static TraceCallPathSymbol MapSymbol(SymbolHit hit) =>
+    internal static async Task<TraceCallPathHop?> BuildAuditableHopAsync(
+        IGraphStore store,
+        SymbolHit source,
+        SymbolHit target,
+        string relation,
+        CancellationToken ct)
+    {
+        var storedEvidence = await store.ListEdgeEvidenceAsync(
+            source.Id,
+            target.Id,
+            relation,
+            EvidenceLimitPerHop + 1,
+            ct).ConfigureAwait(false);
+        if (storedEvidence.Count == 0) return null;
+
+        var includedEvidence = storedEvidence
+            .Take(EvidenceLimitPerHop)
+            .ToList();
+        return new TraceCallPathHop(
+            MapSymbol(source),
+            MapSymbol(target),
+            relation,
+            ConfidenceName(storedEvidence.Max(item => item.Confidence)),
+            includedEvidence.Select(MapEvidence).ToList(),
+            EvidenceTruncated: storedEvidence.Count > EvidenceLimitPerHop);
+    }
+
+    internal static TraceCallPathSymbol MapSymbol(SymbolHit hit) =>
         new(
             hit.Id,
+            hit.CanonicalKey,
             hit.Fqn,
             hit.Kind,
             hit.FilePath,
             hit.StartLine,
-            hit.StartCol);
+            hit.StartCol,
+            hit.EndLine,
+            hit.EndCol);
 
-    private static TraceCallPathEvidence MapEvidence(Evidence evidence) =>
+    internal static TraceCallPathEvidence MapEvidence(Evidence evidence) =>
         new(
             evidence.Location.FilePath,
             evidence.Location.StartLine,
@@ -393,7 +455,7 @@ public static class TraceCallPathTools
             evidence.Producer,
             evidence.Metadata);
 
-    private static string ConfidenceName(CoreEvidenceConfidence confidence) =>
+    internal static string ConfidenceName(CoreEvidenceConfidence confidence) =>
         confidence switch
         {
             CoreEvidenceConfidence.Exact => "exact",
@@ -401,7 +463,7 @@ public static class TraceCallPathTools
             _ => "inferred",
         };
 
-    private static CoreEvidenceConfidence ConfidenceValue(string confidence) =>
+    internal static CoreEvidenceConfidence ConfidenceValue(string confidence) =>
         confidence switch
         {
             "exact" => CoreEvidenceConfidence.Exact,

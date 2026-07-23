@@ -48,9 +48,39 @@ delegate to the established plural/list/impact implementation with the same inpu
 structured output schema, scope semantics, and errors. These aliases SHALL NOT fabricate
 call-site locations before occurrence evidence is available.
 
+`list_callers`/`find_callers` and `list_callees`/`find_callees` SHALL return one row per
+evidence-backed logical edge. Every row SHALL contain the source and target symbol ids, FQNs,
+stored `canonical_key` values when present, the edge's actual relation (including under
+`kind = all`), relation confidence, and all included `edge_evidence` occurrences. Each
+occurrence SHALL contain its real producing file path, 1-based half-open start/end range,
+confidence, producer, and metadata. A logical edge without stored occurrence evidence SHALL be
+skipped rather than rendered at either endpoint's declaration. `limit` SHALL be validated in
+the inclusive range 1-1000 and the structured result SHALL report truncation.
+
+`impact_of_change`/`impact_analysis` SHALL perform a breadth-first, cycle-safe upstream
+traversal rather than returning an unauditable transitive set. `maxDepth` SHALL be validated in
+the inclusive range 1-12 and `limit` in 1-1000. Every impacted row SHALL include its BFS
+predecessor (the next symbol toward the changed target), an ordered source-to-target path, and
+the weakest confidence across that path. Every path hop SHALL satisfy the same source/target,
+relation, and occurrence-evidence contract as direct caller/callee rows. Reaching a depth,
+result, or bounded branch-query cap while unseen evidence-backed relations may remain SHALL set
+`truncated = true`.
+
 #### Scenario: Phase 1 compatibility names are discoverable
 - **WHEN** an MCP client lists tools
 - **THEN** `find_reference`, `find_callers`, `find_callees`, and `impact_analysis` are registered alongside `find_references`, `list_callers`, `list_callees`, and `impact_of_change`
+
+#### Scenario: Direct relations retain occurrence evidence
+- **WHEN** `B` calls `C`, `A` has another relation to `C`, and the agent invokes `find_callers(symbol = "C", kind = "all")`
+- **THEN** each row identifies its canonical source and target, preserves its actual relation and confidence, and includes the stored call-site file and half-open range
+
+#### Scenario: Impact paths are independently auditable
+- **WHEN** `A` calls `B`, `B` calls `C`, and the agent invokes `impact_analysis(symbol = "C")`
+- **THEN** the row for `A` identifies `B` as its predecessor and contains the ordered evidence-backed path `A -> B -> C`, with path confidence equal to its weakest hop
+
+#### Scenario: Malformed and cyclic impact edges stay safe
+- **WHEN** an upstream graph contains a cycle and a logical edge with no `edge_evidence`
+- **THEN** traversal terminates, never returns the changed root as its own impact, and omits the no-evidence edge without inventing a declaration-site occurrence
 
 ### Requirement: Evidence-first bounded call-path tracing
 The server SHALL expose the exact Phase 1 tool name `trace_call_path`. It SHALL traverse
@@ -148,8 +178,8 @@ namespace or path-substring by inbound call count.
 
 ### Requirement: Impact of change
 The server SHALL expose an `impact_of_change` tool that returns the
-transitive set of upstream callers via a recursive CTE on the `Calls`
-edges.
+transitive set of upstream callers via a breadth-first, cycle-safe traversal of
+evidence-backed `Calls` edges.
 
 #### Scenario: Walk transitive callers
 - **WHEN** the agent invokes

@@ -207,11 +207,33 @@ public interface IGraphStore : IAsyncDisposable
     Task<IReadOnlyList<SymbolHit>> ListCallersAsync(long symbolId, int limit = 50, string? edgeKind = "calls", CancellationToken ct = default);
 
     /// <summary>
+    /// Lists inbound logical edges that have at least one stored occurrence in
+    /// <c>edge_evidence</c>. Each row preserves the edge's actual relation, including when
+    /// <paramref name="edgeKind"/> is <c>null</c> (all relations).
+    /// </summary>
+    Task<IReadOnlyList<EdgeTraversalHit>> ListAuditableInboundEdgesAsync(
+        long symbolId,
+        int limit = 50,
+        string? edgeKind = "calls",
+        CancellationToken ct = default);
+
+    /// <summary>
     /// Lists outgoing targets from <paramref name="symbolId"/>. With the default
     /// <paramref name="edgeKind"/> = <c>"calls"</c> this preserves the legacy behaviour. Pass a
     /// different kebab-case kind to walk other edge types; pass <c>null</c> to walk every kind.
     /// </summary>
     Task<IReadOnlyList<SymbolHit>> ListCalleesAsync(long symbolId, int limit = 50, string? edgeKind = "calls", CancellationToken ct = default);
+
+    /// <summary>
+    /// Lists outbound logical edges that have at least one stored occurrence in
+    /// <c>edge_evidence</c>. Each row preserves the edge's actual relation, including when
+    /// <paramref name="edgeKind"/> is <c>null</c> (all relations).
+    /// </summary>
+    Task<IReadOnlyList<EdgeTraversalHit>> ListAuditableOutboundEdgesAsync(
+        long symbolId,
+        int limit = 50,
+        string? edgeKind = "calls",
+        CancellationToken ct = default);
 
     /// <summary>Lists every member that satisfies the named interface member via <c>"implements-member"</c> edges.</summary>
     Task<IReadOnlyList<SymbolHit>> ListImplementationsAsync(long symbolId, int limit = 50, CancellationToken ct = default);

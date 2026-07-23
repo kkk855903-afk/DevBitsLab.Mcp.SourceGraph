@@ -8,6 +8,7 @@ using DevBitsLab.Mcp.SourceGraph.Server.Tools;
 using DevBitsLab.Mcp.SourceGraph.Server.Tools.Output;
 using DevBitsLab.Mcp.SourceGraph.Storage;
 using FluentAssertions;
+using Microsoft.Data.Sqlite;
 using ModelContextProtocol.Protocol;
 using ModelContextProtocol.Server;
 using Xunit;
@@ -36,6 +37,11 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
         var b = await SeedSymbolAsync(store, "B");
         var c = await SeedSymbolAsync(store, "C");
         var d = await SeedSymbolAsync(store, "D");
+        var starveSource = await SeedSymbolAsync(store, "StarveSource");
+        var malformedFirst = await SeedSymbolAsync(store, "AardvarkMalformed");
+        var directTarget = await SeedSymbolAsync(store, "ZDirectTarget");
+        var terminalSource = await SeedSymbolAsync(store, "TerminalSource");
+        var terminalLeaf = await SeedSymbolAsync(store, "TerminalLeaf");
 
         await store.BulkInsertEdgesAsync(new[]
         {
@@ -44,7 +50,24 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
             Edge(a, d, 6, CoreEvidenceConfidence.Exact, "a-to-d"),
             Edge(d, c, 9, CoreEvidenceConfidence.Exact, "d-to-c"),
             Edge(c, a, 12, CoreEvidenceConfidence.Exact, "cycle"),
+            Edge(starveSource, directTarget, 15, CoreEvidenceConfidence.Exact, "auditable-direct"),
+            Edge(terminalSource, terminalLeaf, 16, CoreEvidenceConfidence.Exact, "terminal-leaf"),
         });
+
+        // This raw legacy edge sorts before ZDirectTarget but has no occurrence evidence. An
+        // evidence-first branch query must remove it before applying its one-row branch cap.
+        await using (var connection = new SqliteConnection(
+                         $"Data Source={Path.Join(_tempDir, "graph.db")}"))
+        {
+            await connection.OpenAsync();
+            await using var command = connection.CreateCommand();
+            command.CommandText =
+                "INSERT INTO edges(src, dst, kind_name) VALUES ($src, $dst, $kind);";
+            command.Parameters.AddWithValue("$src", starveSource.SymbolId);
+            command.Parameters.AddWithValue("$dst", malformedFirst.SymbolId);
+            command.Parameters.AddWithValue("$kind", EdgeKinds.Calls);
+            await command.ExecuteNonQueryAsync();
+        }
 
         var scope = new Scope(
             "default",
@@ -169,6 +192,44 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
             maxNodes: 5001);
         invalid.IsError.Should().BeTrue();
         CallToolResultHelpers.ProseText(invalid).Should().Contain("between 1 and 5000");
+    }
+
+    [Fact]
+    public async Task Trace_filtersMalformedEdgesBeforeExactBranchAndPathCaps()
+    {
+        var result = await TraceCallPathTools.TraceCallPathAsync(
+            _router!,
+            from: "Graph.StarveSource",
+            to: "Graph.ZDirectTarget",
+            maxDepth: 1,
+            maxPaths: 1,
+            maxNodes: 1);
+
+        var scope = result.StructuredContent!.Value.Deserialize(
+            ToolOutputJsonContext.Default.TraceCallPathResult)!
+            .Scopes.Should().ContainSingle().Which;
+        scope.Paths.Should().ContainSingle();
+        scope.Paths[0].Hops.Should().ContainSingle()
+            .Which.To.Fqn.Should().Be("Graph.ZDirectTarget");
+        scope.Truncated.Should().BeFalse(
+            "the only evidence-backed branch and path exactly fit every configured cap");
+    }
+
+    [Fact]
+    public async Task Trace_depthBoundaryIsComplete_whenFrontierHasNoAuditableChildren()
+    {
+        var result = await TraceCallPathTools.TraceCallPathAsync(
+            _router!,
+            from: "Graph.TerminalSource",
+            to: "Graph.C",
+            maxDepth: 1);
+
+        var scope = result.StructuredContent!.Value.Deserialize(
+            ToolOutputJsonContext.Default.TraceCallPathResult)!
+            .Scopes.Should().ContainSingle().Which;
+        scope.Paths.Should().BeEmpty();
+        scope.Truncated.Should().BeFalse(
+            "reaching maxDepth at a terminal evidence-backed frontier leaves no work unexplored");
     }
 
     private async Task<SeededSymbol> SeedSymbolAsync(
