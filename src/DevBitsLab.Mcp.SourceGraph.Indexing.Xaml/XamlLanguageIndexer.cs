@@ -13,9 +13,9 @@ namespace DevBitsLab.Mcp.SourceGraph.Indexing.Xaml;
 
 /// <summary>
 /// Built-in XAML <see cref="ILanguageIndexer"/>. Registered for the <c>.xaml</c> extension; emits
-/// the five XAML symbol kinds, the eight cross-language edge kinds (<c>code-behind</c>,
-/// <c>binds-path</c>, <c>binds-element</c>, <c>handles-event</c>, <c>uses-resource</c>,
-/// <c>instantiates-type</c>, <c>merges</c>, <c>applies-style</c>), and the
+/// the five XAML symbol kinds, the nine cross-language edge kinds (<c>code-behind</c>,
+/// <c>binds-to</c>, <c>binds-path</c>, <c>binds-element</c>, <c>handles-event</c>,
+/// <c>uses-resource</c>, <c>instantiates-type</c>, <c>merges</c>, <c>applies-style</c>), and the
 /// <c>xaml-attached-property</c> annotation flavor documented in
 /// <c>openspec/changes/xaml-language-indexer/specs/extensibility/spec.md</c>. The indexer is
 /// profile-aware: it detects the framework profile per file via
@@ -101,6 +101,7 @@ public sealed class XamlLanguageIndexer : ILanguageIndexer
         private readonly XamlLanguageProject? _project;
         private readonly XamlSemanticResolver? _semanticResolver;
         private readonly string _relativePath;
+        private readonly XamlAttribute? _xClassAttribute;
         private readonly string? _xClass;
         private readonly string _viewKey;
         private readonly Dictionary<string, string> _namedElementKeysByName = new(StringComparer.Ordinal);
@@ -122,7 +123,8 @@ public sealed class XamlLanguageIndexer : ILanguageIndexer
             _project = ctx.Project as XamlLanguageProject;
             _semanticResolver = semanticResolver;
             _relativePath = ToRepoRelative(ctx.RepoRoot, ctx.FilePath);
-            _xClass = doc.Root.FindAttribute(XamlReader.XamlNamespace, "Class")?.Value?.Trim();
+            _xClassAttribute = doc.Root.FindAttribute(XamlReader.XamlNamespace, "Class");
+            _xClass = _xClassAttribute?.Value?.Trim();
             _viewKey = $"xaml:view:{_relativePath}";
         }
 
@@ -177,6 +179,8 @@ public sealed class XamlLanguageIndexer : ILanguageIndexer
                 elementKey = EmitNonRoot(element, ancestors);
             }
 
+            EmitViewModelAssociationEdges(element, elementKey);
+
             // Attached properties become annotations on the element symbol.
             EmitAttachedPropertyAnnotations(element, elementKey);
 
@@ -215,13 +219,19 @@ public sealed class XamlLanguageIndexer : ILanguageIndexer
                 xmlSummary: null));
 
             // code-behind edge: xaml-view → csharp:T:<x:Class>
-            if (!string.IsNullOrEmpty(_xClass))
+            if (!string.IsNullOrEmpty(_xClass) && _xClassAttribute is not null)
             {
                 var typeKey = CanonicalKeys.ForType(_xClass!);
                 Events.Add(new IndexEvent.EdgeEmitted(
                     sourceCanonicalKey: _viewKey,
                     targetCanonicalKey: typeKey,
-                    edgeKindName: EdgeCodeBehind));
+                    edgeKindName: EdgeCodeBehind)
+                {
+                    Evidence = CreateAttributeEvidence(
+                        _xClassAttribute,
+                        EvidenceConfidence.Exact,
+                        metadata: null),
+                });
             }
         }
 
@@ -251,7 +261,8 @@ public sealed class XamlLanguageIndexer : ILanguageIndexer
                 // `<Button Grid.Row="2"/>` has no x:Name and no binding but the
                 // `xaml-attached-property` annotation contract requires a host symbol to attach
                 // to, so attached properties also justify synthesizing one.
-                if (!ElementNeedsSymbol(element))
+                if (!ElementNeedsSymbol(element)
+                    && (_semanticResolver?.GetViewModelAssociations(element).Count ?? 0) == 0)
                 {
                     // Use the parent's view key as the surrogate so subsequent emissions still
                     // have something to attach to (they'll skip when this returns the view).
@@ -285,6 +296,38 @@ public sealed class XamlLanguageIndexer : ILanguageIndexer
             EmitInstantiatesTypeEdge(element);
 
             return canonicalKey;
+        }
+
+        private void EmitViewModelAssociationEdges(XamlElement element, string hostKey)
+        {
+            if (_semanticResolver is null) return;
+            if (hostKey == _viewKey && element != _doc.Root) return;
+
+            foreach (var association in _semanticResolver.GetViewModelAssociations(element))
+            {
+                var metadata = new Dictionary<string, string>(StringComparer.Ordinal)
+                {
+                    ["association"] = "data-context",
+                    ["source"] = association.Source,
+                };
+                Events.Add(new IndexEvent.EdgeEmitted(
+                    sourceCanonicalKey: hostKey,
+                    targetCanonicalKey: association.TargetCanonicalKey,
+                    edgeKindName: EdgeKinds.BindsTo,
+                    metadata: metadata)
+                {
+                    Evidence = new EdgeEvidence(
+                        new SourceLocation(
+                            _ctx.FilePath,
+                            association.Line,
+                            association.Column,
+                            association.Line,
+                            association.Column + association.Length),
+                        association.Confidence,
+                        "xaml-semantic",
+                        metadata),
+                });
+            }
         }
 
         private void EmitAttachedPropertyAnnotations(XamlElement element, string hostKey)

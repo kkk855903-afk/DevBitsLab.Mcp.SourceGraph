@@ -1,6 +1,6 @@
 namespace Sample.Domain;
 
-public class Greeter : IGreeter
+public class Greeter : GreeterBase, IGreeter
 {
     private readonly string _prefix;
     private int _count;

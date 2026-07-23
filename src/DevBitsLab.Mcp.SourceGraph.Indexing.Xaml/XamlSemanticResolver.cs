@@ -18,6 +18,8 @@ internal sealed class XamlSemanticResolver
 {
     private readonly Compilation _compilation;
     private readonly Dictionary<XamlElement, XamlBindingContext?> _bindingContexts = new();
+    private readonly Dictionary<XamlElement, IReadOnlyList<XamlViewModelAssociation>>
+        _viewModelAssociations = new();
 
     private XamlSemanticResolver(Compilation compilation, XamlDocument document)
     {
@@ -60,6 +62,12 @@ internal sealed class XamlSemanticResolver
             context.Confidence,
             context.Source);
     }
+
+    public IReadOnlyList<XamlViewModelAssociation> GetViewModelAssociations(
+        XamlElement element) =>
+        _viewModelAssociations.TryGetValue(element, out var associations)
+            ? associations
+            : Array.Empty<XamlViewModelAssociation>();
 
     public IMethodSymbol? ResolveEventHandler(string? xClass, string handlerName)
     {
@@ -134,6 +142,7 @@ internal sealed class XamlSemanticResolver
         XamlBindingContext? inherited)
     {
         var effective = inherited;
+        var associations = new List<XamlViewModelAssociation>(capacity: 2);
 
         var dataContextAttribute = element.Attributes.FirstOrDefault(a =>
             string.IsNullOrEmpty(a.Prefix)
@@ -141,6 +150,13 @@ internal sealed class XamlSemanticResolver
         if (dataContextAttribute is not null)
         {
             effective = ResolveDataContextAttribute(dataContextAttribute, inherited);
+            AddAssociation(
+                associations,
+                effective,
+                "data-context-attribute",
+                dataContextAttribute.Line,
+                dataContextAttribute.Column,
+                QualifiedAttributeNameLength(dataContextAttribute));
         }
 
         var dataContextElements = element.Children
@@ -151,6 +167,17 @@ internal sealed class XamlSemanticResolver
             effective = dataContextElements.Length == 1
                 ? ResolveDataContextPropertyElement(dataContextElements[0])
                 : null;
+            if (dataContextElements.Length == 1)
+            {
+                var propertyElement = dataContextElements[0];
+                AddAssociation(
+                    associations,
+                    effective,
+                    "data-context-element",
+                    propertyElement.Line,
+                    propertyElement.Column,
+                    propertyElement.LocalName.Length);
+            }
         }
 
         var dataType = element.FindAttribute(XamlReader.XamlNamespace, "DataType");
@@ -163,14 +190,48 @@ internal sealed class XamlSemanticResolver
                     declaredType,
                     EvidenceConfidence.Exact,
                     "x-data-type");
+            AddAssociation(
+                associations,
+                effective,
+                "x-data-type",
+                dataType.Line,
+                dataType.Column,
+                QualifiedAttributeNameLength(dataType));
         }
 
         _bindingContexts[element] = effective;
+        _viewModelAssociations[element] = associations;
         foreach (var child in element.Children)
         {
             BuildBindingContexts(child, effective);
         }
     }
+
+    private static void AddAssociation(
+        ICollection<XamlViewModelAssociation> associations,
+        XamlBindingContext? context,
+        string source,
+        int line,
+        int column,
+        int length)
+    {
+        if (context is null) return;
+        var targetCanonicalKey = CanonicalKey(context.Type);
+        if (targetCanonicalKey is null) return;
+        associations.Add(new XamlViewModelAssociation(
+            targetCanonicalKey,
+            context.Confidence,
+            source,
+            line,
+            column,
+            Math.Max(1, length)));
+    }
+
+    private static int QualifiedAttributeNameLength(XamlAttribute attribute) =>
+        attribute.LocalName.Length
+        + (string.IsNullOrEmpty(attribute.Prefix)
+            ? 0
+            : attribute.Prefix.Length + 1);
 
     private XamlBindingContext? ResolveDataContextAttribute(
         XamlAttribute attribute,
@@ -435,6 +496,14 @@ internal sealed record XamlBindingContext(
     INamedTypeSymbol Type,
     EvidenceConfidence Confidence,
     string Source);
+
+internal sealed record XamlViewModelAssociation(
+    string TargetCanonicalKey,
+    EvidenceConfidence Confidence,
+    string Source,
+    int Line,
+    int Column,
+    int Length);
 
 internal sealed record XamlBindingTarget(
     IPropertySymbol Property,

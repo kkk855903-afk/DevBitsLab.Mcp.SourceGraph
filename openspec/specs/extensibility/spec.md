@@ -247,14 +247,20 @@ After this change, the host SHALL discover `ILanguageProjectFactory` instances f
 The `XamlLanguageIndexer` SHALL implement `ILanguageIndexer` and SHALL emit:
 
 - Five symbol kinds under the `xaml:` URI scheme: `xaml-view`, `xaml-element`, `xaml-resource`, `xaml-style`, `xaml-template`
-- Eight edge kinds: `code-behind`, `binds-path`, `binds-element`, `handles-event`, `uses-resource`, `instantiates-type`, `merges`, `applies-style`
+- Nine edge kinds: `code-behind`, `binds-to`, `binds-path`, `binds-element`, `handles-event`, `uses-resource`, `instantiates-type`, `merges`, `applies-style`
 - One annotation flavor: `xaml-attached-property`
 
-Cross-language edges (`code-behind`, `binds-path`, `handles-event`, `instantiates-type`) SHALL target byte-equal C# canonical keys from the privacy-sanitized Roslyn compilation used by the C# indexer. A scope-specific XAML project factory SHALL obtain that compilation lazily from the current sanitized solution so live edits do not retain a cold-start semantic snapshot.
+Cross-language edges (`code-behind`, `binds-to`, `binds-path`, `handles-event`, `instantiates-type`) SHALL target byte-equal C# canonical keys from the privacy-sanitized Roslyn compilation used by the C# indexer. A scope-specific XAML project factory SHALL obtain that compilation lazily from the current sanitized solution so live edits do not retain a cold-start semantic snapshot.
 
 #### Scenario: Code-behind edge joins XAML view to C# partial class
 - **WHEN** the indexer encounters `<Window x:Class="MyApp.Views.Main" ...>` as the root of `Views/Main.xaml`
-- **THEN** it emits `SymbolDeclared(CanonicalKey: "xaml:view:Views/Main.xaml", Kind: "xaml-view", ...)` and `EdgeEmitted(Src: "xaml:view:Views/Main.xaml", Dst: "csharp:T:MyApp.Views.Main", EdgeKindName: "code-behind", Metadata: null)`; the `dst` matches what the Roslyn indexer emitted for `MyApp.Views.Main`, so a query like `find_references --canonical-key csharp:T:MyApp.Views.Main` returns both the C# declaration and the XAML view
+- **THEN** it emits `SymbolDeclared(CanonicalKey: "xaml:view:Views/Main.xaml", Kind: "xaml-view", ...)` and `EdgeEmitted(Src: "xaml:view:Views/Main.xaml", Dst: "csharp:T:MyApp.Views.Main", EdgeKindName: "code-behind", Metadata: null)` with `Exact` `xaml-semantic` evidence on the `x:Class` attribute; the `dst` matches what the Roslyn indexer emitted for `MyApp.Views.Main`, so a query like `find_references --canonical-key csharp:T:MyApp.Views.Main` returns both the C# declaration and the XAML view
+
+#### Scenario: Explicit view-model context is a first-class graph relation
+- **WHEN** a view or XAML element declares a semantically resolvable `x:DataType` or explicit `DataContext`, including the property-element form, even when the document contains no `Binding`
+- **THEN** it emits an `EdgeKinds.BindsTo` (`binds-to`) edge from that view/element to the real C# view-model type with Metadata containing `"association" = "data-context"` and `"source"` identifying `x-data-type`, `data-context-attribute`, or `data-context-element`
+- **AND** the edge carries `xaml-semantic` evidence at the exact declaring attribute or property-element range
+- **AND** an unresolved or ambiguous type produces no edge and no synthetic target symbol
 
 #### Scenario: Event handler edge resolves to C# method
 - **WHEN** the indexer encounters `<Button Click="OnSave"/>` inside a view whose root is `<Window x:Class="MyApp.Views.Main">`, and Roslyn resolves exactly one accessible instance `void OnSave(object, EventArgs-derived)` method

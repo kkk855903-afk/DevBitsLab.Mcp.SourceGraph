@@ -1,0 +1,6 @@
+<UserControl xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:vm="clr-namespace:SampleWpf.ViewModels"
+             x:DataType="vm:MissingViewModel">
+    <Grid />
+</UserControl>

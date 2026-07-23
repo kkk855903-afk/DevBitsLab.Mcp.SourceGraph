@@ -145,4 +145,63 @@ public sealed class IndexFixtureTests : IAsyncLifetime
                 item.Location.EndColumn))
             .Should().OnlyHaveUniqueItems("separate call sites must not collapse");
     }
+
+    [Fact]
+    public async Task RoslynTypeRelations_preserveExactBaseTypeEvidence()
+    {
+        await AssertTypeRelationEvidenceAsync(
+            sourceCanonicalKey: CanonicalKeys.ForType("Sample.Domain.Greeter"),
+            targetCanonicalKey: CanonicalKeys.ForType("Sample.Domain.GreeterBase"),
+            edgeKind: EdgeKinds.Inherits,
+            expectedFileName: "Greeter.cs",
+            expectedLine: 3,
+            expectedText: "GreeterBase");
+        await AssertTypeRelationEvidenceAsync(
+            sourceCanonicalKey: CanonicalKeys.ForType("Sample.Domain.Greeter"),
+            targetCanonicalKey: CanonicalKeys.ForType("Sample.Domain.IGreeter"),
+            edgeKind: EdgeKinds.Implements,
+            expectedFileName: "Greeter.cs",
+            expectedLine: 3,
+            expectedText: "IGreeter");
+    }
+
+    private async Task AssertTypeRelationEvidenceAsync(
+        string sourceCanonicalKey,
+        string targetCanonicalKey,
+        string edgeKind,
+        string expectedFileName,
+        int expectedLine,
+        string expectedText)
+    {
+        const string typeKeyPrefix = "csharp:T:";
+        sourceCanonicalKey.Should().StartWith(typeKeyPrefix);
+        var source = (await _store!.FindSymbolsAsync(
+                sourceCanonicalKey.Substring(typeKeyPrefix.Length)))
+            .Should().ContainSingle(hit => hit.CanonicalKey == sourceCanonicalKey)
+            .Which;
+        var target = (await _store.ListCalleesAsync(
+                source.Id,
+                limit: 50,
+                edgeKind: edgeKind))
+            .Should().ContainSingle(hit => hit.CanonicalKey == targetCanonicalKey)
+            .Which;
+
+        var evidence = await _store.ListEdgeEvidenceAsync(
+            source.Id,
+            target.Id,
+            edgeKind);
+        evidence.Should().ContainSingle();
+        evidence[0].Confidence.Should().Be(CoreEvidenceConfidence.Exact);
+        evidence[0].Producer.Should().Be("roslyn");
+        evidence[0].Location.FilePath.Should()
+            .EndWith(expectedFileName);
+        evidence[0].Location.StartLine.Should().Be(expectedLine);
+
+        var line = File.ReadLines(evidence[0].Location.FilePath)
+            .ElementAt(evidence[0].Location.StartLine - 1);
+        line.Substring(
+                evidence[0].Location.StartColumn - 1,
+                evidence[0].Location.EndColumn - evidence[0].Location.StartColumn)
+            .Should().Be(expectedText);
+    }
 }

@@ -66,7 +66,69 @@ public sealed class XamlIndexFixtureTests : IAsyncLifetime
         var view = (await _wpfStore!.FindSymbolsAsync("Views/MainWindow.xaml"))
             .First(h => h.Kind == "xaml-view");
         var callees = await _wpfStore.ListCalleesAsync(view.Id, limit: 50, edgeKind: "code-behind");
-        callees.Should().Contain(c => c.Fqn.Contains("SampleWpf.Views.MainWindow", StringComparison.Ordinal));
+        var codeBehind = callees.Should().ContainSingle(c =>
+            c.Fqn.Contains("SampleWpf.Views.MainWindow", StringComparison.Ordinal)).Subject;
+
+        var evidence = await _wpfStore.ListEdgeEvidenceAsync(
+            view.Id,
+            codeBehind.Id,
+            "code-behind");
+        evidence.Should().ContainSingle();
+        evidence[0].Confidence.Should().Be(CoreEvidenceConfidence.Exact);
+        evidence[0].Producer.Should().Be("xaml-semantic");
+        EvidenceText(evidence[0]).Should().Be("x:Class");
+    }
+
+    [Fact]
+    public async Task SampleWpf_viewModelAssociationExistsWithoutAnyBinding()
+    {
+        var view = (await _wpfStore!.FindSymbolsAsync("Views/ViewModelOnlyView.xaml"))
+            .First(h => h.Kind == "xaml-view");
+        var targets = await _wpfStore.ListCalleesAsync(
+            view.Id,
+            limit: 50,
+            edgeKind: EdgeKinds.BindsTo);
+        var viewModel = targets.Should().ContainSingle(c =>
+            c.CanonicalKey == CanonicalKeys.ForType(
+                "SampleWpf.ViewModels.MainViewModel")).Subject;
+
+        var payload = JsonSerializer.Deserialize<Dictionary<string, string>>(
+            viewModel.PayloadJson!);
+        payload.Should().Contain("association", "data-context");
+        payload.Should().ContainKey("source");
+
+        var evidence = await _wpfStore.ListEdgeEvidenceAsync(
+            view.Id,
+            viewModel.Id,
+            EdgeKinds.BindsTo);
+        evidence.Should().HaveCount(2,
+            "the explicit DataContext and x:DataType independently support the association");
+        evidence.Should().OnlyContain(item =>
+            item.Confidence == CoreEvidenceConfidence.Exact
+            && item.Producer == "xaml-semantic");
+        evidence.Select(item => item.Metadata!["association"])
+            .Should().OnlyContain(value => value == "data-context");
+        evidence.Select(item => item.Metadata!["source"])
+            .Should().BeEquivalentTo("x-data-type", "data-context-element");
+        evidence.Select(EvidenceText)
+            .Should().BeEquivalentTo("x:DataType", "UserControl.DataContext");
+    }
+
+    [Fact]
+    public async Task SampleWpf_unresolvedViewModelAssociationDoesNotCreateFakeTarget()
+    {
+        var view = (await _wpfStore!.FindSymbolsAsync(
+                "Views/UnknownContextView.xaml"))
+            .First(h => h.Kind == "xaml-view");
+
+        (await _wpfStore.ListCalleesAsync(
+            view.Id,
+            limit: 50,
+            edgeKind: EdgeKinds.BindsTo)).Should().BeEmpty();
+        (await _wpfStore.FindSymbolsAsync("MissingViewModel")).Should().NotContain(
+            hit => hit.CanonicalKey == CanonicalKeys.ForType(
+                "SampleWpf.ViewModels.MissingViewModel"),
+            "an unresolved x:DataType must not manufacture a C# graph symbol");
     }
 
     [Fact]
@@ -375,6 +437,15 @@ public sealed class XamlIndexFixtureTests : IAsyncLifetime
             if (Directory.Exists(candidate)) return candidate;
         }
         throw new DirectoryNotFoundException("Could not locate tests/fixtures/" + fixtureName + " from " + AppContext.BaseDirectory);
+    }
+
+    private static string EvidenceText(DevBitsLab.Mcp.SourceGraph.Core.Evidence evidence)
+    {
+        var line = File.ReadLines(evidence.Location.FilePath)
+            .ElementAt(evidence.Location.StartLine - 1);
+        return line.Substring(
+            evidence.Location.StartColumn - 1,
+            evidence.Location.EndColumn - evidence.Location.StartColumn);
     }
 
     private static void SafeDeleteWithDir(string path)
