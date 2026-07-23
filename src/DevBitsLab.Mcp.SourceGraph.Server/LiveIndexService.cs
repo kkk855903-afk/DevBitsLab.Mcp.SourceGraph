@@ -476,7 +476,11 @@ public sealed class LiveIndexService : BackgroundService
                 indexerSink = new NoOpEmbeddingsRequestSink();
             }
 
-            indexer = new RoslynIndexer(store, _loggerFactory.CreateLogger<RoslynIndexer>(), indexerSink);
+            indexer = new RoslynIndexer(
+                store,
+                _loggerFactory.CreateLogger<RoslynIndexer>(),
+                indexerSink,
+                privacyRoot: scope.Root);
             if (!_historyOptions.Disabled)
             {
                 indexer.OnFileIndexed = (fileId, path, sha) =>
@@ -605,11 +609,11 @@ public sealed class LiveIndexService : BackgroundService
             // built-in XAML factory). Then dispatch every non-`.cs` file the registry knows about
             // — XAML and any plugin-supplied indexer (.py, .ts, …) — so their events land in the
             // store before the analyzer pipeline runs over them.
-            if (host.Indexer.Workspace is { } workspace)
+            if (host.Indexer.SanitizedSolution is not null)
             {
                 var perScopeFactories = new LanguageProjectFactoryRegistry();
                 foreach (var f in _projectFactories.All()) perScopeFactories.Register(f);
-                perScopeFactories.Register(new MSBuildLanguageProjectFactory(workspace));
+                perScopeFactories.Register(new MSBuildLanguageProjectFactory(host.Indexer));
                 var perScopeDispatcher = new LanguageIndexerDispatcher(
                     _languageDispatcher.Indexers,
                     perScopeFactories,
@@ -840,7 +844,7 @@ public sealed class LiveIndexService : BackgroundService
             logger: _loggerFactory.CreateLogger<SolutionWatcher>());
         host.Watcher = watcher;
 
-        _logger.LogInformation("Scope `{Id}`: watching {Root} for .cs and .git/HEAD changes", host.Scope.Id, watchRoot);
+        _logger.LogInformation("Scope `{Id}`: watching {Root} for .cs, .xaml, and .git/HEAD changes", host.Scope.Id, watchRoot);
 
         // Run the watcher loop on a dedicated task so we can supervise multiple scopes from one
         // ExecuteAsync. Failures inside the loop are logged per-scope; we never let one scope's

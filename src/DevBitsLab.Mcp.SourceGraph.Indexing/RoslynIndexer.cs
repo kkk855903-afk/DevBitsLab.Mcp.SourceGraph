@@ -43,8 +43,11 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
     private readonly IEmbeddingsRequestSink _embeddingsSink;
     private readonly ILogger<RoslynIndexer> _logger;
     private readonly SemaphoreSlim _lock = new(1, 1);
+    private readonly string? _configuredPrivacyRoot;
 
     private MSBuildWorkspace? _workspace;
+    private Solution? _sanitizedSolution;
+    private PrivacyPathPolicy? _privacyPolicy;
     private string? _solutionPath;
 
     private readonly Dictionary<string, long> _symbolIdByKey = new(StringComparer.Ordinal);
@@ -69,11 +72,16 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
     /// </summary>
     public Func<long, string, byte[], Task>? OnFileIndexed { get; set; }
 
-    public RoslynIndexer(IGraphStore store, ILogger<RoslynIndexer>? logger = null, IEmbeddingsRequestSink? embeddingsSink = null)
+    public RoslynIndexer(
+        IGraphStore store,
+        ILogger<RoslynIndexer>? logger = null,
+        IEmbeddingsRequestSink? embeddingsSink = null,
+        string? privacyRoot = null)
     {
         _store = store;
         _logger = logger ?? NullLogger<RoslynIndexer>.Instance;
         _embeddingsSink = embeddingsSink ?? new NoOpEmbeddingsRequestSink();
+        _configuredPrivacyRoot = privacyRoot is null ? null : Path.GetFullPath(privacyRoot);
     }
 
     public string? SolutionPath => _solutionPath;
@@ -86,12 +94,27 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
     /// </summary>
     public MSBuildWorkspace? Workspace => _workspace;
 
+    /// <summary>
+    /// The immutable, privacy-filtered snapshot used by every indexing and project-discovery
+    /// operation. Callers must not substitute <see cref="Workspace"/>'s unfiltered
+    /// <see cref="MSBuildWorkspace.CurrentSolution"/>.
+    /// </summary>
+    public Solution? SanitizedSolution => _sanitizedSolution;
+
     public async Task OpenAsync(string solutionPath, CancellationToken ct = default)
     {
         MSBuildHost.EnsureRegistered();
         await _store.EnsureSchemaAsync(ct).ConfigureAwait(false);
 
         _solutionPath = Path.GetFullPath(solutionPath);
+        var privacyRoot = _configuredPrivacyRoot ?? Path.GetDirectoryName(_solutionPath)
+            ?? throw new InvalidOperationException("The solution path has no containing directory.");
+        _privacyPolicy = new PrivacyPathPolicy(privacyRoot);
+        if (_privacyPolicy.IsExcluded(_solutionPath))
+        {
+            throw new InvalidOperationException("The solution path is outside the indexing privacy boundary.");
+        }
+
         _workspace = MSBuildWorkspace.Create();
         _workspace.RegisterWorkspaceFailedHandler(e =>
         {
@@ -102,9 +125,16 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         });
 
         var sw = Stopwatch.StartNew();
-        await _workspace.OpenSolutionAsync(_solutionPath, cancellationToken: ct).ConfigureAwait(false);
+        // MSBuildWorkspace evaluates project files before Roslyn gives us a Solution to filter.
+        // Sanitizing immediately after OpenSolutionAsync prevents excluded documents from reaching
+        // compilation, generators, diagnostics, or persistence, but it does not sandbox MSBuild
+        // evaluation itself. Untrusted solutions still need process/OS isolation.
+        var loadedSolution = await _workspace.OpenSolutionAsync(
+            _solutionPath,
+            cancellationToken: ct).ConfigureAwait(false);
+        _sanitizedSolution = SolutionPrivacySanitizer.Sanitize(loadedSolution, _privacyPolicy);
         _logger.LogInformation("Opened {Path} ({ProjectCount} projects) in {Elapsed}",
-            _solutionPath, _workspace.CurrentSolution.Projects.Count(), sw.Elapsed);
+            _solutionPath, _sanitizedSolution.Projects.Count(), sw.Elapsed);
     }
 
     public async Task<IndexResult> IndexAllAsync(CancellationToken ct = default)
@@ -113,8 +143,9 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         await _lock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
-            await ProbeProjectCompilationsAsync(_workspace!.CurrentSolution.Projects, ct).ConfigureAwait(false);
-            var docs = (await AllCSharpDocumentsAsync(ct).ConfigureAwait(false)).ToList();
+            var solution = _sanitizedSolution!;
+            await ProbeProjectCompilationsAsync(solution.Projects, ct).ConfigureAwait(false);
+            var docs = (await AllCSharpDocumentsAsync(solution, ct).ConfigureAwait(false)).ToList();
             return await IndexCoreAsync(docs, fullReset: false, ct).ConfigureAwait(false);
         }
         finally
@@ -131,11 +162,18 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         await _lock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
+            var privacyPolicy = _privacyPolicy!;
             // Build an updated Solution snapshot in memory. We do NOT call
             // _workspace.TryApplyChanges — MSBuildWorkspace refuses ChangeDocument by default and
             // would throw. The local `solution` value is what IndexCoreAsync walks.
-            var solution = _workspace!.CurrentSolution;
-            var pathSet = new HashSet<string>(paths.Select(Path.GetFullPath), StringComparer.OrdinalIgnoreCase);
+            var solution = _sanitizedSolution!;
+            var pathSet = new HashSet<string>(
+                paths.Select(Path.GetFullPath).Where(path => !privacyPolicy.IsExcluded(path)),
+                StringComparer.OrdinalIgnoreCase);
+            if (pathSet.Count == 0)
+            {
+                return new IndexResult(0, 0, 0, TimeSpan.Zero);
+            }
             var docs = new List<Document>();
             var deleted = new List<string>();
 
@@ -171,6 +209,8 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                     solution = solution.WithDocumentText(did, text);
                 }
             }
+
+            _sanitizedSolution = solution;
 
             // Resolve documents from the LOCAL updated solution (not _workspace.CurrentSolution).
             var touchedProjects = new HashSet<ProjectId>();
@@ -249,7 +289,10 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         try
         {
             _workspace!.CloseSolution();
-            await _workspace.OpenSolutionAsync(slnPath, cancellationToken: ct).ConfigureAwait(false);
+            var loadedSolution = await _workspace.OpenSolutionAsync(
+                slnPath,
+                cancellationToken: ct).ConfigureAwait(false);
+            _sanitizedSolution = SolutionPrivacySanitizer.Sanitize(loadedSolution, _privacyPolicy!);
         }
         finally
         {
@@ -260,7 +303,10 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
 
     private void EnsureOpen()
     {
-        if (_workspace is null) throw new InvalidOperationException("Call OpenAsync before indexing.");
+        if (_workspace is null || _sanitizedSolution is null || _privacyPolicy is null)
+        {
+            throw new InvalidOperationException("Call OpenAsync before indexing.");
+        }
     }
 
     /// <summary>
@@ -313,11 +359,13 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         _probedFailedProjectIds = failedIds;
     }
 
-    private async Task<IEnumerable<Document>> AllCSharpDocumentsAsync(CancellationToken ct)
+    private async Task<IEnumerable<Document>> AllCSharpDocumentsAsync(
+        Solution solution,
+        CancellationToken ct)
     {
         // Regular documents: same set we always walked, minus documents in projects whose
         // pre-flight compilation probe failed.
-        var regular = _workspace!.CurrentSolution.Projects
+        var regular = solution.Projects
             .Where(p => p.Language == LanguageNames.CSharp && !_probedFailedProjectIds.Contains(p.Id))
             .SelectMany(p => p.Documents)
             .Where(d => d.SourceCodeKind == SourceCodeKind.Regular && !string.IsNullOrEmpty(d.FilePath));
@@ -330,7 +378,7 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         // Failed-probe projects are skipped here too — their generators would almost certainly
         // throw given the underlying compilation is unavailable.
         var generatedList = new List<Document>();
-        foreach (var project in _workspace.CurrentSolution.Projects
+        foreach (var project in solution.Projects
                      .Where(p => p.Language == LanguageNames.CSharp && !_probedFailedProjectIds.Contains(p.Id)))
         {
             ct.ThrowIfCancellationRequested();
@@ -389,6 +437,12 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
     private async Task<IndexResult> IndexCoreAsync(IReadOnlyList<Document> documents, bool fullReset, CancellationToken ct)
     {
         var sw = Stopwatch.StartNew();
+
+        // Source-generated documents are in-memory Roslyn outputs and may legitimately carry an
+        // obj/ pseudo-path. Ordinary documents must remain inside the sanitized privacy boundary.
+        documents = documents
+            .Where(d => d is SourceGeneratedDocument || !_privacyPolicy!.IsExcluded(d.FilePath))
+            .ToList();
 
         // Defensive filter: skip documents in projects whose pre-flight probe failed. The probe
         // populates _probedFailedProjectIds before AllCSharpDocumentsAsync is called, so this is
@@ -1015,7 +1069,7 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
             }
             catch (Exception ex)
             {
-                var project = _workspace!.CurrentSolution.GetProject(pid);
+                var project = _sanitizedSolution!.GetProject(pid);
                 _logger.LogWarning(ex, "Failed to read diagnostics for {Project}", project?.Name ?? pid.ToString());
                 continue;
             }

@@ -542,7 +542,14 @@ static async Task<int> RunIndexAsync(CommandLine cli)
         ? Task.CompletedTask
         : RunHistoryPipelineAsync(historyQueue, store, blamer, loggerFactory.CreateLogger<HistoryHostedService>());
 
-    await using var indexer = new RoslynIndexer(store, loggerFactory.CreateLogger<RoslynIndexer>(), sink);
+    // Respect an explicit --root so solutions kept in a subdirectory can still reference
+    // ordinary projects elsewhere in the repository without being mistaken for root escapes.
+    var repoRootForIndex = cli.ResolvedRepoRoot();
+    await using var indexer = new RoslynIndexer(
+        store,
+        loggerFactory.CreateLogger<RoslynIndexer>(),
+        sink,
+        privacyRoot: repoRootForIndex);
     if (!historyDisabled)
     {
         indexer.OnFileIndexed = (fileId, path, sha) =>
@@ -558,7 +565,6 @@ static async Task<int> RunIndexAsync(CommandLine cli)
     // here so a CI / smoke-test invocation produces the same per-scope graph the live server
     // would. Skipped silently when no plugins are declared in `.sourcegraph.json`, preserving
     // the v0.5.0 zero-config single-solution path.
-    var repoRootForIndex = Path.GetDirectoryName(solutionFull) ?? cli.ResolvedRepoRoot();
     DevBitsLab.Mcp.SourceGraph.Storage.ScopeConfig? indexScopeConfig = null;
     try
     {
@@ -601,9 +607,9 @@ static async Task<int> RunIndexAsync(CommandLine cli)
         {
             foreach (var lpf in record.LanguageProjectFactories) projectFactoryRegistry.Register(lpf, record);
         }
-        if (indexer.Workspace is { } ws)
+        if (indexer.SanitizedSolution is not null)
         {
-            projectFactoryRegistry.Register(new MSBuildLanguageProjectFactory(ws));
+            projectFactoryRegistry.Register(new MSBuildLanguageProjectFactory(indexer));
         }
 
         // Dispatch non-C# files (XAML + plugin-supplied) for the one-shot path. The C# bulk index

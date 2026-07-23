@@ -1,0 +1,7 @@
+#warning MEDINTEROP_PRIVACY_DIAGNOSTIC_CANARY_7F8E61
+
+namespace Sample.App.PatientData;
+
+internal sealed class MEDINTEROP_PRIVACY_SYMBOL_CANARY_7F8E61
+{
+}

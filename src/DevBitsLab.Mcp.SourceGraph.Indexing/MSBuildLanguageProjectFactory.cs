@@ -1,24 +1,32 @@
 using DevBitsLab.Mcp.SourceGraph.Sdk;
+using DevBitsLab.Mcp.SourceGraph.Core;
+using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.MSBuild;
 
 namespace DevBitsLab.Mcp.SourceGraph.Indexing;
 
 /// <summary>
-/// <see cref="ILanguageProjectFactory"/> backed by an <see cref="MSBuildWorkspace"/>. The host
-/// hands the same workspace it uses for <see cref="RoslynIndexer"/> so the discovered projects
-/// share state (compilations, source-generated docs) with the bulk indexer path.
+/// <see cref="ILanguageProjectFactory"/> backed by a Roslyn <see cref="Solution"/> snapshot.
+/// The host binds it to <see cref="RoslynIndexer.SanitizedSolution"/> so project discovery shares
+/// the same privacy-filtered project state as the bulk indexer path.
 ///
-/// <para><see cref="DiscoverAsync"/> reflects the workspace's solution at call time — if the host
-/// reloads the workspace between calls, the next discovery picks up the change without the factory
-/// needing its own invalidation hook.</para>
+/// <para>The workspace constructor remains for API compatibility. Its snapshot is sanitized inside
+/// <see cref="DiscoverAsync"/> before any project is exposed.</para>
 /// </summary>
 public sealed class MSBuildLanguageProjectFactory : ILanguageProjectFactory
 {
-    private readonly MSBuildWorkspace _workspace;
+    private readonly Func<Solution?> _solutionProvider;
 
     public MSBuildLanguageProjectFactory(MSBuildWorkspace workspace)
     {
-        _workspace = workspace ?? throw new ArgumentNullException(nameof(workspace));
+        ArgumentNullException.ThrowIfNull(workspace);
+        _solutionProvider = () => workspace.CurrentSolution;
+    }
+
+    public MSBuildLanguageProjectFactory(RoslynIndexer indexer)
+    {
+        ArgumentNullException.ThrowIfNull(indexer);
+        _solutionProvider = () => indexer.SanitizedSolution;
     }
 
     /// <inheritdoc />
@@ -34,9 +42,18 @@ public sealed class MSBuildLanguageProjectFactory : ILanguageProjectFactory
     /// <inheritdoc />
     public Task<IReadOnlyList<ILanguageProject>> DiscoverAsync(string repoRoot, CancellationToken ct)
     {
-        // The workspace owns solution open/close; the factory just exposes whatever is currently
-        // loaded. Re-discovering after a solution reload will surface the new project list.
-        var projects = _workspace.CurrentSolution.Projects
+        var solution = _solutionProvider();
+        if (solution is null)
+        {
+            return Task.FromResult<IReadOnlyList<ILanguageProject>>(Array.Empty<ILanguageProject>());
+        }
+
+        // Apply the boundary here as well for callers using the compatibility workspace
+        // constructor. An MSBuild workspace is not a sandbox; this only prevents excluded Roslyn
+        // inputs from being handed to downstream indexers after project evaluation.
+        var privacyPolicy = new PrivacyPathPolicy(Path.GetFullPath(repoRoot));
+        var sanitized = SolutionPrivacySanitizer.Sanitize(solution, privacyPolicy);
+        var projects = sanitized.Projects
             .Select(p => (ILanguageProject)new MSBuildLanguageProject(p))
             .ToList();
         return Task.FromResult<IReadOnlyList<ILanguageProject>>(projects);
