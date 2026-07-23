@@ -95,8 +95,28 @@ public sealed record Edge(
     long Src,
     long Dst,
     string Kind,
-    IReadOnlyDictionary<string, string>? Metadata = null,
-    Evidence? Evidence = null);
+    IReadOnlyDictionary<string, string>? Metadata = null)
+{
+    /// <summary>
+    /// Occurrence-level proof for this emission. Kept outside the primary constructor so the
+    /// original four-argument constructor remains binary-compatible with existing consumers.
+    /// </summary>
+    public Evidence? Evidence { get; init; }
+
+    /// <summary>
+    /// Convenience overload for callers that already have occurrence evidence.
+    /// </summary>
+    public Edge(
+        long Src,
+        long Dst,
+        string Kind,
+        IReadOnlyDictionary<string, string>? Metadata,
+        Evidence? Evidence)
+        : this(Src, Dst, Kind, Metadata)
+    {
+        this.Evidence = Evidence;
+    }
+}
 
 /// <summary>
 /// One annotation attached to an indexed symbol — a .NET <c>[Attribute]</c>, a TS

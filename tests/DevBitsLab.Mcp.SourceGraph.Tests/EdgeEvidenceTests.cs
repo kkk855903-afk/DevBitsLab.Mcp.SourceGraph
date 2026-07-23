@@ -58,9 +58,9 @@ public sealed class EdgeEvidenceTests : IAsyncLifetime
 
         await _store!.BulkInsertEdgesAsync(new[]
         {
-            new Edge(sourceId, targetId, "calls", Evidence: first),
-            new Edge(sourceId, targetId, "calls", Evidence: second),
-            new Edge(sourceId, targetId, "calls", Evidence: first),
+            new Edge(sourceId, targetId, "calls") { Evidence = first },
+            new Edge(sourceId, targetId, "calls") { Evidence = second },
+            new Edge(sourceId, targetId, "calls") { Evidence = first },
         });
 
         (await CountAsync("edges")).Should().Be(1);
@@ -82,6 +82,9 @@ public sealed class EdgeEvidenceTests : IAsyncLifetime
         var surviving = await _store.ListEdgeEvidenceAsync(sourceId, targetId, "calls");
         surviving.Should().ContainSingle();
         surviving[0].ProducingFileId.Should().Be(secondProducerFileId);
+        (await GetEdgePayloadAsync(sourceId, targetId, "calls")).Should().Be(
+            """{"operation":"second"}""",
+            "the compatibility payload must follow the earliest surviving evidence");
 
         await _store.ClearFileOutgoingAsync(secondProducerFileId);
 
@@ -138,10 +141,48 @@ public sealed class EdgeEvidenceTests : IAsyncLifetime
     public async Task ListingEvidence_rejectsUnboundedOrMalformedQueries()
     {
         var zeroLimit = () => _store!.ListEdgeEvidenceAsync(1, 2, "calls", limit: 0);
+        var excessiveLimit = () => _store!.ListEdgeEvidenceAsync(1, 2, "calls", limit: 1001);
         var emptyKind = () => _store!.ListEdgeEvidenceAsync(1, 2, " ");
 
         await zeroLimit.Should().ThrowAsync<ArgumentOutOfRangeException>();
+        await excessiveLimit.Should().ThrowAsync<ArgumentOutOfRangeException>();
         await emptyKind.Should().ThrowAsync<ArgumentException>();
+    }
+
+    [Fact]
+    public async Task Evidence_requiresAnIndexedProducerWithTheSamePath()
+    {
+        var sourcePath = Path.Join(_tempDir, "ValidatedSource.cs");
+        var targetPath = Path.Join(_tempDir, "ValidatedTarget.cs");
+        var sourceFileId = await SeedFileAsync(sourcePath);
+        var targetFileId = await SeedFileAsync(targetPath);
+        var sourceId = await SeedSymbolAsync(sourceFileId, "ValidatedSource", "Evidence.ValidatedSource");
+        var targetId = await SeedSymbolAsync(targetFileId, "ValidatedTarget", "Evidence.ValidatedTarget");
+
+        var missingProducer = new Evidence(
+            999_999,
+            new SourceLocation(sourcePath, 1, 1, 1, 2),
+            EvidenceConfidence.Exact,
+            "test");
+        var wrongPath = new Evidence(
+            sourceFileId,
+            new SourceLocation(Path.Join(_tempDir, "PatientData", "wrong.cs"), 1, 1, 1, 2),
+            EvidenceConfidence.Exact,
+            "test");
+
+        var insertMissing = () => _store!.BulkInsertEdgesAsync(new[]
+        {
+            new Edge(sourceId, targetId, "calls") { Evidence = missingProducer },
+        });
+        var insertMismatch = () => _store!.BulkInsertEdgesAsync(new[]
+        {
+            new Edge(sourceId, targetId, "calls") { Evidence = wrongPath },
+        });
+
+        await insertMissing.Should().ThrowAsync<InvalidOperationException>();
+        await insertMismatch.Should().ThrowAsync<InvalidOperationException>();
+        (await CountAsync("edges")).Should().Be(0, "failed evidence inserts are transactional");
+        (await CountAsync("edge_evidence")).Should().Be(0);
     }
 
     private async Task<long> SeedFileAsync(string path) =>
@@ -168,5 +209,18 @@ public sealed class EdgeEvidenceTests : IAsyncLifetime
         await using var connection = new SqliteConnection($"Data Source={_dbPath}");
         await connection.OpenAsync();
         return await connection.ExecuteScalarAsync<long>($"SELECT COUNT(*) FROM {table};");
+    }
+
+    private async Task<string?> GetEdgePayloadAsync(long src, long dst, string kind)
+    {
+        await using var connection = new SqliteConnection($"Data Source={_dbPath}");
+        await connection.OpenAsync();
+        return await connection.ExecuteScalarAsync<string?>(
+            """
+            SELECT payload
+            FROM edges
+            WHERE src = @src AND dst = @dst AND kind_name = @kind;
+            """,
+            new { src, dst, kind });
     }
 }

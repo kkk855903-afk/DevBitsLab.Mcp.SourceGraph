@@ -51,15 +51,18 @@ via triggers on `symbols`.
 
 ### Requirement: Per-file outgoing cleanup
 `ClearFileOutgoingAsync(fileId)` SHALL delete only the refs whose
-`file_id = fileId` and the edges whose `src` lives in that file, leaving
-the file's symbols and any incoming refs/edges intact.
+`file_id = fileId` and edge-evidence occurrences whose
+`producing_file_id = fileId`. It SHALL then delete each logical edge that
+has no remaining evidence, leaving the file's symbols and independently
+supported incoming/outgoing edges intact.
 
 #### Scenario: Reset a file's outgoing data before reindex
 - **WHEN** `ClearFileOutgoingAsync(F)` is called as the first step of a live
   reindex of file `F`
 - **THEN** all rows in `refs` with `file_id = F` are removed, all rows in
-  `edges` whose `src` matches `(SELECT id FROM symbols WHERE file_id = F)`
-  are removed, and no rows in `symbols` are touched
+  `edge_evidence` with `producing_file_id = F` are removed, logical
+  `edges` without any remaining evidence are removed, logical edges still
+  supported by another producer are retained, and no rows in `symbols` are touched
 
 ### Requirement: Reconcile a file's symbol set
 `DeleteSymbolsForFileNotInAsync(fileId, keepKeys)` SHALL remove every symbol
@@ -181,27 +184,51 @@ The `edges` table SHALL include a `payload TEXT NULL` column that stores the JSO
 - **WHEN** an edge is emitted with `Metadata = { ["path"] = "User.Name" }`
 - **THEN** the resulting `edges` row has `payload = '{"path":"User.Name"}'` (JSON object form), and `json_extract(payload, '$.path')` returns `'User.Name'`
 
-### Requirement: Stable view layer over the underlying tables
-The storage layer SHALL ship a versioned set of read-only SQL views (`v_symbols`, `v_files`, `v_edges`, `v_references`, `v_scopes`, `v_annotations`, `v_diagnostics`, `v_history`) that present a denormalised, agent-facing contract over the underlying `symbols` / `edges` / `symbol_references` / `files` / `annotations` / `diagnostics` / `symbol_history` tables and the `_meta.db` scope-registry tables. The views SHALL be the public contract for any consumer that runs ad-hoc SQL via the MCP `query_graph` tool; the underlying tables remain implementation details and may evolve without bumping `Views.SchemaVersion`.
+### Requirement: Occurrence-level edge evidence
+The schema SHALL store one logical `edges` row per `(src, dst, kind_name)` and one
+`edge_evidence` row per independently attributable occurrence. Each evidence row SHALL
+carry the producing file id, the matching indexed file path, a valid 1-based source range,
+an ordered confidence (`0=inferred`, `1=semantic`, `2=exact`), a non-empty producer, and
+optional occurrence metadata. Duplicate evidence emissions SHALL be idempotent.
 
-`Views.SchemaVersion` SHALL be a compile-time integer constant exposed on the storage assembly (current value `2`); it SHALL bump on **any view-set change** — addition, removal, column rename, or column-type change — so clients that cache `describe_schema` by version always re-introspect after a server upgrade. The original "backwards-incompatible only" wording is superseded: cache-aware clients need a signal even for additive changes (a new view added without a version bump would otherwise be invisible to a client still serving cached schema).
+Legacy callers that omit evidence SHALL receive an `inferred` proof at the source
+declaration for compatibility. New production indexers SHALL provide the actual producing
+file and occurrence range.
+
+#### Scenario: Repeated edge keeps distinct call sites
+- **WHEN** the same caller emits two `calls` relationships to the same callee from two source ranges
+- **THEN** `edges` contains one logical row and `edge_evidence` contains two rows
+
+#### Scenario: Producer cleanup retains independently supported edge
+- **GIVEN** files `F1` and `F2` each produced evidence for the same logical edge
+- **WHEN** `ClearFileOutgoingAsync(F1)` runs
+- **THEN** only `F1`'s evidence is removed, the logical edge remains supported by `F2`, and the compatibility `edges.payload` reflects surviving evidence rather than deleted metadata
+
+#### Scenario: Evidence cannot spoof another path
+- **WHEN** evidence names a missing producing file id or a path that differs from that file's indexed path
+- **THEN** the write fails transactionally and neither the logical edge nor the evidence row is persisted
+
+### Requirement: Stable view layer over the underlying tables
+The storage layer SHALL ship a versioned set of read-only SQL views (`v_symbols`, `v_files`, `v_edges`, `v_edge_evidence`, `v_references`, `v_scopes`, `v_annotations`, `v_diagnostics`, `v_history`) that present a denormalised, agent-facing contract over the underlying `symbols` / `edges` / `edge_evidence` / `symbol_references` / `files` / `annotations` / `diagnostics` / `symbol_history` tables and the `_meta.db` scope-registry tables. The views SHALL be the public contract for any consumer that runs ad-hoc SQL via the MCP `query_graph` tool; the underlying tables remain implementation details and may evolve without bumping `Views.SchemaVersion`.
+
+`Views.SchemaVersion` SHALL be a compile-time integer constant exposed on the storage assembly (current value `3`); it SHALL bump on **any view-set change** — addition, removal, column rename, or column-type change — so clients that cache `describe_schema` by version always re-introspect after a server upgrade. The original "backwards-incompatible only" wording is superseded: cache-aware clients need a signal even for additive changes (a new view added without a version bump would otherwise be invisible to a client still serving cached schema).
 
 The view definitions SHALL live in an embedded SQL resource (`Views.sql`) with `{{SCOPE_UNION_BLOCK_<view>}}` placeholder tokens for the per-scope `UNION ALL` branches that the connection helper inlines at attach time. Each view (except `v_scopes`) SHALL include a `scope TEXT NOT NULL` column carrying the scope id, populated by the per-scope branch's `SELECT '<scope_id>' AS scope, …` clause; cross-scope joins SHALL use the composite `(scope, id)` tuple.
 
-The view definitions of the original five views (`v_symbols` / `v_files` / `v_edges` / `v_references` / `v_scopes`) are unchanged from the prior version of this requirement (their column shapes do not change in this revision); only the view-set extension and the version-bump-policy clarification differ.
+`v_edge_evidence` SHALL expose one row per proof occurrence with the logical edge tuple, producing file id, file path, 1-based source range, producer, occurrence payload, the text confidence (`inferred` / `semantic` / `exact`), and its ordered integer level (0 / 1 / 2).
 
 #### Scenario: View definitions execute against a single-scope DB
-- **GIVEN** a temp SQLite DB containing one row each in `symbols`, `edges`, `files`, `symbol_references`, `annotations`, `diagnostics`, `symbol_history` (mimicking a single attached scope)
+- **GIVEN** a temp SQLite DB containing one row each in `symbols`, `edges`, `edge_evidence`, `files`, `symbol_references`, `annotations`, `diagnostics`, `symbol_history` (mimicking a single attached scope)
 - **WHEN** the test inlines `Views.Sql` with one branch per per-view template and applies it as TEMP views
-- **THEN** every view from the set executes without syntax error and returns the expected column shapes; `v_symbols.is_public` is `1` for the symbol whose `accessibility = 6`; `v_symbols.is_type` is `1` for the symbol whose `kind_name = 'class'`; `v_diagnostics.severity_name` reflects the documented CASE mapping; `v_history` returns the seeded blame row with all six columns
+- **THEN** every view from the set executes without syntax error and returns the expected column shapes; `v_symbols.is_public` is `1` for the symbol whose `accessibility = 6`; `v_symbols.is_type` is `1` for the symbol whose `kind_name = 'class'`; `v_edge_evidence.confidence` maps level `2` to `exact`; `v_diagnostics.severity_name` reflects the documented CASE mapping; `v_history` returns the seeded blame row with all six columns
 
 #### Scenario: View columns match describe_schema's response
 - **WHEN** `describe_schema` returns the `views` array
-- **THEN** every column listed in the `Views.All` descriptor for each of the eight views is present (and only those columns) when the view is queried via `SELECT * FROM <view> LIMIT 0`; the SQLite `name` and `type` for each column matches the descriptor
+- **THEN** every column listed in the `Views.All` descriptor for each of the nine views is present (and only those columns) when the view is queried via `SELECT * FROM <view> LIMIT 0`; the SQLite `name` and `type` for each column matches the descriptor
 
 #### Scenario: View schema version bumps with the view-set change
 - **WHEN** a consumer reads `Views.SchemaVersion` (or the `view_schema_version` field returned by `describe_schema`)
-- **THEN** the value is `2` for this revision; was `1` for the prior revision (which shipped only the five core views); a future change adding or removing a view SHALL increment the version again
+- **THEN** the value is `3` for this revision; was `2` for the prior revision (which shipped eight views); a future change adding or removing a view SHALL increment the version again
 
 #### Scenario: Underlying table schema evolution does not bump view version
 - **GIVEN** a hypothetical future storage change that adds an internal column `symbols.cyclomatic_complexity INTEGER` without exposing it via `v_symbols`
@@ -209,9 +236,9 @@ The view definitions of the original five views (`v_symbols` / `v_files` / `v_ed
 - **THEN** `Views.SchemaVersion` remains unchanged; agent queries against `v_symbols` return the same columns as before; `Schema.Version` (the storage on-disk version) bumps independently
 
 #### Scenario: Cache-aware client re-introspects after additive view change
-- **GIVEN** a client that called `describe_schema` against a server reporting `view_schema_version = 1` and cached the resulting schema
-- **WHEN** the client reconnects to a server reporting `view_schema_version = 2` after this change ships
-- **THEN** the client SHOULD discard its cached schema and re-call `describe_schema`; `v_annotations`, `v_diagnostics`, and `v_history` appear in the refreshed view list with their columns
+- **GIVEN** a client that called `describe_schema` against a server reporting `view_schema_version = 2` and cached the resulting schema
+- **WHEN** the client reconnects to a server reporting `view_schema_version = 3` after this change ships
+- **THEN** the client SHOULD discard its cached schema and re-call `describe_schema`; `v_edge_evidence` appears in the refreshed view list with its columns
 
 ### Requirement: Read-only multi-scope attached connection helper
 The storage layer SHALL expose `MultiScopeReadOnlyConnection.OpenAsync(IScopeRegistry registry, string repoRoot, string scopeFilter, int maxAttached, CancellationToken ct)` returning an open `SqliteConnection` configured for read-only access to a resolved set of scope DBs plus the `_meta.db` registry, with the view layer (per the `Stable view layer over the underlying tables` requirement) created as TEMP views ready for query. The `repoRoot` parameter resolves the per-scope DB locations via `ScopeLayout.ScopeDbPath(repoRoot, id)` and the registry DB via `ScopeLayout.MetaDbPath(repoRoot)`.

@@ -46,7 +46,9 @@ public interface IGraphStore : IAsyncDisposable
         long targetSymbolId,
         string edgeKind,
         int limit = 100,
-        CancellationToken ct = default);
+        CancellationToken ct = default) =>
+        throw new NotSupportedException(
+            "This graph-store implementation predates occurrence-level edge evidence.");
 
     /// <summary>
     /// Bulk-insert the annotations attached to a set of symbols. Run after the symbols

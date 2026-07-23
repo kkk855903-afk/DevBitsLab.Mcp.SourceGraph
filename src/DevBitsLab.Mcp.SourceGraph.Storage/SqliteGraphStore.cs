@@ -172,6 +172,29 @@ public sealed class SqliteGraphStore : IGraphStore
         {
             using var tx = _connection.BeginTransaction();
             await _connection.ExecuteAsync(new CommandDefinition(
+                """
+                UPDATE edges AS edge
+                SET payload = (
+                    SELECT NULLIF(ev.payload, '')
+                    FROM edge_evidence ev
+                    WHERE ev.src = edge.src
+                      AND ev.dst = edge.dst
+                      AND ev.kind_name = edge.kind_name
+                      AND ev.producing_file_id <> @id
+                    ORDER BY ev.id
+                    LIMIT 1
+                )
+                WHERE EXISTS (
+                    SELECT 1
+                    FROM edge_evidence owned
+                    WHERE owned.src = edge.src
+                      AND owned.dst = edge.dst
+                      AND owned.kind_name = edge.kind_name
+                      AND owned.producing_file_id = @id
+                );
+                """,
+                new { id = fileId }, transaction: tx, cancellationToken: ct)).ConfigureAwait(false);
+            await _connection.ExecuteAsync(new CommandDefinition(
                 "DELETE FROM edge_evidence WHERE producing_file_id = @id;",
                 new { id = fileId }, transaction: tx, cancellationToken: ct)).ConfigureAwait(false);
             await _connection.ExecuteAsync(new CommandDefinition(
@@ -436,12 +459,33 @@ public sealed class SqliteGraphStore : IGraphStore
             JOIN files f ON f.id = s.file_id
             WHERE s.id = @SourceSymbolId;
             """;
+        const string producerFilePathSql = """
+            SELECT path
+            FROM files
+            WHERE id = @ProducingFileId;
+            """;
+        const string syncLogicalPayloadSql = """
+            UPDATE edges
+            SET payload = (
+                SELECT NULLIF(ev.payload, '')
+                FROM edge_evidence ev
+                WHERE ev.src = @Src
+                  AND ev.dst = @Dst
+                  AND ev.kind_name = @Kind
+                ORDER BY ev.id
+                LIMIT 1
+            )
+            WHERE src = @Src
+              AND dst = @Dst
+              AND kind_name = @Kind;
+            """;
 
         await _writeLock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
             using var tx = _connection.BeginTransaction();
             var fallbackBySource = new Dictionary<long, Evidence>();
+            var producerPathByFileId = new Dictionary<long, string>();
             foreach (var e in edges)
             {
                 var logicalPayload = SerializeMetadata(e.Metadata);
@@ -488,9 +532,30 @@ public sealed class SqliteGraphStore : IGraphStore
                             "legacy-declaration",
                             Metadata: null);
                         fallbackBySource[e.Src] = evidence;
+                        producerPathByFileId[evidence.ProducingFileId] =
+                            evidence.Location.FilePath;
                     }
                 }
                 ValidateEvidence(evidence);
+                if (!producerPathByFileId.TryGetValue(
+                        evidence.ProducingFileId,
+                        out var producerPath))
+                {
+                    producerPath = await _connection.ExecuteScalarAsync<string?>(
+                        new CommandDefinition(
+                            producerFilePathSql,
+                            new { evidence.ProducingFileId },
+                            transaction: tx,
+                            cancellationToken: ct)).ConfigureAwait(false)
+                        ?? throw new InvalidOperationException(
+                            $"Evidence producing file {evidence.ProducingFileId} is not indexed.");
+                    producerPathByFileId[evidence.ProducingFileId] = producerPath;
+                }
+                if (!PathsEquivalent(producerPath, evidence.Location.FilePath))
+                {
+                    throw new InvalidOperationException(
+                        $"Evidence path does not match producing file {evidence.ProducingFileId}.");
+                }
 
                 await _connection.ExecuteAsync(new CommandDefinition(insertEvidenceSql, new
                 {
@@ -507,6 +572,11 @@ public sealed class SqliteGraphStore : IGraphStore
                     evidence.Producer,
                     Payload = SerializeMetadata(evidence.Metadata ?? e.Metadata) ?? string.Empty,
                 }, transaction: tx, cancellationToken: ct)).ConfigureAwait(false);
+                await _connection.ExecuteAsync(new CommandDefinition(
+                    syncLogicalPayloadSql,
+                    new { e.Src, e.Dst, Kind = e.Kind },
+                    transaction: tx,
+                    cancellationToken: ct)).ConfigureAwait(false);
             }
             tx.Commit();
         }
@@ -524,6 +594,7 @@ public sealed class SqliteGraphStore : IGraphStore
         CancellationToken ct = default)
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(limit, 1);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(limit, 1000);
         ArgumentException.ThrowIfNullOrWhiteSpace(edgeKind);
 
         const string sql = """
@@ -595,6 +666,27 @@ public sealed class SqliteGraphStore : IGraphStore
             // Evidence locations remain useful if a manually edited/corrupt legacy payload cannot
             // be decoded. Integrity tooling can report the malformed JSON independently.
             return null;
+        }
+    }
+
+    private static bool PathsEquivalent(string left, string right)
+    {
+        try
+        {
+            var normalizedLeft = Path.TrimEndingDirectorySeparator(Path.GetFullPath(left));
+            var normalizedRight = Path.TrimEndingDirectorySeparator(Path.GetFullPath(right));
+            return string.Equals(
+                normalizedLeft,
+                normalizedRight,
+                OperatingSystem.IsWindows()
+                    ? StringComparison.OrdinalIgnoreCase
+                    : StringComparison.Ordinal);
+        }
+        catch (Exception ex) when (ex is ArgumentException
+                                   or NotSupportedException
+                                   or PathTooLongException)
+        {
+            return false;
         }
     }
 
