@@ -6,6 +6,7 @@
     <Project Path="src/DevBitsLab.Mcp.SourceGraph.Indexing.TreeSitter/DevBitsLab.Mcp.SourceGraph.Indexing.TreeSitter.csproj" />
     <Project Path="src/DevBitsLab.Mcp.SourceGraph.Indexing.TypeScript/DevBitsLab.Mcp.SourceGraph.Indexing.TypeScript.csproj" />
     <Project Path="src/DevBitsLab.Mcp.SourceGraph.Indexing.Xaml/DevBitsLab.Mcp.SourceGraph.Indexing.Xaml.csproj" />
+    <Project Path="src/DevBitsLab.Mcp.SourceGraph.Interop/DevBitsLab.Mcp.SourceGraph.Interop.csproj" />
     <Project Path="src/DevBitsLab.Mcp.SourceGraph.Sdk/DevBitsLab.Mcp.SourceGraph.Sdk.csproj" />
     <Project Path="src/DevBitsLab.Mcp.SourceGraph.Server/DevBitsLab.Mcp.SourceGraph.Server.csproj" />
     <Project Path="src/DevBitsLab.Mcp.SourceGraph.Storage/DevBitsLab.Mcp.SourceGraph.Storage.csproj" />
