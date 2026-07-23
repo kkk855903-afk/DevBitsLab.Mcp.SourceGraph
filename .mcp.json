@@ -1,0 +1,21 @@
+{
+  "mcpServers": {
+    "SourceGraph": {
+      "name": "🌿 SourceGraph",
+      "command": "dotnet",
+      "args": [
+        "run",
+        "--project",
+        "src/DevBitsLab.Mcp.SourceGraph.Server",
+        "--no-build",
+        "--no-launch-profile",
+        "--verbosity",
+        "quiet",
+        "--",
+        "serve",
+        "--solution",
+        "DevBitsLab.Mcp.SourceGraph.slnx"
+      ]
+    }
+  }
+}

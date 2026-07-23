@@ -1,0 +1,104 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Jak3b0/DevBitsLab.Mcp.SourceGraph/schema/sourcegraph.schema.json",
+  "title": "DevBitsLab.Mcp.SourceGraph configuration (.sourcegraph.json)",
+  "description": "Repo-root configuration consumed by sourcegraph-mcp at startup. Declares scopes (solution sets, project lists, or path globs) and optional plugin references.",
+  "type": "object",
+  "required": ["scopes"],
+  "additionalProperties": false,
+  "properties": {
+    "scopes": {
+      "type": "array",
+      "minItems": 1,
+      "description": "One entry per indexable scope. Each scope owns its own SQLite database under .sourcegraph/scopes/<id>.db.",
+      "items": { "$ref": "#/$defs/scope" }
+    },
+    "default_scope": {
+      "type": "string",
+      "description": "Name of the scope used when a tool call omits the `scope` argument. Must match one of the names listed in `scopes[]`.",
+      "pattern": "^[a-z0-9][a-z0-9-]{0,63}$"
+    },
+    "plugins": {
+      "type": "array",
+      "description": "Optional plugin references. Each entry declares either a NuGet package or an on-disk DLL.",
+      "items": { "$ref": "#/$defs/plugin" }
+    }
+  },
+  "$defs": {
+    "scope": {
+      "type": "object",
+      "required": ["name"],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Scope identifier (kebab-case, 1-64 chars). Used as the SQLite database file name and as the value of the MCP `scope` argument.",
+          "pattern": "^[a-z0-9][a-z0-9-]{0,63}$"
+        },
+        "solutions": {
+          "type": "array",
+          "description": "Paths to .sln / .slnx files that define this scope. Mutually exclusive with `projects` and `paths`/`include`. Live indexing is currently supported only for `solutions`-based scopes.",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "projects": {
+          "type": "array",
+          "description": "Paths to .csproj files. Mutually exclusive with `solutions` and `paths`/`include`. Accepted by the config loader; live indexing not yet implemented for this shape.",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "paths": {
+          "type": "array",
+          "description": "Glob patterns matching .csproj files (e.g. `third_party/**/*.csproj`). Mutually exclusive with `solutions` and `projects`. Accepted by the config loader; live indexing not yet implemented.",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "include": {
+          "type": "array",
+          "description": "Alias for `paths`. Same semantics, accepted for compatibility with earlier design drafts.",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "exclude": {
+          "type": "array",
+          "description": "Glob patterns to subtract from this scope's project set (e.g. `**/Generated/**`).",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "isolated": {
+          "type": "boolean",
+          "default": false,
+          "description": "When true, this scope is excluded from `scope = \"*\"` fan-out. Use for vendored or generated code that shouldn't pollute references on production symbols."
+        }
+      },
+      "oneOf": [
+        { "required": ["solutions"] },
+        { "required": ["projects"] },
+        { "required": ["paths"] },
+        { "required": ["include"] }
+      ],
+      "description": "A scope must declare exactly one of `solutions`, `projects`, `paths`, or `include`."
+    },
+    "plugin": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "package": {
+          "type": "string",
+          "description": "NuGet package id. When set, `version` is also required.",
+          "minLength": 1
+        },
+        "version": {
+          "type": "string",
+          "description": "NuGet package version. Required when `package` is set.",
+          "minLength": 1
+        },
+        "path": {
+          "type": "string",
+          "description": "Path to a plugin DLL on disk. Mutually exclusive with `package`+`version`.",
+          "minLength": 1
+        }
+      },
+      "oneOf": [
+        { "required": ["package", "version"], "not": { "required": ["path"] } },
+        { "required": ["path"], "not": { "anyOf": [{ "required": ["package"] }, { "required": ["version"] }] } }
+      ],
+      "description": "A plugin entry must declare exactly one of `package`+`version` or `path`."
+    }
+  }
+}

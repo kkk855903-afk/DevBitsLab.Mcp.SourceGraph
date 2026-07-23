@@ -1,0 +1,127 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'New version: x.y.z, or one of patch | minor | major'
+        required: true
+        type: string
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write   # the dispatch path commits the version bump and pushes a tag
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    environment: Release   # NUGET_API_KEY lives as an environment secret
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Bump version (workflow_dispatch only)
+        if: github.event_name == 'workflow_dispatch'
+        id: bump
+        shell: bash
+        run: |
+          set -euo pipefail
+          CSPROJ=src/DevBitsLab.Mcp.SourceGraph.Server/DevBitsLab.Mcp.SourceGraph.Server.csproj
+          current=$(sed -n 's|.*<Version>\([^<][^<]*\)</Version>.*|\1|p' "$CSPROJ" | head -1)
+          if [ -z "$current" ]; then
+            echo "::error::could not read current <Version> from $CSPROJ"
+            exit 1
+          fi
+
+          input='${{ github.event.inputs.version }}'
+          case "$input" in
+            patch|minor|major)
+              IFS='.' read -r MAJ MIN PAT <<< "$current"
+              case "$input" in
+                patch) PAT=$((PAT+1));;
+                minor) MIN=$((MIN+1)); PAT=0;;
+                major) MAJ=$((MAJ+1)); MIN=0; PAT=0;;
+              esac
+              new="$MAJ.$MIN.$PAT"
+              ;;
+            *)
+              if ! [[ "$input" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                echo "::error::version must match x.y.z or be one of patch|minor|major (got: '$input')"
+                exit 1
+              fi
+              new="$input"
+              ;;
+          esac
+
+          tag="v$new"
+          if git rev-parse "refs/tags/$tag" >/dev/null 2>&1; then
+            echo "::error::tag $tag already exists"
+            exit 1
+          fi
+          if [ "$current" = "$new" ]; then
+            echo "::error::version is already $new"
+            exit 1
+          fi
+
+          echo "Bumping $current → $new (tag $tag)"
+          sed -i "s|<Version>$current</Version>|<Version>$new</Version>|" "$CSPROJ"
+          grep '<Version>' "$CSPROJ" | head -1
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add "$CSPROJ"
+          git commit -m "Release $new"
+          git tag -a "$tag" -m "$new"
+          git push origin HEAD --follow-tags
+
+          echo "version=$new" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag"     >> "$GITHUB_OUTPUT"
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Restore
+        run: dotnet restore
+
+      - name: Build
+        run: dotnet build -c Release --no-restore /p:ContinuousIntegrationBuild=true
+
+      - name: Test (gate)
+        # A failing test blocks the publish — never push a broken release to NuGet.
+        run: >
+          dotnet test -c Release --no-build
+          --logger "trx;LogFileName=test-results.trx"
+          --logger "console;verbosity=normal"
+          --results-directory ./TestResults
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-test-results
+          path: ./TestResults/**/*.trx
+
+      - name: Pack tool
+        run: dotnet pack src/DevBitsLab.Mcp.SourceGraph.Server -c Release --no-build -o ./out
+
+      - name: Pack SDK
+        run: dotnet pack src/DevBitsLab.Mcp.SourceGraph.Sdk -c Release --no-build -o ./out
+
+      - name: Push to NuGet
+        env:
+          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+        shell: bash
+        run: |
+          if [ -z "${NUGET_API_KEY:-}" ]; then
+            echo "::error::NUGET_API_KEY secret is not set. Add it under Settings → Secrets and variables → Actions."
+            exit 1
+          fi
+          dotnet nuget push ./out/*.nupkg \
+            --api-key "$NUGET_API_KEY" \
+            --source https://api.nuget.org/v3/index.json \
+            --skip-duplicate

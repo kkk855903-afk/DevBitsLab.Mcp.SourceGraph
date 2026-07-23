@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!-- The XAML indexer is a built-in language indexer that ships with the server (in-tree).
+         It targets net10.0 so it can sit alongside the rest of the server assemblies; the SDK
+         it consumes targets netstandard2.0 and is reference-compatible. -->
+    <RootNamespace>DevBitsLab.Mcp.SourceGraph.Indexing.Xaml</RootNamespace>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="DevBitsLab.Mcp.SourceGraph.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\DevBitsLab.Mcp.SourceGraph.Sdk\DevBitsLab.Mcp.SourceGraph.Sdk.csproj" />
+    <ProjectReference Include="..\DevBitsLab.Mcp.SourceGraph.Storage\DevBitsLab.Mcp.SourceGraph.Storage.csproj" />
+  </ItemGroup>
+
+</Project>

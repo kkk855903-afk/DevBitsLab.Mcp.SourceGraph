@@ -1,0 +1,6 @@
+<Project>
+  <!-- Empty: opt fixture out of the parent's central package management. -->
+  <PropertyGroup>
+    <ManagePackageVersionsCentrally>false</ManagePackageVersionsCentrally>
+  </PropertyGroup>
+</Project>

@@ -1,0 +1,67 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" />
+    <PackageReference Include="xunit" />
+    <PackageReference Include="xunit.runner.visualstudio">
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+      <PrivateAssets>all</PrivateAssets>
+    </PackageReference>
+    <PackageReference Include="FluentAssertions" />
+    <PackageReference Include="coverlet.collector">
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+      <PrivateAssets>all</PrivateAssets>
+    </PackageReference>
+
+    <!-- The official MCP C# SDK ships the Client surface (StdioClientTransport, McpClient) in
+         ModelContextProtocol.Core. Reference both Core and the umbrella ModelContextProtocol so
+         the integration tests drive `initialize` through the same client surface real consumers
+         use, instead of replaying ServiceCollection wiring like the in-process unit tests do. -->
+    <PackageReference Include="ModelContextProtocol.Core" />
+    <PackageReference Include="Microsoft.Extensions.Logging" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The harness spawns the Server as a child process via `dotnet run`, so we don't link the
+         server's binaries. We DO need a build-order dependency: the harness assumes the
+         no_build dotnet flag will succeed, which requires the Server output to already exist
+         on disk by the time the test runner spins up. ReferenceOutputAssembly=false keeps the
+         server binaries out of the test project's link graph (we never touch its types directly)
+         while still forcing MSBuild to build it first. -->
+    <ProjectReference Include="..\..\src\DevBitsLab.Mcp.SourceGraph.Server\DevBitsLab.Mcp.SourceGraph.Server.csproj"
+                      ReferenceOutputAssembly="false"
+                      Private="false"
+                      PrivateAssets="all" />
+
+    <!-- The Sample.App fixture transitively builds Sample.Domain + Sample.Generators. We need
+         it built once before the harness runs the serve subcommand against Sample.sln, otherwise
+         the server's MSBuild workspace will compile it on first index, slowing the test down and
+         logging analyzer-load warnings to stderr (which the smoke test asserts against). Same
+         dance the in-process Tests project does. -->
+    <ProjectReference Include="..\fixtures\Sample.App\Sample.App.csproj"
+                      ReferenceOutputAssembly="false"
+                      Private="false"
+                      PrivateAssets="all"
+                      SetConfiguration="Configuration=Debug" />
+
+    <!-- MultiScope fixture projects must also be built so the multi-scope harness path doesn't
+         trigger a synchronous MSBuild compilation mid-handshake. -->
+    <ProjectReference Include="..\fixtures\MultiScope\Backend.Project\Backend.Project.csproj"
+                      ReferenceOutputAssembly="false"
+                      Private="false"
+                      PrivateAssets="all"
+                      SetConfiguration="Configuration=Debug" />
+    <ProjectReference Include="..\fixtures\MultiScope\Frontend.Project\Frontend.Project.csproj"
+                      ReferenceOutputAssembly="false"
+                      Private="false"
+                      PrivateAssets="all"
+                      SetConfiguration="Configuration=Debug" />
+  </ItemGroup>
+
+</Project>

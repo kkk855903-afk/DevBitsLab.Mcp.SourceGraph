@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!-- Generic tree-sitter language-indexer host. Targets net10.0 alongside the rest of the
+         in-tree server assemblies; the SDK it consumes targets netstandard2.0 and is reference-
+         compatible. Native `libtree-sitter` plus 28+ grammar binaries ride in transitively via
+         the `TreeSitter.DotNet` package — no first-party native-asset packaging in this repo. -->
+    <RootNamespace>DevBitsLab.Mcp.SourceGraph.Indexing.TreeSitter</RootNamespace>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="DevBitsLab.Mcp.SourceGraph.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="TreeSitter.DotNet" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
+    <ProjectReference Include="..\DevBitsLab.Mcp.SourceGraph.Sdk\DevBitsLab.Mcp.SourceGraph.Sdk.csproj" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,42 @@
+<Project>
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
+    <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
+    <RootNamespace>$(MSBuildProjectName)</RootNamespace>
+    <Authors>DevBitsLab</Authors>
+    <Company>DevBitsLab</Company>
+    <Product>DevBitsLab.Mcp.SourceGraph</Product>
+
+    <!--
+      Reproducible / verifiable builds. `Deterministic` makes the compiler emit the same PE
+      bytes for the same inputs (paths, env, timestamps are normalized). `ContinuousIntegrationBuild`
+      flips on the CI-only behaviours (path mapping for source-link, etc.) when set from the
+      command line via `/p:ContinuousIntegrationBuild=true`. `EmbedUntrackedSources` stuffs any
+      generated/non-tracked files into the symbol package so SourceLink stays useful.
+    -->
+    <Deterministic>true</Deterministic>
+    <EmbedUntrackedSources>true</EmbedUntrackedSources>
+
+    <!-- SourceLink wiring for github.com — emits PE-relative source paths into the PDB
+         so consumers can step into our code from a debugger or symbol server. -->
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Embeds source-control metadata into the PDB; required by SourceLink to resolve `https://github.com/...`. -->
+    <PackageReference Include="Microsoft.SourceLink.GitHub" PrivateAssets="all" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Pack the repo-root LICENSE as ordinary content alongside <PackageLicenseExpression>;
+         do NOT also set <PackageLicenseFile>, that would conflict and fail the pack. -->
+    <None Include="$(MSBuildThisFileDirectory)LICENSE" Pack="true" PackagePath="\" Visible="false" />
+  </ItemGroup>
+</Project>

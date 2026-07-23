@@ -1,0 +1,8 @@
+<Project>
+  <!-- Reset the parent Directory.Build.props so fixture projects build standalone, not as part of the main solution. -->
+  <PropertyGroup>
+    <ManagePackageVersionsCentrally>false</ManagePackageVersionsCentrally>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <EnforceCodeStyleInBuild>false</EnforceCodeStyleInBuild>
+  </PropertyGroup>
+</Project>

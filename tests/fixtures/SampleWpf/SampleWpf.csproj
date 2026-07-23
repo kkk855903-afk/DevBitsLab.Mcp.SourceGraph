@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!--
+      Indexing-only fixture. The XAML files are walked by the XAML indexer; the C# files are
+      walked by Roslyn so the cross-language `code-behind` edge has a real C# target. Targeting
+      net10.0 (rather than net10.0-windows + UseWPF=true) so the fixture builds on macOS / Linux
+      CI without pulling in PresentationFramework. The XAML compiler is not invoked — these files
+      are not meant to render at runtime, only to index.
+    -->
+    <TargetFramework>net10.0</TargetFramework>
+    <RootNamespace>SampleWpf</RootNamespace>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <!-- Defeat the parent Directory.Build.props warning-as-error so the partial-class fixtures
+         (which deliberately omit the markup-compiler's .g.cs half) don't fail the test build. -->
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+  </PropertyGroup>
+
+</Project>

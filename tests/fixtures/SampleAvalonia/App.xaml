@@ -1,0 +1,11 @@
+<Application x:Class="SampleAvalonia.App"
+             xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+    <Application.Resources>
+        <ResourceDictionary>
+            <ControlTheme x:Key="DangerButton" TargetType="Button">
+                <Setter Property="Background" Value="Red" />
+            </ControlTheme>
+        </ResourceDictionary>
+    </Application.Resources>
+</Application>

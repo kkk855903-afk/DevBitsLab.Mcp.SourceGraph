@@ -1,0 +1,60 @@
+name: Feature request
+description: Suggest a new MCP tool, CLI flag, scope option, or improvement.
+title: "[feat] "
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the suggestion! Please describe the use case before the implementation —
+        what would you do with this if it existed?
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / use case
+      description: |
+        What are you trying to accomplish? What does the workflow look like today,
+        and why is it awkward or impossible?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: |
+        How might this work? Sketch the MCP-tool name, args, and return shape;
+        or the CLI flag; or the `.sourcegraph.json` field — whichever applies.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: |
+        Any workarounds you've tried, or other shapes the feature could take.
+
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Affected surface
+      multiple: true
+      options:
+        - New MCP tool
+        - Existing MCP tool (signature change)
+        - CLI flag / subcommand
+        - .sourcegraph.json schema
+        - Plugin SDK
+        - Indexing pipeline
+        - Documentation
+        - Other
+
+  - type: checkboxes
+    id: acknowledgements
+    attributes:
+      label: Pre-submit checks
+      options:
+        - label: I searched existing issues and didn't find a duplicate.
+          required: true

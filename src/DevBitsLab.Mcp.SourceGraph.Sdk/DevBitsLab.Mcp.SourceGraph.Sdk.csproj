@@ -1,0 +1,68 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!--
+      The plugin SDK targets netstandard2.0 for max compatibility: third-party plugin authors can
+      build against this assembly from .NET Framework, .NET Core 3.x, or any .NET 5+ without
+      pulling in net10-only types. The host loads plugins into per-plugin AssemblyLoadContexts
+      configured to share `DevBitsLab.Mcp.SourceGraph.Sdk` from the host context, so a plugin
+      built against this DLL is binary-compatible with whatever host version users have installed
+      (until we ship an SDK 2.0 with breaking changes).
+    -->
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <RootNamespace>DevBitsLab.Mcp.SourceGraph.Sdk</RootNamespace>
+
+    <!-- Dual-versioned: server csproj is on 0.6.1, the SDK ships its own 1.0.0 timeline so a
+         plugin pinned at <Version>1.0.0</Version> stays buildable across server minor bumps. -->
+    <PackageId>DevBitsLab.Mcp.SourceGraph.Sdk</PackageId>
+    <!--
+      2.2.0 (add-tree-sitter-language-indexer-host): additive — adds INodeKindMapper,
+      IModuleResolver, LanguageIndexerOptions, ITreeSitterGrammarConfig. The four together
+      form the contract surface a tree-sitter-backed language plugin sits on
+      (see DevBitsLab.Mcp.SourceGraph.Indexing.TreeSitter). No breaking changes; plugins
+      compiled against 2.1 keep working.
+
+      2.1.0 (harden-sdk-pre-xaml): additive only — adds PayloadKeys (kebab-case constants for the
+      well-known keys plugins put in EdgeEmitted.Metadata: path, mode, converter, …) and
+      CanonicalKeys (helpers ForType / ForMethod / ForField / ForProperty constructing
+      doc-comment-id-shaped C# canonical keys, so cross-language plugins don't reimplement
+      Roslyn's format). No breaking changes; plugins built against 2.0 keep working.
+
+      2.0.0 (open-language-contract): breaking SDK reform ahead of XAML and the JS/TS/Vue/Svelte
+      languages. EdgeKind / PluginSymbolKind enums replaced with kebab-case strings + EdgeKinds /
+      SymbolKinds constants classes. EdgeEmitted gains an IReadOnlyDictionary<string,string>?
+      Metadata field. Canonical keys MUST now be `<scheme>:<rest>` (csharp / xaml enforced).
+      AttributeAttached → AnnotationAttached with a Flavor discriminator. New ILanguageProject /
+      ILanguageProjectFactory interfaces; IndexContext gains a Project field. Plugins compiled
+      against 1.x are NOT binary-compatible — recompile against 2.0.
+
+      1.1.0: IToolRegistry gains a 4-arg AddTool(name, description, handler, trigger) overload.
+
+      1.0.0: initial plugin SDK shape (ILanguageIndexer / ICodeAnalyzer / IMcpToolPlugin).
+    -->
+    <Version>2.2.0</Version>
+    <Description>Plugin SDK for DevBitsLab.Mcp.SourceGraph. Public contracts (ILanguageIndexer, ICodeAnalyzer, IMcpToolPlugin, INodeKindMapper, IModuleResolver, ITreeSitterGrammarConfig) plus the IndexEvent discriminated union, LanguageIndexerOptions, and helper base classes for authoring third-party plugins. Targets netstandard2.0 so a single plugin DLL works with every supported host version.</Description>
+    <Authors>DevBitsLab</Authors>
+    <PackageTags>mcp;sourcegraph;plugin-sdk;roslyn;analyzers</PackageTags>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/Jak3b0/DevBitsLab.Mcp.SourceGraph</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/Jak3b0/DevBitsLab.Mcp.SourceGraph.git</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+
+    <!-- Override the parent Directory.Build.props's net10.0 target. -->
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="DevBitsLab.Mcp.SourceGraph.Server" />
+    <InternalsVisibleTo Include="DevBitsLab.Mcp.SourceGraph.Indexing" />
+    <InternalsVisibleTo Include="DevBitsLab.Mcp.SourceGraph.Tests" />
+  </ItemGroup>
+
+</Project>

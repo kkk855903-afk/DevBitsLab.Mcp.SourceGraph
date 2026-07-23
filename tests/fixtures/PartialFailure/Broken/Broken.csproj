@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Deliberately broken project for the partial-failure fixture. The unresolvable
+    PackageReference makes `dotnet restore` fail (NU1101). Roslyn / MSBuildWorkspace
+    is permissive enough to still produce a Compilation with errors when the source
+    files parse, so this fixture does NOT deterministically trigger
+    ProbeProjectCompilationsAsync's failure path on every machine. It DOES exercise
+    the broader user-visible contract: `MSBuildWorkspace.OpenSolutionAsync` returns
+    successfully, the cold index completes without throwing, and the partial-scope
+    plumbing (status decision, list_scopes rendering, registry persistence) all stays
+    on its happy path. The probe path is reserved for rarer Roslyn failure modes
+    (source-generator throws during compilation construction, project Language null);
+    the per-document Pass 1B catch covers per-file Roslyn-throw scenarios.
+  -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="DefinitelyDoesNotExist.Package" Version="999.999.999" />
+  </ItemGroup>
+
+</Project>

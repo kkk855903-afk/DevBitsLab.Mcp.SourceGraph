@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="DevBitsLab.Mcp.SourceGraph.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- ONNX Runtime: embedding generator native dependency. The default Jina v2 base code
+         FP32 graph is ~640 MB, runs on CPU on every developer laptop in single-digit ms per
+         chunk after the first load. -->
+    <PackageReference Include="Microsoft.ML.OnnxRuntime" />
+
+    <!-- Microsoft.Extensions.AI provides the IEmbeddingGenerator&lt;TInput, TEmbedding&gt; surface
+         so callers depend on the interface, not the concrete ONNX implementation. -->
+    <PackageReference Include="Microsoft.Extensions.AI.Abstractions" />
+
+    <!-- Microsoft.ML.Tokenizers: handles both RoBERTa-BPE (Jina v2 base code, BGE-M3, etc.)
+         and BERT-WordPiece via one library. Loaded by parsing tokenizer.json's `model.type`
+         field and dispatching to BpeTokenizer.Create(BpeOptions) or WordPieceTokenizer.Create. -->
+    <PackageReference Include="Microsoft.ML.Tokenizers" />
+
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
+  </ItemGroup>
+
+</Project>

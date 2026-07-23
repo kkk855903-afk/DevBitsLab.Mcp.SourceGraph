@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/Jak3b0/DevBitsLab.Mcp.SourceGraph/security/advisories/new
+    about: Please report security issues privately via a GitHub Security Advisory rather than a public issue. See SECURITY.md for details.
+  - name: Question / discussion
+    url: https://github.com/Jak3b0/DevBitsLab.Mcp.SourceGraph/discussions
+    about: Open-ended questions, design discussion, or "how do I…" — please use Discussions, not Issues.

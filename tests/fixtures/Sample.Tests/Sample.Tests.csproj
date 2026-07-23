@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <!-- Critical: this fixture is loaded by the Roslyn indexer via tests/fixtures/Sample.sln,
+         it MUST NOT be discovered by `dotnet test` against the main repo solution. We're not in
+         the main .slnx, so test discovery doesn't reach us; flagging IsTestProject=false is just
+         belt-and-braces in case some tooling crawls fixture directories. -->
+    <IsPackable>false</IsPackable>
+    <IsTestProject>false</IsTestProject>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Sample.Domain\Sample.Domain.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- xUnit only (NUnit/MSTest fixtures rely on attribute name discrimination, not the runner;
+         we add a #region of NUnit/MSTest-style stubs that share the assembly so the indexer can
+         walk them without us needing two more package references). -->
+    <PackageReference Include="xunit" Version="2.9.3" />
+  </ItemGroup>
+
+</Project>
