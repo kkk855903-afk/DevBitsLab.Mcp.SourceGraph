@@ -53,6 +53,8 @@ public sealed class TelemetrySignalTests
 
         var activity = captured.Should().ContainSingle(a => a.OperationName == $"mcp.tool {toolName}").Subject;
         activity.Status.Should().Be(ActivityStatusCode.Error);
+        activity.StatusDescription.Should().BeNull(
+            "exception messages may contain patient queries, paths, or SQL");
         activity.GetTagItem("exception.type").Should().Be(typeof(InvalidOperationException).FullName);
     }
 

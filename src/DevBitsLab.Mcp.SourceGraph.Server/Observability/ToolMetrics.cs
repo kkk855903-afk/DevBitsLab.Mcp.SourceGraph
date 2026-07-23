@@ -9,8 +9,10 @@ namespace DevBitsLab.Mcp.SourceGraph.Server.Observability;
 
 /// <summary>
 /// Tracks tool-call activity. Each tool wraps its body in <see cref="TrackAsync"/>; the helper
-/// records per-tool counters in memory and appends a JSONL line to <c>usage.jsonl</c> next to the
-/// graph database. Inspectable at runtime via the <c>usage_stats</c> MCP tool.
+/// records per-tool counters in memory and appends a metadata-only JSONL line to
+/// <c>usage.jsonl</c> next to the graph database. Request values are never persisted because
+/// symbol queries, paths, and SQL parameters may contain patient or proprietary data.
+/// Inspectable at runtime via the <c>usage_stats</c> MCP tool.
 /// </summary>
 public static class ToolMetrics
 {
@@ -21,9 +23,10 @@ public static class ToolMetrics
     private static readonly DateTimeOffset _processStart = DateTimeOffset.UtcNow;
 
     /// <summary>Configures the JSONL output path. Call once at process start.</summary>
-    public static void Configure(string logPath)
+    public static void Configure(string? logPath)
     {
         _logPath = logPath;
+        if (logPath is null) return;
         var dir = Path.GetDirectoryName(logPath);
         if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
     }
@@ -51,7 +54,7 @@ public static class ToolMetrics
         catch (Exception ex)
         {
             ok = false;
-            activity?.SetStatus(ActivityStatusCode.Error, ex.Message);
+            activity?.SetStatus(ActivityStatusCode.Error);
             activity?.SetTag("exception.type", ex.GetType().FullName);
             throw;
         }
@@ -82,7 +85,7 @@ public static class ToolMetrics
         catch (Exception ex)
         {
             ok = false;
-            activity?.SetStatus(ActivityStatusCode.Error, ex.Message);
+            activity?.SetStatus(ActivityStatusCode.Error);
             activity?.SetTag("exception.type", ex.GetType().FullName);
             throw;
         }
@@ -120,7 +123,7 @@ public static class ToolMetrics
         catch (Exception ex)
         {
             ok = false;
-            activity?.SetStatus(ActivityStatusCode.Error, ex.Message);
+            activity?.SetStatus(ActivityStatusCode.Error);
             activity?.SetTag("exception.type", ex.GetType().FullName);
             throw;
         }
@@ -177,7 +180,7 @@ public static class ToolMetrics
         catch (Exception ex)
         {
             ok = false;
-            activity?.SetStatus(ActivityStatusCode.Error, ex.Message);
+            activity?.SetStatus(ActivityStatusCode.Error);
             activity?.SetTag("exception.type", ex.GetType().FullName);
             throw;
         }
@@ -285,22 +288,19 @@ public static class ToolMetrics
     private static void AppendJsonl(string toolName, object? args, int responseLen, TimeSpan elapsed, bool ok, string? scope)
     {
         if (_logPath is null) return;
-        // Serialise args once via SerializeToElement, then reuse: request_len is measured from
-        // the element's raw JSON and the element itself goes back into `entry` so the outer
-        // JsonSerializer.Serialize(entry) doesn't re-pay the cost. Narrow catch: only the
-        // serialise-path exceptions are absorbed (record requestLen=0 and drop args from the
-        // row). File I/O exceptions are absorbed by the broader catch below — observability is
+        // Measure the serialized request shape in memory, then discard it. Never persist argument
+        // values: queries, file hints, paths, authors, and SQL bindings may contain patient data.
+        // File I/O exceptions are absorbed by the broader catch below — observability is
         // best-effort and must never break the wrapped tool call.
-        JsonElement? argsElement;
         int requestLen;
         try
         {
-            argsElement = args is null ? null : JsonSerializer.SerializeToElement(args);
-            requestLen = argsElement?.GetRawText().Length ?? 0;
+            requestLen = args is null
+                ? 0
+                : JsonSerializer.SerializeToElement(args).GetRawText().Length;
         }
         catch (Exception ex) when (ex is NotSupportedException or JsonException or InvalidOperationException)
         {
-            argsElement = null;
             requestLen = 0;
         }
         var entry = new
@@ -312,7 +312,6 @@ public static class ToolMetrics
             request_len = requestLen,
             response_len = responseLen,
             scope,
-            args = argsElement,
         };
         try
         {
