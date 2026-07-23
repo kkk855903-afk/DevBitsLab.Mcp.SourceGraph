@@ -1,4 +1,5 @@
 using DevBitsLab.Mcp.SourceGraph.Indexing.Xaml;
+using DevBitsLab.Mcp.SourceGraph.Sdk;
 using FluentAssertions;
 using Xunit;
 
@@ -48,6 +49,37 @@ public sealed class XamlPrivacyDiscoveryTests : IDisposable
         projects.Should().ContainSingle();
         projects[0].Id.Should().Be(projectPath);
         projects[0].FilePaths.Should().BeEquivalentTo(new[] { mainView, prefixBoundaryView });
+    }
+
+    [Fact]
+    public async Task Discover_appliesScopeExcludes_beforeProjectAndXamlDiscovery()
+    {
+        var projectDir = Path.Join(_root, "ManagedApp");
+        var projectPath = await PlantAsync(
+            Path.Join(projectDir, "ManagedApp.csproj"),
+            """<Project Sdk="Microsoft.NET.Sdk"></Project>""");
+        var mainView = await PlantAsync(
+            Path.Join(projectDir, "Views", "MainWindow.xaml"),
+            """<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" />""");
+        await PlantAsync(
+            Path.Join(projectDir, "Generated", "GeneratedView.xaml"),
+            """<Window Tag="SCOPE-EXCLUDE-CANARY" />""");
+        await PlantAsync(
+            Path.Join(_root, "Generated", "Hidden.csproj"),
+            """<Project Sdk="Microsoft.NET.Sdk"></Project>""");
+        await PlantAsync(
+            Path.Join(_root, "Generated", "Hidden.xaml"),
+            """<Window Tag="HIDDEN-SCOPE-PROJECT-CANARY" />""");
+
+        var factory = (IExclusionAwareLanguageProjectFactory)new XamlLanguageProjectFactory();
+        var projects = await factory.DiscoverAsync(
+            _root,
+            ["**/generated/**"],
+            CancellationToken.None);
+
+        projects.Should().ContainSingle();
+        projects[0].Id.Should().Be(projectPath);
+        projects[0].FilePaths.Should().Equal(mainView);
     }
 
     private static async Task<string> PlantAsync(string path, string contents)

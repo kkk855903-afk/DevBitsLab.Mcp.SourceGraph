@@ -21,6 +21,30 @@ The system SHALL model a scope as `(id, name, root, project_set, isolated, last_
 - **WHEN** `.sourcegraph.json` lists three scopes (one solutions-based, one paths-based, one isolated)
 - **THEN** all three appear in the registry and `list_scopes` reports each with the right kind, isolation flag, and root
 
+### Requirement: Scope excludes narrow every live indexing path
+A scope's `project_set.exclude` list SHALL be interpreted as case-insensitive,
+repository-relative glob patterns supporting `*`, `?`, and complete `**` path segments.
+The same effective policy SHALL filter Roslyn documents, source-generated documents,
+XAML/MSBuild project discovery, non-C# dispatch, file-watch events, and drift discovery.
+A pattern that matches a directory SHALL also exclude its descendants.
+
+Scope excludes SHALL only narrow the indexable set. They SHALL NOT relax the mandatory
+medical privacy exclusions or repository containment boundary. Blank, rooted, parent-
+traversing, and otherwise malformed exclude patterns SHALL fail closed with an error that
+identifies the pattern index.
+
+#### Scenario: One exclude applies across cold and live paths
+- **WHEN** a scope configures `exclude: [ "**/generated" ]`
+- **THEN** files in any matching directory are omitted by cold discovery and ignored by incremental watcher/dispatcher paths
+
+#### Scenario: Generated documents retain medical privacy floors
+- **WHEN** Roslyn reports an in-memory generated document under `obj/`
+- **THEN** the build-output segment may be indexed, but an out-of-repository path or a path containing `PatientData` or `Images` remains excluded
+
+#### Scenario: Narrow file glob does not disable an extension globally
+- **WHEN** a scope excludes only the root file `source.cs`
+- **THEN** the watcher ignores that file but continues to report allowed `.cs` files in subdirectories
+
 ### Requirement: Per-scope physical isolation
 Each scope SHALL persist its graph in `<repo>/.sourcegraph/scopes/<id>.db`; a separate `<repo>/.sourcegraph/_meta.db` SHALL hold the `scopes` registry. A new scope's per-scope DB SHALL be created on its first index, whether the scope was added at startup or live via a `.sourcegraph.json` edit.
 

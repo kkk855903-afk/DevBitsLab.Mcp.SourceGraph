@@ -1,6 +1,9 @@
 using System.Security.Cryptography;
+using DevBitsLab.Mcp.SourceGraph.Core;
+using DevBitsLab.Mcp.SourceGraph.Indexing;
 using DevBitsLab.Mcp.SourceGraph.Sdk;
 using DevBitsLab.Mcp.SourceGraph.Server.Plugins;
+using DevBitsLab.Mcp.SourceGraph.Server.Scoping;
 using DevBitsLab.Mcp.SourceGraph.Storage;
 using FluentAssertions;
 using Microsoft.Data.Sqlite;
@@ -50,6 +53,82 @@ public sealed class PrivacyDispatcherTests : IDisposable
         indexer.Paths.Should().Equal(allowed);
     }
 
+    [Fact]
+    public async Task ColdDispatch_appliesScopeExcludes_andPrivacyCannotBeBypassedByExtension()
+    {
+        var allowed = await PlantAsync(Path.Join(_root, "src", "Allowed.privacytest"), "allowed");
+        await PlantAsync(Path.Join(_root, "src", "Generated", "Hidden.privacytest"), "SCOPE-CANARY");
+        await PlantAsync(Path.Join(_root, "pAtIeNtDaTa", "Hidden.privacytest"), "PATIENT-CANARY");
+        await PlantAsync(Path.Join(_root, "src", "study.DCM"), "DICOM-CANARY");
+
+        var indexer = new RecordingIndexer();
+        var indexers = new LanguageIndexerRegistry();
+        indexers.Register(indexer);
+        var dispatcher = new LanguageIndexerDispatcher(
+            indexers,
+            new LanguageProjectFactoryRegistry());
+
+        var dbPath = Path.Join(_root, "scope-aware-graph.db");
+        await using var store = new SqliteGraphStore(dbPath);
+        await store.EnsureSchemaAsync();
+        var dispatched = await dispatcher.DispatchAllForTestAsync(
+            store,
+            "test",
+            _root,
+            new Dictionary<string, ILanguageProject>(StringComparer.OrdinalIgnoreCase),
+            ["**/generated/**"],
+            CancellationToken.None);
+
+        dispatched.Should().Be(1);
+        indexer.Paths.Should().Equal(allowed);
+    }
+
+    [Fact]
+    public async Task ProjectMap_forwardsAndEnforcesEveryScopeExclude()
+    {
+        var allowed = Path.Join(_root, "src", "Allowed.privacytest");
+        var generated = Path.Join(_root, "src", "Generated", "Hidden.privacytest");
+        var patient = Path.Join(_root, "pAtIeNtDaTa", "Hidden.privacytest");
+        var dicom = Path.Join(_root, "src", "study.DCM");
+        var project = new StubProject([allowed, generated, patient, dicom]);
+        var factory = new RecordingProjectFactory(project);
+        var factories = new LanguageProjectFactoryRegistry();
+        factories.Register(factory);
+        var dispatcher = new LanguageIndexerDispatcher(
+            new LanguageIndexerRegistry(),
+            factories);
+
+        var store = new SqliteGraphStore(Path.Join(_root, "project-map.db"));
+        await store.EnsureSchemaAsync();
+        var scope = new Scope(
+            Id: "test",
+            Name: "test",
+            Root: _root,
+            ProjectSet: new ScopeProjectSet.Paths(
+                Globs: ["**/*", "**/*.DCM"],
+                Exclude: ["**/generated/**"]),
+            Isolated: false,
+            LastIndexedAt: DateTimeOffset.MinValue);
+        var host = new ScopeHost(
+            scope,
+            store,
+            store.CreateEmbeddingsStore(384),
+            new RoslynIndexer(store),
+            solutionPath: string.Empty);
+
+        try
+        {
+            await dispatcher.BuildProjectMapAsync(host);
+
+            factory.ObservedExcludePatterns.Should().Equal("**/generated/**");
+            host.ProjectByFilePath.Keys.Should().Equal(allowed);
+        }
+        finally
+        {
+            await host.DisposeAsync();
+        }
+    }
+
     private static async Task<string> PlantAsync(string path, string contents)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
@@ -72,5 +151,34 @@ public sealed class PrivacyDispatcherTests : IDisposable
             };
             return Task.FromResult(events);
         }
+    }
+
+    private sealed class RecordingProjectFactory(ILanguageProject project)
+        : IExclusionAwareLanguageProjectFactory
+    {
+        public IReadOnlyCollection<string> ProjectMarkers { get; } = ["*.privacytest"];
+
+        public IReadOnlyList<string> ObservedExcludePatterns { get; private set; } = [];
+
+        public Task<IReadOnlyList<ILanguageProject>> DiscoverAsync(
+            string repoRoot,
+            CancellationToken ct) =>
+            throw new InvalidOperationException("The exclusion-aware overload should be used.");
+
+        public Task<IReadOnlyList<ILanguageProject>> DiscoverAsync(
+            string repoRoot,
+            IReadOnlyList<string> excludePatterns,
+            CancellationToken ct)
+        {
+            ObservedExcludePatterns = excludePatterns.ToArray();
+            return Task.FromResult<IReadOnlyList<ILanguageProject>>([project]);
+        }
+    }
+
+    private sealed class StubProject(IReadOnlyCollection<string> paths) : ILanguageProject
+    {
+        public string Id { get; } = "stub";
+
+        public IReadOnlyCollection<string> FilePaths { get; } = paths;
     }
 }

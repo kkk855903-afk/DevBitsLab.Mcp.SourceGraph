@@ -73,6 +73,25 @@ public sealed class SourceTreeWalkerTests : IDisposable
     }
 
     [Fact]
+    public async Task Walk_appliesScopeExcludePatterns_beforeHashingOrCountingFiles()
+    {
+        var (kept, keptSha) = await Plant(Path.Join(_root, "src", "Allowed.cs"), "class Allowed {}");
+        await Plant(Path.Join(_root, "src", "Generated", "Hidden.cs"), "SCOPE-EXCLUDE-CANARY");
+
+        var outcome = await SourceTreeWalker.WalkAsync(
+            _root,
+            maxFiles: 1,
+            excludePatterns: ["**/generated/**"],
+            ct: CancellationToken.None);
+
+        outcome.HitLimit.Should().BeFalse(
+            "scope-excluded files must not count toward the traversal cap");
+        outcome.Entries.Should().ContainSingle();
+        outcome.Entries[0].Path.Should().Be(kept);
+        outcome.Entries[0].Sha256.Should().Equal(keptSha);
+    }
+
+    [Fact]
     public async Task Walk_respects_maxFiles_cap_and_setsHitLimit()
     {
         for (var i = 0; i < 5; i++)

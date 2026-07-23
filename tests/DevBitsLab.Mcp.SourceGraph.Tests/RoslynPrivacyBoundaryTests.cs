@@ -117,6 +117,41 @@ public sealed class RoslynPrivacyBoundaryTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task ScopeExclude_appliesToColdSnapshotAndIncrementalChangeOrDeletePaths()
+    {
+        var root = Path.GetDirectoryName(_solutionPath)!;
+        var dbPath = Path.Join(_tempDir, "scope-exclude.db");
+        await using var store = new SqliteGraphStore(dbPath);
+        await using var indexer = new RoslynIndexer(
+            store,
+            logger: null,
+            embeddingsSink: null,
+            privacyRoot: root,
+            excludePatterns: ["**/Sample.App/**"]);
+
+        await indexer.OpenAsync(_solutionPath);
+        indexer.SanitizedSolution!.Projects.Should().NotContain(project =>
+            project.FilePath != null
+            && project.FilePath.Contains("Sample.App", StringComparison.OrdinalIgnoreCase));
+
+        var coldResult = await indexer.IndexAllAsync();
+        coldResult.FilesIndexed.Should().BeGreaterThan(0);
+        (await store.GetAllFilesAsync()).Should().NotContain(file =>
+            file.Path.Contains("Sample.App", StringComparison.OrdinalIgnoreCase));
+
+        var changedPath = Path.Join(root, "Sample.App", "Program.cs");
+        var deletedPath = Path.Join(root, "Sample.App", "Deleted.cs");
+        File.Exists(changedPath).Should().BeTrue();
+        File.Exists(deletedPath).Should().BeFalse();
+
+        var incrementalResult = await indexer.IndexChangedFilesAsync([changedPath, deletedPath]);
+
+        incrementalResult.FilesIndexed.Should().Be(0);
+        (await store.GetAllFilesAsync()).Should().NotContain(file =>
+            file.Path.Contains("Sample.App", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
     public void Sanitizer_removesProjectsAndEveryDiskBackedRoslynInputKind()
     {
         var root = Path.GetFullPath(Path.Join(_tempDir, "repo"));

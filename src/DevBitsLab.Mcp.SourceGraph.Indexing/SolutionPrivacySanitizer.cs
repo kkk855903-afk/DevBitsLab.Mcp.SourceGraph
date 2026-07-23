@@ -15,11 +15,22 @@ internal static class SolutionPrivacySanitizer
     {
         ArgumentNullException.ThrowIfNull(solution);
         ArgumentNullException.ThrowIfNull(privacyPolicy);
+        return Sanitize(solution, privacyPolicy.IsExcluded);
+    }
 
+    public static Solution SanitizeForScope(Solution solution, ScopePathPolicy pathPolicy)
+    {
+        ArgumentNullException.ThrowIfNull(solution);
+        ArgumentNullException.ThrowIfNull(pathPolicy);
+        return Sanitize(solution, pathPolicy.IsExcluded);
+    }
+
+    private static Solution Sanitize(Solution solution, Func<string?, bool> isExcluded)
+    {
         var sanitized = solution;
         foreach (var project in solution.Projects)
         {
-            if (privacyPolicy.IsExcluded(project.FilePath))
+            if (isExcluded(project.FilePath))
             {
                 sanitized = sanitized.RemoveProject(project.Id);
                 continue;
@@ -27,7 +38,7 @@ internal static class SolutionPrivacySanitizer
 
             foreach (var document in project.Documents)
             {
-                if (privacyPolicy.IsExcluded(document.FilePath))
+                if (isExcluded(document.FilePath))
                 {
                     sanitized = sanitized.RemoveDocument(document.Id);
                 }
@@ -35,7 +46,7 @@ internal static class SolutionPrivacySanitizer
 
             foreach (var document in project.AdditionalDocuments)
             {
-                if (privacyPolicy.IsExcluded(document.FilePath))
+                if (isExcluded(document.FilePath))
                 {
                     sanitized = sanitized.RemoveAdditionalDocument(document.Id);
                 }
@@ -43,7 +54,7 @@ internal static class SolutionPrivacySanitizer
 
             foreach (var document in project.AnalyzerConfigDocuments)
             {
-                if (privacyPolicy.IsExcluded(document.FilePath))
+                if (isExcluded(document.FilePath))
                 {
                     sanitized = sanitized.RemoveAnalyzerConfigDocument(document.Id);
                 }

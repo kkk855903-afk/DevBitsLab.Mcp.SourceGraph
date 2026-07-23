@@ -41,7 +41,9 @@ public sealed class ReconcileDriftToolTests : IAsyncLifetime
             Id: "default",
             Name: "default",
             Root: _root,
-            ProjectSet: new ScopeProjectSet.Solutions(Array.Empty<string>(), Array.Empty<string>()),
+            ProjectSet: new ScopeProjectSet.Solutions(
+                Array.Empty<string>(),
+                ["**/generated/**"]),
             Isolated: false,
             LastIndexedAt: DateTimeOffset.UtcNow);
 
@@ -143,6 +145,24 @@ public sealed class ReconcileDriftToolTests : IAsyncLifetime
         diff.Added.Should().BeEmpty();
         diff.Removed.Should().BeEmpty();
         diff.Unchanged.Should().Be(0);
+    }
+
+    [Fact]
+    public async Task ComputeAsync_doesNotDiscoverScopeExcludedFiles()
+    {
+        var allowed = Path.Join(_root, "src", "Allowed.cs");
+        var excluded = Path.Join(_root, "src", "Generated", "Hidden.cs");
+        await PlantFile(allowed, "class Allowed {}");
+        await PlantFile(excluded, "class Hidden {}");
+
+        var diff = await DriftReconciler.ComputeAsync(
+            _host!,
+            maxFiles: 100,
+            CancellationToken.None);
+
+        diff.Scanned.Should().Be(1);
+        diff.Added.Should().Equal(allowed);
+        diff.Added.Should().NotContain(excluded);
     }
 
     private static async Task PlantFile(string path, string content)

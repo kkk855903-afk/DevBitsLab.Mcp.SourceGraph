@@ -171,6 +171,77 @@ public sealed class SolutionWatcherTests
     }
 
     [Fact]
+    public async Task ScopeExclude_filtersChangeAndDeletePaths()
+    {
+        var root = MakeTempRoot();
+        try
+        {
+            var excludedChanged = CreateParentedPath(root, "src", "generated", "Changed.cs");
+            var excludedDeleted = CreateParentedPath(root, "src", "Generated", "Deleted.xaml");
+            var includedChanged = CreateParentedPath(root, "src", "Changed.cs");
+            await File.WriteAllTextAsync(excludedChanged, "before");
+            await File.WriteAllTextAsync(excludedDeleted, "<Page />");
+            await File.WriteAllTextAsync(includedChanged, "before");
+
+            await using var watcher = new SolutionWatcher(
+                root,
+                debounce: _shortDebounce,
+                logger: null,
+                sourceExtensions: null,
+                excludePatterns: ["**/generated/**"]);
+
+            await File.WriteAllTextAsync(excludedChanged, "after");
+            File.Delete(excludedDeleted);
+            await Task.Delay(_shortDebounce * 3);
+            await File.WriteAllTextAsync(includedChanged, "after");
+
+            var observed = await ReadPathsUntilAsync(
+                watcher,
+                paths => paths.Contains(includedChanged),
+                _eventTimeout);
+
+            observed.Should().BeEquivalentTo([includedChanged]);
+        }
+        finally
+        {
+            DeleteTempRoot(root);
+        }
+    }
+
+    [Fact]
+    public async Task ScopeExclude_matchingSyntheticProbe_doesNotRemoveTheExtensionGlobally()
+    {
+        var root = MakeTempRoot();
+        try
+        {
+            var excludedProbePath = Path.Join(root, "source.cs");
+            var includedPath = CreateParentedPath(root, "src", "Other.cs");
+
+            await using var watcher = new SolutionWatcher(
+                root,
+                debounce: _shortDebounce,
+                logger: null,
+                sourceExtensions: [".cs"],
+                excludePatterns: ["**/source.cs"]);
+
+            await File.WriteAllTextAsync(excludedProbePath, "excluded");
+            await Task.Delay(_shortDebounce * 3);
+            await File.WriteAllTextAsync(includedPath, "included");
+
+            var observed = await ReadPathsUntilAsync(
+                watcher,
+                paths => paths.Contains(includedPath),
+                _eventTimeout);
+
+            observed.Should().BeEquivalentTo([includedPath]);
+        }
+        finally
+        {
+            DeleteTempRoot(root);
+        }
+    }
+
+    [Fact]
     public async Task ConfiguredExtensions_replaceDefaults_butCannotBypassPrivacyPolicy()
     {
         var root = MakeTempRoot();
@@ -232,6 +303,17 @@ public sealed class SolutionWatcherTests
     private static string CreateParentedPath(string root, string directory, string fileName)
     {
         var parent = Path.Join(root, directory);
+        Directory.CreateDirectory(parent);
+        return Path.Join(parent, fileName);
+    }
+
+    private static string CreateParentedPath(
+        string root,
+        string directory,
+        string subdirectory,
+        string fileName)
+    {
+        var parent = Path.Join(root, directory, subdirectory);
         Directory.CreateDirectory(parent);
         return Path.Join(parent, fileName);
     }

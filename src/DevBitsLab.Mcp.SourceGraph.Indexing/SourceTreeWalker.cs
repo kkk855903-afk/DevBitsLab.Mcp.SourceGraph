@@ -32,7 +32,18 @@ public static class SourceTreeWalker
     public static async Task<WalkOutcome> WalkAsync(
         string root,
         int maxFiles,
-        CancellationToken ct = default)
+        CancellationToken ct = default) =>
+        await WalkAsync(root, maxFiles, Array.Empty<string>(), ct).ConfigureAwait(false);
+
+    /// <summary>
+    /// Scope-aware walk that applies <paramref name="excludePatterns"/> in addition to the
+    /// mandatory privacy boundary.
+    /// </summary>
+    public static async Task<WalkOutcome> WalkAsync(
+        string root,
+        int maxFiles,
+        IReadOnlyList<string> excludePatterns,
+        CancellationToken ct)
     {
         var entries = new List<FileShaEntry>();
         if (!Directory.Exists(root))
@@ -41,7 +52,7 @@ public static class SourceTreeWalker
         }
 
         var normalizedRoot = Path.GetFullPath(root);
-        var privacyPolicy = new PrivacyPathPolicy(normalizedRoot);
+        var pathPolicy = new ScopePathPolicy(normalizedRoot, excludePatterns);
 
         // Stack-based DFS so an unreadable subtree fails locally (per-directory catch) instead
         // of aborting the whole traversal — `Directory.EnumerateFiles(SearchOption.AllDirectories)`
@@ -54,7 +65,7 @@ public static class SourceTreeWalker
         {
             ct.ThrowIfCancellationRequested();
             var dir = stack.Pop();
-            if (privacyPolicy.IsExcluded(dir)) continue;
+            if (pathPolicy.IsExcluded(dir)) continue;
 
             IEnumerable<string> children;
             try
@@ -75,11 +86,11 @@ public static class SourceTreeWalker
 
                 if (isDir)
                 {
-                    if (!privacyPolicy.IsExcluded(child)) stack.Push(child);
+                    if (!pathPolicy.IsExcluded(child)) stack.Push(child);
                     continue;
                 }
 
-                if (privacyPolicy.IsExcluded(child)) continue;
+                if (pathPolicy.IsExcluded(child)) continue;
 
                 // Cap probe: we've encountered a non-ignored file we WOULD yield. If we've
                 // already produced maxFiles entries, this proves the tree has more than the cap

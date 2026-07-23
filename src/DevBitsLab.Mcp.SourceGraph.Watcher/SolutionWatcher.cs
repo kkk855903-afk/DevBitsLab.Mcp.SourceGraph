@@ -18,7 +18,7 @@ public sealed class SolutionWatcher : IAsyncDisposable
     private readonly string _root;
     private readonly TimeSpan _debounce;
     private readonly ILogger<SolutionWatcher> _logger;
-    private readonly PrivacyPathPolicy _privacyPathPolicy;
+    private readonly ScopePathPolicy _pathPolicy;
     private readonly HashSet<string> _sourceExtensions;
     private readonly FileSystemWatcher _sourceWatcher;
     private readonly FileSystemWatcher? _gitHeadWatcher;
@@ -40,14 +40,48 @@ public sealed class SolutionWatcher : IAsyncDisposable
         TimeSpan? debounce = null,
         ILogger<SolutionWatcher>? logger = null,
         IEnumerable<string>? sourceExtensions = null)
+        : this(
+            solutionDirectory,
+            debounce,
+            logger,
+            sourceExtensions,
+            Array.Empty<string>())
+    {
+    }
+
+    public SolutionWatcher(
+        string solutionDirectory,
+        TimeSpan? debounce,
+        ILogger<SolutionWatcher>? logger,
+        IEnumerable<string>? sourceExtensions,
+        IReadOnlyList<string>? excludePatterns)
+        : this(
+            solutionDirectory,
+            debounce,
+            logger,
+            sourceExtensions,
+            excludePatterns,
+            solutionDirectory)
+    {
+    }
+
+    public SolutionWatcher(
+        string solutionDirectory,
+        TimeSpan? debounce,
+        ILogger<SolutionWatcher>? logger,
+        IEnumerable<string>? sourceExtensions,
+        IReadOnlyList<string>? excludePatterns,
+        string policyRoot)
     {
         _root = Path.GetFullPath(solutionDirectory);
         _debounce = debounce ?? TimeSpan.FromMilliseconds(200);
         _logger = logger ?? NullLogger<SolutionWatcher>.Instance;
-        _privacyPathPolicy = new PrivacyPathPolicy(_root);
+        var normalizedPolicyRoot = Path.GetFullPath(policyRoot);
+        _pathPolicy = new ScopePathPolicy(normalizedPolicyRoot, excludePatterns);
+        var privacyPathPolicy = new PrivacyPathPolicy(normalizedPolicyRoot);
         _sourceExtensions = NormalizeSourceExtensions(sourceExtensions);
         _sourceExtensions.RemoveWhere(extension =>
-            _privacyPathPolicy.IsExcluded(Path.Join(_root, $"source{extension}")));
+            privacyPathPolicy.IsExcluded(Path.Join(_root, $"source{extension}")));
         if (_sourceExtensions.Count == 0)
         {
             throw new ArgumentException(
@@ -150,7 +184,7 @@ public sealed class SolutionWatcher : IAsyncDisposable
     }
 
     private bool IsTrackedSourcePath(string path) =>
-        !_privacyPathPolicy.IsExcluded(path)
+        !_pathPolicy.IsExcluded(path)
         && _sourceExtensions.Contains(Path.GetExtension(path));
 
     private static HashSet<string> NormalizeSourceExtensions(IEnumerable<string>? sourceExtensions)

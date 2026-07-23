@@ -30,6 +30,20 @@ public sealed class PrivacyPathPolicy
         ".png",
     };
 
+    private static readonly HashSet<string> _generatedDocumentBuildRootNames = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "bin",
+        "obj",
+    };
+
+    private static readonly HashSet<string> _buildOutputDirectoryNames = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "bin",
+        "obj",
+        "Debug",
+        "Release",
+    };
+
     private readonly string _repoRoot;
     private readonly string _repoRootPrefix;
 
@@ -53,7 +67,19 @@ public sealed class PrivacyPathPolicy
     /// contains an excluded directory segment, or has an excluded medical/image extension.
     /// Relative paths are resolved against the repository root. Invalid paths fail closed.
     /// </summary>
-    public bool IsExcluded(string? path)
+    public bool IsExcluded(string? path) =>
+        IsExcludedCore(path, allowGeneratedDocumentBuildOutput: false);
+
+    /// <summary>
+    /// Generated Roslyn documents are in memory but conventionally carry synthetic paths below
+    /// <c>obj/</c> or <c>bin/</c>. Permit only that build-output portion of the directory policy;
+    /// repository containment, medical/image extensions, and every non-build privacy directory
+    /// remain mandatory.
+    /// </summary>
+    internal bool IsGeneratedDocumentExcluded(string? path) =>
+        IsExcludedCore(path, allowGeneratedDocumentBuildOutput: true);
+
+    private bool IsExcludedCore(string? path, bool allowGeneratedDocumentBuildOutput)
     {
         if (string.IsNullOrWhiteSpace(path)) return true;
 
@@ -93,8 +119,18 @@ public sealed class PrivacyPathPolicy
             Path.DirectorySeparatorChar,
             StringSplitOptions.RemoveEmptyEntries);
 
-        if (segments.Any(_excludedDirectoryNames.Contains))
+        var generatedBuildRootIndex = allowGeneratedDocumentBuildOutput
+            ? Array.FindIndex(segments, _generatedDocumentBuildRootNames.Contains)
+            : -1;
+        for (var i = 0; i < segments.Length; i++)
         {
+            if (!_excludedDirectoryNames.Contains(segments[i])) continue;
+            if (generatedBuildRootIndex >= 0
+                && i >= generatedBuildRootIndex
+                && _buildOutputDirectoryNames.Contains(segments[i]))
+            {
+                continue;
+            }
             return true;
         }
 

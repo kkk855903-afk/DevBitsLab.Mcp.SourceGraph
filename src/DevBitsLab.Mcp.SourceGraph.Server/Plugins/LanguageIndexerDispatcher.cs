@@ -76,14 +76,21 @@ public sealed class LanguageIndexerDispatcher
     public async Task BuildProjectMapAsync(ScopeHost host, CancellationToken ct = default)
     {
         host.ProjectByFilePath.Clear();
-        var privacyPolicy = new PrivacyPathPolicy(Path.GetFullPath(host.Scope.Root));
+        var pathPolicy = new ScopePathPolicy(
+            Path.GetFullPath(host.Scope.Root),
+            host.Scope.ProjectSet.Exclude);
         foreach (var factory in _factories.All())
         {
             ct.ThrowIfCancellationRequested();
             IReadOnlyList<ILanguageProject> projects;
             try
             {
-                projects = await factory.DiscoverAsync(host.Scope.Root, ct).ConfigureAwait(false);
+                projects = factory is IExclusionAwareLanguageProjectFactory exclusionAware
+                    ? await exclusionAware.DiscoverAsync(
+                        host.Scope.Root,
+                        host.Scope.ProjectSet.Exclude,
+                        ct).ConfigureAwait(false)
+                    : await factory.DiscoverAsync(host.Scope.Root, ct).ConfigureAwait(false);
             }
             catch (Exception ex)
             {
@@ -96,7 +103,7 @@ public sealed class LanguageIndexerDispatcher
                 foreach (var path in project.FilePaths)
                 {
                     if (string.IsNullOrEmpty(path)) continue;
-                    if (privacyPolicy.IsExcluded(path)) continue;
+                    if (pathPolicy.IsExcluded(path)) continue;
                     // First-write-wins: the project that claims a file first owns it. Cross-factory
                     // overlap is rare today (MSBuild doesn't claim .xaml; XAML doesn't claim .cs)
                     // but the rule keeps behaviour predictable when a future factory pair overlaps.
@@ -122,10 +129,30 @@ public sealed class LanguageIndexerDispatcher
         string scopeId,
         string repoRoot,
         IReadOnlyDictionary<string, ILanguageProject> projectMap,
-        CancellationToken ct = default)
+        CancellationToken ct = default) =>
+        await DispatchAllForTestAsync(
+            store,
+            scopeId,
+            repoRoot,
+            projectMap,
+            Array.Empty<string>(),
+            ct).ConfigureAwait(false);
+
+    /// <summary>
+    /// Scope-exclude-aware variant used by host-level tests and one-shot callers that already
+    /// resolved a scope configuration.
+    /// </summary>
+    public async Task<int> DispatchAllForTestAsync(
+        IGraphStore store,
+        string scopeId,
+        string repoRoot,
+        IReadOnlyDictionary<string, ILanguageProject> projectMap,
+        IReadOnlyList<string> excludePatterns,
+        CancellationToken ct)
     {
         if (!HasNonCSharpIndexers) return 0;
         if (string.IsNullOrEmpty(repoRoot) || !Directory.Exists(repoRoot)) return 0;
+        var pathPolicy = new ScopePathPolicy(Path.GetFullPath(repoRoot), excludePatterns);
 
         var extensions = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var pair in _indexers.All())
@@ -139,7 +166,7 @@ public sealed class LanguageIndexerDispatcher
         await PopulateSymbolKeyMapAsync(store, symbolIdByKey, ct).ConfigureAwait(false);
 
         var dispatched = 0;
-        foreach (var file in EnumerateFiles(repoRoot, extensions))
+        foreach (var file in EnumerateFiles(repoRoot, extensions, pathPolicy))
         {
             ct.ThrowIfCancellationRequested();
             var ext = Path.GetExtension(file);
@@ -147,7 +174,16 @@ public sealed class LanguageIndexerDispatcher
             if (indexerHit is null) continue;
             try
             {
-                await DispatchOneCoreAsync(store, scopeId, repoRoot, projectMap, file, indexerHit.Value.Indexer, symbolIdByKey, ct).ConfigureAwait(false);
+                await DispatchOneCoreAsync(
+                    store,
+                    scopeId,
+                    repoRoot,
+                    projectMap,
+                    file,
+                    indexerHit.Value.Indexer,
+                    symbolIdByKey,
+                    pathPolicy,
+                    ct).ConfigureAwait(false);
                 dispatched++;
             }
             catch (Exception ex)
@@ -178,6 +214,9 @@ public sealed class LanguageIndexerDispatcher
             extensions.Add(pair.Key);
         }
         if (extensions.Count == 0) return 0;
+        var pathPolicy = new ScopePathPolicy(
+            Path.GetFullPath(host.Scope.Root),
+            host.Scope.ProjectSet.Exclude);
 
         // Cache canonical-key → symbol-id across files in this pass so cross-file edges (e.g. a
         // XAML view binding to a viewmodel symbol the C# indexer wrote) resolve correctly.
@@ -185,7 +224,7 @@ public sealed class LanguageIndexerDispatcher
         await PopulateSymbolKeyMapAsync(host.Store, symbolIdByKey, ct).ConfigureAwait(false);
 
         var dispatched = 0;
-        foreach (var file in EnumerateFiles(host.Scope.Root, extensions))
+        foreach (var file in EnumerateFiles(host.Scope.Root, extensions, pathPolicy))
         {
             ct.ThrowIfCancellationRequested();
             var ext = Path.GetExtension(file);
@@ -194,7 +233,14 @@ public sealed class LanguageIndexerDispatcher
 
             try
             {
-                await DispatchOneAsync(host, file, indexerHit.Value.Indexer, indexerHit.Value.Owner, symbolIdByKey, ct).ConfigureAwait(false);
+                await DispatchOneAsync(
+                    host,
+                    file,
+                    indexerHit.Value.Indexer,
+                    indexerHit.Value.Owner,
+                    symbolIdByKey,
+                    pathPolicy,
+                    ct).ConfigureAwait(false);
                 dispatched++;
             }
             catch (OperationCanceledException) { throw; }
@@ -224,8 +270,18 @@ public sealed class LanguageIndexerDispatcher
         ILanguageIndexer indexer,
         PluginRecord? owner,
         Dictionary<string, long> symbolIdByKey,
+        ScopePathPolicy pathPolicy,
         CancellationToken ct) =>
-        await DispatchOneCoreAsync(host.Store, host.Scope.Id, host.Scope.Root, host.ProjectByFilePath, filePath, indexer, symbolIdByKey, ct).ConfigureAwait(false);
+        await DispatchOneCoreAsync(
+            host.Store,
+            host.Scope.Id,
+            host.Scope.Root,
+            host.ProjectByFilePath,
+            filePath,
+            indexer,
+            symbolIdByKey,
+            pathPolicy,
+            ct).ConfigureAwait(false);
 
     private async Task DispatchOneCoreAsync(
         IGraphStore store,
@@ -235,10 +291,10 @@ public sealed class LanguageIndexerDispatcher
         string filePath,
         ILanguageIndexer indexer,
         Dictionary<string, long> symbolIdByKey,
+        ScopePathPolicy pathPolicy,
         CancellationToken ct)
     {
-        var privacyPolicy = new PrivacyPathPolicy(Path.GetFullPath(repoRoot));
-        if (privacyPolicy.IsExcluded(filePath)) return;
+        if (pathPolicy.IsExcluded(filePath)) return;
 
         byte[] contents;
         try
@@ -311,16 +367,18 @@ public sealed class LanguageIndexerDispatcher
     /// <see cref="PrivacyPathPolicy"/> prunes excluded subtrees before enumeration and rejects
     /// excluded files before they can be opened by <see cref="DispatchOneCoreAsync"/>.
     /// </summary>
-    private static IEnumerable<string> EnumerateFiles(string root, HashSet<string> extensions)
+    private static IEnumerable<string> EnumerateFiles(
+        string root,
+        HashSet<string> extensions,
+        ScopePathPolicy pathPolicy)
     {
         var normalizedRoot = Path.GetFullPath(root);
-        var privacyPolicy = new PrivacyPathPolicy(normalizedRoot);
         var stack = new Stack<string>();
         stack.Push(normalizedRoot);
         while (stack.Count > 0)
         {
             var dir = stack.Pop();
-            if (privacyPolicy.IsExcluded(dir)) continue;
+            if (pathPolicy.IsExcluded(dir)) continue;
 
             IEnumerable<string> children;
             try { children = Directory.EnumerateDirectories(dir); }
@@ -329,7 +387,7 @@ public sealed class LanguageIndexerDispatcher
 
             foreach (var child in children)
             {
-                if (!privacyPolicy.IsExcluded(child)) stack.Push(child);
+                if (!pathPolicy.IsExcluded(child)) stack.Push(child);
             }
 
             IEnumerable<string> files;
@@ -339,7 +397,7 @@ public sealed class LanguageIndexerDispatcher
 
             foreach (var f in files)
             {
-                if (privacyPolicy.IsExcluded(f)) continue;
+                if (pathPolicy.IsExcluded(f)) continue;
                 var ext = Path.GetExtension(f);
                 if (extensions.Contains(ext)) yield return f;
             }

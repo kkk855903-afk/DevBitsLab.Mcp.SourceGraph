@@ -13,7 +13,7 @@ namespace DevBitsLab.Mcp.SourceGraph.Indexing;
 /// <para>The workspace constructor remains for API compatibility. Its snapshot is sanitized inside
 /// <see cref="DiscoverAsync"/> before any project is exposed.</para>
 /// </summary>
-public sealed class MSBuildLanguageProjectFactory : ILanguageProjectFactory
+public sealed class MSBuildLanguageProjectFactory : IExclusionAwareLanguageProjectFactory
 {
     private readonly Func<Solution?> _solutionProvider;
 
@@ -40,7 +40,16 @@ public sealed class MSBuildLanguageProjectFactory : ILanguageProjectFactory
     };
 
     /// <inheritdoc />
-    public Task<IReadOnlyList<ILanguageProject>> DiscoverAsync(string repoRoot, CancellationToken ct)
+    public Task<IReadOnlyList<ILanguageProject>> DiscoverAsync(
+        string repoRoot,
+        CancellationToken ct) =>
+        DiscoverAsync(repoRoot, Array.Empty<string>(), ct);
+
+    /// <inheritdoc />
+    public Task<IReadOnlyList<ILanguageProject>> DiscoverAsync(
+        string repoRoot,
+        IReadOnlyList<string> excludePatterns,
+        CancellationToken ct)
     {
         var solution = _solutionProvider();
         if (solution is null)
@@ -51,8 +60,8 @@ public sealed class MSBuildLanguageProjectFactory : ILanguageProjectFactory
         // Apply the boundary here as well for callers using the compatibility workspace
         // constructor. An MSBuild workspace is not a sandbox; this only prevents excluded Roslyn
         // inputs from being handed to downstream indexers after project evaluation.
-        var privacyPolicy = new PrivacyPathPolicy(Path.GetFullPath(repoRoot));
-        var sanitized = SolutionPrivacySanitizer.Sanitize(solution, privacyPolicy);
+        var pathPolicy = new ScopePathPolicy(Path.GetFullPath(repoRoot), excludePatterns);
+        var sanitized = SolutionPrivacySanitizer.SanitizeForScope(solution, pathPolicy);
         var projects = sanitized.Projects
             .Select(p => (ILanguageProject)new MSBuildLanguageProject(p))
             .ToList();

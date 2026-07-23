@@ -54,3 +54,21 @@ public interface ILanguageProjectFactory
     /// </summary>
     Task<IReadOnlyList<ILanguageProject>> DiscoverAsync(string repoRoot, CancellationToken ct);
 }
+
+/// <summary>
+/// Optional project-factory capability for hosts that carry repository-relative scope excludes.
+/// Implementations apply the patterns before reading project anchors or project-owned files.
+/// Older factories remain compatible through <see cref="ILanguageProjectFactory"/>; the host
+/// still filters their returned file maps.
+/// </summary>
+public interface IExclusionAwareLanguageProjectFactory : ILanguageProjectFactory
+{
+    /// <summary>
+    /// Discover projects while excluding every path matched by <paramref name="excludePatterns"/>.
+    /// Patterns narrow the host's mandatory privacy boundary and cannot expand it.
+    /// </summary>
+    Task<IReadOnlyList<ILanguageProject>> DiscoverAsync(
+        string repoRoot,
+        IReadOnlyList<string> excludePatterns,
+        CancellationToken ct);
+}

@@ -30,7 +30,11 @@ internal static class DriftReconciler
         // more"; a simple `scanned >= maxFiles` test would incorrectly report partial in the
         // first case. Reported BEFORE the walk so callers see motion during the disk pass.
         progress?.Report(Format.Progress(0.0, "walking source tree"));
-        var outcome = await SourceTreeWalker.WalkAsync(host.Scope.Root, maxFiles, ct).ConfigureAwait(false);
+        var outcome = await SourceTreeWalker.WalkAsync(
+            host.Scope.Root,
+            maxFiles,
+            host.Scope.ProjectSet.Exclude,
+            ct).ConfigureAwait(false);
         var disk = new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
         foreach (var entry in outcome.Entries)
         {

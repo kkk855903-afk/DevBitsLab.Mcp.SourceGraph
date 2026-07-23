@@ -44,10 +44,11 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
     private readonly ILogger<RoslynIndexer> _logger;
     private readonly SemaphoreSlim _lock = new(1, 1);
     private readonly string? _configuredPrivacyRoot;
+    private readonly IReadOnlyList<string> _configuredExcludePatterns;
 
     private MSBuildWorkspace? _workspace;
     private Solution? _sanitizedSolution;
-    private PrivacyPathPolicy? _privacyPolicy;
+    private ScopePathPolicy? _pathPolicy;
     private string? _solutionPath;
 
     private readonly Dictionary<string, long> _symbolIdByKey = new(StringComparer.Ordinal);
@@ -77,11 +78,22 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         ILogger<RoslynIndexer>? logger = null,
         IEmbeddingsRequestSink? embeddingsSink = null,
         string? privacyRoot = null)
+        : this(store, logger, embeddingsSink, privacyRoot, Array.Empty<string>())
+    {
+    }
+
+    public RoslynIndexer(
+        IGraphStore store,
+        ILogger<RoslynIndexer>? logger,
+        IEmbeddingsRequestSink? embeddingsSink,
+        string? privacyRoot,
+        IReadOnlyList<string>? excludePatterns)
     {
         _store = store;
         _logger = logger ?? NullLogger<RoslynIndexer>.Instance;
         _embeddingsSink = embeddingsSink ?? new NoOpEmbeddingsRequestSink();
         _configuredPrivacyRoot = privacyRoot is null ? null : Path.GetFullPath(privacyRoot);
+        _configuredExcludePatterns = excludePatterns?.ToArray() ?? Array.Empty<string>();
     }
 
     public string? SolutionPath => _solutionPath;
@@ -109,8 +121,8 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         _solutionPath = Path.GetFullPath(solutionPath);
         var privacyRoot = _configuredPrivacyRoot ?? Path.GetDirectoryName(_solutionPath)
             ?? throw new InvalidOperationException("The solution path has no containing directory.");
-        _privacyPolicy = new PrivacyPathPolicy(privacyRoot);
-        if (_privacyPolicy.IsExcluded(_solutionPath))
+        _pathPolicy = new ScopePathPolicy(privacyRoot, _configuredExcludePatterns);
+        if (_pathPolicy.IsExcluded(_solutionPath))
         {
             throw new InvalidOperationException("The solution path is outside the indexing privacy boundary.");
         }
@@ -132,7 +144,7 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         var loadedSolution = await _workspace.OpenSolutionAsync(
             _solutionPath,
             cancellationToken: ct).ConfigureAwait(false);
-        _sanitizedSolution = SolutionPrivacySanitizer.Sanitize(loadedSolution, _privacyPolicy);
+        _sanitizedSolution = SolutionPrivacySanitizer.SanitizeForScope(loadedSolution, _pathPolicy);
         _logger.LogInformation("Opened {Path} ({ProjectCount} projects) in {Elapsed}",
             _solutionPath, _sanitizedSolution.Projects.Count(), sw.Elapsed);
     }
@@ -162,13 +174,13 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         await _lock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
-            var privacyPolicy = _privacyPolicy!;
+            var pathPolicy = _pathPolicy!;
             // Build an updated Solution snapshot in memory. We do NOT call
             // _workspace.TryApplyChanges — MSBuildWorkspace refuses ChangeDocument by default and
             // would throw. The local `solution` value is what IndexCoreAsync walks.
             var solution = _sanitizedSolution!;
             var pathSet = new HashSet<string>(
-                paths.Select(Path.GetFullPath).Where(path => !privacyPolicy.IsExcluded(path)),
+                paths.Select(Path.GetFullPath).Where(path => !pathPolicy.IsExcluded(path)),
                 StringComparer.OrdinalIgnoreCase);
             if (pathSet.Count == 0)
             {
@@ -292,7 +304,7 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
             var loadedSolution = await _workspace.OpenSolutionAsync(
                 slnPath,
                 cancellationToken: ct).ConfigureAwait(false);
-            _sanitizedSolution = SolutionPrivacySanitizer.Sanitize(loadedSolution, _privacyPolicy!);
+            _sanitizedSolution = SolutionPrivacySanitizer.SanitizeForScope(loadedSolution, _pathPolicy!);
         }
         finally
         {
@@ -303,7 +315,7 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
 
     private void EnsureOpen()
     {
-        if (_workspace is null || _sanitizedSolution is null || _privacyPolicy is null)
+        if (_workspace is null || _sanitizedSolution is null || _pathPolicy is null)
         {
             throw new InvalidOperationException("Call OpenAsync before indexing.");
         }
@@ -441,7 +453,9 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         // Source-generated documents are in-memory Roslyn outputs and may legitimately carry an
         // obj/ pseudo-path. Ordinary documents must remain inside the sanitized privacy boundary.
         documents = documents
-            .Where(d => d is SourceGeneratedDocument || !_privacyPolicy!.IsExcluded(d.FilePath))
+            .Where(d => d is SourceGeneratedDocument generated
+                ? !_pathPolicy!.IsGeneratedDocumentExcluded(generated.FilePath)
+                : !_pathPolicy!.IsExcluded(d.FilePath))
             .ToList();
 
         // Defensive filter: skip documents in projects whose pre-flight probe failed. The probe

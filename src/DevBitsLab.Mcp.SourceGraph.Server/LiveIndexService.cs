@@ -480,7 +480,8 @@ public sealed class LiveIndexService : BackgroundService
                 store,
                 _loggerFactory.CreateLogger<RoslynIndexer>(),
                 indexerSink,
-                privacyRoot: scope.Root);
+                scope.Root,
+                scope.ProjectSet.Exclude);
             if (!_historyOptions.Disabled)
             {
                 indexer.OnFileIndexed = (fileId, path, sha) =>
@@ -841,7 +842,10 @@ public sealed class LiveIndexService : BackgroundService
         var watcher = new SolutionWatcher(
             watchRoot,
             debounce: TimeSpan.FromMilliseconds(_config.DebounceMs),
-            logger: _loggerFactory.CreateLogger<SolutionWatcher>());
+            logger: _loggerFactory.CreateLogger<SolutionWatcher>(),
+            sourceExtensions: null,
+            excludePatterns: host.Scope.ProjectSet.Exclude,
+            policyRoot: host.Scope.Root);
         host.Watcher = watcher;
 
         _logger.LogInformation("Scope `{Id}`: watching {Root} for .cs, .xaml, and .git/HEAD changes", host.Scope.Id, watchRoot);
@@ -917,6 +921,9 @@ public sealed class LiveIndexService : BackgroundService
     {
         var files = await host.Store.GetAllFilesAsync(ct).ConfigureAwait(false);
         var symbolKeys = await host.Store.GetAllSymbolKeysAsync(ct).ConfigureAwait(false);
+        var pathPolicy = new ScopePathPolicy(
+            Path.GetFullPath(host.Scope.Root),
+            host.Scope.ProjectSet.Exclude);
 
         // Build canonical-key -> id map for the emitter; analyzers can target any indexed symbol
         // by canonical key, including ones in files other than the one currently being analysed.
@@ -936,6 +943,7 @@ public sealed class LiveIndexService : BackgroundService
         foreach (var file in files)
         {
             ct.ThrowIfCancellationRequested();
+            if (pathPolicy.IsExcluded(file.Path)) continue;
             byte[] contents;
             try
             {
