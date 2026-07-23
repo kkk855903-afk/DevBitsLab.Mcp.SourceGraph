@@ -9,9 +9,8 @@ public interface IGraphStore : IAsyncDisposable
     Task<long> UpsertFileAsync(string path, byte[] contentSha256, DateTimeOffset indexedAt, bool isGenerated = false, CancellationToken ct = default);
     Task<byte[]?> GetFileContentHashAsync(string path, CancellationToken ct = default);
 
-    /// <summary>Wipes refs and edges that originate IN this file (ref.file_id = id, edge.src in file's symbols).
-    /// Does NOT delete the symbols themselves — they're upserted by canonical key so their integer ids stay
-    /// stable across edits, keeping incoming refs/edges from other files valid.</summary>
+    /// <summary>Wipes refs and edge evidence emitted by this file, then removes logical edges
+    /// left with no evidence. Does NOT delete symbols — they retain stable ids across edits.</summary>
     Task ClearFileOutgoingAsync(long fileId, CancellationToken ct = default);
 
     /// <summary>Delete every symbol declared in <paramref name="fileId"/> whose canonical key is not in
@@ -32,11 +31,22 @@ public interface IGraphStore : IAsyncDisposable
     Task BulkInsertReferencesAsync(IEnumerable<SymbolReference> references, CancellationToken ct = default);
 
     /// <summary>
-    /// Bulk-insert edges. <see cref="Edge.Metadata"/> is JSON-serialised into the
-    /// <c>edges.payload</c> column when non-null. <see cref="Edge.Kind"/> is the kebab-case
-    /// kind identifier (e.g. <c>"calls"</c>, <c>"binds-path"</c>).
+    /// Bulk-insert logical edges and their occurrence-level evidence. Repeated
+    /// <c>(src, dst, kind)</c> values retain one logical edge while every distinct
+    /// <see cref="Edge.Evidence"/> row is preserved. When a legacy caller omits evidence, the
+    /// store creates inferred declaration evidence from the source symbol.
     /// </summary>
     Task BulkInsertEdgesAsync(IEnumerable<Edge> edges, CancellationToken ct = default);
+
+    /// <summary>
+    /// Return every stored proof for one logical edge in stable source order.
+    /// </summary>
+    Task<IReadOnlyList<Evidence>> ListEdgeEvidenceAsync(
+        long sourceSymbolId,
+        long targetSymbolId,
+        string edgeKind,
+        int limit = 100,
+        CancellationToken ct = default);
 
     /// <summary>
     /// Bulk-insert the annotations attached to a set of symbols. Run after the symbols

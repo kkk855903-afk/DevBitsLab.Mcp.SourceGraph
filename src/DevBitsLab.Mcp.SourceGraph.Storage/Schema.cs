@@ -16,9 +16,14 @@ public static class Schema
     /// drops all data tables when the on-disk version is below this, since the index can always be
     /// rebuilt from source.
     /// </summary>
-    public const int Version = 12;
+    public const int Version = 13;
 
     /// <summary>
+    /// V13 separates logical edges from their one-to-many evidence rows. The
+    /// <c>edge_evidence</c> table records the producing file, exact range, confidence, producer,
+    /// and occurrence-specific payload, allowing repeated call/binding sites to survive
+    /// deduplication and to be removed independently during incremental indexing.
+    ///
     /// V12 is an intentional destructive privacy boundary with no layout change: opening any
     /// v11-or-older graph drops all indexed rows before rebuilding, so data captured before the
     /// medical privacy path policy (including PatientData, DICOM, and image-derived records)
@@ -38,9 +43,9 @@ public static class Schema
     /// test/history awareness, V8 added <c>files.is_generated</c> and <c>diagnostics</c>,
     /// V7 wired in <c>sqlite-vec</c>, V6 added <c>attributes</c> + <c>attributes_fts</c>,
     /// V5 enriched symbols with modifiers/accessibility/xml_summary, V3 dropped FK constraints
-    /// from refs/edges. V12 is the cumulative drop-and-rebuild target — there is no preserved
+    /// from refs/edges. V13 is the cumulative drop-and-rebuild target — there is no preserved
     /// data path; <see cref="SqliteGraphStore.EnsureSchemaAsync"/> calls <see cref="DropAll"/>
-    /// when the on-disk version is anything below 12.
+    /// when the on-disk version is anything below 13.
     /// </summary>
     internal const string V1 = """
         CREATE TABLE IF NOT EXISTS schema_version (
@@ -99,6 +104,31 @@ public static class Schema
         );
         CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(dst, kind_name);
         CREATE INDEX IF NOT EXISTS idx_edges_kind_name ON edges(kind_name);
+
+        CREATE TABLE IF NOT EXISTS edge_evidence (
+            id INTEGER PRIMARY KEY,
+            src INTEGER NOT NULL,
+            dst INTEGER NOT NULL,
+            kind_name TEXT NOT NULL,
+            producing_file_id INTEGER NOT NULL,
+            file_path TEXT NOT NULL,
+            start_line INTEGER NOT NULL,
+            start_col INTEGER NOT NULL,
+            end_line INTEGER NOT NULL,
+            end_col INTEGER NOT NULL,
+            confidence INTEGER NOT NULL,
+            producer TEXT NOT NULL,
+            payload TEXT NOT NULL DEFAULT '',
+            UNIQUE (
+                src, dst, kind_name, producing_file_id, file_path,
+                start_line, start_col, end_line, end_col,
+                confidence, producer, payload
+            )
+        );
+        CREATE INDEX IF NOT EXISTS idx_edge_evidence_edge
+            ON edge_evidence(src, dst, kind_name);
+        CREATE INDEX IF NOT EXISTS idx_edge_evidence_file
+            ON edge_evidence(producing_file_id);
 
         CREATE TABLE IF NOT EXISTS annotations (
             id INTEGER PRIMARY KEY,
@@ -282,6 +312,7 @@ public static class Schema
         DROP TABLE   IF EXISTS symbols_fts;
         DROP TABLE   IF EXISTS symbol_embeddings;
         DROP TABLE   IF EXISTS embedding_meta;
+        DROP TABLE   IF EXISTS edge_evidence;
         DROP TABLE   IF EXISTS edges;
         DROP TABLE   IF EXISTS refs;
         DROP TABLE   IF EXISTS symbols;

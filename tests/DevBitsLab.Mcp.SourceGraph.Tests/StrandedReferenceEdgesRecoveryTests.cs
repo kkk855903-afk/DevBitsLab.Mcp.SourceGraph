@@ -66,11 +66,11 @@ public sealed class StrandedReferenceEdgesRecoveryTests : IAsyncLifetime
             beforeRefs.Should().BeGreaterThan(0, "Calculator.cs body produces calls + uses-type refs");
         }
 
-        // Construct the zombie state: drop the file's outgoing refs AND edges (mirroring
+        // Construct the zombie state: drop the file's refs and edge evidence (mirroring
         // what ClearFileOutgoingAsync does in production), but keep the file row + symbols
         // intact. content_sha256 stays put, so the next index sees "unchanged" in pass 1.
-        // Both tables are wiped because the integrity check probes refs OR edges — leaving
-        // edges in place would (correctly) read as "healthy" and skip the SHA check.
+        // Both producer-owned artifact sets are wiped because the integrity check probes refs
+        // OR evidence — leaving evidence in place would read as healthy and skip the SHA check.
         await ClearOutgoingForFileAsync(_dbPath, calcFileId);
         var zombieRefs = await CountRefsForFileAsync(_dbPath, calcFileId);
         zombieRefs.Should().Be(0, "the deletion should have left the file zombied");
@@ -297,15 +297,26 @@ public sealed class StrandedReferenceEdgesRecoveryTests : IAsyncLifetime
 
     private static async Task ClearOutgoingForFileAsync(string dbPath, long fileId)
     {
-        // Mirrors SqliteGraphStore.ClearFileOutgoingAsync: drops both refs (by file_id) and
-        // edges (whose src is one of the file's declared symbols). Used by the zombie-state
-        // construction in the recovery regression test.
+        // Mirrors SqliteGraphStore.ClearFileOutgoingAsync: drops producer-owned evidence and
+        // refs, then removes logical edges whose final evidence disappeared.
         await using var c = OpenReadWrite(dbPath);
         await c.OpenAsync();
+        await using var deleteEvidence = c.CreateCommand();
+        deleteEvidence.CommandText =
+            "DELETE FROM edge_evidence WHERE producing_file_id = $id;";
+        deleteEvidence.Parameters.AddWithValue("$id", fileId);
+        await deleteEvidence.ExecuteNonQueryAsync();
         await using var deleteEdges = c.CreateCommand();
         deleteEdges.CommandText =
-            "DELETE FROM edges WHERE src IN (SELECT id FROM symbols WHERE file_id = $id);";
-        deleteEdges.Parameters.AddWithValue("$id", fileId);
+            """
+            DELETE FROM edges
+            WHERE NOT EXISTS (
+                SELECT 1 FROM edge_evidence ev
+                WHERE ev.src = edges.src
+                  AND ev.dst = edges.dst
+                  AND ev.kind_name = edges.kind_name
+            );
+            """;
         await deleteEdges.ExecuteNonQueryAsync();
         await using var deleteRefs = c.CreateCommand();
         deleteRefs.CommandText = "DELETE FROM refs WHERE file_id = $id;";

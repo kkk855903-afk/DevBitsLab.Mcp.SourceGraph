@@ -48,17 +48,55 @@ public sealed record SymbolReference(
     ReferenceKind Kind);
 
 /// <summary>
+/// How strongly an analyzer established one relationship. Values are ordered from weakest to
+/// strongest so callers can apply a minimum-confidence filter without language-specific rules.
+/// </summary>
+public enum EvidenceConfidence
+{
+    Inferred = 0,
+    Semantic = 1,
+    Exact = 2,
+}
+
+/// <summary>
+/// One 1-based source range supporting a graph relationship.
+/// </summary>
+public sealed record SourceLocation(
+    string FilePath,
+    int StartLine,
+    int StartColumn,
+    int EndLine,
+    int EndColumn);
+
+/// <summary>
+/// One independently attributable proof for a logical edge. <see cref="ProducingFileId"/> is the
+/// indexed file whose pass emitted this evidence and is used for precise incremental cleanup;
+/// it need not be the file that declares the edge's source symbol. <see cref="Producer"/> names
+/// the analyzer that made the determination. Optional metadata is stored per evidence so two
+/// call sites or bindings between the same symbols cannot overwrite one another.
+/// </summary>
+public sealed record Evidence(
+    long ProducingFileId,
+    SourceLocation Location,
+    EvidenceConfidence Confidence,
+    string Producer,
+    IReadOnlyDictionary<string, string>? Metadata = null);
+
+/// <summary>
 /// One edge between two symbols in the graph. <see cref="Kind"/> is a kebab-case identifier
 /// (<c>"calls"</c>, <c>"inherits"</c>, …); the SDK's <c>EdgeKinds</c> static class supplies
 /// the well-known constants. <see cref="Metadata"/> carries per-edge facts (binding paths,
-/// event names, prop names) that don't fit in the <c>(src, dst, kind)</c> triple — stored as
-/// JSON in the <c>edges.payload</c> column when non-null.
+/// event names, prop names) retained for compatibility with existing payload-aware queries.
+/// <see cref="Evidence"/> identifies the exact source range and confidence for this emission.
+/// Repeating the same logical <c>(src, dst, kind)</c> edge with different evidence preserves
+/// every occurrence.
 /// </summary>
 public sealed record Edge(
     long Src,
     long Dst,
     string Kind,
-    IReadOnlyDictionary<string, string>? Metadata = null);
+    IReadOnlyDictionary<string, string>? Metadata = null,
+    Evidence? Evidence = null);
 
 /// <summary>
 /// One annotation attached to an indexed symbol — a .NET <c>[Attribute]</c>, a TS

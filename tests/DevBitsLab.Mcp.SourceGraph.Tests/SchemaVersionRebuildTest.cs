@@ -31,9 +31,9 @@ public sealed class SchemaVersionRebuildTest
         var dbPath = Path.Join(tmp, "graph.db");
         try
         {
-            // Create the full current layout through the public entry point. V12 intentionally
-            // has the same layout as v11; only the version boundary and destructive rebuild are
-            // new. Downgrading the marker after seeding therefore models a populated v11 DB.
+            // Create the current layout through the public entry point, seed every privacy-
+            // relevant table, then downgrade the marker to v11. This directly exercises the
+            // production version gate while the separate v10 test below covers historical DDL.
             await using (var store = new SqliteGraphStore(dbPath))
             {
                 await store.EnsureSchemaAsync();
@@ -74,6 +74,24 @@ public sealed class SchemaVersionRebuildTest
                         'calls',
                         '{"patient":"Patient-0001"}');
 
+                    INSERT INTO edge_evidence(
+                        src, dst, kind_name, producing_file_id, file_path,
+                        start_line, start_col, end_line, end_col,
+                        confidence, producer, payload)
+                    VALUES (
+                        @PatientSymbolId,
+                        @PatientImageSymbolId,
+                        'calls',
+                        101,
+                        @DicomPath,
+                        12,
+                        9,
+                        12,
+                        18,
+                        2,
+                        'pre-policy-canary',
+                        '{"patient":"Patient-0001"}');
+
                     INSERT INTO diagnostics(
                         id, symbol_id, file_id, severity, code, message, line, col)
                     VALUES (
@@ -88,7 +106,7 @@ public sealed class SchemaVersionRebuildTest
 
                     -- embedding_meta is always present. The vec0-backed symbol_embeddings table
                     -- is optional and only exists when the native extension loaded, so this is
-                    -- the deterministic embedding canary supported by every v11 graph.
+                    -- the deterministic embedding canary supported by every graph layout here.
                     INSERT INTO embedding_meta(symbol_id, content_hash, model_version)
                     VALUES
                         (@PatientSymbolId, X'0A0B0C0D', 'patient-canary/v1'),
@@ -138,6 +156,7 @@ public sealed class SchemaVersionRebuildTest
                              "symbols",
                              "refs",
                              "edges",
+                             "edge_evidence",
                              "diagnostics",
                              "embedding_meta",
                          })
@@ -203,7 +222,7 @@ public sealed class SchemaVersionRebuildTest
 
                 var hasLegacyAttributes = await conn.ExecuteScalarAsync<long>(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='attributes';");
-                hasLegacyAttributes.Should().Be(0, "legacy attributes table is dropped on the v10 -> v11 rebuild");
+                hasLegacyAttributes.Should().Be(0, "legacy attributes table is dropped on the v10 -> current rebuild");
 
                 var hasAnnotations = await conn.ExecuteScalarAsync<long>(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='annotations';");

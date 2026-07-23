@@ -164,19 +164,31 @@ public sealed class SqliteGraphStore : IGraphStore
 
     public async Task ClearFileOutgoingAsync(long fileId, CancellationToken ct = default)
     {
-        // Wipe outgoing-only: refs whose file_id is this file, and edges whose src is one of this
-        // file's symbols. Symbol rows themselves are NOT touched here — they're upserted by
-        // canonical key in pass-1 to keep stable ids, which keeps incoming refs/edges valid.
+        // Evidence is owned by the file pass that produced it, not necessarily by the file that
+        // declares the logical edge's source symbol. Remove only this producer's occurrences,
+        // then discard logical edges whose final supporting occurrence disappeared.
         await _writeLock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
             using var tx = _connection.BeginTransaction();
             await _connection.ExecuteAsync(new CommandDefinition(
-                "DELETE FROM edges WHERE src IN (SELECT id FROM symbols WHERE file_id = @id);",
+                "DELETE FROM edge_evidence WHERE producing_file_id = @id;",
                 new { id = fileId }, transaction: tx, cancellationToken: ct)).ConfigureAwait(false);
             await _connection.ExecuteAsync(new CommandDefinition(
                 "DELETE FROM refs WHERE file_id = @id;",
                 new { id = fileId }, transaction: tx, cancellationToken: ct)).ConfigureAwait(false);
+            await _connection.ExecuteAsync(new CommandDefinition(
+                """
+                DELETE FROM edges
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM edge_evidence ev
+                    WHERE ev.src = edges.src
+                      AND ev.dst = edges.dst
+                      AND ev.kind_name = edges.kind_name
+                );
+                """,
+                transaction: tx, cancellationToken: ct)).ConfigureAwait(false);
             tx.Commit();
         }
         finally
@@ -224,6 +236,16 @@ public sealed class SqliteGraphStore : IGraphStore
                     WHERE file_id = @id AND canonical_key NOT IN (SELECT key FROM keep_keys)
                 );
                 """;
+            const string deleteEdgeEvidenceSql = """
+                DELETE FROM edge_evidence
+                WHERE src IN (
+                    SELECT id FROM symbols
+                    WHERE file_id = @id AND canonical_key NOT IN (SELECT key FROM keep_keys)
+                ) OR dst IN (
+                    SELECT id FROM symbols
+                    WHERE file_id = @id AND canonical_key NOT IN (SELECT key FROM keep_keys)
+                );
+                """;
             // Wipe annotations for every symbol attributed to this file. The indexer rebuilds
             // the annotation set per-file in pass 1 and bulk-inserts immediately after this
             // reconcile step, so dropping the rows for surviving symbols too is correct (and
@@ -242,6 +264,7 @@ public sealed class SqliteGraphStore : IGraphStore
                 WHERE file_id = @id AND canonical_key NOT IN (SELECT key FROM keep_keys);
                 """;
             await _connection.ExecuteAsync(new CommandDefinition(deleteRefsSql, new { id = fileId }, transaction: tx, cancellationToken: ct)).ConfigureAwait(false);
+            await _connection.ExecuteAsync(new CommandDefinition(deleteEdgeEvidenceSql, new { id = fileId }, transaction: tx, cancellationToken: ct)).ConfigureAwait(false);
             await _connection.ExecuteAsync(new CommandDefinition(deleteEdgesSql, new { id = fileId }, transaction: tx, cancellationToken: ct)).ConfigureAwait(false);
             await _connection.ExecuteAsync(new CommandDefinition(deleteAnnotationsSql, new { id = fileId }, transaction: tx, cancellationToken: ct)).ConfigureAwait(false);
             await _connection.ExecuteAsync(new CommandDefinition(deleteDiagnosticsSql, new { id = fileId }, transaction: tx, cancellationToken: ct)).ConfigureAwait(false);
@@ -387,37 +410,102 @@ public sealed class SqliteGraphStore : IGraphStore
 
     public async Task BulkInsertEdgesAsync(IEnumerable<Edge> edges, CancellationToken ct = default)
     {
-        // INSERT OR IGNORE preserves the dedup behaviour against the new (src, dst, kind_name)
-        // PK; if a logical edge appears twice with different metadata payloads, the first write
-        // wins. That matches the legacy semantics — callers don't expect "merge" behaviour for
-        // edge metadata; they emit each edge once per file and rely on ClearFileOutgoingAsync
-        // to wipe stale rows.
-        const string sql = """
+        const string insertEdgeSql = """
             INSERT OR IGNORE INTO edges(src, dst, kind_name, payload)
             VALUES (@Src, @Dst, @Kind, @Payload);
             """;
+        const string insertEvidenceSql = """
+            INSERT OR IGNORE INTO edge_evidence(
+                src, dst, kind_name, producing_file_id, file_path,
+                start_line, start_col, end_line, end_col,
+                confidence, producer, payload)
+            VALUES (
+                @Src, @Dst, @Kind, @ProducingFileId, @FilePath,
+                @StartLine, @StartColumn, @EndLine, @EndColumn,
+                @Confidence, @Producer, @Payload);
+            """;
+        const string fallbackEvidenceSql = """
+            SELECT
+                s.file_id AS ProducingFileId,
+                f.path AS FilePath,
+                s.start_line AS StartLine,
+                s.start_col AS StartColumn,
+                s.end_line AS EndLine,
+                s.end_col AS EndColumn
+            FROM symbols s
+            JOIN files f ON f.id = s.file_id
+            WHERE s.id = @SourceSymbolId;
+            """;
+
         await _writeLock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
             using var tx = _connection.BeginTransaction();
+            var fallbackBySource = new Dictionary<long, Evidence>();
             foreach (var e in edges)
             {
-                // Serialise metadata to JSON when non-empty; bind SQL NULL otherwise.
-                // System.Text.Json default options give a stable, compact representation; the
-                // payload column is opaque to the indexer (only consumed by tools that already
-                // know the kind-specific shape).
-                string? payload = null;
-                if (e.Metadata is not null && e.Metadata.Count > 0)
-                {
-                    payload = JsonSerializer.Serialize(e.Metadata);
-                }
-
-                await _connection.ExecuteAsync(new CommandDefinition(sql, new
+                var logicalPayload = SerializeMetadata(e.Metadata);
+                await _connection.ExecuteAsync(new CommandDefinition(insertEdgeSql, new
                 {
                     e.Src,
                     e.Dst,
                     Kind = e.Kind,
-                    Payload = payload,
+                    Payload = logicalPayload,
+                }, transaction: tx, cancellationToken: ct)).ConfigureAwait(false);
+
+                var evidence = e.Evidence;
+                if (evidence is null)
+                {
+                    if (!fallbackBySource.TryGetValue(e.Src, out evidence))
+                    {
+                        var source = await _connection.QuerySingleOrDefaultAsync<RawEvidenceSource>(
+                            new CommandDefinition(
+                                fallbackEvidenceSql,
+                                new { SourceSymbolId = e.Src },
+                                transaction: tx,
+                                cancellationToken: ct)).ConfigureAwait(false);
+                        if (source is null)
+                        {
+                            throw new InvalidOperationException(
+                                $"Cannot create evidence for edge {e.Src} -[{e.Kind}]-> {e.Dst}: source symbol is missing.");
+                        }
+
+                        var startLine = Math.Max(1L, source.StartLine);
+                        var startColumn = Math.Max(1L, source.StartColumn);
+                        var endLine = Math.Max(startLine, source.EndLine);
+                        var endColumn = Math.Max(
+                            endLine == startLine ? startColumn : 1L,
+                            source.EndColumn);
+                        evidence = new Evidence(
+                            source.ProducingFileId,
+                            new SourceLocation(
+                                source.FilePath,
+                                checked((int)startLine),
+                                checked((int)startColumn),
+                                checked((int)endLine),
+                                checked((int)endColumn)),
+                            EvidenceConfidence.Inferred,
+                            "legacy-declaration",
+                            Metadata: null);
+                        fallbackBySource[e.Src] = evidence;
+                    }
+                }
+                ValidateEvidence(evidence);
+
+                await _connection.ExecuteAsync(new CommandDefinition(insertEvidenceSql, new
+                {
+                    e.Src,
+                    e.Dst,
+                    Kind = e.Kind,
+                    evidence.ProducingFileId,
+                    evidence.Location.FilePath,
+                    evidence.Location.StartLine,
+                    evidence.Location.StartColumn,
+                    evidence.Location.EndLine,
+                    evidence.Location.EndColumn,
+                    Confidence = (int)evidence.Confidence,
+                    evidence.Producer,
+                    Payload = SerializeMetadata(evidence.Metadata ?? e.Metadata) ?? string.Empty,
                 }, transaction: tx, cancellationToken: ct)).ConfigureAwait(false);
             }
             tx.Commit();
@@ -425,6 +513,124 @@ public sealed class SqliteGraphStore : IGraphStore
         finally
         {
             _writeLock.Release();
+        }
+    }
+
+    public async Task<IReadOnlyList<Evidence>> ListEdgeEvidenceAsync(
+        long sourceSymbolId,
+        long targetSymbolId,
+        string edgeKind,
+        int limit = 100,
+        CancellationToken ct = default)
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThan(limit, 1);
+        ArgumentException.ThrowIfNullOrWhiteSpace(edgeKind);
+
+        const string sql = """
+            SELECT
+                producing_file_id AS ProducingFileId,
+                file_path AS FilePath,
+                start_line AS StartLine,
+                start_col AS StartColumn,
+                end_line AS EndLine,
+                end_col AS EndColumn,
+                confidence AS Confidence,
+                producer AS Producer,
+                payload AS Payload
+            FROM edge_evidence
+            WHERE src = @SourceSymbolId
+              AND dst = @TargetSymbolId
+              AND kind_name = @EdgeKind
+            ORDER BY file_path, start_line, start_col, id
+            LIMIT @Limit;
+            """;
+        var rows = await _connection.QueryAsync<RawEvidenceRow>(new CommandDefinition(
+            sql,
+            new
+            {
+                SourceSymbolId = sourceSymbolId,
+                TargetSymbolId = targetSymbolId,
+                EdgeKind = edgeKind,
+                Limit = limit,
+            },
+            cancellationToken: ct)).ConfigureAwait(false);
+
+        return rows.Select(row => new Evidence(
+                row.ProducingFileId,
+                new SourceLocation(
+                    row.FilePath,
+                    checked((int)row.StartLine),
+                    checked((int)row.StartColumn),
+                    checked((int)row.EndLine),
+                    checked((int)row.EndColumn)),
+                row.Confidence is >= (long)EvidenceConfidence.Inferred
+                    and <= (long)EvidenceConfidence.Exact
+                    ? (EvidenceConfidence)row.Confidence
+                    : EvidenceConfidence.Inferred,
+                row.Producer,
+                DeserializeMetadata(row.Payload)))
+            .ToList();
+    }
+
+    private static string? SerializeMetadata(IReadOnlyDictionary<string, string>? metadata)
+    {
+        if (metadata is null || metadata.Count == 0) return null;
+        var canonical = new SortedDictionary<string, string>(StringComparer.Ordinal);
+        foreach (var pair in metadata)
+        {
+            canonical[pair.Key] = pair.Value;
+        }
+        return JsonSerializer.Serialize(canonical);
+    }
+
+    private static IReadOnlyDictionary<string, string>? DeserializeMetadata(string? payload)
+    {
+        if (string.IsNullOrEmpty(payload)) return null;
+        try
+        {
+            return JsonSerializer.Deserialize<Dictionary<string, string>>(payload);
+        }
+        catch (JsonException)
+        {
+            // Evidence locations remain useful if a manually edited/corrupt legacy payload cannot
+            // be decoded. Integrity tooling can report the malformed JSON independently.
+            return null;
+        }
+    }
+
+    private static void ValidateEvidence(Evidence evidence)
+    {
+        ArgumentNullException.ThrowIfNull(evidence);
+        if (evidence.ProducingFileId <= 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(evidence),
+                evidence.ProducingFileId,
+                "Producing file id must be positive.");
+        }
+        if (string.IsNullOrWhiteSpace(evidence.Location.FilePath))
+        {
+            throw new ArgumentException("Evidence file path is required.", nameof(evidence));
+        }
+        if (evidence.Location.StartLine <= 0
+            || evidence.Location.StartColumn <= 0
+            || evidence.Location.EndLine < evidence.Location.StartLine
+            || evidence.Location.EndColumn <= 0
+            || (evidence.Location.EndLine == evidence.Location.StartLine
+                && evidence.Location.EndColumn < evidence.Location.StartColumn))
+        {
+            throw new ArgumentException("Evidence must use a valid 1-based source range.", nameof(evidence));
+        }
+        if (!Enum.IsDefined(evidence.Confidence))
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(evidence),
+                evidence.Confidence,
+                "Evidence confidence is not defined.");
+        }
+        if (string.IsNullOrWhiteSpace(evidence.Producer))
+        {
+            throw new ArgumentException("Evidence producer is required.", nameof(evidence));
         }
     }
 
@@ -888,6 +1094,25 @@ public sealed class SqliteGraphStore : IGraphStore
             PayloadJson);
     }
 
+    private sealed record RawEvidenceSource(
+        long ProducingFileId,
+        string FilePath,
+        long StartLine,
+        long StartColumn,
+        long EndLine,
+        long EndColumn);
+
+    private sealed record RawEvidenceRow(
+        long ProducingFileId,
+        string FilePath,
+        long StartLine,
+        long StartColumn,
+        long EndLine,
+        long EndColumn,
+        long Confidence,
+        string Producer,
+        string? Payload);
+
     /// <summary>
     /// Two-sided edge projection used by <see cref="FindDataBindingsAsync"/> /
     /// <see cref="FindEventHandlersAsync"/>: full SymbolHit columns for both endpoints
@@ -1275,18 +1500,14 @@ public sealed class SqliteGraphStore : IGraphStore
 
     public async Task<bool> HasOutgoingReferencesAsync(long fileId, CancellationToken ct = default)
     {
-        // EXISTS short-circuits on the first hit. Refs probe uses idx_refs_file; edges probe
-        // joins via idx_symbols_file (file_id) onto edges.src (PK leftmost column on the
-        // edges PRIMARY KEY (src, dst, kind_name)). Checking both tables avoids forcing a
-        // re-walk of files that legitimately produce zero refs but emit edges from member
-        // signatures (uses-type / inherits / implements-member).
+        // EXISTS short-circuits on the first hit. Both probes are directly indexed by the
+        // producing file, including edges whose logical source symbol is declared elsewhere.
         const string sql = """
             SELECT
               EXISTS (SELECT 1 FROM refs WHERE file_id = @id)
               OR EXISTS (
-                SELECT 1 FROM edges e
-                JOIN symbols s ON s.id = e.src
-                WHERE s.file_id = @id
+                SELECT 1 FROM edge_evidence
+                WHERE producing_file_id = @id
               );
             """;
         var v = await _connection.ExecuteScalarAsync<long?>(new CommandDefinition(
