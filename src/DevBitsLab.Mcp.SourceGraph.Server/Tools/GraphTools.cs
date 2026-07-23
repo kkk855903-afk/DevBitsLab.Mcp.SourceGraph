@@ -2658,7 +2658,7 @@ public static class GraphTools
 
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(DescribeSchemaResult))]
     [ToolTrigger("\"what tables/columns can I query?\" or before writing query_graph SQL")]
-    [Description("Returns the stable view layer (v_symbols, v_files, v_edges, v_references, v_scopes, v_annotations, v_diagnostics, v_history) that query_graph runs SQL against, plus the live symbol_kinds, edge_kinds, and annotation_flavors vocabularies present in the resolved scope set. Call this before composing query_graph SQL when you don't yet know the column shapes — the `Use when` line below (auto-appended from the ToolTrigger attribute) is the canonical guidance.")]
+    [Description("Returns the stable view layer (v_symbols, v_files, v_edges, v_edge_evidence, v_references, v_scopes, v_annotations, v_diagnostics, v_history) that query_graph runs SQL against, plus the live symbol_kinds, edge_kinds, and annotation_flavors vocabularies present in the resolved scope set. Call this before composing query_graph SQL when you don't yet know the column shapes — the `Use when` line below (auto-appended from the ToolTrigger attribute) is the canonical guidance.")]
     public static Task<CallToolResult> DescribeSchemaAsync(
         IScopeRegistry registry,
         RepoRootInfo repoInfo,
@@ -2836,7 +2836,7 @@ public static class GraphTools
 
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(QueryGraphResult))]
     [ToolTrigger("\"how many public types use this type?\", \"which classes implement IDisposable but lack Dispose?\", \"which types have > 50 methods?\" — anything that needs aggregation/join/grouping over the graph that no curated tool exposes")]
-    [Description("Run a read-only SQL SELECT or WITH statement against the stable view layer (v_symbols, v_edges, v_files, v_references, v_scopes, v_annotations, v_diagnostics, v_history). Call describe_schema first to learn the view shapes. Parameters bind via @name placeholders; scope filter follows the standard convention. Returns tabular {columns, rows} structured content. The `Use when` line below (auto-appended from the ToolTrigger attribute) is the canonical guidance.")]
+    [Description("Run a read-only SQL SELECT or WITH statement against the stable view layer (v_symbols, v_edges, v_edge_evidence, v_files, v_references, v_scopes, v_annotations, v_diagnostics, v_history). Call describe_schema first to learn the view shapes. Parameters bind via @name placeholders; scope filter follows the standard convention. Returns tabular {columns, rows} structured content. The `Use when` line below (auto-appended from the ToolTrigger attribute) is the canonical guidance.")]
     public static Task<CallToolResult> QueryGraphAsync(
         IScopeRegistry registry,
         RepoRootInfo repoInfo,

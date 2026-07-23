@@ -366,12 +366,12 @@ When no curated tool fits the question — aggregations, joins, "how many public
 
 | Tool | Purpose |
 |---|---|
-| `describe_schema` | Returns the queryable view layer (`v_symbols`, `v_files`, `v_edges`, `v_references`, `v_scopes`, `v_annotations`, `v_diagnostics`, `v_history`) with each column's type and description, plus the live `symbol_kinds` and `edge_kinds` vocabularies present in the resolved scope set. Call this first when composing `query_graph` SQL. |
+| `describe_schema` | Returns the queryable view layer (`v_symbols`, `v_files`, `v_edges`, `v_edge_evidence`, `v_references`, `v_scopes`, `v_annotations`, `v_diagnostics`, `v_history`) with each column's type and description, plus the live `symbol_kinds` and `edge_kinds` vocabularies present in the resolved scope set. Call this first when composing `query_graph` SQL. |
 | `query_graph` | Runs a single read-only `SELECT` or `WITH` statement against the views. Named parameter binding via `@name` placeholders. Read-only at the SQLite connection level, single-statement enforced at prepare, 5-second statement timeout (configurable), 5000-row cap (configurable). Returns tabular `{columns, rows}` structured content plus a markdown table. Logged into `.sourcegraph/usage.jsonl` with the SQL text — the call log is the evidence base for which queries deserve to be promoted into curated tools. |
 
-The view layer is versioned (`view_schema_version`, currently `2`); the underlying tables remain implementation details and may evolve without bumping it. The version bumps on **any** view-set change — addition, removal, column rename, or column-type change — so cache-aware clients always re-introspect after a server upgrade.
+The view layer is versioned (`view_schema_version`, currently `3`); the underlying tables remain implementation details and may evolve without bumping it. The version bumps on **any** view-set change — addition, removal, column rename, or column-type change — so cache-aware clients always re-introspect after a server upgrade.
 
-The eight views cover: code structure (`v_symbols`/`v_files`/`v_edges`/`v_references`), scope metadata (`v_scopes`), attribute / decorator metadata (`v_annotations`), Roslyn diagnostics (`v_diagnostics`), and per-symbol git history (`v_history`). Cross-view JOINs use the composite `(scope, id)` tuple — see `describe_schema`'s response for the per-column documentation.
+The nine views cover: code structure (`v_symbols`/`v_files`/`v_edges`/`v_references`), occurrence-level edge proof (`v_edge_evidence`, including file/range/producer/confidence), scope metadata (`v_scopes`), attribute / decorator metadata (`v_annotations`), Roslyn diagnostics (`v_diagnostics`), and per-symbol git history (`v_history`). Cross-view JOINs use the composite `(scope, id)` tuple — see `describe_schema`'s response for the per-column documentation.
 
 ### Example tool calls
 

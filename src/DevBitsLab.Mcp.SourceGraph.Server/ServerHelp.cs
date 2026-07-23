@@ -28,9 +28,9 @@ internal static class ServerHelp
         many public types use X", "which classes implement IDisposable but lack
         Dispose", etc. — call `describe_schema` to learn the view layer, then
         `query_graph` to run read-only SQL against it. The view layer (v_symbols,
-        v_edges, v_files, v_references, v_scopes, v_annotations, v_diagnostics,
-        v_history) is a stable contract; the underlying tables remain implementation
-        details.
+        v_edges, v_edge_evidence, v_files, v_references, v_scopes, v_annotations,
+        v_diagnostics, v_history) is a stable contract; the underlying tables remain
+        implementation details.
 
         # Verifying graph use
 

@@ -755,7 +755,7 @@ The server SHALL expose a `describe_schema` tool that returns the live view laye
 The tool's `structuredContent` SHALL include:
 
 - `view_schema_version`: integer matching the storage layer's `Views.SchemaVersion` constant; bumps on **any view-set change** (addition, removal, column rename, or column-type change) so cache-aware clients always re-introspect after a server upgrade.
-- `views`: array of `{ name, description, columns: [{ name, type, nullable, description }] }`. The list is hand-curated in `Views.All` and SHALL include all eight views currently shipped: `v_symbols`, `v_files`, `v_edges`, `v_references`, `v_scopes`, `v_annotations`, `v_diagnostics`, `v_history`.
+- `views`: array of `{ name, description, columns: [{ name, type, nullable, description }] }`. The list is hand-curated in `Views.All` and SHALL include all nine views currently shipped: `v_symbols`, `v_files`, `v_edges`, `v_edge_evidence`, `v_references`, `v_scopes`, `v_annotations`, `v_diagnostics`, `v_history`.
 - `symbol_kinds`: array of distinct `kind` values present in `v_symbols` across the resolved scope set, populated by `SELECT DISTINCT kind FROM v_symbols`.
 - `edge_kinds`: array of distinct `kind` values present in `v_edges` across the resolved scope set, populated by `SELECT DISTINCT kind FROM v_edges`.
 
@@ -763,7 +763,7 @@ The tool's `outputSchema` SHALL declare the structured shape so MCP clients can 
 
 #### Scenario: Agent enumerates the queryable views
 - **WHEN** an MCP agent calls `describe_schema()` against an indexed multi-scope solution
-- **THEN** the response lists `v_symbols`, `v_files`, `v_edges`, `v_references`, `v_scopes`, `v_annotations`, `v_diagnostics`, `v_history` (eight views) with their columns; `view_schema_version` is `2`; `symbol_kinds` includes at minimum `class`, `interface`, `method`, `field`; `edge_kinds` includes at minimum `calls`, `uses-type`
+- **THEN** the response lists `v_symbols`, `v_files`, `v_edges`, `v_edge_evidence`, `v_references`, `v_scopes`, `v_annotations`, `v_diagnostics`, `v_history` (nine views) with their columns; `view_schema_version` is `3`; `symbol_kinds` includes at minimum `class`, `interface`, `method`, `field`; `edge_kinds` includes at minimum `calls`, `uses-type`
 
 #### Scenario: Symbol-kind vocabulary reflects live data
 - **GIVEN** the indexer's vocabulary expands (e.g., the XAML indexer adds `xaml-view`, `xaml-element` to the `kind` column)
@@ -771,13 +771,13 @@ The tool's `outputSchema` SHALL declare the structured shape so MCP clients can 
 - **THEN** `symbol_kinds` includes the new values without any code change to `describe_schema` or `Views.All`
 
 #### Scenario: Schema version bumps on any view-set change
-- **GIVEN** the prior revision shipped `view_schema_version = 1` with five views
-- **WHEN** the current revision ships with three additional views
-- **THEN** `view_schema_version` reads `2`; a future revision that renames `v_symbols.kind` → `v_symbols.symbol_kind` SHALL bump it to `3`; a future revision that adds `v_bindings` SHALL also bump (the policy does not distinguish breaking from additive)
+- **GIVEN** the prior revision shipped `view_schema_version = 2` with eight views
+- **WHEN** the current revision adds `v_edge_evidence`
+- **THEN** `view_schema_version` reads `3`; any future rename, addition, or removal SHALL increment it again (the policy does not distinguish breaking from additive)
 
 #### Scenario: New view descriptors carry the same documentation depth
-- **WHEN** an agent inspects the `columns` array of `v_annotations`, `v_diagnostics`, or `v_history` in `describe_schema`'s response
-- **THEN** every column has a `name`, `type`, `nullable`, and `description` populated; descriptions surface notable nuances (e.g. `v_diagnostics.symbol_id` documented as nullable; `v_diagnostics.severity_name` documents the integer-to-text mapping; `v_history.last_authored_at` documents the Unix-millis unit)
+- **WHEN** an agent inspects the `columns` array of `v_edge_evidence`, `v_annotations`, `v_diagnostics`, or `v_history` in `describe_schema`'s response
+- **THEN** every column has a `name`, `type`, `nullable`, and `description` populated; descriptions surface notable nuances (e.g. `v_edge_evidence.confidence` documents its ordered confidence mapping; `v_diagnostics.symbol_id` is documented as nullable; `v_history.last_authored_at` documents the Unix-millis unit)
 
 ### Requirement: Ad-hoc graph query tool
 The server SHALL expose a `query_graph` tool that accepts a read-only SQL `SELECT` or `WITH` statement, optional named parameters, and an optional `scope` filter, executes the statement against the multi-scope view layer, and returns the resulting rows as `structuredContent` plus a markdown table for display.

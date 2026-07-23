@@ -19,6 +19,8 @@
 --   * v_files.sha renames files.content_sha256 — "sha" is the agent-facing name.
 --   * v_edges.kind / v_symbols.kind are projected from the underlying *_kind_name
 --     columns; "kind" is the contract.
+--   * v_edge_evidence.confidence maps the ordered integer confidence to
+--     'inferred' / 'semantic' / 'exact'; confidence_level retains the integer.
 --   * v_references.kind maps the integer Core.ReferenceKind enum to short text:
 --     0='def', 1='ref', 2='call', 3='impl', 4='inherit', 5='read', 6='write'.
 --   * v_diagnostics.severity_name maps the integer Roslyn DiagnosticSeverity enum
@@ -35,6 +37,10 @@ CREATE TEMP VIEW v_files AS
 
 CREATE TEMP VIEW v_edges AS
 {{SCOPE_UNION_BLOCK_v_edges}}
+;
+
+CREATE TEMP VIEW v_edge_evidence AS
+{{SCOPE_UNION_BLOCK_v_edge_evidence}}
 ;
 
 CREATE TEMP VIEW v_references AS

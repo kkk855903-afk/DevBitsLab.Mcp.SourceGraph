@@ -81,14 +81,13 @@ public sealed class GraphQueryToolTests : IAsyncLifetime, IDisposable
 
         var dto = result.StructuredContent!.Value.Deserialize<DescribeSchemaResult>(
             ToolOutputJsonContext.Default.DescribeSchemaResult)!;
-        dto.ViewSchemaVersion.Should().Be(2,
-            "Views.SchemaVersion is at 2 after the extended-views change "
-            + "(v_annotations / v_diagnostics / v_history added)");
-        dto.Views.Should().HaveCount(8);
+        dto.ViewSchemaVersion.Should().Be(3,
+            "v_edge_evidence adds an agent-queryable occurrence-evidence contract");
+        dto.Views.Should().HaveCount(9);
         dto.Views.Select(v => v.Name).Should().BeEquivalentTo(
             new[]
             {
-                "v_symbols", "v_files", "v_edges", "v_references", "v_scopes",
+                "v_symbols", "v_files", "v_edges", "v_edge_evidence", "v_references", "v_scopes",
                 "v_annotations", "v_diagnostics", "v_history",
             });
 
@@ -96,6 +95,9 @@ public sealed class GraphQueryToolTests : IAsyncLifetime, IDisposable
         // must surface the well-known is_public / is_type convenience booleans.
         var vSymbols = dto.Views.Single(v => v.Name == "v_symbols");
         vSymbols.Columns.Select(c => c.Name).Should().Contain(new[] { "scope", "id", "name", "kind", "is_public", "is_type" });
+        var vEvidence = dto.Views.Single(v => v.Name == "v_edge_evidence");
+        vEvidence.Columns.Select(c => c.Name).Should().Contain(
+            new[] { "src", "dst", "kind", "file_path", "start_line", "confidence", "producer" });
 
         // Live kind vocabularies populated from SELECT DISTINCT against the view layer.
         dto.SymbolKinds.Should().Contain("class").And.Contain("method");
@@ -115,7 +117,7 @@ public sealed class GraphQueryToolTests : IAsyncLifetime, IDisposable
         var first = result.Content!.OfType<TextContentBlock>().First(IsUserVisible);
         first.Text.Should().StartWith("\U0001F33F ", "the leaf chokepoint should brand the first text block");
         first.Text.Should().Contain("describe_schema");
-        first.Text.Should().Contain("view_schema_version=2");
+        first.Text.Should().Contain("view_schema_version=3");
         first.Text.Should().Contain("v_symbols");
 
         // Audience-restricted metadata block at the tail.

@@ -10,9 +10,9 @@ namespace DevBitsLab.Mcp.SourceGraph.Storage;
 /// version always re-introspect after a server upgrade.
 ///
 /// The underlying tables (<c>symbols</c>, <c>edges</c>, <c>refs</c>, <c>files</c>,
-/// <c>annotations</c>, <c>diagnostics</c>, <c>symbol_history</c>) remain implementation
-/// details and may evolve without bumping <see cref="SchemaVersion"/> — only
-/// <see cref="Schema.Version"/> moves for those.
+/// <c>edge_evidence</c>, <c>annotations</c>, <c>diagnostics</c>,
+/// <c>symbol_history</c>) remain implementation details and may evolve without bumping
+/// <see cref="SchemaVersion"/> — only <see cref="Schema.Version"/> moves for those.
 /// </summary>
 public static class Views
 {
@@ -22,7 +22,7 @@ public static class Views
     /// column-type change — so clients that cache <c>describe_schema</c> by version always
     /// re-introspect after a server upgrade.
     /// </summary>
-    public const int SchemaVersion = 2;
+    public const int SchemaVersion = 3;
 
     /// <summary>
     /// The CREATE TEMP VIEW scaffolding loaded from <c>Views.sql</c>. Contains
@@ -37,8 +37,9 @@ public static class Views
     /// scope and joins them with <c>UNION ALL</c>, then substitutes the joined text into the
     /// matching <c>{{SCOPE_UNION_BLOCK_&lt;view&gt;}}</c> token in <see cref="Sql"/>.
     ///
-    /// Keys: <c>"v_symbols"</c>, <c>"v_files"</c>, <c>"v_edges"</c>, <c>"v_references"</c>,
-    /// <c>"v_annotations"</c>, <c>"v_diagnostics"</c>, <c>"v_history"</c>.
+    /// Keys: <c>"v_symbols"</c>, <c>"v_files"</c>, <c>"v_edges"</c>,
+    /// <c>"v_edge_evidence"</c>, <c>"v_references"</c>, <c>"v_annotations"</c>,
+    /// <c>"v_diagnostics"</c>, <c>"v_history"</c>.
     /// (<c>v_scopes</c> is single-source from <c>meta.scopes</c> and has no per-scope template.)
     ///
     /// The ATTACH alias <c>"{SCOPE_ID}"</c> is double-quoted because scope ids can contain
@@ -47,12 +48,9 @@ public static class Views
     public static IReadOnlyDictionary<string, string> PerScopeBlockTemplates { get; }
 
     /// <summary>
-    /// Hand-curated descriptors for <c>describe_schema</c>'s response. Order: the five core
-    /// views from the parent change (<c>v_symbols</c>, <c>v_files</c>, <c>v_edges</c>,
-    /// <c>v_references</c>, <c>v_scopes</c>) followed by the three extended views from
-    /// <c>add-graph-query-extended-views</c> (<c>v_annotations</c>, <c>v_diagnostics</c>,
-    /// <c>v_history</c>). The contract is "8 views, names match the live <c>tools/list</c>
-    /// output"; the specific iteration order is documentation, not contract.
+    /// Hand-curated descriptors for <c>describe_schema</c>'s response. The contract is
+    /// "9 views, names match the live <c>tools/list</c> output"; the specific iteration order
+    /// is documentation, not contract.
     /// </summary>
     public static IReadOnlyList<ViewDescriptor> All { get; }
 
@@ -102,6 +100,21 @@ public static class Views
             FROM "{SCOPE_ID}".edges e
             """;
 
+        const string vEdgeEvidence = """
+            SELECT '{SCOPE_ID}' AS scope, ev.id AS id, ev.src AS src, ev.dst AS dst,
+                   ev.kind_name AS kind, ev.producing_file_id AS producing_file_id,
+                   ev.file_path AS file_path, ev.start_line AS start_line,
+                   ev.start_col AS start_column, ev.end_line AS end_line,
+                   ev.end_col AS end_column,
+                   (CASE ev.confidence WHEN 0 THEN 'inferred'
+                                       WHEN 1 THEN 'semantic'
+                                       WHEN 2 THEN 'exact'
+                                       ELSE CAST(ev.confidence AS TEXT) END) AS confidence,
+                   ev.confidence AS confidence_level, ev.producer AS producer,
+                   NULLIF(ev.payload, '') AS payload
+            FROM "{SCOPE_ID}".edge_evidence ev
+            """;
+
         const string vReferences = """
             SELECT '{SCOPE_ID}' AS scope, r.symbol_id AS symbol_id, r.file_id AS file_id,
                    r.line AS line, r.col AS column_number,
@@ -142,6 +155,7 @@ public static class Views
             ["v_symbols"] = vSymbols,
             ["v_files"] = vFiles,
             ["v_edges"] = vEdges,
+            ["v_edge_evidence"] = vEdgeEvidence,
             ["v_references"] = vReferences,
             ["v_annotations"] = vAnnotations,
             ["v_diagnostics"] = vDiagnostics,
@@ -199,6 +213,30 @@ public static class Views
                     new("dst", "INTEGER", false, "Destination symbol id (the callee / used type / base / ...). Join to `v_symbols.id` in the same scope."),
                     new("kind", "TEXT", false, "Edge kind: `calls`, `uses-type`, `inherits`, `implements`, `instantiates`, `throws`, `tests`, `binds-path`, `handles-event`, `uses-resource`, ... See `describe_schema.edge_kinds` for the live vocabulary."),
                     new("payload", "TEXT", true, "Optional JSON payload carrying edge metadata (binding paths, event names, prop names). NULL when the edge kind has no associated metadata."),
+                }),
+
+            new(
+                "v_edge_evidence",
+                "Every independently attributable source occurrence supporting a logical edge. "
+                + "Join (scope, src, dst, kind) to v_edges and producing_file_id to v_files.id "
+                + "within the same scope. Multiple rows may support the same logical edge.",
+                new List<ViewColumn>
+                {
+                    new("scope", "TEXT", false, "Scope id this evidence row lives in."),
+                    new("id", "INTEGER", false, "Per-scope evidence id; combine with `scope` for cross-scope uniqueness."),
+                    new("src", "INTEGER", false, "Source symbol id of the supported edge."),
+                    new("dst", "INTEGER", false, "Destination symbol id of the supported edge."),
+                    new("kind", "TEXT", false, "Kind of the supported logical edge."),
+                    new("producing_file_id", "INTEGER", false, "File id whose index pass emitted this proof; join to `v_files.id` in the same scope."),
+                    new("file_path", "TEXT", false, "Source file containing the evidence range."),
+                    new("start_line", "INTEGER", false, "1-based start line of the evidence range."),
+                    new("start_column", "INTEGER", false, "1-based start column of the evidence range."),
+                    new("end_line", "INTEGER", false, "1-based inclusive end line of the evidence range."),
+                    new("end_column", "INTEGER", false, "1-based inclusive end column of the evidence range."),
+                    new("confidence", "TEXT", false, "Confidence name: `inferred`, `semantic`, or `exact`."),
+                    new("confidence_level", "INTEGER", false, "Ordered confidence level: 0=inferred, 1=semantic, 2=exact; useful for minimum-confidence filters."),
+                    new("producer", "TEXT", false, "Analyzer that established this proof, such as `roslyn` or `xaml`."),
+                    new("payload", "TEXT", true, "Optional occurrence-specific JSON metadata; NULL when absent."),
                 }),
 
             new(

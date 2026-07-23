@@ -86,6 +86,15 @@ public sealed class ViewsTests : IAsyncLifetime
                 INSERT INTO edges(src, dst, kind_name, payload)
                 VALUES (101, 100, 'uses-type', '{"call-site":"local"}');
 
+                INSERT INTO edge_evidence(
+                    id, src, dst, kind_name, producing_file_id, file_path,
+                    start_line, start_col, end_line, end_col,
+                    confidence, producer, payload)
+                VALUES (
+                    1, 101, 100, 'uses-type', 10, '/repo/src/Foo.cs',
+                    9, 16, 9, 18,
+                    2, 'roslyn', '{"operation":"type-syntax"}');
+
                 -- A textual reference site with kind=2 (Call) so we can verify the
                 -- v_references integer-to-text mapping for ReferenceKind.Call -> 'call'.
                 INSERT INTO refs(id, symbol_id, file_id, line, col, kind)
@@ -175,6 +184,7 @@ public sealed class ViewsTests : IAsyncLifetime
         Views.Sql.Should().Contain("{{SCOPE_UNION_BLOCK_v_symbols}}");
         Views.Sql.Should().Contain("{{SCOPE_UNION_BLOCK_v_files}}");
         Views.Sql.Should().Contain("{{SCOPE_UNION_BLOCK_v_edges}}");
+        Views.Sql.Should().Contain("{{SCOPE_UNION_BLOCK_v_edge_evidence}}");
         Views.Sql.Should().Contain("{{SCOPE_UNION_BLOCK_v_references}}");
         Views.Sql.Should().Contain("{{SCOPE_UNION_BLOCK_v_annotations}}");
         Views.Sql.Should().Contain("{{SCOPE_UNION_BLOCK_v_diagnostics}}");
@@ -183,13 +193,12 @@ public sealed class ViewsTests : IAsyncLifetime
         Views.PerScopeBlockTemplates.Keys.Should().BeEquivalentTo(
             new[]
             {
-                "v_symbols", "v_files", "v_edges", "v_references",
+                "v_symbols", "v_files", "v_edges", "v_edge_evidence", "v_references",
                 "v_annotations", "v_diagnostics", "v_history",
             });
 
-        Views.SchemaVersion.Should().Be(2,
-            "the extended-views change bumps the version to signal the v_annotations / "
-            + "v_diagnostics / v_history additions to cache-aware clients");
+        Views.SchemaVersion.Should().Be(3,
+            "the occurrence-evidence view addition must invalidate cached view schemas");
     }
 
     [Fact]
@@ -273,6 +282,33 @@ public sealed class ViewsTests : IAsyncLifetime
         row["dst"].Should().Be(100L);
         row["kind"].Should().Be("uses-type");
         row["payload"].Should().Be("{\"call-site\":\"local\"}");
+    }
+
+    [Fact]
+    public async Task v_edge_evidence_returnsOccurrenceRangeAndConfidence()
+    {
+        var descriptor = Views.All.First(v => v.Name == "v_edge_evidence");
+
+        var rows = (await _connection!.QueryAsync("SELECT * FROM v_edge_evidence;")).ToList();
+        rows.Should().ContainSingle();
+
+        var row = (IDictionary<string, object?>)rows[0]!;
+        row.Keys.Should().BeEquivalentTo(descriptor.Columns.Select(c => c.Name));
+        row["scope"].Should().Be("test");
+        row["id"].Should().Be(1L);
+        row["src"].Should().Be(101L);
+        row["dst"].Should().Be(100L);
+        row["kind"].Should().Be("uses-type");
+        row["producing_file_id"].Should().Be(10L);
+        row["file_path"].Should().Be("/repo/src/Foo.cs");
+        row["start_line"].Should().Be(9L);
+        row["start_column"].Should().Be(16L);
+        row["end_line"].Should().Be(9L);
+        row["end_column"].Should().Be(18L);
+        row["confidence"].Should().Be("exact");
+        row["confidence_level"].Should().Be(2L);
+        row["producer"].Should().Be("roslyn");
+        row["payload"].Should().Be("{\"operation\":\"type-syntax\"}");
     }
 
     [Fact]
