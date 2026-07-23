@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "findings": [
+    { "rule": "Interop001", "managed_file": "NegativeCases/Interop001/Managed.cs", "managed_symbol": "WrongCallingConvention", "native_file": "NegativeCases/Interop001/Native.cpp", "native_symbol": "risk_callconv", "severity": "error" },
+    { "rule": "Interop002", "managed_file": "NegativeCases/Interop002/Managed.cs", "managed_symbol": "WrongLayout", "native_file": "NegativeCases/Interop002/Native.cpp", "native_symbol": "WrongLayout", "severity": "error" },
+    { "rule": "Interop003", "managed_file": "NegativeCases/Interop003/Managed.cs", "managed_symbol": "RiskyParameter", "native_file": "NegativeCases/Interop003/Native.cpp", "native_symbol": "risk_parameter", "severity": "warning" },
+    { "rule": "Interop004", "managed_file": "NegativeCases/Interop004/Managed.cs", "managed_symbol": "RegisterUnrootedCallback", "native_file": "NegativeCases/Interop004/Native.cpp", "native_symbol": "risk_register_callback", "severity": "warning" },
+    { "rule": "Interop005", "managed_file": "NegativeCases/Interop005/Managed.cs", "managed_symbol": "InvokeThrowingExport", "native_file": "NegativeCases/Interop005/Native.cpp", "native_symbol": "risk_throws", "severity": "error" },
+    { "rule": "Interop006", "managed_file": "NegativeCases/Interop006/Managed.cs", "managed_symbol": "FreeWithWrongAllocator", "native_file": "NegativeCases/Interop006/Native.cpp", "native_symbol": "risk_allocate", "severity": "warning" }
+  ]
+}

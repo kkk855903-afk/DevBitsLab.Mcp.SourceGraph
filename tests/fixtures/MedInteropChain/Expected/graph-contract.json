@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "required_edges": [
+    { "from": "xaml:element:ManagedApp/Views/MainWindow.xaml#RunAlgorithmButton", "relation": "binds-path", "to": "csharp:P:MedInteropChain.ManagedApp.ViewModels.MainViewModel.RunAlgorithmCommand" },
+    { "from": "csharp:M:MedInteropChain.ManagedApp.ViewModels.MainViewModel.RunAlgorithmAsync", "relation": "calls", "to": "csharp:M:MedInteropChain.GrpcService.AlgorithmService.CalculateAsync(System.Int32,System.Threading.CancellationToken)" },
+    { "from": "csharp:M:MedInteropChain.GrpcService.AlgorithmService.CalculateAsync(System.Int32,System.Threading.CancellationToken)", "relation": "grpc-calls", "to": "proto:R:medinterop.algorithm.v1.AlgorithmApi/Calculate" },
+    { "from": "csharp:M:MedInteropChain.GrpcService.AlgorithmGrpcService.Calculate(MedInteropChain.GrpcService.Generated.CalculateRequest,System.Threading.CancellationToken)", "relation": "implements-rpc", "to": "proto:R:medinterop.algorithm.v1.AlgorithmApi/Calculate" },
+    { "from": "csharp:M:MedInteropChain.GrpcService.Interop.NativeMethods.Calculate(MedInteropChain.GrpcService.Interop.NativeInput@,MedInteropChain.GrpcService.Interop.NativeOutput@)", "relation": "pinvoke-maps-to", "to": "c:E:NativeLibrary/include/medalgo.h::medalgo_calculate" },
+    { "from": "c:E:NativeLibrary/include/medalgo.h::medalgo_calculate", "relation": "calls", "to": "cpp:F:NativeLibrary/src/algorithm.cpp::Algorithm::Calculate" }
+  ]
+}

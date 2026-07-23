@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="GrpcService/GrpcService.csproj" />
+  <Project Path="ManagedApp/ManagedApp.csproj" />
+</Solution>

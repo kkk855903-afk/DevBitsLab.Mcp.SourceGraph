@@ -1,0 +1,16 @@
+<Window x:Class="MedInteropChain.ManagedApp.Views.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="clr-namespace:MedInteropChain.ManagedApp.ViewModels"
+        x:DataType="vm:MainViewModel"
+        Title="Medical algorithm">
+    <Window.DataContext>
+        <vm:MainViewModel />
+    </Window.DataContext>
+    <Grid>
+        <TextBox Text="{Binding PatientAge, Mode=TwoWay}" />
+        <Button x:Name="RunAlgorithmButton"
+                Content="{StaticResource RunAlgorithmLabel}"
+                Command="{Binding RunAlgorithmCommand}" />
+    </Grid>
+</Window>

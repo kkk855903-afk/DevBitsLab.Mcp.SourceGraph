@@ -1,0 +1,15 @@
+syntax = "proto3";
+
+package medinterop.algorithm.v1;
+
+service AlgorithmApi {
+  rpc Calculate(CalculateRequest) returns (CalculateReply);
+}
+
+message CalculateRequest {
+  int32 patient_age = 1;
+}
+
+message CalculateReply {
+  int32 value = 1;
+}
