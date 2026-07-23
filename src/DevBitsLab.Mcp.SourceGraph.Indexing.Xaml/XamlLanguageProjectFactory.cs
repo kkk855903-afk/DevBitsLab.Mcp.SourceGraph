@@ -8,6 +8,7 @@ using System.Xml;
 using DevBitsLab.Mcp.SourceGraph.Core;
 using DevBitsLab.Mcp.SourceGraph.Indexing.Xaml.Parser;
 using DevBitsLab.Mcp.SourceGraph.Sdk;
+using Microsoft.CodeAnalysis;
 
 namespace DevBitsLab.Mcp.SourceGraph.Indexing.Xaml;
 
@@ -30,6 +31,22 @@ namespace DevBitsLab.Mcp.SourceGraph.Indexing.Xaml;
 /// </summary>
 public sealed class XamlLanguageProjectFactory : IExclusionAwareLanguageProjectFactory
 {
+    private readonly Func<Solution?>? _solutionProvider;
+
+    public XamlLanguageProjectFactory()
+    {
+    }
+
+    /// <summary>
+    /// Creates a factory backed by the host's current privacy-sanitized Roslyn solution.
+    /// The callback is intentionally lazy so live solution snapshots remain current.
+    /// </summary>
+    public XamlLanguageProjectFactory(Func<Solution?> solutionProvider)
+    {
+        _solutionProvider = solutionProvider
+            ?? throw new ArgumentNullException(nameof(solutionProvider));
+    }
+
     /// <inheritdoc />
     public IReadOnlyCollection<string> ProjectMarkers { get; } = new[] { "*.csproj", "*.xaml" };
 
@@ -106,7 +123,7 @@ public sealed class XamlLanguageProjectFactory : IExclusionAwareLanguageProjectF
         }
     }
 
-    private static XamlLanguageProject? TryBuildProject(
+    private XamlLanguageProject? TryBuildProject(
         string csprojPath,
         ScopePathPolicy pathPolicy)
     {
@@ -117,11 +134,45 @@ public sealed class XamlLanguageProjectFactory : IExclusionAwareLanguageProjectF
             if (xamlFiles.Count == 0) return null;
 
             var resourceCache = BuildResourceCache(xamlFiles, pathPolicy);
-            return new XamlLanguageProject(Path.GetFullPath(csprojPath), xamlFiles, resourceCache);
+            var fullProjectPath = Path.GetFullPath(csprojPath);
+            Func<Project?>? roslynProjectProvider = _solutionProvider is null
+                ? null
+                : () => FindRoslynProject(_solutionProvider(), fullProjectPath);
+            return new XamlLanguageProject(
+                fullProjectPath,
+                xamlFiles,
+                resourceCache,
+                roslynProjectProvider);
         }
         catch (IOException) { return null; }
         catch (XmlException) { return null; }
         catch (UnauthorizedAccessException) { return null; }
+    }
+
+    private static Project? FindRoslynProject(Solution? solution, string projectFilePath)
+    {
+        if (solution is null) return null;
+
+        foreach (var project in solution.Projects)
+        {
+            if (string.IsNullOrEmpty(project.FilePath)) continue;
+            string candidate;
+            try
+            {
+                candidate = Path.GetFullPath(project.FilePath);
+            }
+            catch (Exception ex) when (ex is ArgumentException or NotSupportedException)
+            {
+                continue;
+            }
+
+            if (string.Equals(candidate, projectFilePath, StringComparison.OrdinalIgnoreCase))
+            {
+                return project;
+            }
+        }
+
+        return null;
     }
 
     /// <summary>

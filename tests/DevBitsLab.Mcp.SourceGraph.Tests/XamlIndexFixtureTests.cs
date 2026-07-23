@@ -11,6 +11,7 @@ using DevBitsLab.Mcp.SourceGraph.Server.Plugins;
 using DevBitsLab.Mcp.SourceGraph.Storage;
 using FluentAssertions;
 using Xunit;
+using CoreEvidenceConfidence = DevBitsLab.Mcp.SourceGraph.Core.EvidenceConfidence;
 
 namespace DevBitsLab.Mcp.SourceGraph.Tests;
 
@@ -77,20 +78,128 @@ public sealed class XamlIndexFixtureTests : IAsyncLifetime
             .FirstOrDefault(h => h.Kind == "xaml-element");
         saveButton.Should().NotBeNull();
         var callees = await _wpfStore.ListCalleesAsync(saveButton!.Id, limit: 50, edgeKind: "handles-event");
-        callees.Should().Contain(c => c.Fqn.Contains("SampleWpf.Views.MainWindow.OnSave", StringComparison.Ordinal));
+        var handler = callees.Should().ContainSingle(c =>
+            c.CanonicalKey == CanonicalKeys.ForMethod(
+                "SampleWpf.Views.MainWindow",
+                "OnSave",
+                new[] { "System.Object", "System.EventArgs" })).Subject;
+        handler.Fqn.Contains(
+            "SampleWpf.Views.MainWindow.OnSave",
+            StringComparison.Ordinal).Should().BeTrue();
+
+        var evidence = await _wpfStore.ListEdgeEvidenceAsync(
+            saveButton.Id,
+            handler.Id,
+            "handles-event");
+        evidence.Should().ContainSingle();
+        evidence[0].Confidence.Should().Be(CoreEvidenceConfidence.Exact);
+        evidence[0].Producer.Should().Be("xaml-semantic");
     }
 
     [Fact]
-    public async Task SampleWpf_bindsPathPayloadCarriesPathAndMode()
+    public async Task SampleWpf_dataContextBindingResolvesToRealTerminalPropertyWithExactEvidence()
     {
         var box = (await _wpfStore!.FindSymbolsAsync("UserNameBox"))
             .First(h => h.Kind == "xaml-element");
         var callees = await _wpfStore.ListCalleesAsync(box.Id, limit: 50, edgeKind: "binds-path");
-        callees.Should().NotBeEmpty();
-        var withPayload = callees.First(c => !string.IsNullOrEmpty(c.PayloadJson));
+        var nameProperty = callees.Should().ContainSingle(c =>
+            c.CanonicalKey == CanonicalKeys.ForProperty("SampleWpf.ViewModels.User", "Name")).Subject;
+        var withPayload = nameProperty;
         var dict = JsonSerializer.Deserialize<Dictionary<string, string>>(withPayload.PayloadJson!);
         dict.Should().ContainKey("path").WhoseValue.Should().Be("User.Name");
         dict.Should().ContainKey("mode").WhoseValue.Should().Be("two-way");
+        dict.Should().ContainKey("data-type").WhoseValue.Should()
+            .Be(CanonicalKeys.ForType("SampleWpf.ViewModels.MainViewModel"));
+
+        var evidence = await _wpfStore.ListEdgeEvidenceAsync(
+            box.Id,
+            nameProperty.Id,
+            "binds-path");
+        evidence.Should().ContainSingle();
+        evidence[0].Confidence.Should().Be(CoreEvidenceConfidence.Exact);
+        evidence[0].Producer.Should().Be("xaml-semantic");
+        evidence[0].Location.FilePath.Replace('\\', '/').Should()
+            .EndWith("Views/MainWindow.xaml");
+        evidence[0].Location.StartLine.Should().BeGreaterThan(0);
+        evidence[0].Location.EndColumn.Should().BeGreaterThan(evidence[0].Location.StartColumn);
+        var evidenceLine = File.ReadLines(evidence[0].Location.FilePath)
+            .ElementAt(evidence[0].Location.StartLine - 1);
+        evidenceLine.Substring(
+            evidence[0].Location.StartColumn - 1,
+            evidence[0].Location.EndColumn - evidence[0].Location.StartColumn)
+            .Should().Be("Text");
+    }
+
+    [Fact]
+    public async Task SampleWpf_xDataTypeBindingResolvesToRealProperty()
+    {
+        var emailProperty = (await _wpfStore!.FindSymbolsAsync("Email"))
+            .First(h => h.CanonicalKey == CanonicalKeys.ForProperty("SampleWpf.ViewModels.User", "Email"));
+        var callers = await _wpfStore.ListCallersAsync(
+            emailProperty.Id,
+            limit: 50,
+            edgeKind: "binds-path");
+
+        callers.Should().ContainSingle(c =>
+            c.Kind == "xaml-element"
+            && c.FilePath.Replace('\\', '/').EndsWith(
+                "Views/UserView.xaml",
+                StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public async Task SampleWpf_commandBindingResolvesOnlyICommandProperty()
+    {
+        var saveButton = (await _wpfStore!.FindSymbolsAsync("SaveButton"))
+            .First(h => h.Kind == "xaml-element");
+        var commandTargets = await _wpfStore.ListCalleesAsync(
+            saveButton.Id,
+            limit: 50,
+            edgeKind: "binds-path");
+
+        commandTargets.Should().ContainSingle(c =>
+            c.CanonicalKey == CanonicalKeys.ForProperty(
+                "SampleWpf.ViewModels.MainViewModel",
+                "SaveCommand"));
+
+        var invalidButton = (await _wpfStore.FindSymbolsAsync("InvalidCommandButton"))
+            .First(h => h.Kind == "xaml-element");
+        (await _wpfStore.ListCalleesAsync(
+            invalidButton.Id,
+            limit: 50,
+            edgeKind: "binds-path")).Should().BeEmpty(
+                "a Command binding to a non-ICommand property must not be guessed as valid");
+    }
+
+    [Fact]
+    public async Task SampleWpf_unresolvedBindingDoesNotCreateSyntheticTarget()
+    {
+        var broken = (await _wpfStore!.FindSymbolsAsync("BrokenBinding"))
+            .First(h => h.Kind == "xaml-element");
+
+        (await _wpfStore.ListCalleesAsync(
+            broken.Id,
+            limit: 50,
+            edgeKind: "binds-path")).Should().BeEmpty();
+        (await _wpfStore.FindSymbolsAsync("binding-target")).Should().BeEmpty(
+            "unresolved paths must degrade without manufacturing symbols");
+    }
+
+    [Theory]
+    [InlineData("RelativeSourceText")]
+    [InlineData("ExplicitSourceText")]
+    [InlineData("CompiledBindingText")]
+    public async Task SampleWpf_unsupportedBindingSourcesDoNotReuseInheritedDataContext(
+        string elementName)
+    {
+        var element = (await _wpfStore!.FindSymbolsAsync(elementName))
+            .First(h => h.Kind == "xaml-element");
+
+        (await _wpfStore.ListCalleesAsync(
+            element.Id,
+            limit: 50,
+            edgeKind: "binds-path")).Should().BeEmpty(
+                "explicit, ElementName, RelativeSource, and compiled bindings require their own source-type resolver");
     }
 
     [Fact]
@@ -153,12 +262,14 @@ public sealed class XamlIndexFixtureTests : IAsyncLifetime
         Directory.CreateDirectory(tmp);
         var dbPath = Path.Combine(tmp, "graph.db");
         var store = new SqliteGraphStore(dbPath);
-        await RoslynIndexer.IndexSolutionOnceAsync(slnPath, store);
+        await using var roslyn = new RoslynIndexer(store);
+        await roslyn.OpenAsync(slnPath);
+        await roslyn.IndexAllAsync();
 
         var langRegistry = new LanguageIndexerRegistry();
         langRegistry.Register(new XamlLanguageIndexer());
         var factories = new LanguageProjectFactoryRegistry();
-        factories.Register(new XamlLanguageProjectFactory());
+        factories.Register(new XamlLanguageProjectFactory(() => roslyn.SanitizedSolution));
         var dispatcher = new LanguageIndexerDispatcher(langRegistry, factories);
 
         var projectMap = new Dictionary<string, ILanguageProject>(StringComparer.OrdinalIgnoreCase);

@@ -237,23 +237,35 @@ The `XamlLanguageIndexer` SHALL implement `ILanguageIndexer` and SHALL emit:
 - Eight edge kinds: `code-behind`, `binds-path`, `binds-element`, `handles-event`, `uses-resource`, `instantiates-type`, `merges`, `applies-style`
 - One annotation flavor: `xaml-attached-property`
 
-Cross-language edges (`code-behind`, `handles-event`, `instantiates-type`) SHALL construct C# canonical keys via `CanonicalKeys.ForType` / `CanonicalKeys.ForMethod` (from `harden-sdk-pre-xaml`) so the resulting `dst` is byte-equal to the key the Roslyn indexer wrote for the same symbol.
+Cross-language edges (`code-behind`, `binds-path`, `handles-event`, `instantiates-type`) SHALL target byte-equal C# canonical keys from the privacy-sanitized Roslyn compilation used by the C# indexer. A scope-specific XAML project factory SHALL obtain that compilation lazily from the current sanitized solution so live edits do not retain a cold-start semantic snapshot.
 
 #### Scenario: Code-behind edge joins XAML view to C# partial class
 - **WHEN** the indexer encounters `<Window x:Class="MyApp.Views.Main" ...>` as the root of `Views/Main.xaml`
 - **THEN** it emits `SymbolDeclared(CanonicalKey: "xaml:view:Views/Main.xaml", Kind: "xaml-view", ...)` and `EdgeEmitted(Src: "xaml:view:Views/Main.xaml", Dst: "csharp:T:MyApp.Views.Main", EdgeKindName: "code-behind", Metadata: null)`; the `dst` matches what the Roslyn indexer emitted for `MyApp.Views.Main`, so a query like `find_references --canonical-key csharp:T:MyApp.Views.Main` returns both the C# declaration and the XAML view
 
 #### Scenario: Event handler edge resolves to C# method
-- **WHEN** the indexer encounters `<Button Click="OnSave"/>` inside a view whose root is `<Window x:Class="MyApp.Views.Main">`
-- **THEN** it emits `EdgeEmitted(Src: "xaml:element:Views/Main.xaml#<elementId>", Dst: "csharp:M:MyApp.Views.Main.OnSave", EdgeKindName: "handles-event", Metadata: { "event": "Click" })`
+- **WHEN** the indexer encounters `<Button Click="OnSave"/>` inside a view whose root is `<Window x:Class="MyApp.Views.Main">`, and Roslyn resolves exactly one accessible instance `void OnSave(object, EventArgs-derived)` method
+- **THEN** it emits `EdgeEmitted(Src: "xaml:element:Views/Main.xaml#<elementId>", Dst: "csharp:M:MyApp.Views.Main.OnSave(System.Object,System.EventArgs)", EdgeKindName: "handles-event", Metadata: { "event": "Click" })` with exact evidence on the XAML attribute occurrence
+- **AND** an absent, ambiguous, static, inaccessible, or incompatible handler produces no guessed edge
 
 #### Scenario: Binding emits payload via PayloadKeys
-- **WHEN** the indexer encounters `<TextBox Text="{Binding User.Name, Mode=TwoWay, Converter={StaticResource b2v}}"/>`
-- **THEN** it emits `EdgeEmitted` with `EdgeKindName: "binds-path"` and Metadata including (verbatim) the keys `"path" = "User.Name"`, `"mode" = "two-way"`, `"converter" = "BoolToVisibility"` (the keys come from the `PayloadKeys` constants documented by `harden-sdk-pre-xaml`)
+- **WHEN** the indexer encounters `<TextBox Text="{Binding User.Name, Mode=TwoWay, Converter={StaticResource b2v}}"/>` under an inherited `x:DataType` or statically resolved `DataContext`
+- **THEN** it resolves every path segment and emits `EdgeEmitted` to the terminal C# property with `EdgeKindName: "binds-path"` and Metadata including (verbatim) the keys `"path" = "User.Name"`, `"mode" = "two-way"`, `"converter" = "BoolToVisibility"`, `"data-type"`, and `"context-source"` (the common keys come from the `PayloadKeys` constants documented by `harden-sdk-pre-xaml`)
+- **AND** an unresolved segment produces no synthetic `xaml:binding-target` symbol and no guessed semantic edge
 
-#### Scenario: ElementName binding emits two edges
+#### Scenario: ElementName binding emits only the relationship it can prove
 - **WHEN** the indexer encounters `<TextBox Text="{Binding ElementName=OtherCtrl, Path=Value}"/>`
-- **THEN** it emits two edges: a `binds-path` edge from the source element to nothing-resolvable carrying `Metadata = { "path": "Value", "element-name": "OtherCtrl" }`, plus a `binds-element` edge from the source element to the resolved target element (looked up via `x:Name` within the same XAML view) carrying the same `path` payload
+- **THEN** it emits a `binds-element` edge from the source element to the resolved target element (looked up via `x:Name` within the same XAML view) carrying the path payload and exact occurrence evidence
+- **AND** it does not reuse the inherited `DataContext` to fabricate a `binds-path` edge until the target element's CLR property type can be established
+
+#### Scenario: Command binding requires ICommand
+- **WHEN** a `Command="{Binding SaveCommand}"` path resolves to a property whose type is `System.Windows.Input.ICommand` or implements it
+- **THEN** the indexer emits a `binds-path` edge to that C# property with `"command" = "SaveCommand"` metadata
+- **AND** a path resolving to a non-command property emits no command edge
+
+#### Scenario: Unsupported source shape degrades honestly
+- **WHEN** a binding or `DataContext` uses an explicit `Source`, `ElementName`, or `RelativeSource` shape for which no CLR source-type resolver exists
+- **THEN** the indexer emits no property-target edge from the inherited `DataContext` and creates no placeholder symbol
 
 #### Scenario: Attached property emitted as annotation
 - **WHEN** the indexer encounters `<Button Grid.Row="2" Grid.Column="1"/>`

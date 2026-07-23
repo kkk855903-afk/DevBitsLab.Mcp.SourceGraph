@@ -207,15 +207,14 @@ public sealed class PayloadToolingFixtureTests : IAsyncLifetime, IDisposable
     }
 
     [Fact]
-    public async Task FindDataBindings_resolvesXamlPlaceholderFqn_viaNameLookup_notVerbatimPassthrough()
+    public async Task FindDataBindings_resolvesColonBearingNonCanonicalTarget_viaNameLookup()
     {
         // Regression for the Copilot review feedback on PR #33: `ResolveCanonicalKeyAsync` used
         // to treat any input containing `:` as a canonical key and pass it through verbatim. XAML
-        // placeholder symbols have FQNs like `binding-target:Views/MainWindow.xaml#Text@12:24`
-        // (colons baked into the FQN body) but their actual `canonical_key` is `xaml:binding-target:…`.
-        // The verbatim passthrough would silently produce zero rows. The new scheme-prefix
-        // heuristic only short-circuits known schemes (`csharp:`, `xaml:`); any other colon-bearing
-        // input falls through to FindSymbolsAsync, which resolves the FQN to its real canonical key.
+        // v1 XAML placeholder FQNs used to look like
+        // `binding-target:Views/MainWindow.xaml#Text@12:24`. Semantic XAML indexing no longer
+        // emits those placeholders, but a legacy-looking, colon-bearing lookup must still fall
+        // through to FindSymbolsAsync rather than being mistaken for a canonical key.
         var result = await GraphTools.FindDataBindingsAsync(
             router: _wpfRouter!,
             target: "binding-target:Views/MainWindow.xaml#Text@12:24", // unresolved-placeholder FQN-shape
@@ -229,12 +228,10 @@ public sealed class PayloadToolingFixtureTests : IAsyncLifetime, IDisposable
             result.StructuredContent!.Value.GetRawText(),
             new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower });
         dto.Should().NotBeNull();
-        // The FQN above doesn't actually exist in the SampleWpf store under that exact spelling
-        // (the synthesised placeholder uses the live source span); FindSymbolsAsync returns zero
-        // hits, so target resolves to null, the query fans wide, and the all-filters-null `note:`
-        // fires. The point of this test isn't the row count — it's that we DIDN'T pass the FQN
-        // through verbatim as if it were a canonical key (which would have silently produced
-        // zero rows + no note).
+        // Semantic indexing intentionally emits no synthetic binding-target symbol, so
+        // FindSymbolsAsync returns zero hits, the query fans wide, and the all-filters-null
+        // `note:` fires. The point of this test isn't the row count — it's that we DIDN'T pass
+        // the value through verbatim as if it were a canonical key.
         dto!.Note.Should().NotBeNullOrEmpty(
             "with no resolved filter, the all-filters-null hint should fire");
     }
@@ -329,12 +326,14 @@ public sealed class PayloadToolingFixtureTests : IAsyncLifetime, IDisposable
         Directory.CreateDirectory(tmp);
         var dbPath = Path.Join(tmp, "graph.db");
         var store = new SqliteGraphStore(dbPath);
-        await RoslynIndexer.IndexSolutionOnceAsync(slnPath, store);
+        await using var roslyn = new RoslynIndexer(store);
+        await roslyn.OpenAsync(slnPath);
+        await roslyn.IndexAllAsync();
 
         var langRegistry = new LanguageIndexerRegistry();
         langRegistry.Register(new XamlLanguageIndexer());
         var factories = new LanguageProjectFactoryRegistry();
-        factories.Register(new XamlLanguageProjectFactory());
+        factories.Register(new XamlLanguageProjectFactory(() => roslyn.SanitizedSolution));
         var dispatcher = new LanguageIndexerDispatcher(langRegistry, factories);
 
         var projectMap = new Dictionary<string, ILanguageProject>(StringComparer.OrdinalIgnoreCase);

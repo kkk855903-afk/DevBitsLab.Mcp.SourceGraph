@@ -625,7 +625,20 @@ public sealed class LiveIndexService : BackgroundService
             if (host.Indexer.SanitizedSolution is not null)
             {
                 var perScopeFactories = new LanguageProjectFactoryRegistry();
-                foreach (var f in _projectFactories.All()) perScopeFactories.Register(f);
+                perScopeFactories.Register(
+                    new DevBitsLab.Mcp.SourceGraph.Indexing.Xaml.XamlLanguageProjectFactory(
+                        () => host.Indexer.SanitizedSolution));
+                foreach (var f in _projectFactories.All())
+                {
+                    // Replace the process-wide discovery-only XAML factory with this scope's
+                    // Roslyn-aware instance. First-write-wins project mapping would otherwise
+                    // pin each .xaml file to a project with no semantic compilation.
+                    if (f is DevBitsLab.Mcp.SourceGraph.Indexing.Xaml.XamlLanguageProjectFactory)
+                    {
+                        continue;
+                    }
+                    perScopeFactories.Register(f);
+                }
                 perScopeFactories.Register(new MSBuildLanguageProjectFactory(host.Indexer));
                 var perScopeDispatcher = new LanguageIndexerDispatcher(
                     _languageDispatcher.Indexers,

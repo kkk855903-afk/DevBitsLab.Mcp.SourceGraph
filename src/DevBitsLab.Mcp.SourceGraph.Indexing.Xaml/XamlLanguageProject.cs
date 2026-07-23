@@ -1,5 +1,9 @@
+using System;
 using System.Collections.Generic;
+using System.Threading;
+using System.Threading.Tasks;
 using DevBitsLab.Mcp.SourceGraph.Sdk;
+using Microsoft.CodeAnalysis;
 
 namespace DevBitsLab.Mcp.SourceGraph.Indexing.Xaml;
 
@@ -15,15 +19,26 @@ namespace DevBitsLab.Mcp.SourceGraph.Indexing.Xaml;
 public sealed class XamlLanguageProject : ILanguageProject
 {
     private readonly Dictionary<string, ResourceDefinition> _resourceCache;
+    private readonly Func<Project?>? _roslynProjectProvider;
 
     public XamlLanguageProject(
         string projectFilePath,
         IReadOnlyList<string> xamlFilePaths,
         Dictionary<string, ResourceDefinition> resourceCache)
+        : this(projectFilePath, xamlFilePaths, resourceCache, roslynProjectProvider: null)
+    {
+    }
+
+    internal XamlLanguageProject(
+        string projectFilePath,
+        IReadOnlyList<string> xamlFilePaths,
+        Dictionary<string, ResourceDefinition> resourceCache,
+        Func<Project?>? roslynProjectProvider)
     {
         Id = projectFilePath;
         FilePaths = xamlFilePaths;
         _resourceCache = resourceCache;
+        _roslynProjectProvider = roslynProjectProvider;
     }
 
     /// <inheritdoc />
@@ -38,4 +53,17 @@ public sealed class XamlLanguageProject : ILanguageProject
     /// cascade (cross-project references are an open question — see design.md).
     /// </summary>
     public IReadOnlyDictionary<string, ResourceDefinition> ResourceCache => _resourceCache;
+
+    /// <summary>
+    /// Returns the compilation from the host's current privacy-sanitized Roslyn solution.
+    /// The provider is evaluated per call so live C# edits are not pinned to the project
+    /// snapshot that happened to exist when XAML discovery first ran.
+    /// </summary>
+    internal async Task<Compilation?> GetCompilationAsync(CancellationToken ct)
+    {
+        var project = _roslynProjectProvider?.Invoke();
+        return project is null
+            ? null
+            : await project.GetCompilationAsync(ct).ConfigureAwait(false);
+    }
 }

@@ -1,3 +1,5 @@
+using System;
+
 namespace SampleWpf.Views;
 
 /// <summary>
@@ -6,7 +8,7 @@ namespace SampleWpf.Views;
 /// </summary>
 public partial class MainWindow
 {
-    public void OnSave()
+    public void OnSave(object? sender, EventArgs e)
     {
         // Body deliberately empty — the indexer only needs the symbol to exist for the
         // cross-language `handles-event` edge to land on a real C# method.

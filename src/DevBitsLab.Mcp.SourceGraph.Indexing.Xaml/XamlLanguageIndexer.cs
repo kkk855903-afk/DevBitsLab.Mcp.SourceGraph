@@ -48,7 +48,7 @@ public sealed class XamlLanguageIndexer : ILanguageIndexer
     public IReadOnlyCollection<string> FileExtensions { get; } = new[] { ".xaml" };
 
     /// <inheritdoc />
-    public Task<IReadOnlyList<IndexEvent>> IndexAsync(IndexContext ctx, CancellationToken ct)
+    public async Task<IReadOnlyList<IndexEvent>> IndexAsync(IndexContext ctx, CancellationToken ct)
     {
         if (ctx is null) throw new ArgumentNullException(nameof(ctx));
 
@@ -61,12 +61,16 @@ public sealed class XamlLanguageIndexer : ILanguageIndexer
         {
             // Malformed XAML — return no events rather than throwing so a single bad file doesn't
             // fail the entire indexing pass.
-            IReadOnlyList<IndexEvent> empty = Array.Empty<IndexEvent>();
-            return Task.FromResult(empty);
+            return Array.Empty<IndexEvent>();
         }
 
         var dialect = XamlProfileDetector.Detect(doc.RootNamespaceMappings);
-        var emission = new EmissionContext(ctx, doc, dialect);
+        var project = ctx.Project as XamlLanguageProject;
+        var semanticResolver = await XamlSemanticResolver.CreateAsync(
+            project,
+            doc,
+            ct).ConfigureAwait(false);
+        var emission = new EmissionContext(ctx, doc, dialect, semanticResolver);
 
         // Pass 1: collect every named element so binds-element can resolve targets later.
         XamlReader.Walk(doc.Root, (element, _) => emission.RegisterNamedElement(element));
@@ -74,8 +78,7 @@ public sealed class XamlLanguageIndexer : ILanguageIndexer
         // Pass 2: emit all symbol declarations, edges, and annotations.
         XamlReader.Walk(doc.Root, (element, ancestors) => emission.Emit(element, ancestors));
 
-        IReadOnlyList<IndexEvent> result = emission.Events;
-        return Task.FromResult(result);
+        return emission.Events;
     }
 
     /// <summary>
@@ -89,6 +92,7 @@ public sealed class XamlLanguageIndexer : ILanguageIndexer
         private readonly XamlDocument _doc;
         private readonly IXamlDialect _dialect;
         private readonly XamlLanguageProject? _project;
+        private readonly XamlSemanticResolver? _semanticResolver;
         private readonly string _relativePath;
         private readonly string? _xClass;
         private readonly string _viewKey;
@@ -97,12 +101,17 @@ public sealed class XamlLanguageIndexer : ILanguageIndexer
 
         public List<IndexEvent> Events { get; } = new();
 
-        public EmissionContext(IndexContext ctx, XamlDocument doc, IXamlDialect dialect)
+        public EmissionContext(
+            IndexContext ctx,
+            XamlDocument doc,
+            IXamlDialect dialect,
+            XamlSemanticResolver? semanticResolver)
         {
             _ctx = ctx;
             _doc = doc;
             _dialect = dialect;
             _project = ctx.Project as XamlLanguageProject;
+            _semanticResolver = semanticResolver;
             _relativePath = ToRepoRelative(ctx.RepoRoot, ctx.FilePath);
             _xClass = doc.Root.FindAttribute(XamlReader.XamlNamespace, "Class")?.Value?.Trim();
             _viewKey = $"xaml:view:{_relativePath}";
@@ -274,7 +283,7 @@ public sealed class XamlLanguageIndexer : ILanguageIndexer
                 if (classification == XamlAttributeKind.AttachedProperty) continue;
                 if (classification == XamlAttributeKind.MarkupExtension)
                 {
-                    EmitMarkupExtensionEdges(attr, hostKey);
+                    EmitMarkupExtensionEdges(element, attr, hostKey);
                 }
                 else
                 {
@@ -335,7 +344,10 @@ public sealed class XamlLanguageIndexer : ILanguageIndexer
             }
         }
 
-        private void EmitMarkupExtensionEdges(XamlAttribute attr, string hostKey)
+        private void EmitMarkupExtensionEdges(
+            XamlElement element,
+            XamlAttribute attr,
+            string hostKey)
         {
             if (!MarkupExtensionParser.TryParse(attr.Value, out var ext)) return;
             if (ext.IsLiteral) return;
@@ -344,7 +356,7 @@ public sealed class XamlLanguageIndexer : ILanguageIndexer
             {
                 case "Binding":
                 case "x:Bind":
-                    EmitBindingEdge(attr, hostKey, ext);
+                    EmitBindingEdge(element, attr, hostKey, ext);
                     break;
                 case "StaticResource":
                 case "DynamicResource":
@@ -354,7 +366,11 @@ public sealed class XamlLanguageIndexer : ILanguageIndexer
             }
         }
 
-        private void EmitBindingEdge(XamlAttribute attr, string hostKey, MarkupExtensionValue ext)
+        private void EmitBindingEdge(
+            XamlElement element,
+            XamlAttribute attr,
+            string hostKey,
+            MarkupExtensionValue ext)
         {
             var path = ResolveBindingPath(ext);
             var mode = ResolveNamedAsLiteral(ext, "Mode");
@@ -376,28 +392,6 @@ public sealed class XamlLanguageIndexer : ILanguageIndexer
             if (!string.IsNullOrEmpty(fallback)) metadata[PayloadKeys.FallbackValue] = fallback!;
             if (!string.IsNullOrEmpty(stringFormat)) metadata[PayloadKeys.StringFormat] = stringFormat!;
             if (!string.IsNullOrEmpty(updateSourceTrigger)) metadata[PayloadKeys.UpdateSourceTrigger] = updateSourceTrigger!;
-            // No resolvable target for the binds-path edge — bindings resolve against the data
-            // context, which the indexer doesn't statically know. The host's edge resolver will
-            // skip the row but the metadata dictionary is preserved (see binds-element below
-            // for the resolved target case).
-            var bindsPathTarget = $"xaml:binding-target:{_relativePath}#{attr.LocalName}@{attr.Line}:{attr.Column}";
-            // Synthesise a placeholder symbol so the edge can land — the GraphStoreEmitter
-            // skips edges whose endpoints aren't known.
-            Events.Add(new IndexEvent.SymbolDeclared(
-                canonicalKey: bindsPathTarget,
-                name: attr.LocalName,
-                fqn: bindsPathTarget.Substring(bindsPathTarget.IndexOf(':') + 1),
-                kind: KindXamlElement,
-                startLine: attr.Line,
-                startColumn: attr.Column,
-                endLine: attr.Line,
-                endColumn: attr.Column,
-                containerCanonicalKey: _viewKey));
-            Events.Add(new IndexEvent.EdgeEmitted(
-                sourceCanonicalKey: hostKey,
-                targetCanonicalKey: bindsPathTarget,
-                edgeKindName: EdgeBindsPath,
-                metadata: metadata.Count == 0 ? null : metadata));
 
             if (!string.IsNullOrEmpty(elementName) && _namedElementKeysByName.TryGetValue(elementName!, out var resolvedTarget))
             {
@@ -407,8 +401,55 @@ public sealed class XamlLanguageIndexer : ILanguageIndexer
                     sourceCanonicalKey: hostKey,
                     targetCanonicalKey: resolvedTarget,
                     edgeKindName: EdgeBindsElement,
-                    metadata: elementMeta.Count == 0 ? null : elementMeta));
+                    metadata: elementMeta.Count == 0 ? null : elementMeta)
+                {
+                    Evidence = CreateAttributeEvidence(
+                        attr,
+                        EvidenceConfidence.Exact,
+                        elementMeta),
+                });
             }
+
+            // ElementName / RelativeSource / explicit Source bindings do not evaluate against the
+            // inherited DataContext. Until those source shapes have their own CLR-type resolver,
+            // retaining only the exact binds-element fact is safer than claiming a property edge
+            // against the wrong object.
+            if (ext.NamedArgs.ContainsKey("ElementName")
+                || ext.NamedArgs.ContainsKey("RelativeSource")
+                || ext.NamedArgs.ContainsKey("Source")
+                || !string.Equals(ext.Name, "Binding", StringComparison.Ordinal)
+                || string.IsNullOrWhiteSpace(path))
+            {
+                return;
+            }
+
+            var semanticTarget = _semanticResolver?.ResolveBinding(
+                element,
+                path!,
+                requireCommand: string.Equals(
+                    attr.LocalName,
+                    "Command",
+                    StringComparison.Ordinal));
+            if (semanticTarget is null) return;
+
+            metadata[PayloadKeys.DataType] = semanticTarget.DataTypeCanonicalKey;
+            metadata["context-source"] = semanticTarget.ContextSource;
+            if (string.Equals(attr.LocalName, "Command", StringComparison.Ordinal))
+            {
+                metadata["command"] = semanticTarget.Property.Name;
+            }
+
+            Events.Add(new IndexEvent.EdgeEmitted(
+                sourceCanonicalKey: hostKey,
+                targetCanonicalKey: semanticTarget.PropertyCanonicalKey,
+                edgeKindName: EdgeBindsPath,
+                metadata: metadata.Count == 0 ? null : metadata)
+            {
+                Evidence = CreateAttributeEvidence(
+                    attr,
+                    semanticTarget.Confidence,
+                    metadata),
+            });
         }
 
         private void EmitUsesResourceEdge(XamlAttribute attr, string hostKey, MarkupExtensionValue ext)
@@ -488,7 +529,10 @@ public sealed class XamlLanguageIndexer : ILanguageIndexer
             if (!IsLikelyEventName(attr.LocalName)) return;
             if (string.IsNullOrEmpty(_xClass)) return;
 
-            var handlerKey = CanonicalKeys.ForMethod(_xClass!, value!);
+            var handler = _semanticResolver?.ResolveEventHandler(_xClass, value!);
+            if (handler is null) return;
+            var handlerKey = XamlSemanticResolver.CanonicalKey(handler);
+            if (handlerKey is null) return;
             var meta = new Dictionary<string, string>(StringComparer.Ordinal)
             {
                 [PayloadKeys.Event] = attr.LocalName,
@@ -498,7 +542,13 @@ public sealed class XamlLanguageIndexer : ILanguageIndexer
                 sourceCanonicalKey: hostKey,
                 targetCanonicalKey: handlerKey,
                 edgeKindName: EdgeHandlesEvent,
-                metadata: meta));
+                metadata: meta)
+            {
+                Evidence = CreateAttributeEvidence(
+                    attr,
+                    EvidenceConfidence.Exact,
+                    meta),
+            });
         }
 
         private void EmitInstantiatesTypeEdge(XamlElement element)
@@ -595,7 +645,10 @@ public sealed class XamlLanguageIndexer : ILanguageIndexer
 
         private static string? ResolveBindingPath(MarkupExtensionValue ext)
         {
-            if (ext.NamedArgs.TryGetValue("Path", out var named) && named.IsLiteral) return named.Literal;
+            if (ext.NamedArgs.TryGetValue("Path", out var named))
+            {
+                return named.IsLiteral ? named.Literal : null;
+            }
             if (ext.PositionalArgs.Count > 0 && ext.PositionalArgs[0].IsLiteral) return ext.PositionalArgs[0].Literal;
             return null;
         }
@@ -614,6 +667,27 @@ public sealed class XamlLanguageIndexer : ILanguageIndexer
             "{" +
             "\"ctor\":[" + System.Text.Json.JsonSerializer.Serialize(value) + "]," +
             "\"named\":{}}";
+
+        private EdgeEvidence CreateAttributeEvidence(
+            XamlAttribute attribute,
+            EvidenceConfidence confidence,
+            IReadOnlyDictionary<string, string>? metadata)
+        {
+            var qualifiedNameLength = attribute.LocalName.Length
+                + (string.IsNullOrEmpty(attribute.Prefix)
+                    ? 0
+                    : attribute.Prefix.Length + 1);
+            return new EdgeEvidence(
+                new SourceLocation(
+                    _ctx.FilePath,
+                    attribute.Line,
+                    attribute.Column,
+                    attribute.Line,
+                    attribute.Column + Math.Max(1, qualifiedNameLength)),
+                confidence,
+                "xaml-semantic",
+                metadata);
+        }
 
         private static bool IsBareIdentifier(string value)
         {

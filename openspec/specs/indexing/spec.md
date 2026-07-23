@@ -430,7 +430,8 @@ The detected profile selects an `IXamlDialect` strategy that handles markup-exte
 
 #### Scenario: Profile-specific markup extension dialect
 - **WHEN** a WinUI 3 file uses `Text="{x:Bind ViewModel.Name}"` (compiled binding)
-- **THEN** the `WinUiDialect`'s markup-extension dispatcher recognises `x:Bind`, the binding is recorded with `payload` keys including `mode`, and the canonical key form distinguishes it from a runtime `{Binding}`
+- **THEN** the `WinUiDialect`'s markup-extension dispatcher recognises `x:Bind` as a compiled-binding shape
+- **AND** until the code-behind source type and full path can be resolved semantically, the indexer emits no inherited-`DataContext` edge and no synthetic target
 
 ### Requirement: Per-project resource cascade cache
 For every project that contains XAML files, the `XamlLanguageProjectFactory` SHALL build a per-project `XamlLanguageProject` instance whose private `ResourceCache` indexes every `x:Key` declared in:

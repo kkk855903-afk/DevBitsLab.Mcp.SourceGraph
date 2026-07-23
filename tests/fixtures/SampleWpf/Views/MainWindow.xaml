@@ -14,8 +14,22 @@
                 Grid.Row="1"
                 Content="Save"
                 Background="{StaticResource AccentBrush}"
+                Command="{Binding SaveCommand}"
                 Click="OnSave" />
         <TextBlock Grid.Row="2"
                    Text="{Binding ElementName=UserNameBox, Path=Text}" />
+        <TextBlock x:Name="BrokenBinding"
+                   Text="{Binding Missing.Name}" />
+        <Button x:Name="InvalidCommandButton"
+                Command="{Binding User.Name}" />
+        <TextBlock x:Name="RelativeSourceText"
+                   Text="{Binding User.Name, RelativeSource={RelativeSource Self}}" />
+        <TextBlock x:Name="CompiledBindingText"
+                   Text="{x:Bind User.Name}" />
+        <StackPanel x:Name="ExplicitSourcePanel"
+                    DataContext="{Binding Source={StaticResource AccentBrush}}">
+            <TextBlock x:Name="ExplicitSourceText"
+                       Text="{Binding User.Name}" />
+        </StackPanel>
     </Grid>
 </Window>
