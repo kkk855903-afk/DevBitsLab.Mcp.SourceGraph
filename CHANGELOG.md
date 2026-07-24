@@ -101,7 +101,9 @@ plugin SDK is `2.5.0`.
   `osx-x64` is not published. CI installs the packed tool, exercises `--help`,
   bundled `protoc`, and a real native worker/libclang parse on installed Ubuntu,
   Windows, and ARM64 macOS runtimes; Ubuntu also completes a stdio MCP
-  `tools/list` handshake.
+  `tools/list` handshake. The release gate verifies exact metadata and packaged
+  LICENSE/README content across all seven primary packages, plus Portable PDB
+  and repository-bound Source Link data in the SDK and five RID symbol packages.
 
 ### Changed
 

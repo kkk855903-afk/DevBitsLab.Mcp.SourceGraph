@@ -1130,11 +1130,13 @@ packages, each carrying the matching native dependencies:
 Install all of them through the same command:
 `dotnet tool install -g DevBitsLab.Mcp.SourceGraph.Tool --version 0.9.0`.
 CI validates all seven package identities (outer tool, five implementations,
-and SDK), local tool installation, `--help`, bundled `protoc`, a real native
-worker/libclang parse, and a stdio MCP `tools/list` handshake from the installed
-command. Installed runtime smoke runs on Ubuntu x64, Windows x64, and macOS
-ARM64. The `osx-arm64` payload uses Grpc.Tools' x64 `protoc`, so macOS hosts also
-need x86_64 translation support (Rosetta 2).
+and SDK), exact license/README/repository metadata, and six Portable-PDB symbol
+packages with repository-bound Source Link mappings. It then validates local
+tool installation, `--help`, bundled `protoc`, a real native worker/libclang
+parse, and a stdio MCP `tools/list` handshake from the installed command.
+Installed runtime smoke runs on Ubuntu x64, Windows x64, and macOS ARM64. The
+`osx-arm64` payload uses Grpc.Tools' x64 `protoc`, so macOS hosts also need
+x86_64 translation support (Rosetta 2).
 
 The published tool targets **`net10.0`**. Earlier .NET runtimes (8, 9) are not
 currently supported — see [GOVERNANCE.md](GOVERNANCE.md#roadmap-items-currently-parked)

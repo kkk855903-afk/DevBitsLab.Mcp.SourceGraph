@@ -183,7 +183,7 @@ dotnet pack src/DevBitsLab.Mcp.SourceGraph.Sdk/DevBitsLab.Mcp.SourceGraph.Sdk.cs
 
 1. 工作树只含预期变更且所有小步提交可追溯；
 2. locked restore、Release build、全量 test 全绿；
-3. 结构化 transitive vulnerability scan 无 High/Critical；
+3. 结构化 transitive vulnerability scan 不报告任何已知漏洞；
 4. tool 0.9.0 和 SDK 2.5.0 package metadata、license、symbols/source link 正确；
 5. 从本地 package feed 安装的实际 executable 能执行 `--help`；
 6. 安装后的进程完成 MCP stdio initialize 和 `tools/list`；

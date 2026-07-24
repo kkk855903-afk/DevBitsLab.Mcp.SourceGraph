@@ -429,8 +429,9 @@ Dedicated tests cover worker protocol, PE parsing, real WPF binding resolution,
 and both WPF risk rules on a complete WindowsDesktop compilation. Release
 validation additionally performs locked restore, Release build/test, structured
 transitive vulnerability scanning, exact seven-package identity/version checks,
-package installation, `--help`, bundled `protoc`, a real native worker/libclang
-parse, and a stdio `tools/list` smoke.
+exact license/README/repository metadata checks, Portable PDB and Source Link
+validation for six symbol packages, package installation, `--help`, bundled
+`protoc`, a real native worker/libclang parse, and a stdio `tools/list` smoke.
 
 ## Versioning boundaries
 
