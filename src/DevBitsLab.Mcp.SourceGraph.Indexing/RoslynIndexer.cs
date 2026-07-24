@@ -5,6 +5,7 @@ using System.Diagnostics.CodeAnalysis;
 using System.Security.Cryptography;
 using DevBitsLab.Mcp.SourceGraph.Core;
 using DevBitsLab.Mcp.SourceGraph.Embeddings;
+using DevBitsLab.Mcp.SourceGraph.Indexing.Interop;
 using DevBitsLab.Mcp.SourceGraph.Sdk;
 using DevBitsLab.Mcp.SourceGraph.Storage;
 using Microsoft.CodeAnalysis;
@@ -48,6 +49,9 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         OperatingSystem.IsWindows()
             ? StringComparison.OrdinalIgnoreCase
             : StringComparison.Ordinal;
+    private const string ManagedInteropAnnotationName = "ManagedImportV1";
+    private const string ManagedInteropAnnotationFullName =
+        "MedInterop.ManagedImport.v1";
     /// <inheritdoc />
     IReadOnlyCollection<string> ILanguageIndexer.FileExtensions => _fileExtensions;
 
@@ -549,6 +553,7 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                 fullReset: false,
                 preIndexFailures,
                 snapshotPreparation.Snapshots,
+                forceInteropProjectionRefresh: false,
                 ct).ConfigureAwait(false);
         }
         finally
@@ -577,6 +582,12 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
 
     private async Task<IndexResult> IndexAllCoreAsync(bool fullReset, CancellationToken ct)
     {
+        if (_interopTarget is null)
+        {
+            await ClearDisabledManagedInteropProjectionAsync(ct)
+                .ConfigureAwait(false);
+        }
+
         var solution = SolutionPrivacySanitizer.SanitizeForScope(
             _sanitizedSolution!,
             _pathPolicy!);
@@ -607,6 +618,7 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
             fullReset,
             initialFailures,
             snapshotPreparation.Snapshots,
+            forceInteropProjectionRefresh: _interopTarget is not null,
             ct).ConfigureAwait(false);
         var passIsComplete =
             discovery.IsComplete
@@ -628,6 +640,43 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
             _requiresStructuralReload = true;
         }
         return result;
+    }
+
+    private async Task ClearDisabledManagedInteropProjectionAsync(
+        CancellationToken ct)
+    {
+        const int pageSize = 1000;
+        var paths = new HashSet<string>(_pathComparer);
+        long afterId = 0;
+        while (true)
+        {
+            ct.ThrowIfCancellationRequested();
+            var page = await _store.ListAnnotationsByFlavorAsync(
+                    InteropAnnotationFlavors.ManagedImport,
+                    afterId,
+                    pageSize,
+                    ct)
+                .ConfigureAwait(false);
+            foreach (var row in page)
+            {
+                paths.Add(row.FilePath);
+            }
+            if (page.Count < pageSize) break;
+            afterId = page[^1].AnnotationId;
+        }
+
+        foreach (var path in paths.OrderBy(
+                     value => value,
+                     _pathComparer))
+        {
+            ct.ThrowIfCancellationRequested();
+            await _store.ReplaceAnnotationsForFileByFlavorAsync(
+                    path,
+                    InteropAnnotationFlavors.ManagedImport,
+                    [],
+                    ct)
+                .ConfigureAwait(false);
+        }
     }
 
     /// <summary>
@@ -1381,6 +1430,7 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         bool fullReset,
         IReadOnlyCollection<FileFailure>? initialFailures,
         IReadOnlyDictionary<string, RegularDocumentSnapshot> regularSnapshots,
+        bool forceInteropProjectionRefresh,
         CancellationToken ct)
     {
         var sw = Stopwatch.StartNew();
@@ -1613,7 +1663,10 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
             }
             _storedPathByFileId[fileId] = path;
 
-            if (unchanged && !fullReset && _keysByFileId.TryGetValue(fileId, out var keysForFile))
+            if (unchanged
+                && !fullReset
+                && !forceInteropProjectionRefresh
+                && _keysByFileId.TryGetValue(fileId, out var keysForFile))
             {
                 // SHA matches and the in-memory symbol map is hydrated. Verify the store's
                 // refs/edges are in agreement before we skip pass 2: a symbol-bearing file
@@ -1667,6 +1720,8 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         var newKeysForFile = new Dictionary<long, HashSet<string>>();
         var parentKeyByChildKey = new Dictionary<string, string>(StringComparer.Ordinal);
         var pendingAttrsByFile = new Dictionary<long, List<PendingAnnotation>>();
+        var pendingInteropByFile =
+            new Dictionary<long, List<FileAnnotationFact>>();
         var seenSymbolForAttr = new Dictionary<long, HashSet<string>>();
         var fileIdBySyntaxTree = new Dictionary<SyntaxTree, long>(
             ReferenceEqualityComparer.Instance);
@@ -1684,6 +1739,8 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
             // has already updated the file row and cleared its outgoing facts.
             var fileKeys = new HashSet<string>(StringComparer.Ordinal);
             var pendingAttrs = new List<PendingAnnotation>();
+            var interopPayloadByKey =
+                new Dictionary<string, string>(StringComparer.Ordinal);
             var attrSeen = new HashSet<string>(StringComparer.Ordinal);
             var path = changedFileMeta.TryGetValue(fileId, out var meta) ? meta.Path : "<unknown>";
 
@@ -1708,7 +1765,44 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
 
                         var key = SymbolMapping.CanonicalKey(symbol);
                         if (key is null) continue;
-                        if (!fileKeys.Add(key)) continue;
+                        var isFirstSymbolIteration = fileKeys.Add(key);
+
+                        // A physical source path can appear in multiple target-framework or
+                        // linked-project compilations. Extract every iteration before applying
+                        // the normal symbol de-duplication gate so a TFM-dependent ABI conflict
+                        // is surfaced instead of whichever compilation happened to enumerate
+                        // first winning silently.
+                        if (_interopTarget is not null
+                            && symbol is IMethodSymbol interopMethod)
+                        {
+                            var import = ManagedInteropExtractor.TryExtract(
+                                interopMethod,
+                                _interopTarget,
+                                fileId);
+                            if (import is not null)
+                            {
+                                var payload =
+                                    InteropFactPayloadCodec.EncodeManagedImport(
+                                        import);
+                                if (interopPayloadByKey.TryGetValue(
+                                        import.SymbolCanonicalKey,
+                                        out var previousPayload)
+                                    && !string.Equals(
+                                        previousPayload,
+                                        payload,
+                                        StringComparison.Ordinal))
+                                {
+                                    throw new InvalidOperationException(
+                                        "Managed interop declaration "
+                                        + $"`{import.SymbolCanonicalKey}` has conflicting "
+                                        + "target-framework projections.");
+                                }
+                                interopPayloadByKey[import.SymbolCanonicalKey] =
+                                    payload;
+                            }
+                        }
+
+                        if (!isFirstSymbolIteration) continue;
 
                         // Remember parent canonical key for the pass-1c container_id batch update.
                         var parentSym = symbol.ContainingSymbol;
@@ -1755,7 +1849,11 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                         // double-store it.
                         if (attrSeen.Add(key))
                         {
-                            AttributeExtractor.AppendAnnotations(symbol, id, pendingAttrs);
+                            AttributeExtractor.AppendAnnotations(
+                                symbol,
+                                key,
+                                id,
+                                pendingAttrs);
 
                             // Enqueue an embedding request once per (file, symbol). The sink is
                             // a no-op when --no-embeddings was passed or the model isn't available;
@@ -1772,6 +1870,19 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                 // iterate. Pass 2 will also gate on walkedFileIds so failed files are skipped.
                 newKeysForFile[fileId] = fileKeys;
                 pendingAttrsByFile[fileId] = pendingAttrs;
+                if (_interopTarget is not null)
+                {
+                    pendingInteropByFile[fileId] = interopPayloadByKey
+                        .OrderBy(pair => pair.Key, StringComparer.Ordinal)
+                        .Select(pair => new FileAnnotationFact(
+                            pair.Key,
+                            ManagedInteropAnnotationName,
+                            ManagedInteropAnnotationFullName,
+                            InteropAnnotationFlavors.ManagedImport,
+                            pair.Value,
+                            AttributeCanonicalKey: null))
+                        .ToList();
+                }
                 seenSymbolForAttr[fileId] = attrSeen;
                 walkedFileIds.Add(fileId);
             }
@@ -1840,6 +1951,23 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
             if (pendingAttrs.Count == 0) continue;
             var resolved = pendingAttrs.Select(p => AttributeExtractor.Resolve(p, _symbolIdByKey)).ToList();
             await _store.BulkInsertAnnotationsAsync(resolved, ct).ConfigureAwait(false);
+        }
+
+        // Publish a successful zero-fact projection as well as populated imports. This removes a
+        // stale DllImport/LibraryImport annotation when the declaration disappears while leaving
+        // ordinary C# attributes untouched.
+        foreach (var (fileId, interopAnnotations) in pendingInteropByFile)
+        {
+            var path = changedFileMeta.TryGetValue(fileId, out var meta)
+                ? meta.Path
+                : throw new InvalidOperationException(
+                    $"Missing changed-file metadata for interop owner {fileId}.");
+            await _store.ReplaceAnnotationsForFileByFlavorAsync(
+                    path,
+                    InteropAnnotationFlavors.ManagedImport,
+                    interopAnnotations,
+                    ct)
+                .ConfigureAwait(false);
         }
 
         // PASS 1 — phase E: flush detected test_framework values for the methods we walked.

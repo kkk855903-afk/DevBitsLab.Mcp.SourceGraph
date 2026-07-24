@@ -1,4 +1,5 @@
 using DevBitsLab.Mcp.SourceGraph.Core;
+using DevBitsLab.Mcp.SourceGraph.Storage;
 using Microsoft.CodeAnalysis;
 
 namespace DevBitsLab.Mcp.SourceGraph.Indexing;
@@ -11,6 +12,7 @@ namespace DevBitsLab.Mcp.SourceGraph.Indexing;
 /// the moment we walk a use site.
 /// </summary>
 internal readonly record struct PendingAnnotation(
+    string SymbolCanonicalKey,
     long SymbolId,
     string Name,
     string FullName,
@@ -33,9 +35,11 @@ internal static class AttributeExtractor
 
     public static void AppendAnnotations(
         ISymbol symbol,
+        string symbolCanonicalKey,
         long symbolId,
         List<PendingAnnotation> sink)
     {
+        ArgumentException.ThrowIfNullOrWhiteSpace(symbolCanonicalKey);
         var attrs = symbol.GetAttributes();
         if (attrs.IsDefaultOrEmpty) return;
 
@@ -66,6 +70,7 @@ internal static class AttributeExtractor
             }
 
             sink.Add(new PendingAnnotation(
+                symbolCanonicalKey,
                 symbolId,
                 name,
                 fullName,
@@ -97,6 +102,19 @@ internal static class AttributeExtractor
             pending.ArgsJson,
             attrSymbolId);
     }
+
+    /// <summary>
+    /// Converts a pending attribute to its canonical-key form for atomic declaration reconcile.
+    /// The store resolves the optional attribute definition in the same transaction as the host.
+    /// </summary>
+    public static FileAnnotationFact ToFact(PendingAnnotation pending) =>
+        new(
+            pending.SymbolCanonicalKey,
+            pending.Name,
+            pending.FullName,
+            CSharpAttributeFlavor,
+            pending.ArgsJson,
+            pending.AnnotationClassKey);
 
     private static object? UnwrapTypedConstant(TypedConstant tc)
     {
