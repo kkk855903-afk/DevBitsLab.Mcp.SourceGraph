@@ -51,6 +51,7 @@ public sealed class ManagedInteropExtractorTests
         import!.ImportKind.Should().Be(ManagedImportKind.DllImport);
         import.LibraryName.Should().Be("medalgo");
         import.EntryPoint.Should().Be("medalgo_run");
+        import.ExactSpelling.Should().BeFalse();
         import.CallingConvention.Should().Be(InteropCallingConvention.Cdecl);
         import.CharacterSet.Should().Be("utf-16");
         import.SetLastError.Should().BeTrue();
@@ -118,6 +119,7 @@ public sealed class ManagedInteropExtractorTests
 
         import.Should().NotBeNull();
         import!.ImportKind.Should().Be(ManagedImportKind.LibraryImport);
+        import.ExactSpelling.Should().BeTrue();
         import.CallingConvention.Should().Be(InteropCallingConvention.StdCall);
         import.CharacterSet.Should().Be("utf-8");
         import.Parameters.Should().ContainSingle();
@@ -144,6 +146,32 @@ public sealed class ManagedInteropExtractorTests
                 InteropTarget.WindowsX64Msvc,
                 producingFileId: 1)
             .Should().BeNull();
+    }
+
+    [Fact]
+    public void DllImport_defaultsToAnsiLookup_andExtractsExplicitExactSpelling()
+    {
+        const string source = """
+            using System.Runtime.InteropServices;
+
+            namespace Fixture;
+
+            internal static class Native
+            {
+                [DllImport("medalgo", ExactSpelling = true)]
+                internal static extern int Run();
+            }
+            """;
+        var method = CompileMethod(source, "Fixture.Native", "Run");
+
+        var import = ManagedInteropExtractor.TryExtract(
+            method,
+            InteropTarget.WindowsX64Msvc,
+            producingFileId: 29);
+
+        import.Should().NotBeNull();
+        import!.ExactSpelling.Should().BeTrue();
+        import.CharacterSet.Should().Be("ansi");
     }
 
     [Fact]

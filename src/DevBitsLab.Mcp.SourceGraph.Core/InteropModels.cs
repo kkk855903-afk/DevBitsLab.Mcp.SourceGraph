@@ -274,7 +274,15 @@ public sealed record ManagedImport(
     string? CharacterSet,
     bool SetLastError,
     InteropTarget Target,
-    Evidence Evidence);
+    Evidence Evidence)
+{
+    /// <summary>
+    /// Whether the runtime must resolve <see cref="EntryPoint"/> exactly. A false value permits
+    /// the platform- and character-set-specific DllImport lookup sequence; <see langword="null"/>
+    /// means the lookup policy could not be proven.
+    /// </summary>
+    public bool? ExactSpelling { get; init; }
+}
 
 /// <summary>
 /// Proof that a native export retains one callback parameter after the call returns. Presence of

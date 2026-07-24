@@ -137,9 +137,173 @@ public sealed class InteropMatcherTests
         match.Status.Should().Be(InteropMatchStatus.Unmatched);
     }
 
+    [Fact]
+    public void ExactSpelling_onlyAllowsDeclaredEntryPoint()
+    {
+        var match = new InteropMatcher().Match(
+            Managed("medalgo", "run", exactSpelling: true, characterSet: "utf-16"),
+            [Native("medalgo.dll", "runW", "c:E:native.cpp::runW")]);
+
+        match.Status.Should().Be(InteropMatchStatus.Unmatched);
+        match.Evidence.Should().ContainSingle()
+            .Which.Should().Be(Managed(
+                "medalgo",
+                "run",
+                exactSpelling: true,
+                characterSet: "utf-16").Evidence);
+        match.Reasons.Should().Contain(reason => reason.Contains(
+            "exact entry-point spelling 'run'",
+            StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void WindowsAnsiLookup_usesOriginalNameBeforeAFallback()
+    {
+        var original = Native("medalgo.dll", "run", "c:E:native.cpp::run");
+        var fallback = Native("medalgo.dll", "runA", "c:E:native.cpp::runA");
+
+        var match = new InteropMatcher().Match(
+            Managed("medalgo", "run", exactSpelling: false, characterSet: "ansi"),
+            [fallback, original]);
+
+        match.Status.Should().Be(InteropMatchStatus.Matched);
+        match.NativeSymbolCanonicalKey.Should().Be(original.SymbolCanonicalKey);
+        match.Evidence.Should().Equal(
+            Managed(
+                "medalgo",
+                "run",
+                exactSpelling: false,
+                characterSet: "ansi").Evidence,
+            original.Evidence);
+        match.Reasons.Should().Contain(reason => reason.Contains(
+            "'run', then 'runA'",
+            StringComparison.Ordinal));
+        match.Reasons.Should().Contain(reason => reason.Contains(
+            "resolves to 'run'",
+            StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void WindowsAnsiLookup_fallsBackToASuffix()
+    {
+        var fallback = Native("medalgo.dll", "runA", "c:E:native.cpp::runA");
+
+        var match = new InteropMatcher().Match(
+            Managed("medalgo", "run", exactSpelling: false, characterSet: "ansi"),
+            [fallback]);
+
+        match.Status.Should().Be(InteropMatchStatus.Matched);
+        match.NativeSymbolCanonicalKey.Should().Be(fallback.SymbolCanonicalKey);
+        match.Reasons.Should().Contain(reason => reason.Contains(
+            "resolves to 'runA'",
+            StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void WindowsUnicodeLookup_prefersWSuffix_independentOfCandidateOrder()
+    {
+        var fallback = Native("medalgo.dll", "run", "c:E:native.cpp::run");
+        var wide = Native("medalgo.dll", "runW", "c:E:native.cpp::runW");
+
+        var match = new InteropMatcher().Match(
+            Managed("medalgo", "run", exactSpelling: false, characterSet: "utf-16"),
+            [fallback, wide]);
+
+        match.Status.Should().Be(InteropMatchStatus.Matched);
+        match.NativeSymbolCanonicalKey.Should().Be(wide.SymbolCanonicalKey);
+        match.Reasons.Should().Contain(reason => reason.Contains(
+            "'runW', then 'run'",
+            StringComparison.Ordinal));
+    }
+
+    [Theory]
+    [InlineData(null, false, "Character set")]
+    [InlineData("ansi", null, "lookup policy")]
+    public void UnknownLookupFacts_remainUnknown(
+        string? characterSet,
+        bool? exactSpelling,
+        string expectedReason)
+    {
+        var managed = Managed(
+            "medalgo",
+            "run",
+            exactSpelling,
+            characterSet);
+
+        var match = new InteropMatcher().Match(
+            managed,
+            [
+                Native("medalgo.dll", "run", "c:E:native.cpp::run"),
+                Native("medalgo.dll", "runA", "c:E:native.cpp::runA"),
+            ]);
+
+        match.Status.Should().Be(InteropMatchStatus.Unknown);
+        match.NativeSymbolCanonicalKey.Should().BeNull();
+        match.Confidence.Should().Be(EvidenceConfidence.Inferred);
+        match.Evidence.Should().Equal(managed.Evidence);
+        match.Reasons.Should().ContainSingle(reason => reason.Contains(
+            expectedReason,
+            StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void DuplicateCandidatesAtRuntimeSelectedSpelling_areAmbiguous()
+    {
+        var first = Native("medalgo.dll", "runW", "c:E:a.cpp::runW");
+        var second = Native("medalgo.dll", "runW", "c:E:b.cpp::runW");
+
+        var match = new InteropMatcher().Match(
+            Managed("medalgo", "run", exactSpelling: false, characterSet: "utf-16"),
+            [Native("medalgo.dll", "run", "c:E:fallback.cpp::run"), first, second]);
+
+        match.Status.Should().Be(InteropMatchStatus.Ambiguous);
+        match.NativeSymbolCanonicalKey.Should().BeNull();
+        match.Evidence.Should().Equal(
+            Managed(
+                "medalgo",
+                "run",
+                exactSpelling: false,
+                characterSet: "utf-16").Evidence,
+            first.Evidence,
+            second.Evidence);
+        match.Reasons.Should().Contain(reason => reason.Contains(
+            "runtime-selected spelling 'runW'",
+            StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void NonWindowsLookup_doesNotProbeWindowsSuffixes()
+    {
+        var target = new InteropTarget(
+            "linux-x64",
+            InteropArchitecture.X64,
+            InteropCompilerAbi.Itanium,
+            pointerSizeBytes: 8,
+            defaultPack: 8);
+        var managed = Managed(
+            "medalgo.so",
+            "run",
+            exactSpelling: false,
+            characterSet: "ansi",
+            target);
+
+        var match = new InteropMatcher().Match(
+            managed,
+            [Native("medalgo.so", "runA", "c:E:native.cpp::runA", target)]);
+
+        match.Status.Should().Be(InteropMatchStatus.Unmatched);
+        match.Evidence.Should().Equal(managed.Evidence);
+        match.Reasons.Should().Contain(reason => reason.Contains(
+            "without Windows A/W suffix probing",
+            StringComparison.Ordinal));
+    }
+
     private static ManagedImport Managed(
         string library,
-        string entryPoint) =>
+        string entryPoint,
+        bool? exactSpelling = true,
+        string? characterSet = null,
+        InteropTarget? target = null) =>
         new(
             "csharp:M:Fixture.Native.Run",
             ManagedImportKind.DllImport,
@@ -148,10 +312,13 @@ public sealed class InteropMatcherTests
             InteropCallingConvention.Cdecl,
             Int32(),
             [],
-            CharacterSet: null,
+            CharacterSet: characterSet,
             SetLastError: false,
-            InteropTarget.WindowsX64Msvc,
-            EvidenceAt(1, "Managed.cs", EvidenceConfidence.Semantic));
+            target ?? InteropTarget.WindowsX64Msvc,
+            EvidenceAt(1, "Managed.cs", EvidenceConfidence.Semantic))
+        {
+            ExactSpelling = exactSpelling,
+        };
 
     private static NativeExport Native(
         string? library,

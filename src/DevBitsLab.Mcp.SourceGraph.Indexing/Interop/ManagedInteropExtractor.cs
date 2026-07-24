@@ -89,7 +89,14 @@ internal static class ManagedInteropExtractor
                 producingFileId,
                 declarationLocation,
                 EvidenceConfidence.Semantic,
-                "roslyn-managed-interop"));
+                "roslyn-managed-interop"))
+        {
+            // C# emits false when DllImport.ExactSpelling is omitted. LibraryImport has no
+            // equivalent name-mangling switch and always binds the declared entry point.
+            ExactSpelling = kind == ManagedImportKind.DllImport
+                ? GetNamedBoolean(import, "ExactSpelling") ?? false
+                : true,
+        };
     }
 
     private static AbiParameter ExtractParameter(
@@ -555,6 +562,8 @@ internal static class ManagedInteropExtractor
                 "win-",
                 StringComparison.OrdinalIgnoreCase) => "utf-16",
             "Auto" => "auto",
+            // C#'s omitted DllImport CharSet is ANSI for marshalling and entry-point lookup.
+            "None" or null => "ansi",
             _ => null,
         };
 
