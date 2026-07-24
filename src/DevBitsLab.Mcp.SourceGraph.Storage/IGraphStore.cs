@@ -91,6 +91,20 @@ public interface IGraphStore : IAsyncDisposable
             "This graph-store implementation predates atomic file-facts replacement.");
 
     /// <summary>
+    /// Atomically replaces all annotations in the selected native interop flavors and upserts
+    /// their physical-file declarations. Existing non-interop facts in those files are
+    /// preserved. Prior native symbols are deliberately retained until the caller has
+    /// successfully refreshed every managed boundary, so last-good interop edges remain
+    /// resolvable if downstream analysis fails.
+    /// </summary>
+    Task<NativeInteropSnapshotReplacementResult>
+        ReplaceNativeInteropSnapshotAsync(
+            NativeInteropSnapshotReplacement replacement,
+            CancellationToken ct = default) =>
+        throw new NotSupportedException(
+            "This graph-store implementation predates atomic native interop snapshots.");
+
+    /// <summary>
     /// Atomically replaces annotations of one exact <paramref name="flavor"/> on declarations
     /// owned by the indexed <paramref name="filePath"/>. Every annotation host is resolved by
     /// canonical key and verified to belong to that file before prior rows are changed. An empty
