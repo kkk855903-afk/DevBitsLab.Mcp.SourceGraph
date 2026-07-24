@@ -489,7 +489,8 @@ public sealed class UserExecutionTrustPolicy : IExecutionTrustPolicy
 
     private static bool IsRepositoryCapability(ExecutionCapability capability) =>
         capability is ExecutionCapability.MsBuildEvaluation
-            or ExecutionCapability.ProjectSourceGenerators;
+            or ExecutionCapability.ProjectSourceGenerators
+            or ExecutionCapability.NativeParsing;
 
     private static bool IsPluginCapability(ExecutionCapability capability) =>
         capability is ExecutionCapability.PluginLanguageIndexer

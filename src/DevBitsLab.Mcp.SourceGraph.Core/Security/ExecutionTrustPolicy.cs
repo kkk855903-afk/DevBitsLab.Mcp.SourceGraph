@@ -8,6 +8,7 @@ public enum ExecutionCapability
 {
     MsBuildEvaluation,
     ProjectSourceGenerators,
+    NativeParsing,
     PluginLanguageIndexer,
     PluginAnalyzer,
     PluginTool,

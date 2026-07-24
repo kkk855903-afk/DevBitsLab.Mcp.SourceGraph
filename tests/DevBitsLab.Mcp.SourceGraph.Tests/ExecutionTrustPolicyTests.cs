@@ -57,6 +57,7 @@ public sealed class ExecutionTrustPolicyTests : IDisposable
         {
             var decision = capability is ExecutionCapability.MsBuildEvaluation
                 or ExecutionCapability.ProjectSourceGenerators
+                or ExecutionCapability.NativeParsing
                 ? policy.EvaluateRepositoryCapability(
                     _repositoryRoot,
                     capability)
@@ -70,9 +71,31 @@ public sealed class ExecutionTrustPolicyTests : IDisposable
             decision.Reason.Should().Be(
                 capability is ExecutionCapability.MsBuildEvaluation
                     or ExecutionCapability.ProjectSourceGenerators
+                    or ExecutionCapability.NativeParsing
                     ? ExecutionTrustReason.RepositoryNotTrusted
                     : ExecutionTrustReason.NuGetPluginNotTrusted);
         }
+    }
+
+    [Fact]
+    public void NativeParsing_requires_its_own_repository_grant()
+    {
+        WriteTrust(
+            RepositoryTrustDocument(
+                _repositoryRoot,
+                "MsBuildEvaluation",
+                "NativeParsing"));
+        var policy = new UserExecutionTrustPolicy(_trustFile);
+
+        policy.EvaluateRepositoryCapability(
+                _repositoryRoot,
+                ExecutionCapability.NativeParsing)
+            .IsAllowed.Should().BeTrue();
+        policy.EvaluateRepositoryCapability(
+                _repositoryRoot,
+                ExecutionCapability.ProjectSourceGenerators)
+            .IsAllowed.Should().BeFalse(
+                "native parsing must not imply source-generator execution");
     }
 
     [Fact]
