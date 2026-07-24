@@ -88,6 +88,22 @@ public interface IGraphStore : IAsyncDisposable
         throw new NotSupportedException(
             "This graph-store implementation predates atomic annotation-flavor replacement.");
 
+    /// <summary>
+    /// Atomically reconciles the declarations owned by one indexed file and replaces the complete
+    /// annotation set on its surviving declarations. Every keep key, annotation host, optional
+    /// attribute definition, and JSON payload is resolved and validated before prior declarations
+    /// or annotations are changed. Empty <paramref name="annotations"/> is a successful complete
+    /// annotation cleanup. File-scoped diagnostics are also cleared because the indexing pass
+    /// rebuilds them only after declaration reconciliation succeeds.
+    /// </summary>
+    Task ReconcileFileDeclarationsAndAnnotationsAsync(
+        string filePath,
+        IReadOnlyCollection<string> keysToKeep,
+        IReadOnlyList<FileAnnotationFact> annotations,
+        CancellationToken ct = default) =>
+        throw new NotSupportedException(
+            "This graph-store implementation predates atomic declaration/annotation reconciliation.");
+
     /// <summary>Upsert a symbol by canonical key. Returns the symbol's stable id (existing or newly created).</summary>
     Task<long> UpsertSymbolAsync(string canonicalKey, Symbol symbol, CancellationToken ct = default);
 

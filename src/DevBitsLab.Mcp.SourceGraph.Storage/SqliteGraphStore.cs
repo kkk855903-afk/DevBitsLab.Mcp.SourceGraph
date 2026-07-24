@@ -748,6 +748,348 @@ public sealed class SqliteGraphStore : IGraphStore
         }
     }
 
+    public async Task ReconcileFileDeclarationsAndAnnotationsAsync(
+        string filePath,
+        IReadOnlyCollection<string> keysToKeep,
+        IReadOnlyList<FileAnnotationFact> annotations,
+        CancellationToken ct = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(filePath);
+        ArgumentNullException.ThrowIfNull(keysToKeep);
+        ArgumentNullException.ThrowIfNull(annotations);
+
+        // Snapshot and validate caller-owned collections before acquiring the write lock. This
+        // prevents concurrent collection mutation from changing the keep/annotation set between
+        // validation and publication.
+        var keepKeySet = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var key in keysToKeep)
+        {
+            CanonicalKeyValidator.Validate(key, nameof(keysToKeep));
+            keepKeySet.Add(key);
+        }
+        var orderedKeepKeys = keepKeySet
+            .OrderBy(key => key, StringComparer.Ordinal)
+            .ToArray();
+
+        var candidateAnnotations = new FileAnnotationFact[annotations.Count];
+        for (var index = 0; index < annotations.Count; index++)
+        {
+            var annotation = annotations[index]
+                ?? throw new ArgumentException(
+                    $"Annotation reconciliation contains a null fact at index {index}.",
+                    nameof(annotations));
+            CanonicalKeyValidator.Validate(
+                annotation.SymbolCanonicalKey,
+                nameof(annotations));
+            if (!keepKeySet.Contains(annotation.SymbolCanonicalKey))
+            {
+                throw new InvalidOperationException(
+                    "Annotation reconciliation hosts must be present in the declaration keep set; "
+                    + $"`{annotation.SymbolCanonicalKey}` is not retained.");
+            }
+            ArgumentException.ThrowIfNullOrWhiteSpace(annotation.Name);
+            ArgumentException.ThrowIfNullOrWhiteSpace(annotation.FullName);
+            KebabCaseValidator.Validate(annotation.Flavor, nameof(annotations));
+            if (annotation.AttributeCanonicalKey is not null)
+            {
+                CanonicalKeyValidator.Validate(
+                    annotation.AttributeCanonicalKey,
+                    nameof(annotations));
+            }
+            if (annotation.ArgsJson is not null)
+            {
+                try
+                {
+                    using var _ = JsonDocument.Parse(annotation.ArgsJson);
+                }
+                catch (JsonException ex)
+                {
+                    throw new ArgumentException(
+                        $"Annotation args_json must contain valid JSON (index {index}).",
+                        nameof(annotations),
+                        ex);
+                }
+            }
+            candidateAnnotations[index] = annotation with { };
+        }
+
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            using var tx = _connection.BeginTransaction();
+            var indexedFile = await _connection.QuerySingleOrDefaultAsync<RawProducingFile>(
+                new CommandDefinition(
+                    """
+                    SELECT id AS FileId, path AS FilePath
+                    FROM files
+                    WHERE path = @FilePath;
+                    """,
+                    new { FilePath = filePath },
+                    transaction: tx,
+                    cancellationToken: ct)).ConfigureAwait(false)
+                ?? throw new InvalidOperationException(
+                    $"Declaration reconciliation could not resolve indexed file `{filePath}`.");
+
+            // Temp tables avoid SQLite's parameter-count limit and give every cleanup statement
+            // the exact same immutable keep/stale sets.
+            await _connection.ExecuteAsync(new CommandDefinition(
+                """
+                CREATE TEMP TABLE IF NOT EXISTS reconcile_keep_keys(
+                    key TEXT PRIMARY KEY);
+                CREATE TEMP TABLE IF NOT EXISTS reconcile_stale_symbol_ids(
+                    id INTEGER PRIMARY KEY);
+                DELETE FROM reconcile_keep_keys;
+                DELETE FROM reconcile_stale_symbol_ids;
+                """,
+                transaction: tx,
+                cancellationToken: ct)).ConfigureAwait(false);
+            if (orderedKeepKeys.Length > 0)
+            {
+                await _connection.ExecuteAsync(new CommandDefinition(
+                    "INSERT INTO reconcile_keep_keys(key) VALUES (@key);",
+                    orderedKeepKeys.Select(key => new { key }),
+                    transaction: tx,
+                    cancellationToken: ct)).ConfigureAwait(false);
+            }
+
+            var retainedSymbols = (await _connection.QueryAsync<RawReconciledSymbol>(
+                    new CommandDefinition(
+                        """
+                        SELECT canonical_key AS CanonicalKey,
+                               id AS SymbolId,
+                               file_id AS FileId
+                        FROM symbols
+                        WHERE canonical_key IN (
+                            SELECT key FROM reconcile_keep_keys
+                        );
+                        """,
+                        transaction: tx,
+                        cancellationToken: ct)).ConfigureAwait(false))
+                .ToDictionary(symbol => symbol.CanonicalKey, StringComparer.Ordinal);
+            foreach (var key in orderedKeepKeys)
+            {
+                if (!retainedSymbols.TryGetValue(key, out var symbol))
+                {
+                    throw new InvalidOperationException(
+                        $"Declaration reconciliation could not resolve retained symbol `{key}`.");
+                }
+                if (symbol.FileId != indexedFile.FileId)
+                {
+                    throw new InvalidOperationException(
+                        "Declaration reconciliation keep keys must belong to indexed file "
+                        + $"`{indexedFile.FilePath}`; `{key}` is external.");
+                }
+            }
+
+            var resolvedSymbols = new Dictionary<string, RawAnnotationSymbol>(
+                StringComparer.Ordinal);
+            foreach (var symbol in retainedSymbols.Values)
+            {
+                resolvedSymbols[symbol.CanonicalKey] =
+                    new RawAnnotationSymbol(symbol.SymbolId, symbol.FileId);
+            }
+
+            async Task<RawAnnotationSymbol> ResolveSymbolAsync(string canonicalKey)
+            {
+                if (resolvedSymbols.TryGetValue(canonicalKey, out var cached))
+                {
+                    return cached;
+                }
+                var resolved = await _connection.QuerySingleOrDefaultAsync<RawAnnotationSymbol>(
+                    new CommandDefinition(
+                        """
+                        SELECT id AS SymbolId, file_id AS FileId
+                        FROM symbols
+                        WHERE canonical_key = @CanonicalKey;
+                        """,
+                        new { CanonicalKey = canonicalKey },
+                        transaction: tx,
+                        cancellationToken: ct)).ConfigureAwait(false)
+                    ?? throw new InvalidOperationException(
+                        $"Annotation reconciliation could not resolve symbol `{canonicalKey}`.");
+                resolvedSymbols[canonicalKey] = resolved;
+                return resolved;
+            }
+
+            // Resolve the complete annotation candidate set before materializing or deleting the
+            // stale set. Optional attribute definitions may live in another indexed file.
+            var resolvedAnnotations =
+                new List<ResolvedFileAnnotationFact>(candidateAnnotations.Length);
+            for (var index = 0; index < candidateAnnotations.Length; index++)
+            {
+                var annotation = candidateAnnotations[index];
+                var host = await ResolveSymbolAsync(annotation.SymbolCanonicalKey)
+                    .ConfigureAwait(false);
+                if (host.FileId != indexedFile.FileId)
+                {
+                    throw new InvalidOperationException(
+                        "Annotation reconciliation hosts must belong to indexed file "
+                        + $"`{indexedFile.FilePath}`; "
+                        + $"`{annotation.SymbolCanonicalKey}` is external.");
+                }
+
+                long? attributeSymbolId = null;
+                if (annotation.AttributeCanonicalKey is not null)
+                {
+                    var attribute = await ResolveSymbolAsync(
+                            annotation.AttributeCanonicalKey)
+                        .ConfigureAwait(false);
+                    if (attribute.FileId == indexedFile.FileId
+                        && !keepKeySet.Contains(annotation.AttributeCanonicalKey))
+                    {
+                        throw new InvalidOperationException(
+                            "Annotation reconciliation cannot reference a same-file attribute "
+                            + $"definition that is not retained: "
+                            + $"`{annotation.AttributeCanonicalKey}`.");
+                    }
+                    attributeSymbolId = attribute.SymbolId;
+                }
+
+                resolvedAnnotations.Add(new ResolvedFileAnnotationFact(
+                    annotation.SymbolCanonicalKey,
+                    host.SymbolId,
+                    annotation.Name,
+                    annotation.FullName,
+                    annotation.Flavor,
+                    annotation.ArgsJson,
+                    annotation.AttributeCanonicalKey,
+                    attributeSymbolId));
+            }
+
+            var orderedAnnotations = resolvedAnnotations
+                .Distinct()
+                .OrderBy(annotation => annotation.SymbolCanonicalKey, StringComparer.Ordinal)
+                .ThenBy(annotation => annotation.Flavor, StringComparer.Ordinal)
+                .ThenBy(annotation => annotation.Name, StringComparer.Ordinal)
+                .ThenBy(annotation => annotation.FullName, StringComparer.Ordinal)
+                .ThenBy(annotation => annotation.ArgsJson ?? string.Empty, StringComparer.Ordinal)
+                .ThenBy(
+                    annotation => annotation.AttributeCanonicalKey ?? string.Empty,
+                    StringComparer.Ordinal)
+                .ToArray();
+
+            ct.ThrowIfCancellationRequested();
+            await _connection.ExecuteAsync(new CommandDefinition(
+                """
+                INSERT INTO reconcile_stale_symbol_ids(id)
+                SELECT id
+                FROM symbols
+                WHERE file_id = @FileId
+                  AND canonical_key NOT IN (
+                      SELECT key FROM reconcile_keep_keys
+                  );
+
+                DELETE FROM refs
+                WHERE symbol_id IN (
+                    SELECT id FROM reconcile_stale_symbol_ids
+                );
+
+                DELETE FROM edge_evidence
+                WHERE src IN (
+                    SELECT id FROM reconcile_stale_symbol_ids
+                ) OR dst IN (
+                    SELECT id FROM reconcile_stale_symbol_ids
+                );
+
+                DELETE FROM edges
+                WHERE src IN (
+                    SELECT id FROM reconcile_stale_symbol_ids
+                ) OR dst IN (
+                    SELECT id FROM reconcile_stale_symbol_ids
+                );
+
+                UPDATE annotations
+                SET attribute_symbol_id = NULL
+                WHERE attribute_symbol_id IN (
+                    SELECT id FROM reconcile_stale_symbol_ids
+                );
+
+                DELETE FROM annotations
+                WHERE symbol_id IN (
+                    SELECT id FROM symbols WHERE file_id = @FileId
+                );
+
+                DELETE FROM diagnostics
+                WHERE file_id = @FileId
+                   OR symbol_id IN (
+                       SELECT id FROM reconcile_stale_symbol_ids
+                   );
+
+                DELETE FROM symbol_history
+                WHERE symbol_id IN (
+                    SELECT id FROM reconcile_stale_symbol_ids
+                );
+
+                DELETE FROM embedding_meta
+                WHERE symbol_id IN (
+                    SELECT id FROM reconcile_stale_symbol_ids
+                );
+
+                UPDATE symbols
+                SET container_id = NULL
+                WHERE container_id IN (
+                    SELECT id FROM reconcile_stale_symbol_ids
+                );
+                """,
+                new { indexedFile.FileId },
+                transaction: tx,
+                cancellationToken: ct)).ConfigureAwait(false);
+
+            if (_vectorExtensionLoaded)
+            {
+                await _connection.ExecuteAsync(new CommandDefinition(
+                    """
+                    DELETE FROM symbol_embeddings
+                    WHERE symbol_id IN (
+                        SELECT id FROM reconcile_stale_symbol_ids
+                    );
+                    """,
+                    transaction: tx,
+                    cancellationToken: ct)).ConfigureAwait(false);
+            }
+
+            await _connection.ExecuteAsync(new CommandDefinition(
+                """
+                DELETE FROM symbols
+                WHERE id IN (
+                    SELECT id FROM reconcile_stale_symbol_ids
+                );
+                """,
+                transaction: tx,
+                cancellationToken: ct)).ConfigureAwait(false);
+
+            const string insertAnnotationSql = """
+                INSERT INTO annotations(
+                    symbol_id, name, full_name, flavor, args_json, attribute_symbol_id)
+                VALUES (
+                    @SymbolId, @Name, @FullName, @Flavor, @ArgsJson, @AttributeSymbolId);
+                """;
+            foreach (var annotation in orderedAnnotations)
+            {
+                ct.ThrowIfCancellationRequested();
+                await _connection.ExecuteAsync(new CommandDefinition(
+                    insertAnnotationSql,
+                    annotation,
+                    transaction: tx,
+                    cancellationToken: ct)).ConfigureAwait(false);
+            }
+
+            await _connection.ExecuteAsync(new CommandDefinition(
+                """
+                DELETE FROM reconcile_keep_keys;
+                DELETE FROM reconcile_stale_symbol_ids;
+                """,
+                transaction: tx,
+                cancellationToken: ct)).ConfigureAwait(false);
+            ct.ThrowIfCancellationRequested();
+            tx.Commit();
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
     public async Task DeleteSymbolsForFileNotInAsync(long fileId, IReadOnlyCollection<string> keysToKeep, CancellationToken ct = default)
     {
         await _writeLock.WaitAsync(ct).ConfigureAwait(false);
@@ -2485,6 +2827,11 @@ public sealed class SqliteGraphStore : IGraphStore
     private sealed record RawProducingFile(long FileId, string FilePath);
 
     private sealed record RawAnnotationSymbol(long SymbolId, long FileId);
+
+    private sealed record RawReconciledSymbol(
+        string CanonicalKey,
+        long SymbolId,
+        long FileId);
 
     private sealed record ResolvedFileAnnotationFact(
         string SymbolCanonicalKey,
