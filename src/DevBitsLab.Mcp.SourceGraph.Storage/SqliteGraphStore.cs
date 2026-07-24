@@ -130,6 +130,19 @@ public sealed partial class SqliteGraphStore : IGraphStore
         }
     }
 
+    public Task<GraphReadVersion> GetReadVersionAsync(
+        CancellationToken ct = default)
+    {
+        const string sql = """
+            SELECT
+                total_changes() AS ConnectionChanges,
+                data_version AS DataVersion
+            FROM pragma_data_version;
+            """;
+        return _connection.QuerySingleAsync<GraphReadVersion>(
+            new CommandDefinition(sql, cancellationToken: ct));
+    }
+
     public async Task<long> UpsertFileAsync(string path, byte[] contentSha256, DateTimeOffset indexedAt, bool isGenerated = false, CancellationToken ct = default)
     {
         const string sql = """

@@ -6,6 +6,12 @@ public interface IGraphStore : IAsyncDisposable
 {
     Task EnsureSchemaAsync(CancellationToken ct = default);
 
+    /// <summary>
+    /// Reads the bounded connection-local version pair used to detect graph changes caused by
+    /// this connection or by another connection. The operation does not mutate graph state.
+    /// </summary>
+    Task<GraphReadVersion> GetReadVersionAsync(CancellationToken ct = default);
+
     Task<long> UpsertFileAsync(string path, byte[] contentSha256, DateTimeOffset indexedAt, bool isGenerated = false, CancellationToken ct = default);
     Task<byte[]?> GetFileContentHashAsync(string path, CancellationToken ct = default);
 
