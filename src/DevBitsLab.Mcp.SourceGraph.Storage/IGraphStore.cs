@@ -14,6 +14,19 @@ public interface IGraphStore : IAsyncDisposable
     Task ClearFileOutgoingAsync(long fileId, CancellationToken ct = default);
 
     /// <summary>
+    /// Wipes references emitted by this file and all of its edge evidence except rows whose exact
+    /// producer is selected for preservation. Logical edges and compatibility payloads are
+    /// reconciled transactionally against the surviving evidence. This supports source refreshes
+    /// that must retain a separately published last-good derived projection.
+    /// </summary>
+    Task ClearFileOutgoingAsync(
+        long fileId,
+        IReadOnlyCollection<string> edgeEvidenceProducersToPreserve,
+        CancellationToken ct = default) =>
+        throw new NotSupportedException(
+            "This graph-store implementation predates producer-preserving outgoing cleanup.");
+
+    /// <summary>
     /// Transactionally removes only edge evidence produced by the exact
     /// <paramref name="producingFileId"/> + <paramref name="producer"/> pair. Compatibility
     /// payloads on surviving logical edges are resynchronised to their earliest remaining

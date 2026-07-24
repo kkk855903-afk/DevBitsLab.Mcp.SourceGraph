@@ -163,8 +163,44 @@ public sealed partial class SqliteGraphStore : IGraphStore
             cancellationToken: ct)).ConfigureAwait(false);
     }
 
-    public async Task ClearFileOutgoingAsync(long fileId, CancellationToken ct = default)
+    public Task ClearFileOutgoingAsync(
+        long fileId,
+        CancellationToken ct = default) =>
+        ClearFileOutgoingAsync(
+            fileId,
+            Array.Empty<string>(),
+            ct);
+
+    public async Task ClearFileOutgoingAsync(
+        long fileId,
+        IReadOnlyCollection<string> edgeEvidenceProducersToPreserve,
+        CancellationToken ct = default)
     {
+        ArgumentOutOfRangeException.ThrowIfLessThan(fileId, 1);
+        ArgumentNullException.ThrowIfNull(edgeEvidenceProducersToPreserve);
+        ct.ThrowIfCancellationRequested();
+
+        var candidateProducers = edgeEvidenceProducersToPreserve.ToArray();
+        var producerSet = new HashSet<string>(StringComparer.Ordinal);
+        for (var index = 0; index < candidateProducers.Length; index++)
+        {
+            ct.ThrowIfCancellationRequested();
+            var producer = candidateProducers[index];
+            ArgumentException.ThrowIfNullOrWhiteSpace(
+                producer,
+                nameof(edgeEvidenceProducersToPreserve));
+            if (!producerSet.Add(producer))
+            {
+                throw new ArgumentException(
+                    $"Preserved edge-evidence producer `{producer}` is duplicated "
+                    + $"(index {index}).",
+                    nameof(edgeEvidenceProducersToPreserve));
+            }
+        }
+        var orderedProducers = producerSet
+            .OrderBy(producer => producer, StringComparer.Ordinal)
+            .ToArray();
+
         // Evidence is owned by the file pass that produced it, not necessarily by the file that
         // declares the logical edge's source symbol. Remove only this producer's occurrences,
         // then discard logical edges whose final supporting occurrence disappeared.
@@ -174,6 +210,27 @@ public sealed partial class SqliteGraphStore : IGraphStore
             using var tx = _connection.BeginTransaction();
             await _connection.ExecuteAsync(new CommandDefinition(
                 """
+                CREATE TEMP TABLE IF NOT EXISTS
+                    clear_outgoing_preserved_producers(
+                        producer TEXT PRIMARY KEY);
+                DELETE FROM clear_outgoing_preserved_producers;
+                """,
+                transaction: tx,
+                cancellationToken: ct)).ConfigureAwait(false);
+            if (orderedProducers.Length > 0)
+            {
+                await _connection.ExecuteAsync(new CommandDefinition(
+                    """
+                    INSERT INTO clear_outgoing_preserved_producers(producer)
+                    VALUES (@producer);
+                    """,
+                    orderedProducers.Select(producer => new { producer }),
+                    transaction: tx,
+                    cancellationToken: ct)).ConfigureAwait(false);
+            }
+
+            await _connection.ExecuteAsync(new CommandDefinition(
+                """
                 UPDATE edges AS edge
                 SET payload = (
                     SELECT NULLIF(ev.payload, '')
@@ -181,7 +238,13 @@ public sealed partial class SqliteGraphStore : IGraphStore
                     WHERE ev.src = edge.src
                       AND ev.dst = edge.dst
                       AND ev.kind_name = edge.kind_name
-                      AND ev.producing_file_id <> @id
+                      AND (
+                          ev.producing_file_id <> @id
+                          OR ev.producer IN (
+                              SELECT producer
+                              FROM clear_outgoing_preserved_producers
+                          )
+                      )
                     ORDER BY ev.id
                     LIMIT 1
                 )
@@ -192,11 +255,22 @@ public sealed partial class SqliteGraphStore : IGraphStore
                       AND owned.dst = edge.dst
                       AND owned.kind_name = edge.kind_name
                       AND owned.producing_file_id = @id
+                      AND owned.producer NOT IN (
+                          SELECT producer
+                          FROM clear_outgoing_preserved_producers
+                      )
                 );
                 """,
                 new { id = fileId }, transaction: tx, cancellationToken: ct)).ConfigureAwait(false);
             await _connection.ExecuteAsync(new CommandDefinition(
-                "DELETE FROM edge_evidence WHERE producing_file_id = @id;",
+                """
+                DELETE FROM edge_evidence
+                WHERE producing_file_id = @id
+                  AND producer NOT IN (
+                      SELECT producer
+                      FROM clear_outgoing_preserved_producers
+                  );
+                """,
                 new { id = fileId }, transaction: tx, cancellationToken: ct)).ConfigureAwait(false);
             await _connection.ExecuteAsync(new CommandDefinition(
                 "DELETE FROM refs WHERE file_id = @id;",
@@ -213,6 +287,11 @@ public sealed partial class SqliteGraphStore : IGraphStore
                 );
                 """,
                 transaction: tx, cancellationToken: ct)).ConfigureAwait(false);
+            await _connection.ExecuteAsync(new CommandDefinition(
+                "DELETE FROM clear_outgoing_preserved_producers;",
+                transaction: tx,
+                cancellationToken: ct)).ConfigureAwait(false);
+            ct.ThrowIfCancellationRequested();
             tx.Commit();
         }
         finally

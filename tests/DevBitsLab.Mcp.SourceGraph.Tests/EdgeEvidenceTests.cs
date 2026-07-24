@@ -94,6 +94,75 @@ public sealed class EdgeEvidenceTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task Outgoing_cleanup_can_preserve_a_separately_published_producer()
+    {
+        var sourcePath = Path.Join(_tempDir, "Source.cs");
+        var targetPath = Path.Join(_tempDir, "Target.cs");
+        var sourceFileId = await SeedFileAsync(sourcePath);
+        var targetFileId = await SeedFileAsync(targetPath);
+        var sourceId = await SeedSymbolAsync(
+            sourceFileId,
+            "Source",
+            "Evidence.Source");
+        var targetId = await SeedSymbolAsync(
+            targetFileId,
+            "Target",
+            "Evidence.Target");
+
+        await _store!.BulkInsertReferencesAsync(
+        [
+            new SymbolReference(
+                0,
+                targetId,
+                sourceFileId,
+                4,
+                8,
+                ReferenceKind.Call),
+        ]);
+        await _store.BulkInsertEdgesAsync(
+        [
+            new Edge(sourceId, targetId, "calls")
+            {
+                Evidence = new Evidence(
+                    sourceFileId,
+                    new SourceLocation(sourcePath, 4, 8, 4, 14),
+                    EvidenceConfidence.Exact,
+                    "roslyn",
+                    new Dictionary<string, string>
+                    {
+                        ["owner"] = "source",
+                    }),
+            },
+            new Edge(sourceId, targetId, "calls")
+            {
+                Evidence = new Evidence(
+                    sourceFileId,
+                    new SourceLocation(sourcePath, 7, 3, 7, 20),
+                    EvidenceConfidence.Semantic,
+                    "interop-analysis",
+                    new Dictionary<string, string>
+                    {
+                        ["owner"] = "analysis",
+                    }),
+            },
+        ]);
+
+        await _store.ClearFileOutgoingAsync(
+            sourceFileId,
+            ["interop-analysis"]);
+
+        (await CountAsync("refs")).Should().Be(0);
+        var surviving = await _store.ListEdgeEvidenceAsync(
+            sourceId,
+            targetId,
+            "calls");
+        surviving.Should().ContainSingle();
+        surviving[0].Producer.Should().Be("interop-analysis");
+        (await GetEdgePayloadAsync(sourceId, targetId, "calls")).Should().Be(
+            """{"owner":"analysis"}""");
+    }
+
+    [Fact]
     public async Task LegacyEdge_withoutEvidence_getsInferredSourceDeclarationEvidence()
     {
         var sourcePath = Path.Join(_tempDir, "LegacySource.cs");
