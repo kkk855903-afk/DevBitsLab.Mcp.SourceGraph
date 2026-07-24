@@ -20,6 +20,15 @@ public static class ClangNativeExtractor
     private const string TargetMismatchCode = "CLANG0004";
     private const string UnsafeInputCode = "CLANG0005";
     private const string ClangDiagnosticCode = "CLANG1000";
+    private const string IncompleteCallGraphCode = "CLANG2000";
+    private const string CallGraphLimitCode = "CLANG2001";
+    private const string CallProducer = "clang-native-call";
+    internal const int MaximumExtractedFunctions = 4096;
+    internal const int MaximumExtractedCalls = 8192;
+    internal const int MaximumDeclarationDepth = 128;
+    internal const int MaximumStatementDepth = 256;
+    internal const int MaximumVisitedStatements = 100_000;
+    internal const int MaximumCallDiagnostics = 4096;
 
     private static StringComparer PathComparer =>
         OperatingSystem.IsWindows()
@@ -467,6 +476,12 @@ public static class ClangNativeExtractor
         private readonly List<NativeTypeDeclarationFact> _types = [];
         private readonly List<NativeExportCandidate> _exportCandidates = [];
         private readonly List<AbiRecordLayout> _recordLayouts = [];
+        private readonly List<NativeCallCandidate> _callCandidates = [];
+        private readonly Dictionary<string, string> _definitionGraphKeysByUsr =
+            new(StringComparer.Ordinal);
+        private bool _isCallGraphComplete = true;
+        private int _callDiagnosticCount;
+        private int _visitedStatements;
 
         public Collector(
             ClangNativeExtractionRequest request,
@@ -486,7 +501,7 @@ public static class ClangNativeExtractor
         {
             foreach (var declaration in declarations)
             {
-                Visit(declaration, hasCLinkageContext);
+                Visit(declaration, hasCLinkageContext, depth: 0);
             }
         }
 
@@ -503,9 +518,48 @@ public static class ClangNativeExtractor
                 .OrderBy(export => export.SymbolCanonicalKey, StringComparer.Ordinal)
                 .ToArray();
 
+            var calls = _callCandidates
+                .Select(candidate => new NativeCallFact(
+                    candidate.CallerSymbolCanonicalKey,
+                    candidate.ReferencedDeclarationUsr,
+                    _definitionGraphKeysByUsr.GetValueOrDefault(
+                        candidate.ReferencedDeclarationUsr),
+                    _request.Target,
+                    candidate.Evidence))
+                .DistinctBy(call => (
+                    call.CallerSymbolCanonicalKey,
+                    call.ReferencedDeclarationUsr,
+                    call.Evidence.Location.FilePath,
+                    call.Evidence.Location.StartLine,
+                    call.Evidence.Location.StartColumn,
+                    call.Evidence.Location.EndLine,
+                    call.Evidence.Location.EndColumn))
+                .OrderBy(
+                    call => call.CallerSymbolCanonicalKey,
+                    StringComparer.Ordinal)
+                .ThenBy(
+                    call => call.ReferencedDeclarationUsr,
+                    StringComparer.Ordinal)
+                .ThenBy(
+                    call => call.Evidence.Location.FilePath,
+                    PathComparer)
+                .ThenBy(call => call.Evidence.Location.StartLine)
+                .ThenBy(call => call.Evidence.Location.StartColumn)
+                .ToArray();
+
             return new ClangNativeExtractionResult(
                 _functions
-                    .DistinctBy(function => function.SymbolCanonicalKey)
+                    .GroupBy(
+                        function => function.SymbolCanonicalKey,
+                        StringComparer.Ordinal)
+                    .Select(group => group
+                        .OrderByDescending(function => function.IsDefinition)
+                        .ThenBy(
+                            function => function.Evidence.Location.FilePath,
+                            PathComparer)
+                        .ThenBy(function => function.Evidence.Location.StartLine)
+                        .ThenBy(function => function.Evidence.Location.StartColumn)
+                        .First())
                     .OrderBy(function => function.SymbolCanonicalKey, StringComparer.Ordinal)
                     .ToArray(),
                 _types
@@ -521,11 +575,41 @@ public static class ClangNativeExtractor
                     .Select(group => group.First())
                     .OrderBy(layout => layout.SymbolCanonicalKey, StringComparer.Ordinal)
                     .ToArray(),
-                _diagnostics.ToArray());
+                _diagnostics
+                    .OrderBy(diagnostic => diagnostic.Code, StringComparer.Ordinal)
+                    .ThenBy(
+                        diagnostic => diagnostic.Location?.FilePath,
+                        PathComparer)
+                    .ThenBy(diagnostic => diagnostic.Location?.StartLine ?? 0)
+                    .ThenBy(diagnostic => diagnostic.Location?.StartColumn ?? 0)
+                    .ThenBy(diagnostic => diagnostic.Message, StringComparer.Ordinal)
+                    .ToArray())
+            {
+                Calls = calls,
+                IsCallGraphComplete = _isCallGraphComplete,
+            };
         }
 
-        private void Visit(Decl declaration, bool hasCLinkageContext)
+        private void Visit(
+            Decl declaration,
+            bool hasCLinkageContext,
+            int depth)
         {
+            if (depth > MaximumDeclarationDepth)
+            {
+                MarkCallGraphIncomplete(
+                    CallGraphLimitCode,
+                    $"Declaration nesting exceeds the {MaximumDeclarationDepth}-level limit.",
+                    location: null);
+                return;
+            }
+
+            if (declaration is CXXRecordDecl lambdaClosure
+                && !lambdaClosure.Handle.LambdaCallOperator.IsNull)
+            {
+                return;
+            }
+
             switch (declaration)
             {
                 case FunctionDecl function:
@@ -549,7 +633,10 @@ public static class ClangNativeExtractor
                     {
                         Language: CXLanguageKind.CXLanguage_C,
                     };
-                Visit(context.Decls, childHasCLinkage);
+                foreach (var child in context.Decls)
+                {
+                    Visit(child, childHasCLinkage, checked(depth + 1));
+                }
             }
         }
 
@@ -557,6 +644,14 @@ public static class ClangNativeExtractor
             FunctionDecl function,
             bool hasCLinkageContext)
         {
+            if (_functions.Count >= MaximumExtractedFunctions)
+            {
+                MarkCallGraphIncomplete(
+                    CallGraphLimitCode,
+                    $"Function extraction exceeds the {MaximumExtractedFunctions}-item limit.",
+                    location: null);
+                return;
+            }
             if (string.IsNullOrWhiteSpace(function.Name)
                 || !TryCreateEvidence(
                     function.SourceRange,
@@ -590,10 +685,23 @@ public static class ClangNativeExtractor
                 + "("
                 + string.Join(",", parameters.Select(
                     parameter => parameter.Type.CanonicalName))
-                + ")";
+                + ")"
+                + MethodQualifierSuffix(function);
             var scheme = hasCLinkage ? "c" : sourceScheme;
+            var functionKey = NativeCanonicalKeys.ForFunction(
+                scheme,
+                repoRelativePath,
+                signature);
+            var isGraphExport = hasCLinkage && isExported && function.IsGlobal;
+            var graphKey = isGraphExport
+                ? NativeCanonicalKeys.ForExport(
+                    "c",
+                    repoRelativePath,
+                    function.Name)
+                : functionKey;
+            var usr = function.Handle.Usr.ToString();
             var functionFact = new NativeFunctionFact(
-                NativeCanonicalKeys.ForFunction(scheme, repoRelativePath, signature),
+                functionKey,
                 function.Name,
                 qualifiedName,
                 callingConvention,
@@ -602,37 +710,245 @@ public static class ClangNativeExtractor
                 hasCLinkage,
                 isExported,
                 function.IsThisDeclarationADefinition,
-                evidence);
+                evidence)
+            {
+                DeclarationUsr = usr,
+                GraphCanonicalKey = graphKey,
+                IsMethod = function is CXXMethodDecl,
+                Target = _request.Target,
+            };
             _functions.Add(functionFact);
 
-            if (!hasCLinkage || !isExported || !function.IsGlobal)
+            if (function.IsThisDeclarationADefinition)
             {
+                if (string.IsNullOrWhiteSpace(usr))
+                {
+                    MarkCallGraphIncomplete(
+                        IncompleteCallGraphCode,
+                        "A function definition has no stable Clang declaration identity.",
+                        evidence.Location);
+                }
+                else if (_definitionGraphKeysByUsr.TryGetValue(
+                             usr,
+                             out var existingGraphKey)
+                         && !string.Equals(
+                             existingGraphKey,
+                             graphKey,
+                             StringComparison.Ordinal))
+                {
+                    MarkCallGraphIncomplete(
+                        IncompleteCallGraphCode,
+                        "One Clang declaration identity maps to conflicting function definitions.",
+                        evidence.Location);
+                }
+                else
+                {
+                    _definitionGraphKeysByUsr[usr] = graphKey;
+                }
+            }
+
+            if (isGraphExport)
+            {
+                var nativeExport = new NativeExport(
+                    graphKey,
+                    function.Name,
+                    callingConvention,
+                    functionFact.ReturnType,
+                    parameters,
+                    HasCLinkage: true,
+                    IsBinaryVerified: false,
+                    _request.Target,
+                    evidence)
+                {
+                    LibraryName = _request.LibraryName,
+                    ModuleIdentitySource = _request.LibraryName is null
+                        ? NativeModuleIdentitySource.Unknown
+                        : NativeModuleIdentitySource.Configuration,
+                };
+                _exportCandidates.Add(new NativeExportCandidate(
+                    string.IsNullOrWhiteSpace(usr)
+                        ? functionFact.SymbolCanonicalKey
+                        : usr,
+                    function.IsThisDeclarationADefinition,
+                    nativeExport));
+            }
+
+            if (function.IsThisDeclarationADefinition
+                && function.HasBody
+                && function.Body is { } body)
+            {
+                CollectDirectCalls(body, graphKey);
+            }
+        }
+
+        private void CollectDirectCalls(
+            Stmt body,
+            string callerGraphKey)
+        {
+            var pending = new Stack<(Stmt Statement, int Depth)>();
+            pending.Push((body, 0));
+            while (pending.Count > 0)
+            {
+                var (statement, depth) = pending.Pop();
+                if (depth > MaximumStatementDepth)
+                {
+                    MarkCallGraphIncomplete(
+                        CallGraphLimitCode,
+                        $"Statement nesting exceeds the {MaximumStatementDepth}-level limit.",
+                        TryCreatePointLocation(statement.Location, _scopePolicy));
+                    continue;
+                }
+                if (_visitedStatements >= MaximumVisitedStatements)
+                {
+                    MarkCallGraphIncomplete(
+                        CallGraphLimitCode,
+                        $"Statement traversal exceeds the {MaximumVisitedStatements}-node limit.",
+                        TryCreatePointLocation(statement.Location, _scopePolicy));
+                    return;
+                }
+                _visitedStatements++;
+
+                if (statement is LambdaExpr)
+                {
+                    continue;
+                }
+                if (statement is CallExpr call)
+                {
+                    AddDirectCall(call, callerGraphKey);
+                }
+
+                var children = statement.Children;
+                for (var childIndex = children.Count - 1;
+                     childIndex >= 0;
+                     childIndex--)
+                {
+                    pending.Push((
+                        children[childIndex],
+                        checked(depth + 1)));
+                }
+            }
+        }
+
+        private void AddDirectCall(
+            CallExpr call,
+            string callerGraphKey)
+        {
+            var callLocation = TryCreatePointLocation(
+                call.Location,
+                _scopePolicy);
+            FunctionDecl? directCallee;
+            try
+            {
+                directCallee = call.DirectCallee;
+            }
+            catch (Exception ex) when (
+                ex is InvalidOperationException
+                    or NotSupportedException)
+            {
+                MarkCallGraphIncomplete(
+                    IncompleteCallGraphCode,
+                    "Clang could not resolve a call expression to a direct declaration.",
+                    callLocation);
                 return;
             }
 
-            var nativeExport = new NativeExport(
-                NativeCanonicalKeys.ForExport("c", repoRelativePath, function.Name),
-                function.Name,
-                callingConvention,
-                functionFact.ReturnType,
-                parameters,
-                HasCLinkage: true,
-                IsBinaryVerified: false,
-                _request.Target,
-                evidence)
+            if (directCallee is null)
             {
-                LibraryName = _request.LibraryName,
-                ModuleIdentitySource = _request.LibraryName is null
-                    ? NativeModuleIdentitySource.Unknown
-                    : NativeModuleIdentitySource.Configuration,
+                MarkCallGraphIncomplete(
+                    IncompleteCallGraphCode,
+                    "An indirect or dependent call has no exact referenced declaration.",
+                    callLocation);
+                return;
+            }
+
+            var referencedUsr = directCallee.Handle.Usr.ToString();
+            if (string.IsNullOrWhiteSpace(referencedUsr))
+            {
+                MarkCallGraphIncomplete(
+                    IncompleteCallGraphCode,
+                    "A direct call's referenced declaration has no stable Clang identity.",
+                    callLocation);
+                return;
+            }
+            if (_callCandidates.Count >= MaximumExtractedCalls)
+            {
+                MarkCallGraphIncomplete(
+                    CallGraphLimitCode,
+                    $"Direct-call extraction exceeds the {MaximumExtractedCalls}-item limit.",
+                    callLocation);
+                return;
+            }
+            if (!TryCreateCallEvidence(call.Extent, out var evidence))
+            {
+                MarkCallGraphIncomplete(
+                    IncompleteCallGraphCode,
+                    "A direct call has no approved source location.",
+                    callLocation);
+                return;
+            }
+
+            _callCandidates.Add(new NativeCallCandidate(
+                callerGraphKey,
+                referencedUsr,
+                evidence));
+        }
+
+        private static string MethodQualifierSuffix(FunctionDecl function)
+        {
+            if (function is not CXXMethodDecl method)
+            {
+                return string.Empty;
+            }
+
+            var suffix = method.IsConst ? " const" : string.Empty;
+            var functionType = function.Type as FunctionProtoType
+                ?? function.Type.CanonicalType as FunctionProtoType;
+            return functionType?.RefQualifier switch
+            {
+                CXRefQualifierKind.CXRefQualifier_LValue => suffix + " &",
+                CXRefQualifierKind.CXRefQualifier_RValue => suffix + " &&",
+                _ => suffix,
             };
-            var usr = function.Handle.Usr.ToString();
-            _exportCandidates.Add(new NativeExportCandidate(
-                string.IsNullOrWhiteSpace(usr)
-                    ? functionFact.SymbolCanonicalKey
-                    : usr,
-                function.IsThisDeclarationADefinition,
-                nativeExport));
+        }
+
+        private bool TryCreateCallEvidence(
+            CXSourceRange range,
+            out Evidence evidence)
+        {
+            evidence = null!;
+            if (!TryCreateSourceLocation(range, _scopePolicy, out var location))
+            {
+                return false;
+            }
+            evidence = new Evidence(
+                _request.ProducingFileId,
+                location,
+                CoreEvidenceConfidence.Exact,
+                CallProducer,
+                new Dictionary<string, string>(StringComparer.Ordinal)
+                {
+                    ["callKind"] = "direct",
+                    ["target"] = _request.Target.RuntimeIdentifier,
+                });
+            return true;
+        }
+
+        private void MarkCallGraphIncomplete(
+            string code,
+            string message,
+            CoreSourceLocation? location)
+        {
+            _isCallGraphComplete = false;
+            if (_callDiagnosticCount >= MaximumCallDiagnostics)
+            {
+                return;
+            }
+            _callDiagnosticCount++;
+            _diagnostics.Add(new ClangExtractionDiagnostic(
+                code,
+                ClangExtractionDiagnosticSeverity.Warning,
+                message,
+                location));
         }
 
         private void AddRecord(RecordDecl record)
@@ -1173,4 +1489,9 @@ public static class ClangNativeExtractor
         string Usr,
         bool IsDefinition,
         NativeExport Export);
+
+    private sealed record NativeCallCandidate(
+        string CallerSymbolCanonicalKey,
+        string ReferencedDeclarationUsr,
+        Evidence Evidence);
 }

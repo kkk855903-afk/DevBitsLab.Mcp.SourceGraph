@@ -1,5 +1,6 @@
 using System.Buffers;
 using System.Security.Cryptography;
+using System.Text.Json;
 using DevBitsLab.Mcp.SourceGraph.Core;
 using DevBitsLab.Mcp.SourceGraph.Indexing.Clang;
 using DevBitsLab.Mcp.SourceGraph.Interop;
@@ -32,6 +33,10 @@ internal enum NativeInteropSnapshotFailureKind
     InvalidFact,
     ExportConflict,
     RecordConflict,
+    FunctionConflict,
+    CallConflict,
+    CallGraphIncomplete,
+    FactSetChanged,
 }
 
 internal sealed record NativeInteropSnapshotFailure(
@@ -64,7 +69,11 @@ internal sealed record NativeInteropTranslationUnitContribution(
     IReadOnlyList<ClangExtractionDiagnostic> Diagnostics,
     BinaryExportVerificationResult? BinaryVerification,
     bool IsComplete,
-    IReadOnlyList<NativeInteropSnapshotFailure> Failures);
+    IReadOnlyList<NativeInteropSnapshotFailure> Failures)
+{
+    public IReadOnlyList<NativeFunctionFact> Functions { get; init; } = [];
+    public IReadOnlyList<NativeCallFact> Calls { get; init; } = [];
+}
 
 internal sealed record NativeInteropSnapshot(
     InteropTarget Target,
@@ -79,7 +88,11 @@ internal sealed record NativeInteropSnapshot(
     bool IsSourceComplete,
     bool IsExportUniverseComplete,
     bool IsComplete,
-    IReadOnlyList<NativeInteropSnapshotFailure> Failures);
+    IReadOnlyList<NativeInteropSnapshotFailure> Failures)
+{
+    public IReadOnlyList<NativeFunctionFact> Functions { get; init; } = [];
+    public IReadOnlyList<NativeCallFact> Calls { get; init; } = [];
+}
 
 internal delegate Task<ClangNativeExtractionResult> NativeInteropExtractor(
     ClangNativeExtractionRequest request,
@@ -101,6 +114,10 @@ internal sealed class NativeInteropSnapshotBuilder
     internal const int MaximumCompilerArguments = 4096;
     internal const int MaximumIncludedFilesPerTranslationUnit = 4096;
     internal const int MaximumDiagnosticsPerTranslationUnit = 4096;
+    internal const int MaximumFunctionsPerTranslationUnit = 4096;
+    internal const int MaximumCallsPerTranslationUnit = 8192;
+    internal const int MaximumSymbolsPerSnapshot = 100_000;
+    internal const int MaximumCallsPerSnapshot = 200_000;
     internal const int MaximumExportsPerTranslationUnit = 4096;
     internal const int MaximumRecordLayoutsPerTranslationUnit = 4096;
     internal const int MaximumParametersPerExport = 4096;
@@ -194,19 +211,74 @@ internal sealed class NativeInteropSnapshotBuilder
         var contributions =
             new List<NativeInteropTranslationUnitContribution>(
                 configuration.TranslationUnits.Count);
+        var symbolCount = 0;
+        var callCount = 0;
         for (var index = 0;
              index < configuration.TranslationUnits.Count;
              index++)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            contributions.Add(await BuildContributionAsync(
+            var contribution = await BuildContributionAsync(
                     lexicalRoot,
                     effectivePolicy,
                     configuration.Target,
                     configuration.TranslationUnits[index],
                     index,
                     cancellationToken)
-                .ConfigureAwait(false));
+                .ConfigureAwait(false);
+            int nextSymbolCount;
+            int nextCallCount;
+            try
+            {
+                nextSymbolCount = checked(
+                    symbolCount
+                    + contribution.Functions.Count
+                    + contribution.SourceExports.Count
+                    + contribution.RecordLayouts.Count);
+                nextCallCount = checked(
+                    callCount + contribution.Calls.Count);
+            }
+            catch (OverflowException)
+            {
+                return EmptySnapshot(
+                    configuration.Target,
+                    [
+                        CollectionLimitFailure(
+                            index,
+                            configuration.TranslationUnits[index]?.Path,
+                            "Native snapshot collection",
+                            MaximumSymbolsPerSnapshot),
+                    ]);
+            }
+
+            if (nextSymbolCount > MaximumSymbolsPerSnapshot)
+            {
+                return EmptySnapshot(
+                    configuration.Target,
+                    [
+                        CollectionLimitFailure(
+                            index,
+                            configuration.TranslationUnits[index]?.Path,
+                            "Native snapshot symbol",
+                            MaximumSymbolsPerSnapshot),
+                    ]);
+            }
+            if (nextCallCount > MaximumCallsPerSnapshot)
+            {
+                return EmptySnapshot(
+                    configuration.Target,
+                    [
+                        CollectionLimitFailure(
+                            index,
+                            configuration.TranslationUnits[index]?.Path,
+                            "Native snapshot direct-call",
+                            MaximumCallsPerSnapshot),
+                    ]);
+            }
+
+            symbolCount = nextSymbolCount;
+            callCount = nextCallCount;
+            contributions.Add(contribution);
         }
 
         cancellationToken.ThrowIfCancellationRequested();
@@ -487,6 +559,60 @@ internal sealed class NativeInteropSnapshotBuilder
             includedFiles,
             _pathComparer);
         var diagnostics = reparse.Diagnostics;
+        NativeFunctionFact[] functions = [];
+        NativeCallFact[] calls = [];
+        var discoveryProjectionValid = TryBuildCallProjection(
+            discoveryAttempt.Extraction!,
+            includedFileSet,
+            pathPolicy,
+            target,
+            cancellationToken,
+            out var discoveryFunctions,
+            out var discoveryCalls,
+            out var discoveryProjectionKind,
+            out var discoveryProjectionMessage);
+        if (!discoveryProjectionValid)
+        {
+            failures.Add(Failure(
+                discoveryProjectionKind,
+                index,
+                translationUnit.Path,
+                discoveryProjectionMessage));
+        }
+        var reparseProjectionValid = TryBuildCallProjection(
+            extraction,
+            includedFileSet,
+            pathPolicy,
+            target,
+            cancellationToken,
+            out functions,
+            out calls,
+            out var reparseProjectionKind,
+            out var reparseProjectionMessage);
+        if (!reparseProjectionValid)
+        {
+            failures.Add(Failure(
+                reparseProjectionKind,
+                index,
+                translationUnit.Path,
+                reparseProjectionMessage));
+        }
+        if (discoveryProjectionValid
+            && reparseProjectionValid
+            && !CallProjectionsEqual(
+                discoveryFunctions,
+                discoveryCalls,
+                functions,
+                calls))
+        {
+            failures.Add(Failure(
+                NativeInteropSnapshotFailureKind.FactSetChanged,
+                index,
+                translationUnit.Path,
+                "Native function or direct-call facts changed between the two content-bound parses."));
+            functions = [];
+            calls = [];
+        }
 
         var sourceExportList = new List<NativeExport>(extraction.Exports!.Count);
         for (var exportIndex = 0;
@@ -683,6 +809,8 @@ internal sealed class NativeInteropSnapshotBuilder
             sourceExports = [];
             verifiedExports = [];
             records = [];
+            functions = [];
+            calls = [];
         }
         else if (!HashSetsEqual(
                      hashesAfterReparse.Hashes,
@@ -696,6 +824,8 @@ internal sealed class NativeInteropSnapshotBuilder
             sourceExports = [];
             verifiedExports = [];
             records = [];
+            functions = [];
+            calls = [];
         }
         else
         {
@@ -715,7 +845,11 @@ internal sealed class NativeInteropSnapshotBuilder
             diagnostics,
             binaryVerification,
             failures.Count == 0,
-            OrderFailures(failures));
+            OrderFailures(failures))
+        {
+            Functions = functions,
+            Calls = calls,
+        };
     }
 
     private async Task<ExtractionAttempt> ExtractOnceAsync(
@@ -819,6 +953,17 @@ internal sealed class NativeInteropSnapshotBuilder
                     index,
                     configuredPath,
                     "Extractor diagnostic location is not one of the approved included files."));
+        }
+        if (!extraction.IsCallGraphComplete)
+        {
+            return new PreparedExtraction(
+                includedFiles,
+                diagnostics,
+                Failure(
+                    NativeInteropSnapshotFailureKind.CallGraphIncomplete,
+                    index,
+                    configuredPath,
+                    "Native call extraction is partial; the prior complete snapshot was retained."));
         }
         if (diagnostics.Any(diagnostic =>
                 diagnostic.Severity is ClangExtractionDiagnosticSeverity.Error
@@ -1063,6 +1208,8 @@ internal sealed class NativeInteropSnapshotBuilder
         out NativeInteropSnapshotFailure failure)
     {
         if (extraction.Diagnostics is null
+            || extraction.Functions is null
+            || extraction.Calls is null
             || extraction.Exports is null
             || extraction.RecordLayouts is null)
         {
@@ -1080,6 +1227,24 @@ internal sealed class NativeInteropSnapshotBuilder
                 configuredPath,
                 "Extraction diagnostic",
                 MaximumDiagnosticsPerTranslationUnit);
+            return false;
+        }
+        if (extraction.Functions.Count > MaximumFunctionsPerTranslationUnit)
+        {
+            failure = CollectionLimitFailure(
+                index,
+                configuredPath,
+                "Native function",
+                MaximumFunctionsPerTranslationUnit);
+            return false;
+        }
+        if (extraction.Calls.Count > MaximumCallsPerTranslationUnit)
+        {
+            failure = CollectionLimitFailure(
+                index,
+                configuredPath,
+                "Native call",
+                MaximumCallsPerTranslationUnit);
             return false;
         }
         if (extraction.IncludedFiles is not null
@@ -1125,6 +1290,43 @@ internal sealed class NativeInteropSnapshotBuilder
         out NativeInteropSnapshotFailure failure)
     {
         long nestedFactCount = 0;
+        for (var functionIndex = 0;
+             functionIndex < extraction.Functions.Count;
+             functionIndex++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var function = extraction.Functions[functionIndex];
+            if (function?.Parameters is
+                { Count: > MaximumParametersPerExport })
+            {
+                failure = CollectionLimitFailure(
+                    index,
+                    configuredPath,
+                    "Native function parameter",
+                    MaximumParametersPerExport);
+                return false;
+            }
+            nestedFactCount += 1L + (function?.Parameters?.Count ?? 0);
+            if (nestedFactCount > MaximumNestedFactsPerTranslationUnit)
+            {
+                failure = CollectionLimitFailure(
+                    index,
+                    configuredPath,
+                    "Nested native fact",
+                    MaximumNestedFactsPerTranslationUnit);
+                return false;
+            }
+        }
+        nestedFactCount += extraction.Calls.Count;
+        if (nestedFactCount > MaximumNestedFactsPerTranslationUnit)
+        {
+            failure = CollectionLimitFailure(
+                index,
+                configuredPath,
+                "Nested native fact",
+                MaximumNestedFactsPerTranslationUnit);
+            return false;
+        }
         for (var exportIndex = 0;
              exportIndex < extraction.Exports.Count;
              exportIndex++)
@@ -1204,6 +1406,314 @@ internal sealed class NativeInteropSnapshotBuilder
         failure = null!;
         return true;
     }
+
+    private static bool TryBuildCallProjection(
+        ClangNativeExtractionResult extraction,
+        IReadOnlySet<string> includedFiles,
+        ScopePathPolicy pathPolicy,
+        InteropTarget target,
+        CancellationToken cancellationToken,
+        out NativeFunctionFact[] functions,
+        out NativeCallFact[] calls,
+        out NativeInteropSnapshotFailureKind rejectionKind,
+        out string rejectionMessage)
+    {
+        functions = [];
+        calls = [];
+        var normalizedFunctions = new List<NativeFunctionFact>();
+        var graphKeys = new HashSet<string>(StringComparer.Ordinal);
+        var definitionsByUsr =
+            new Dictionary<string, string>(StringComparer.Ordinal);
+        var exportKeys = extraction.Exports
+            .Where(export => export is not null)
+            .Select(export => export.SymbolCanonicalKey)
+            .ToHashSet(StringComparer.Ordinal);
+        foreach (var function in extraction.Functions)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (function is null)
+            {
+                rejectionKind = NativeInteropSnapshotFailureKind.InvalidFact;
+                rejectionMessage = "Native function collection contains a null item.";
+                return false;
+            }
+            if (!function.IsDefinition)
+            {
+                continue;
+            }
+            if (!TryNormalizeFunction(
+                    function,
+                    includedFiles,
+                    pathPolicy,
+                    target,
+                    cancellationToken,
+                    out var normalized,
+                    out rejectionKind,
+                    out rejectionMessage))
+            {
+                return false;
+            }
+            if ((!string.Equals(
+                     normalized.GraphCanonicalKey,
+                     normalized.SymbolCanonicalKey,
+                     StringComparison.Ordinal)
+                 && !exportKeys.Contains(normalized.GraphCanonicalKey))
+                || !graphKeys.Add(normalized.GraphCanonicalKey)
+                || (definitionsByUsr.TryGetValue(
+                        normalized.DeclarationUsr,
+                        out var existing)
+                    && !string.Equals(
+                        existing,
+                        normalized.GraphCanonicalKey,
+                        StringComparison.Ordinal)))
+            {
+                rejectionKind =
+                    NativeInteropSnapshotFailureKind.FunctionConflict;
+                rejectionMessage =
+                    "Native function identities or graph endpoints conflict within one translation unit.";
+                return false;
+            }
+            definitionsByUsr[normalized.DeclarationUsr] =
+                normalized.GraphCanonicalKey;
+            normalizedFunctions.Add(normalized);
+        }
+
+        var normalizedCalls = new List<NativeCallFact>();
+        var occurrences = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var call in extraction.Calls)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (call is null
+                || string.IsNullOrWhiteSpace(call.CallerSymbolCanonicalKey)
+                || string.IsNullOrWhiteSpace(call.ReferencedDeclarationUsr)
+                || call.Target is null
+                || !call.Target.IsAbiEquivalentTo(target)
+                || call.Evidence is null
+                || call.Evidence.Confidence != EvidenceConfidence.Exact
+                || !string.Equals(
+                    call.Evidence.Producer,
+                    "clang-native-call",
+                    StringComparison.Ordinal)
+                || call.Evidence.Metadata is null
+                || !call.Evidence.Metadata.TryGetValue(
+                    "callKind",
+                    out var callKind)
+                || !string.Equals(
+                    callKind,
+                    "direct",
+                    StringComparison.Ordinal)
+                || !call.Evidence.Metadata.TryGetValue(
+                    "target",
+                    out var callTarget)
+                || !string.Equals(
+                    callTarget,
+                    target.RuntimeIdentifier,
+                    StringComparison.Ordinal)
+                || !graphKeys.Contains(call.CallerSymbolCanonicalKey)
+                || (call.CalleeSymbolCanonicalKey is not null
+                    && (!definitionsByUsr.TryGetValue(
+                            call.ReferencedDeclarationUsr,
+                            out var expectedTarget)
+                        || !string.Equals(
+                            expectedTarget,
+                            call.CalleeSymbolCanonicalKey,
+                            StringComparison.Ordinal))))
+            {
+                rejectionKind = NativeInteropSnapshotFailureKind.InvalidFact;
+                rejectionMessage =
+                    "A native direct call is malformed or does not match an exact function definition.";
+                return false;
+            }
+            if (!TryNormalizeEvidence(
+                    call.Evidence,
+                    includedFiles,
+                    pathPolicy,
+                    cancellationToken,
+                    out var evidence,
+                    out rejectionKind,
+                    out rejectionMessage))
+            {
+                return false;
+            }
+            var occurrence = string.Join(
+                "\n",
+                call.CallerSymbolCanonicalKey,
+                call.ReferencedDeclarationUsr,
+                evidence.Location.FilePath,
+                evidence.Location.StartLine,
+                evidence.Location.StartColumn,
+                evidence.Location.EndLine,
+                evidence.Location.EndColumn);
+            if (!occurrences.Add(occurrence))
+            {
+                rejectionKind = NativeInteropSnapshotFailureKind.CallConflict;
+                rejectionMessage =
+                    "A native direct-call occurrence is duplicated.";
+                return false;
+            }
+            normalizedCalls.Add(call with { Evidence = evidence });
+        }
+
+        functions = normalizedFunctions
+            .OrderBy(
+                function => function.SymbolCanonicalKey,
+                StringComparer.Ordinal)
+            .ToArray();
+        calls = normalizedCalls
+            .OrderBy(
+                call => call.CallerSymbolCanonicalKey,
+                StringComparer.Ordinal)
+            .ThenBy(
+                call => call.ReferencedDeclarationUsr,
+                StringComparer.Ordinal)
+            .ThenBy(call => call.Evidence.Location.FilePath, _pathComparer)
+            .ThenBy(call => call.Evidence.Location.StartLine)
+            .ThenBy(call => call.Evidence.Location.StartColumn)
+            .ToArray();
+        rejectionKind = default;
+        rejectionMessage = string.Empty;
+        return true;
+    }
+
+    private static bool TryNormalizeFunction(
+        NativeFunctionFact function,
+        IReadOnlySet<string> includedFiles,
+        ScopePathPolicy pathPolicy,
+        InteropTarget target,
+        CancellationToken cancellationToken,
+        out NativeFunctionFact normalized,
+        out NativeInteropSnapshotFailureKind rejectionKind,
+        out string rejectionMessage)
+    {
+        normalized = null!;
+        if (string.IsNullOrWhiteSpace(function.SymbolCanonicalKey)
+            || !IsNativeFunctionKey(function.SymbolCanonicalKey)
+            || string.IsNullOrWhiteSpace(function.GraphCanonicalKey)
+            || (!IsNativeFunctionKey(function.GraphCanonicalKey)
+                && !IsNativeExportKey(function.GraphCanonicalKey))
+            || string.IsNullOrWhiteSpace(function.Name)
+            || string.IsNullOrWhiteSpace(function.QualifiedName)
+            || string.IsNullOrWhiteSpace(function.DeclarationUsr)
+            || function.Target is null
+            || !function.Target.IsAbiEquivalentTo(target)
+            || function.Parameters is null
+            || function.Parameters.Count > MaximumParametersPerExport
+            || function.ReturnType is null
+            || function.Evidence is null
+            || function.Evidence.Confidence != EvidenceConfidence.Exact
+            || !string.Equals(
+                function.Evidence.Producer,
+                "clang-native",
+                StringComparison.Ordinal)
+            || function.Evidence.Metadata is null
+            || !function.Evidence.Metadata.TryGetValue(
+                "target",
+                out var evidenceTarget)
+            || !string.Equals(
+                evidenceTarget,
+                target.RuntimeIdentifier,
+                StringComparison.Ordinal)
+            || (function.IsMethod && function.HasCLinkage))
+        {
+            rejectionKind = NativeInteropSnapshotFailureKind.InvalidFact;
+            rejectionMessage = "A native function definition is malformed.";
+            return false;
+        }
+        if (!TryNormalizeEvidence(
+                function.Evidence,
+                includedFiles,
+                pathPolicy,
+                cancellationToken,
+                out var evidence,
+                out rejectionKind,
+                out rejectionMessage))
+        {
+            return false;
+        }
+
+        var parameters = new List<AbiParameter>(function.Parameters.Count);
+        for (var parameterIndex = 0;
+             parameterIndex < function.Parameters.Count;
+             parameterIndex++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var parameter = function.Parameters[parameterIndex];
+            if (parameter is null
+                || parameter.Position != parameterIndex
+                || parameter.Type is null
+                || parameter.Location is null
+                || !TryNormalizeLocation(
+                    parameter.Location,
+                    includedFiles,
+                    pathPolicy,
+                    out var location))
+            {
+                rejectionKind = NativeInteropSnapshotFailureKind.InvalidFact;
+                rejectionMessage =
+                    "A native function parameter is malformed or outside the approved include graph.";
+                return false;
+            }
+            parameters.Add(parameter with { Location = location });
+        }
+        normalized = function with
+        {
+            Parameters = parameters,
+            Evidence = evidence,
+        };
+        rejectionKind = default;
+        rejectionMessage = string.Empty;
+        return true;
+    }
+
+    private static bool CallProjectionsEqual(
+        IReadOnlyList<NativeFunctionFact> firstFunctions,
+        IReadOnlyList<NativeCallFact> firstCalls,
+        IReadOnlyList<NativeFunctionFact> secondFunctions,
+        IReadOnlyList<NativeCallFact> secondCalls)
+    {
+        var first = JsonSerializer.Serialize(new
+        {
+            Functions = firstFunctions,
+            Calls = firstCalls,
+        });
+        var second = JsonSerializer.Serialize(new
+        {
+            Functions = secondFunctions,
+            Calls = secondCalls,
+        });
+        return string.Equals(first, second, StringComparison.Ordinal);
+    }
+
+    private static string FunctionFingerprint(NativeFunctionFact function) =>
+        JsonSerializer.Serialize(function with
+        {
+            Evidence = function.Evidence with
+            {
+                ProducingFileId = 0,
+            },
+        });
+
+    private static string CallOccurrenceIdentity(NativeCallFact call)
+    {
+        var location = call.Evidence.Location;
+        return string.Join(
+            "\n",
+            call.CallerSymbolCanonicalKey,
+            call.ReferencedDeclarationUsr,
+            location.FilePath,
+            location.StartLine,
+            location.StartColumn,
+            location.EndLine,
+            location.EndColumn);
+    }
+
+    private static bool IsNativeFunctionKey(string key) =>
+        key.StartsWith("c:F:", StringComparison.Ordinal)
+        || key.StartsWith("cpp:F:", StringComparison.Ordinal);
+
+    private static bool IsNativeExportKey(string key) =>
+        key.StartsWith("c:E:", StringComparison.Ordinal)
+        || key.StartsWith("cpp:E:", StringComparison.Ordinal);
 
     private static bool TryNormalizeDiagnostics(
         IReadOnlyList<ClangExtractionDiagnostic> diagnostics,
@@ -1528,15 +2038,17 @@ internal sealed class NativeInteropSnapshotBuilder
             }
             var boundedMetadata =
                 new Dictionary<string, string>(StringComparer.Ordinal);
-            using var enumerator = evidence.Metadata.GetEnumerator();
             var observedMetadataEntries = 0;
-            while (enumerator.MoveNext())
+            foreach (var item in evidence.Metadata
+                         .OrderBy(
+                             item => item.Key,
+                             StringComparer.Ordinal))
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 if (observedMetadataEntries
                         >= MaximumEvidenceMetadataEntries
-                    || enumerator.Current.Key is null
-                    || enumerator.Current.Value is null)
+                    || item.Key is null
+                    || item.Value is null)
                 {
                     rejectionKind = observedMetadataEntries
                         >= MaximumEvidenceMetadataEntries
@@ -1550,8 +2062,7 @@ internal sealed class NativeInteropSnapshotBuilder
                     return false;
                 }
                 observedMetadataEntries++;
-                boundedMetadata[enumerator.Current.Key] =
-                    enumerator.Current.Value;
+                boundedMetadata[item.Key] = item.Value;
             }
             metadata = boundedMetadata;
         }
@@ -1812,6 +2323,110 @@ internal sealed class NativeInteropSnapshotBuilder
             failures,
             cancellationToken,
             out _);
+        var functions = AggregateFacts(
+            contributions.SelectMany(contribution => contribution.Functions),
+            function => function.SymbolCanonicalKey,
+            FunctionFingerprint,
+            NativeInteropSnapshotFailureKind.FunctionConflict,
+            failures,
+            cancellationToken,
+            out _);
+        var definitionsByUsr = new Dictionary<string, string>(
+            StringComparer.Ordinal);
+        foreach (var group in functions
+                     .Where(function => function.IsDefinition)
+                     .GroupBy(
+                         function => function.DeclarationUsr,
+                         StringComparer.Ordinal)
+                     .OrderBy(group => group.Key, StringComparer.Ordinal))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var graphKeys = group
+                .Select(function => function.GraphCanonicalKey)
+                .Distinct(StringComparer.Ordinal)
+                .ToArray();
+            if (string.IsNullOrWhiteSpace(group.Key)
+                || graphKeys.Length != 1)
+            {
+                failures.Add(Failure(
+                    NativeInteropSnapshotFailureKind.FunctionConflict,
+                    null,
+                    null,
+                    "A Clang declaration identity maps to conflicting native definitions."));
+                continue;
+            }
+            definitionsByUsr[group.Key] = graphKeys[0];
+        }
+
+        var resolvedCalls = new List<NativeCallFact>();
+        foreach (var rawCall in contributions
+                     .SelectMany(contribution => contribution.Calls)
+                     .OrderBy(
+                         call => call.CallerSymbolCanonicalKey,
+                         StringComparer.Ordinal)
+                     .ThenBy(
+                         call => call.ReferencedDeclarationUsr,
+                         StringComparer.Ordinal)
+                     .ThenBy(
+                         call => call.Evidence.Location.FilePath,
+                         _pathComparer)
+                     .ThenBy(call => call.Evidence.Location.StartLine)
+                     .ThenBy(call => call.Evidence.Location.StartColumn))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!definitionsByUsr.TryGetValue(
+                    rawCall.ReferencedDeclarationUsr,
+                    out var calleeGraphKey))
+            {
+                // A direct declaration without an in-scope definition (for example a CRT API)
+                // is known but is outside this definition-only projection.
+                continue;
+            }
+            if (rawCall.CalleeSymbolCanonicalKey is not null
+                && !string.Equals(
+                    rawCall.CalleeSymbolCanonicalKey,
+                    calleeGraphKey,
+                    StringComparison.Ordinal))
+            {
+                failures.Add(Failure(
+                    NativeInteropSnapshotFailureKind.CallConflict,
+                    null,
+                    null,
+                    "A direct call resolves to conflicting definition keys.",
+                    rawCall.CallerSymbolCanonicalKey));
+                continue;
+            }
+            resolvedCalls.Add(rawCall with
+            {
+                CalleeSymbolCanonicalKey = calleeGraphKey,
+            });
+        }
+        var calls = new List<NativeCallFact>();
+        foreach (var occurrence in resolvedCalls
+                     .GroupBy(
+                         call => CallOccurrenceIdentity(call),
+                         StringComparer.Ordinal)
+                     .OrderBy(group => group.Key, StringComparer.Ordinal))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var targets = occurrence
+                .Select(call => call.CalleeSymbolCanonicalKey)
+                .Distinct(StringComparer.Ordinal)
+                .ToArray();
+            if (targets.Length != 1)
+            {
+                failures.Add(Failure(
+                    NativeInteropSnapshotFailureKind.CallConflict,
+                    null,
+                    null,
+                    "One native call occurrence resolves to conflicting definitions."));
+                continue;
+            }
+            calls.Add(occurrence
+                .OrderBy(
+                    call => call.Evidence.ProducingFileId)
+                .First());
+        }
 
         var contentHashes =
             new Dictionary<string, NativeInteropFileContentHash>(_pathComparer);
@@ -1904,10 +2519,14 @@ internal sealed class NativeInteropSnapshotBuilder
                     or NativeInteropSnapshotFailureKind.ContentHashFailed
                     or NativeInteropSnapshotFailureKind.ContentHashLimitExceeded
                     or NativeInteropSnapshotFailureKind.InputContentChanged
-                    or NativeInteropSnapshotFailureKind.InvalidFact))
+                    or NativeInteropSnapshotFailureKind.InvalidFact
+                    or NativeInteropSnapshotFailureKind.CallGraphIncomplete
+                    or NativeInteropSnapshotFailureKind.FactSetChanged))
             && !orderedFailures.Any(failure => failure.Kind
                 is NativeInteropSnapshotFailureKind.ExportConflict
                 or NativeInteropSnapshotFailureKind.RecordConflict
+                or NativeInteropSnapshotFailureKind.FunctionConflict
+                or NativeInteropSnapshotFailureKind.CallConflict
                 or NativeInteropSnapshotFailureKind.InputContentChanged);
         var exportUniverseComplete = sourceComplete
             && contributions.All(contribution => contribution.IsComplete);
@@ -1938,7 +2557,21 @@ internal sealed class NativeInteropSnapshotBuilder
             sourceComplete,
             exportUniverseComplete,
             sourceComplete && exportUniverseComplete && orderedFailures.Length == 0,
-            orderedFailures);
+            orderedFailures)
+        {
+            Functions = functions,
+            Calls = calls
+                .OrderBy(
+                    call => call.CallerSymbolCanonicalKey,
+                    StringComparer.Ordinal)
+                .ThenBy(
+                    call => call.CalleeSymbolCanonicalKey,
+                    StringComparer.Ordinal)
+                .ThenBy(call => call.Evidence.Location.FilePath, _pathComparer)
+                .ThenBy(call => call.Evidence.Location.StartLine)
+                .ThenBy(call => call.Evidence.Location.StartColumn)
+                .ToArray(),
+        };
     }
 
     private static T[] AggregateFacts<T>(

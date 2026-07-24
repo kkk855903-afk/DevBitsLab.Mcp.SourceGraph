@@ -930,6 +930,102 @@ public sealed class NativeInteropSnapshotBuilderTests : IDisposable
     }
 
     [Theory]
+    [InlineData("symbols")]
+    [InlineData("calls")]
+    public async Task Cumulative_projection_limit_stops_before_aggregate(
+        string collectionKind)
+    {
+        Write("native/api.cpp");
+        var extractionCalls = 0;
+        var factsPerContribution = collectionKind == "symbols"
+            ? NativeInteropSnapshotBuilder.MaximumFunctionsPerTranslationUnit
+            : NativeInteropSnapshotBuilder.MaximumCallsPerTranslationUnit;
+        var snapshotLimit = collectionKind == "symbols"
+            ? NativeInteropSnapshotBuilder.MaximumSymbolsPerSnapshot
+            : NativeInteropSnapshotBuilder.MaximumCallsPerSnapshot;
+        var attemptedContributions = snapshotLimit / factsPerContribution + 1;
+        var unit = new InteropTranslationUnitConfig(
+            "native/api.cpp",
+            "native.dll",
+            ["-x", "c++"],
+            BinaryPath: null);
+        var units = Enumerable.Repeat(
+                unit,
+                attemptedContributions + 1)
+            .ToArray();
+        var builder = new NativeInteropSnapshotBuilder(
+            (request, _) =>
+            {
+                extractionCalls++;
+                if (collectionKind == "symbols")
+                {
+                    var functions = Enumerable.Range(
+                            0,
+                            NativeInteropSnapshotBuilder
+                                .MaximumFunctionsPerTranslationUnit)
+                        .Select(value => Function(
+                            request,
+                            $"cpp:F:native/api.cpp::Native::f{value}()",
+                            $"usr:f{value}",
+                            $"f{value}",
+                            $"Native::f{value}",
+                            graphKey: null,
+                            isMethod: true))
+                        .ToArray();
+                    return Task.FromResult(Extraction(
+                        request,
+                        functions: functions));
+                }
+
+                const string callerKey =
+                    "cpp:F:native/api.cpp::Native::run()";
+                const string callerUsr = "usr:run";
+                var caller = Function(
+                    request,
+                    callerKey,
+                    callerUsr,
+                    "run",
+                    "Native::run",
+                    graphKey: null,
+                    isMethod: true);
+                var calls = Enumerable.Range(
+                        0,
+                        NativeInteropSnapshotBuilder
+                            .MaximumCallsPerTranslationUnit)
+                    .Select(value => DirectCall(
+                        request,
+                        callerKey,
+                        callerUsr,
+                        callerKey,
+                        value + 1))
+                    .ToArray();
+                return Task.FromResult(Extraction(
+                    request,
+                    functions: [caller],
+                    calls: calls));
+            });
+
+        var snapshot = await builder.BuildAsync(
+            _root,
+            Config(units),
+            new ScopePathPolicy(_root),
+            CancellationToken.None);
+
+        extractionCalls.Should().Be(
+            attemptedContributions * 2,
+            "the double parse must stop at the first cumulative overflow");
+        snapshot.Contributions.Should().BeEmpty();
+        snapshot.Functions.Should().BeEmpty();
+        snapshot.Calls.Should().BeEmpty();
+        snapshot.IsComplete.Should().BeFalse();
+        snapshot.Failures.Should().ContainSingle(failure =>
+            failure.Kind
+                == NativeInteropSnapshotFailureKind.CollectionLimitExceeded
+            && failure.TranslationUnitIndex
+                == attemptedContributions - 1);
+    }
+
+    [Theory]
     [InlineData("included-files")]
     [InlineData("exports")]
     [InlineData("records")]
@@ -1237,6 +1333,218 @@ public sealed class NativeInteropSnapshotBuilderTests : IDisposable
         verifierCalled.Should().BeFalse();
     }
 
+    [Fact]
+    public async Task Resolves_direct_call_to_out_of_line_definition_by_clang_usr()
+    {
+        var exportPath = Write("native/exports.cpp");
+        var algorithmPath = Write("native/algorithm.cpp");
+        const string definitionUsr = "c:@S@Algorithm@F@Calculate#I#";
+        var builder = new NativeInteropSnapshotBuilder(
+            (request, _) =>
+            {
+                if (PathComparer.Equals(
+                        request.SourceFilePath,
+                        exportPath))
+                {
+                    var export = Export(
+                        request,
+                        "c:E:native/exports.cpp::calculate",
+                        "calculate");
+                    var caller = Function(
+                        request,
+                        "c:F:native/exports.cpp::calculate(int)",
+                        "c:@F@calculate#I#",
+                        "calculate",
+                        "calculate",
+                        graphKey: export.SymbolCanonicalKey,
+                        isMethod: false);
+                    var call = new NativeCallFact(
+                        caller.GraphCanonicalKey,
+                        definitionUsr,
+                        CalleeSymbolCanonicalKey: null,
+                        request.Target,
+                        new Evidence(
+                            request.ProducingFileId,
+                            new SourceLocation(exportPath, 2, 10, 2, 32),
+                            EvidenceConfidence.Exact,
+                            "clang-native-call",
+                            new Dictionary<string, string>(
+                                StringComparer.Ordinal)
+                            {
+                                ["callKind"] = "direct",
+                                ["target"] =
+                                    request.Target.RuntimeIdentifier,
+                            }));
+                    return Task.FromResult(Extraction(
+                        request,
+                        exports: [export],
+                        functions: [caller],
+                        calls: [call]));
+                }
+                var definition = Function(
+                    request,
+                    "cpp:F:native/algorithm.cpp::Algorithm::Calculate(int)",
+                    definitionUsr,
+                    "Calculate",
+                    "Algorithm::Calculate",
+                    graphKey: null,
+                    isMethod: true);
+                return Task.FromResult(Extraction(
+                    request,
+                    functions: [definition]));
+            });
+
+        var snapshot = await builder.BuildAsync(
+            _root,
+            Config(
+                new InteropTranslationUnitConfig(
+                    "native/exports.cpp",
+                    "native.dll",
+                    ["-x", "c++"],
+                    BinaryPath: null),
+                new InteropTranslationUnitConfig(
+                    "native/algorithm.cpp",
+                    "native.dll",
+                    ["-x", "c++"],
+                    BinaryPath: null)),
+            new ScopePathPolicy(_root),
+            CancellationToken.None);
+
+        snapshot.IsComplete.Should().BeTrue();
+        snapshot.Functions.Should().HaveCount(2);
+        snapshot.Calls.Should().ContainSingle(call =>
+            call.CallerSymbolCanonicalKey
+                == "c:E:native/exports.cpp::calculate"
+            && call.CalleeSymbolCanonicalKey
+                == "cpp:F:native/algorithm.cpp::Algorithm::Calculate(int)"
+            && call.ReferencedDeclarationUsr == definitionUsr);
+    }
+
+    [Fact]
+    public async Task Resolves_direct_call_to_definition_when_same_usr_has_header_declaration()
+    {
+        var exportPath = Write("native/exports.cpp");
+        var algorithmPath = Write("native/algorithm.cpp");
+        const string definitionUsr = "c:@S@Algorithm@F@Calculate#I#";
+        var builder = new NativeInteropSnapshotBuilder(
+            (request, _) =>
+            {
+                var declaration = Function(
+                    request,
+                    "cpp:F:native/algorithm.hpp::Algorithm::Calculate(int)",
+                    definitionUsr,
+                    "Calculate",
+                    "Algorithm::Calculate",
+                    graphKey: null,
+                    isMethod: true,
+                    isDefinition: false);
+                if (PathComparer.Equals(request.SourceFilePath, exportPath))
+                {
+                    var caller = Function(
+                        request,
+                        "cpp:F:native/exports.cpp::run()",
+                        "c:@F@run#",
+                        "run",
+                        "run",
+                        graphKey: null,
+                        isMethod: false);
+                    return Task.FromResult(Extraction(
+                        request,
+                        functions: [caller, declaration],
+                        calls:
+                        [
+                            new NativeCallFact(
+                                caller.GraphCanonicalKey,
+                                definitionUsr,
+                                CalleeSymbolCanonicalKey: null,
+                                request.Target,
+                                new Evidence(
+                                    request.ProducingFileId,
+                                    new SourceLocation(exportPath, 2, 10, 2, 32),
+                                    EvidenceConfidence.Exact,
+                                    "clang-native-call",
+                                    new Dictionary<string, string>(
+                                        StringComparer.Ordinal)
+                                    {
+                                        ["callKind"] = "direct",
+                                        ["target"] =
+                                            request.Target.RuntimeIdentifier,
+                                    }))
+                        ]));
+                }
+
+                var definition = Function(
+                    request,
+                    "cpp:F:native/algorithm.cpp::Algorithm::Calculate(int)",
+                    definitionUsr,
+                    "Calculate",
+                    "Algorithm::Calculate",
+                    graphKey: null,
+                    isMethod: true);
+                return Task.FromResult(Extraction(
+                    request,
+                    functions: [declaration, definition]));
+            });
+
+        var snapshot = await builder.BuildAsync(
+            _root,
+            Config(
+                new InteropTranslationUnitConfig(
+                    "native/exports.cpp",
+                    "native.dll",
+                    ["-x", "c++"],
+                    BinaryPath: null),
+                new InteropTranslationUnitConfig(
+                    "native/algorithm.cpp",
+                    "native.dll",
+                    ["-x", "c++"],
+                    BinaryPath: null)),
+            new ScopePathPolicy(_root),
+            CancellationToken.None);
+
+        snapshot.IsComplete.Should().BeTrue();
+        snapshot.Calls.Should().ContainSingle(call =>
+            call.CalleeSymbolCanonicalKey
+                == "cpp:F:native/algorithm.cpp::Algorithm::Calculate(int)");
+    }
+
+    [Fact]
+    public async Task Changed_call_projection_between_double_parse_is_rejected()
+    {
+        Write("native/api.cpp");
+        var extractionCount = 0;
+        var builder = new NativeInteropSnapshotBuilder(
+            (request, _) =>
+            {
+                extractionCount++;
+                var function = Function(
+                    request,
+                    "cpp:F:native/api.cpp::run()",
+                    "c:@F@run#",
+                    extractionCount == 1 ? "run" : "changed",
+                    extractionCount == 1 ? "run" : "changed",
+                    graphKey: null,
+                    isMethod: false);
+                return Task.FromResult(Extraction(
+                    request,
+                    functions: [function]));
+            });
+
+        var snapshot = await builder.BuildAsync(
+            _root,
+            Config(new InteropTranslationUnitConfig(
+                "native/api.cpp",
+                "native.dll",
+                ["-x", "c++"],
+                BinaryPath: null)),
+            new ScopePathPolicy(_root),
+            CancellationToken.None);
+
+        snapshot.IsComplete.Should().BeFalse();
+        snapshot.Failures.Should().ContainSingle(failure =>
+            failure.Kind == NativeInteropSnapshotFailureKind.FactSetChanged);
+    }
+
     private ScopeInteropConfig Config(params InteropTranslationUnitConfig[] units) =>
         new(InteropTarget.WindowsX64Msvc, units);
 
@@ -1261,15 +1569,20 @@ public sealed class NativeInteropSnapshotBuilderTests : IDisposable
         IReadOnlyList<NativeExport>? exports = null,
         IReadOnlyList<AbiRecordLayout>? records = null,
         IReadOnlyList<ClangExtractionDiagnostic>? diagnostics = null,
-        IReadOnlyList<string>? includedFiles = null) =>
+        IReadOnlyList<string>? includedFiles = null,
+        IReadOnlyList<NativeFunctionFact>? functions = null,
+        IReadOnlyList<NativeCallFact>? calls = null,
+        bool callGraphComplete = true) =>
         new(
-            [],
+            functions ?? [],
             [],
             exports ?? [],
             records ?? [],
             diagnostics ?? [])
         {
             IncludedFiles = includedFiles ?? [request.SourceFilePath],
+            Calls = calls ?? [],
+            IsCallGraphComplete = callGraphComplete,
         };
 
     private static NativeExport Export(
@@ -1336,6 +1649,73 @@ public sealed class NativeInteropSnapshotBuilderTests : IDisposable
             sizeBytes: 4,
             alignmentBytes: 4,
             isSigned: true);
+
+    private static NativeFunctionFact Function(
+        ClangNativeExtractionRequest request,
+        string key,
+        string usr,
+        string name,
+        string qualifiedName,
+        string? graphKey,
+        bool isMethod,
+        bool isDefinition = true) =>
+        new(
+            key,
+            name,
+            qualifiedName,
+            InteropCallingConvention.Cdecl,
+            IntType(),
+            [],
+            HasCLinkage: !isMethod,
+            IsExported: graphKey is not null,
+            IsDefinition: isDefinition,
+            new Evidence(
+                request.ProducingFileId,
+                new SourceLocation(
+                    request.SourceFilePath,
+                    1,
+                    1,
+                    1,
+                    8),
+                EvidenceConfidence.Exact,
+                "clang-native",
+                new Dictionary<string, string>(StringComparer.Ordinal)
+                {
+                    ["target"] = request.Target.RuntimeIdentifier,
+                }))
+        {
+            DeclarationUsr = usr,
+            GraphCanonicalKey = graphKey ?? key,
+            IsMethod = isMethod,
+            Target = request.Target,
+        };
+
+    private static NativeCallFact DirectCall(
+        ClangNativeExtractionRequest request,
+        string callerKey,
+        string referencedUsr,
+        string calleeKey,
+        int line) =>
+        new(
+            callerKey,
+            referencedUsr,
+            calleeKey,
+            request.Target,
+            new Evidence(
+                request.ProducingFileId,
+                new SourceLocation(
+                    request.SourceFilePath,
+                    line,
+                    1,
+                    line,
+                    8),
+                EvidenceConfidence.Exact,
+                "clang-native-call",
+                new Dictionary<string, string>(StringComparer.Ordinal)
+                {
+                    ["callKind"] = "direct",
+                    ["target"] = request.Target.RuntimeIdentifier,
+                }));
 
     private static Evidence TestEvidence(
         ClangNativeExtractionRequest request,

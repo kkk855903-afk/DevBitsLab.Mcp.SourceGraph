@@ -277,6 +277,75 @@ public sealed class InteropAnalysisPublisherTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task Explicit_clear_removes_only_analysis_projection_and_keeps_import_fact()
+    {
+        var managed = await SeedManagedAsync(
+            callingConvention: InteropCallingConvention.Cdecl);
+        var native = await SeedNativeAsync(
+            "native/verified.h",
+            "c:E:native/verified.h::run",
+            library: "native.dll",
+            callingConvention: InteropCallingConvention.StdCall,
+            binaryVerified: true);
+        (await Publisher().PublishAsync(Target, true))
+            .IsComplete.Should().BeTrue();
+
+        var cleared = await Publisher().ClearAsync();
+
+        cleared.IsComplete.Should().BeTrue();
+        cleared.FilesPublished.Should().Be(1);
+        (await InteropFactStoreReader.ReadManagedImportsAsync(_store!))
+            .Facts.Should().ContainSingle()
+            .Which.Fact.SymbolCanonicalKey.Should().Be(managed.Key);
+        (await InteropFactStoreReader.ReadNativeExportsAsync(_store!))
+            .Facts.Should().ContainSingle()
+            .Which.Fact.SymbolCanonicalKey.Should().Be(native.Key);
+        (await InteropFactStoreReader.ReadMatchesAsync(_store!))
+            .Facts.Should().BeEmpty();
+        (await InteropFactStoreReader.ReadFindingsAsync(_store!))
+            .Facts.Should().BeEmpty();
+        (await _store!.ListEdgeEvidenceAsync(
+                managed.SymbolId,
+                native.SymbolId,
+                EdgeKinds.PInvokeMapsTo))
+            .Should().BeEmpty();
+    }
+
+    [Fact]
+    public async Task Removing_native_configuration_clears_analysis_before_native_facts()
+    {
+        var managed = await SeedManagedAsync(
+            callingConvention: InteropCallingConvention.Cdecl);
+        var native = await SeedNativeAsync(
+            "native/verified.h",
+            "c:E:native/verified.h::run",
+            library: "native.dll",
+            callingConvention: InteropCallingConvention.StdCall,
+            binaryVerified: true);
+        (await Publisher().PublishAsync(Target, true))
+            .IsComplete.Should().BeTrue();
+
+        var cleared = await new NativeInteropSnapshotPublisher(_store!)
+            .ClearAsync();
+
+        cleared.IsComplete.Should().BeTrue();
+        (await InteropFactStoreReader.ReadManagedImportsAsync(_store!))
+            .Facts.Should().ContainSingle()
+            .Which.Fact.SymbolCanonicalKey.Should().Be(managed.Key);
+        (await InteropFactStoreReader.ReadNativeExportsAsync(_store!))
+            .Facts.Should().BeEmpty();
+        (await InteropFactStoreReader.ReadMatchesAsync(_store!))
+            .Facts.Should().BeEmpty();
+        (await InteropFactStoreReader.ReadFindingsAsync(_store!))
+            .Facts.Should().BeEmpty();
+        (await _store!.ListEdgeEvidenceAsync(
+                managed.SymbolId,
+                native.SymbolId,
+                EdgeKinds.PInvokeMapsTo))
+            .Should().BeEmpty();
+    }
+
+    [Fact]
     public async Task Proven_native_exception_fact_publishes_Interop005_only()
     {
         await SeedManagedAsync();

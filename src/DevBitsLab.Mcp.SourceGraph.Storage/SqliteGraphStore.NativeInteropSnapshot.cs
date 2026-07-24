@@ -2,6 +2,8 @@ using System.Text.Json;
 using Dapper;
 using DevBitsLab.Mcp.SourceGraph.Core;
 using DevBitsLab.Mcp.SourceGraph.Sdk.Validation;
+using EdgeKinds = DevBitsLab.Mcp.SourceGraph.Sdk.EdgeKinds;
+using SymbolKinds = DevBitsLab.Mcp.SourceGraph.Sdk.SymbolKinds;
 
 namespace DevBitsLab.Mcp.SourceGraph.Storage;
 
@@ -10,6 +12,8 @@ public sealed partial class SqliteGraphStore
     private const int MaximumNativeInteropFiles = 10_000;
     private const int MaximumNativeInteropSymbols = 100_000;
     private const int MaximumNativeInteropAnnotations = 200_000;
+    private const int MaximumNativeInteropEdges = 200_000;
+    private const string NativeCallProducer = "clang-native-call";
 
     public async Task<NativeInteropSnapshotReplacementResult>
         ReplaceNativeInteropSnapshotAsync(
@@ -76,7 +80,6 @@ public sealed partial class SqliteGraphStore
                 xml_summary   = excluded.xml_summary
             RETURNING id;
             """;
-
         await _writeLock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
@@ -85,16 +88,31 @@ public sealed partial class SqliteGraphStore
                     new CommandDefinition(
                         """
                         SELECT DISTINCT symbol.canonical_key
-                        FROM annotations annotation
-                        JOIN symbols symbol ON symbol.id = annotation.symbol_id
-                        WHERE annotation.flavor IN @Flavors
+                        FROM symbols symbol
+                        WHERE (
+                                symbol.canonical_key GLOB 'c:*'
+                                OR symbol.canonical_key GLOB 'cpp:*'
+                              )
                           AND (
-                              symbol.canonical_key GLOB 'c:*'
-                              OR symbol.canonical_key GLOB 'cpp:*'
-                          )
+                                symbol.kind_name IN @FunctionKinds
+                                OR EXISTS (
+                                    SELECT 1
+                                    FROM annotations annotation
+                                    WHERE annotation.symbol_id = symbol.id
+                                      AND annotation.flavor IN @Flavors
+                                )
+                              )
                         ORDER BY symbol.canonical_key;
                         """,
-                        new { Flavors = flavors },
+                        new
+                        {
+                            Flavors = flavors,
+                            FunctionKinds = new[]
+                            {
+                                SymbolKinds.Function,
+                                SymbolKinds.Method,
+                            },
+                        },
                         transaction: tx,
                         cancellationToken: ct))
                     .ConfigureAwait(false))
@@ -160,6 +178,63 @@ public sealed partial class SqliteGraphStore
                 }
             }
 
+            // Remove only call occurrences produced by this projection. Logical edges with
+            // independent evidence survive and have their compatibility payload resynchronised.
+            await _connection.ExecuteAsync(new CommandDefinition(
+                    """
+                    UPDATE edges AS edge
+                    SET payload = (
+                        SELECT NULLIF(evidence.payload, '')
+                        FROM edge_evidence evidence
+                        WHERE evidence.src = edge.src
+                          AND evidence.dst = edge.dst
+                          AND evidence.kind_name = edge.kind_name
+                          AND evidence.producer <> @Producer
+                        ORDER BY evidence.id
+                        LIMIT 1
+                    )
+                    WHERE edge.kind_name = @Kind
+                      AND EXISTS (
+                          SELECT 1
+                          FROM edge_evidence owned
+                          WHERE owned.src = edge.src
+                            AND owned.dst = edge.dst
+                            AND owned.kind_name = edge.kind_name
+                            AND owned.producer = @Producer
+                      );
+
+                    DELETE FROM edges
+                    WHERE kind_name = @Kind
+                      AND EXISTS (
+                          SELECT 1
+                          FROM edge_evidence owned
+                          WHERE owned.src = edges.src
+                            AND owned.dst = edges.dst
+                            AND owned.kind_name = edges.kind_name
+                            AND owned.producer = @Producer
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM edge_evidence survivor
+                          WHERE survivor.src = edges.src
+                            AND survivor.dst = edges.dst
+                            AND survivor.kind_name = edges.kind_name
+                            AND survivor.producer <> @Producer
+                      );
+
+                    DELETE FROM edge_evidence
+                    WHERE kind_name = @Kind
+                      AND producer = @Producer;
+                    """,
+                    new
+                    {
+                        Kind = EdgeKinds.Calls,
+                        Producer = NativeCallProducer,
+                    },
+                    transaction: tx,
+                    cancellationToken: ct))
+                .ConfigureAwait(false);
+
             await _connection.ExecuteAsync(new CommandDefinition(
                     """
                     DELETE FROM annotations
@@ -215,6 +290,100 @@ public sealed partial class SqliteGraphStore
                 }
             }
 
+            var edgeCount = 0;
+            foreach (var file in files)
+            {
+                var producingFileId = fileIdsByPath[file.Path];
+                foreach (var edge in file.Edges)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    var sourceSymbol = symbolsByKey[edge.SourceCanonicalKey];
+                    var targetSymbol = symbolsByKey[edge.TargetCanonicalKey];
+                    if (sourceSymbol.FileId != producingFileId)
+                    {
+                        throw new InvalidOperationException(
+                            "Native call evidence is not owned by its source declaration file.");
+                    }
+                    var payload = SerializeMetadata(edge.Metadata);
+                    await _connection.ExecuteAsync(new CommandDefinition(
+                            """
+                            INSERT OR IGNORE INTO edges(
+                                src, dst, kind_name, payload)
+                            VALUES (@Src, @Dst, @Kind, @Payload);
+                            """,
+                            new
+                            {
+                                Src = sourceSymbol.SymbolId,
+                                Dst = targetSymbol.SymbolId,
+                                edge.Kind,
+                                Payload = payload,
+                            },
+                            transaction: tx,
+                            cancellationToken: ct))
+                        .ConfigureAwait(false);
+
+                    var evidence = edge.Evidence!;
+                    await _connection.ExecuteAsync(new CommandDefinition(
+                            """
+                            INSERT OR IGNORE INTO edge_evidence(
+                                src, dst, kind_name, producing_file_id,
+                                file_path, start_line, start_col,
+                                end_line, end_col, confidence, producer, payload)
+                            VALUES (
+                                @Src, @Dst, @Kind, @ProducingFileId,
+                                @FilePath, @StartLine, @StartColumn,
+                                @EndLine, @EndColumn, @Confidence, @Producer,
+                                @Payload);
+                            """,
+                            new
+                            {
+                                Src = sourceSymbol.SymbolId,
+                                Dst = targetSymbol.SymbolId,
+                                edge.Kind,
+                                ProducingFileId = producingFileId,
+                                evidence.Location.FilePath,
+                                evidence.Location.StartLine,
+                                evidence.Location.StartColumn,
+                                evidence.Location.EndLine,
+                                evidence.Location.EndColumn,
+                                Confidence = (int)evidence.Confidence,
+                                evidence.Producer,
+                                Payload = SerializeMetadata(
+                                        evidence.Metadata ?? edge.Metadata)
+                                    ?? string.Empty,
+                            },
+                            transaction: tx,
+                            cancellationToken: ct))
+                        .ConfigureAwait(false);
+                    await _connection.ExecuteAsync(new CommandDefinition(
+                            """
+                            UPDATE edges
+                            SET payload = (
+                                SELECT NULLIF(evidence.payload, '')
+                                FROM edge_evidence evidence
+                                WHERE evidence.src = @Src
+                                  AND evidence.dst = @Dst
+                                  AND evidence.kind_name = @Kind
+                                ORDER BY evidence.id
+                                LIMIT 1
+                            )
+                            WHERE src = @Src
+                              AND dst = @Dst
+                              AND kind_name = @Kind;
+                            """,
+                            new
+                            {
+                                Src = sourceSymbol.SymbolId,
+                                Dst = targetSymbol.SymbolId,
+                                edge.Kind,
+                            },
+                            transaction: tx,
+                            cancellationToken: ct))
+                        .ConfigureAwait(false);
+                    edgeCount++;
+                }
+            }
+
             ct.ThrowIfCancellationRequested();
             tx.Commit();
             return new NativeInteropSnapshotReplacementResult(
@@ -224,7 +393,10 @@ public sealed partial class SqliteGraphStore
                 priorKeys,
                 symbolsByKey.Keys
                     .OrderBy(key => key, StringComparer.Ordinal)
-                    .ToArray());
+                    .ToArray())
+            {
+                EdgesUpdated = edgeCount,
+            };
         }
         finally
         {
@@ -250,8 +422,11 @@ public sealed partial class SqliteGraphStore
         var paths = new HashSet<string>(PathComparer);
         var symbolKeys = new HashSet<string>(StringComparer.Ordinal);
         var annotationHostKeys = new HashSet<string>(StringComparer.Ordinal);
+        var requiredAnnotationKeys = new HashSet<string>(StringComparer.Ordinal);
+        var callOccurrences = new HashSet<string>(StringComparer.Ordinal);
         var symbolCount = 0;
         var annotationCount = 0;
+        var edgeCount = 0;
         for (var fileIndex = 0; fileIndex < source.Count; fileIndex++)
         {
             ct.ThrowIfCancellationRequested();
@@ -282,10 +457,13 @@ public sealed partial class SqliteGraphStore
             }
             ArgumentNullException.ThrowIfNull(file.Symbols);
             ArgumentNullException.ThrowIfNull(file.Annotations);
+            ArgumentNullException.ThrowIfNull(file.Edges);
             symbolCount = checked(symbolCount + file.Symbols.Count);
             annotationCount = checked(annotationCount + file.Annotations.Count);
+            edgeCount = checked(edgeCount + file.Edges.Count);
             if (symbolCount > MaximumNativeInteropSymbols
-                || annotationCount > MaximumNativeInteropAnnotations)
+                || annotationCount > MaximumNativeInteropAnnotations
+                || edgeCount > MaximumNativeInteropEdges)
             {
                 throw new ArgumentException(
                     "Native interop snapshot declaration or annotation limit exceeded.",
@@ -311,6 +489,11 @@ public sealed partial class SqliteGraphStore
                         + $"`{symbol.CanonicalKey}` is duplicated.",
                         nameof(source));
                 }
+                if (symbol.Kind is not (
+                    SymbolKinds.Function or SymbolKinds.Method))
+                {
+                    requiredAnnotationKeys.Add(symbol.CanonicalKey);
+                }
                 symbols[symbolIndex] = symbol with { };
             }
 
@@ -333,20 +516,68 @@ public sealed partial class SqliteGraphStore
                 annotations[annotationIndex] = annotation with { };
             }
 
+            var edges = file.Edges.ToArray();
+            for (var edgeIndex = 0;
+                 edgeIndex < edges.Length;
+                 edgeIndex++)
+            {
+                var edge = edges[edgeIndex]
+                    ?? throw new ArgumentException(
+                        $"Native interop edge {fileIndex}:{edgeIndex} is null.",
+                        nameof(source));
+                ValidateNativeCallEdge(edge, localKeys, path, source);
+                var evidence = edge.Evidence!;
+                var occurrence = string.Join(
+                    "\n",
+                    edge.SourceCanonicalKey,
+                    edge.TargetCanonicalKey,
+                    evidence.Location.FilePath,
+                    evidence.Location.StartLine,
+                    evidence.Location.StartColumn,
+                    evidence.Location.EndLine,
+                    evidence.Location.EndColumn);
+                if (!callOccurrences.Add(occurrence))
+                {
+                    throw new ArgumentException(
+                        "A native call occurrence is duplicated.",
+                        nameof(source));
+                }
+                edges[edgeIndex] = edge with
+                {
+                    Metadata = CopyMetadata(edge.Metadata),
+                    Evidence = evidence with
+                    {
+                        Metadata = CopyMetadata(evidence.Metadata),
+                    },
+                };
+            }
+
             result[fileIndex] = new NativeInteropFileFacts(
                 path,
                 file.ContentSha256.ToArray(),
                 file.IndexedAt,
                 symbols,
-                annotations);
+                annotations)
+            {
+                Edges = edges,
+            };
         }
 
-        if (!symbolKeys.SetEquals(annotationHostKeys))
+        if (!requiredAnnotationKeys.SetEquals(annotationHostKeys))
         {
             throw new ArgumentException(
-                "Every native interop declaration must own at least one selected "
-                + "interop annotation.",
+                "Every non-function native interop declaration must own exactly one "
+                + "selected interop annotation.",
                 nameof(source));
+        }
+        foreach (var edge in result.SelectMany(file => file.Edges))
+        {
+            if (!symbolKeys.Contains(edge.TargetCanonicalKey))
+            {
+                throw new ArgumentException(
+                    "A native call target must be a definition in the same complete snapshot.",
+                    nameof(source));
+            }
         }
 
         return result
@@ -436,6 +667,95 @@ public sealed partial class SqliteGraphStore
                 "Native interop annotation payload is not valid JSON.",
                 nameof(source),
                 ex);
+        }
+    }
+
+    private static void ValidateNativeCallEdge(
+        FileEdgeFact edge,
+        IReadOnlySet<string> localKeys,
+        string ownerPath,
+        IReadOnlyList<NativeInteropFileFacts> source)
+    {
+        CanonicalKeyValidator.Validate(
+            edge.SourceCanonicalKey,
+            nameof(source));
+        CanonicalKeyValidator.Validate(
+            edge.TargetCanonicalKey,
+            nameof(source));
+        if (!localKeys.Contains(edge.SourceCanonicalKey)
+            || !IsNativeCanonicalKey(edge.SourceCanonicalKey)
+            || !IsNativeCanonicalKey(edge.TargetCanonicalKey))
+        {
+            throw new ArgumentException(
+                "Native calls must originate from a local c/cpp declaration and target "
+                + "another c/cpp declaration.",
+                nameof(source));
+        }
+        if (!string.Equals(edge.Kind, EdgeKinds.Calls, StringComparison.Ordinal)
+            || edge.Evidence is null
+            || !string.Equals(
+                edge.Evidence.Producer,
+                NativeCallProducer,
+                StringComparison.Ordinal)
+            || edge.Evidence.Confidence != EvidenceConfidence.Exact)
+        {
+            throw new ArgumentException(
+                "Native snapshot edges must be exact clang-native-call occurrences.",
+                nameof(source));
+        }
+        var location = edge.Evidence.Location;
+        if (location is null
+            || !PathsEquivalent(location.FilePath, ownerPath)
+            || location.StartLine <= 0
+            || location.StartColumn <= 0
+            || location.EndLine < location.StartLine
+            || location.EndColumn <= 0
+            || (location.EndLine == location.StartLine
+                && location.EndColumn < location.StartColumn))
+        {
+            throw new ArgumentException(
+                "Native call evidence must be a valid range in its source owner file.",
+                nameof(source));
+        }
+        ValidateMetadata(edge.Metadata, source);
+        ValidateMetadata(edge.Evidence.Metadata, source);
+    }
+
+    private static IReadOnlyDictionary<string, string>? CopyMetadata(
+        IReadOnlyDictionary<string, string>? metadata)
+    {
+        if (metadata is null)
+        {
+            return null;
+        }
+        return metadata
+            .OrderBy(item => item.Key, StringComparer.Ordinal)
+            .ToDictionary(
+                item => item.Key,
+                item => item.Value,
+                StringComparer.Ordinal);
+    }
+
+    private static void ValidateMetadata(
+        IReadOnlyDictionary<string, string>? metadata,
+        IReadOnlyList<NativeInteropFileFacts> source)
+    {
+        const int maximumEntries = 256;
+        const int maximumCharacters = 32 * 1024;
+        if (metadata is null)
+        {
+            return;
+        }
+        if (metadata.Count > maximumEntries
+            || metadata.Any(item =>
+                string.IsNullOrWhiteSpace(item.Key)
+                || item.Key.Length > maximumCharacters
+                || item.Value is null
+                || item.Value.Length > maximumCharacters))
+        {
+            throw new ArgumentException(
+                "Native call metadata is malformed or exceeds its bound.",
+                nameof(source));
         }
     }
 

@@ -26,6 +26,8 @@ internal sealed record InteropAnalysisPublicationResult(
 internal sealed class InteropAnalysisPublisher
 {
     internal const string Producer = "interop-analysis";
+    private const int ProjectionScanPageSize = 1_000;
+    private const int MaximumProjectionRows = 100_000;
     private static readonly string[] _annotationFlavors =
     [
         InteropAnnotationFlavors.Match,
@@ -184,6 +186,144 @@ internal sealed class InteropAnalysisPublisher
         {
             _publicationLock.Release();
         }
+    }
+
+    /// <summary>
+    /// Removes only the producer-owned match, finding, and P/Invoke projection while preserving
+    /// managed import declarations. This is used when a scope explicitly removes its native
+    /// interop configuration, where retaining a last-good boundary would be a stale claim.
+    /// </summary>
+    public async Task<InteropAnalysisPublicationResult> ClearAsync(
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        await _publicationLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            var ownerScan = await ListProjectionOwnerPathsAsync(cancellationToken)
+                .ConfigureAwait(false);
+            if (ownerScan.Failure is not null)
+            {
+                return Failed([ownerScan.Failure]);
+            }
+
+            var failures = new List<InteropAnalysisPublicationFailure>();
+            var filesPublished = 0;
+            foreach (var filePath in ownerScan.FilePaths)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                try
+                {
+                    await _store.ReplaceFileDerivedProjectionAsync(
+                            filePath,
+                            Producer,
+                            _annotationFlavors,
+                            annotations: [],
+                            edges: [],
+                            cancellationToken)
+                        .ConfigureAwait(false);
+                    filesPublished++;
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch (Exception ex) when (
+                    ex is ArgumentException
+                        or InvalidOperationException
+                        or NotSupportedException
+                        or OverflowException)
+                {
+                    failures.Add(new InteropAnalysisPublicationFailure(
+                        filePath,
+                        "clear-storage",
+                        BoundedMessage(ex)));
+                }
+            }
+
+            return new InteropAnalysisPublicationResult(
+                failures.Count == 0,
+                filesPublished,
+                MatchesPublished: 0,
+                FindingsPublished: 0,
+                EdgesPublished: 0,
+                OrderFailures(failures));
+        }
+        finally
+        {
+            _publicationLock.Release();
+        }
+    }
+
+    private async Task<ProjectionOwnerScan> ListProjectionOwnerPathsAsync(
+        CancellationToken cancellationToken)
+    {
+        var paths = new HashSet<string>(PathComparer);
+        var rowsRead = 0;
+        foreach (var flavor in _annotationFlavors)
+        {
+            long afterId = 0;
+            while (rowsRead < MaximumProjectionRows)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var limit = Math.Min(
+                    ProjectionScanPageSize,
+                    MaximumProjectionRows - rowsRead);
+                var page = await _store.ListAnnotationsByFlavorAsync(
+                        flavor,
+                        afterId,
+                        limit,
+                        cancellationToken)
+                    .ConfigureAwait(false);
+                if (page.Count == 0)
+                {
+                    break;
+                }
+
+                foreach (var row in page)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    rowsRead++;
+                    afterId = row.AnnotationId;
+                    if (!string.IsNullOrWhiteSpace(row.FilePath))
+                    {
+                        paths.Add(row.FilePath);
+                    }
+                }
+                if (page.Count < limit)
+                {
+                    break;
+                }
+            }
+
+            if (rowsRead == MaximumProjectionRows)
+            {
+                var probe = await _store.ListAnnotationsByFlavorAsync(
+                        flavor,
+                        afterId,
+                        limit: 1,
+                        cancellationToken)
+                    .ConfigureAwait(false);
+                if (probe.Count > 0)
+                {
+                    return new ProjectionOwnerScan(
+                        [],
+                        new InteropAnalysisPublicationFailure(
+                            FilePath: null,
+                            Stage: "clear-scan",
+                            Message:
+                                "Interop analysis projection scan exceeded the "
+                                + $"{MaximumProjectionRows}-row limit."));
+                }
+            }
+        }
+
+        return new ProjectionOwnerScan(
+            paths
+                .OrderBy(path => path, PathComparer)
+                .ThenBy(path => path, StringComparer.Ordinal)
+                .ToArray(),
+            Failure: null);
     }
 
     private IReadOnlyList<ManagedFileProjection> BuildProjections(
@@ -498,4 +638,8 @@ internal sealed class InteropAnalysisPublisher
         IReadOnlyList<ProducerEdgeEvidenceFact> Edges,
         int MatchCount,
         int FindingCount);
+
+    private sealed record ProjectionOwnerScan(
+        IReadOnlyList<string> FilePaths,
+        InteropAnalysisPublicationFailure? Failure);
 }

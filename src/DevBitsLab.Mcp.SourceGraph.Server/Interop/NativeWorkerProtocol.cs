@@ -80,7 +80,7 @@ internal sealed class NativeWorkerProtocolException : Exception
 /// </summary>
 internal static class NativeWorkerProtocol
 {
-    public const int CurrentVersion = 1;
+    public const int CurrentVersion = 2;
     public const string RequestKind = "native-extraction-request";
     public const string ResponseKind = "native-extraction-response";
     public const int MaximumRequestBytes = 1024 * 1024;
@@ -88,6 +88,8 @@ internal static class NativeWorkerProtocol
     public const int MaximumStandardErrorBytes = 64 * 1024;
 
     private const int MaximumCollectionItems = 16 * 1024;
+    private const int MaximumFunctions = 4096;
+    private const int MaximumCalls = 8192;
     private const int MaximumCompilerArguments = 4096;
     private const int MaximumExcludePatterns = 1024;
     private const int MaximumMetadataEntries = 256;
@@ -533,7 +535,8 @@ internal static class NativeWorkerProtocol
         ClangNativeExtractionResult result,
         ClangNativeExtractionRequest request)
     {
-        ValidateCollection(result.Functions, MaximumCollectionItems, "Functions");
+        ValidateCollection(result.Functions, MaximumFunctions, "Functions");
+        ValidateCollection(result.Calls, MaximumCalls, "Calls");
         ValidateCollection(result.Types, MaximumCollectionItems, "Types");
         ValidateCollection(result.Exports, MaximumCollectionItems, "Exports");
         ValidateCollection(
@@ -592,6 +595,7 @@ internal static class NativeWorkerProtocol
         }
         var errorWithoutFacts = result.HasErrors
             && result.Functions.Count == 0
+            && result.Calls.Count == 0
             && result.Types.Count == 0
             && result.Exports.Count == 0
             && result.RecordLayouts.Count == 0;
@@ -602,15 +606,119 @@ internal static class NativeWorkerProtocol
                 "The native worker result does not retain its translation-unit source.");
         }
 
+        var definitionGraphKeys = new HashSet<string>(StringComparer.Ordinal);
+        var definitionsByUsr =
+            new Dictionary<string, string>(StringComparer.Ordinal);
         foreach (var function in result.Functions)
         {
             ValidateNonBlankString(function.SymbolCanonicalKey, "Function key");
+            if (!IsNativeFunctionKey(function.SymbolCanonicalKey))
+            {
+                throw InvalidResponse(
+                    "A native function key must use the c/cpp F scheme.");
+            }
             ValidateNonBlankString(function.Name, "Function name");
             ValidateNonBlankString(function.QualifiedName, "Function qualified name");
+            ValidateNonBlankString(function.DeclarationUsr, "Function declaration USR");
+            ValidateNonBlankString(function.GraphCanonicalKey, "Function graph key");
+            if (!string.Equals(
+                    function.GraphCanonicalKey,
+                    function.SymbolCanonicalKey,
+                    StringComparison.Ordinal)
+                && !IsNativeExportKey(function.GraphCanonicalKey))
+            {
+                throw InvalidResponse(
+                    "A function graph key must be its declaration key or a native export key.");
+            }
+            if (function.IsMethod && function.HasCLinkage)
+            {
+                throw InvalidResponse(
+                    "A C++ member function cannot carry C linkage.");
+            }
             ValidateEnum(function.CallingConvention, "Function calling convention");
             ValidateType(function.ReturnType, 0);
             ValidateParameters(function.Parameters, request, policy, included);
+            ValidateTargetEquivalent(
+                function.Target!,
+                request.Target,
+                "Function target");
             ValidateEvidence(function.Evidence, request, policy, included);
+            if (function.IsDefinition)
+            {
+                if (!definitionGraphKeys.Add(function.GraphCanonicalKey))
+                {
+                    throw InvalidResponse(
+                        "A native function graph key is duplicated.");
+                }
+                if (definitionsByUsr.TryGetValue(
+                        function.DeclarationUsr,
+                        out var existing)
+                    && !string.Equals(
+                        existing,
+                        function.GraphCanonicalKey,
+                        StringComparison.Ordinal))
+                {
+                    throw InvalidResponse(
+                        "A Clang declaration identity maps to conflicting definitions.");
+                }
+                definitionsByUsr[function.DeclarationUsr] =
+                    function.GraphCanonicalKey;
+            }
+        }
+        var observedCalls = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var call in result.Calls)
+        {
+            ValidateNonBlankString(
+                call.CallerSymbolCanonicalKey,
+                "Call source key");
+            ValidateNonBlankString(
+                call.ReferencedDeclarationUsr,
+                "Call referenced declaration USR");
+            if (!definitionGraphKeys.Contains(call.CallerSymbolCanonicalKey))
+            {
+                throw InvalidResponse(
+                    "A direct call source is not a function definition in the result.");
+            }
+            if (call.CalleeSymbolCanonicalKey is not null)
+            {
+                ValidateNonBlankString(
+                    call.CalleeSymbolCanonicalKey,
+                    "Call target key");
+                if (!definitionsByUsr.TryGetValue(
+                        call.ReferencedDeclarationUsr,
+                        out var expectedTarget)
+                    || !string.Equals(
+                        call.CalleeSymbolCanonicalKey,
+                        expectedTarget,
+                        StringComparison.Ordinal))
+                {
+                    throw InvalidResponse(
+                        "A direct call target does not match its referenced definition.");
+                }
+            }
+            ValidateTargetEquivalent(call.Target, request.Target, "Call target");
+            ValidateEvidence(call.Evidence, request, policy, included);
+            var occurrenceKey = string.Join(
+                "\n",
+                call.CallerSymbolCanonicalKey,
+                call.ReferencedDeclarationUsr,
+                call.Evidence.Location.FilePath,
+                call.Evidence.Location.StartLine,
+                call.Evidence.Location.StartColumn,
+                call.Evidence.Location.EndLine,
+                call.Evidence.Location.EndColumn);
+            if (!observedCalls.Add(occurrenceKey))
+            {
+                throw InvalidResponse(
+                    "A direct call occurrence is duplicated.");
+            }
+        }
+        if (!result.IsCallGraphComplete
+            && !result.Diagnostics.Any(diagnostic =>
+                diagnostic.Code.StartsWith("CLANG2", StringComparison.Ordinal)))
+        {
+            throw InvalidResponse(
+                "An incomplete native call graph requires a bounded call diagnostic.");
         }
         foreach (var type in result.Types)
         {
@@ -1025,6 +1133,14 @@ internal static class NativeWorkerProtocol
             character is >= 'a' and <= 'z'
             or >= '0' and <= '9'
             or '-');
+
+    private static bool IsNativeFunctionKey(string canonicalKey) =>
+        canonicalKey.StartsWith("c:F:", StringComparison.Ordinal)
+        || canonicalKey.StartsWith("cpp:F:", StringComparison.Ordinal);
+
+    private static bool IsNativeExportKey(string canonicalKey) =>
+        canonicalKey.StartsWith("c:E:", StringComparison.Ordinal)
+        || canonicalKey.StartsWith("cpp:E:", StringComparison.Ordinal);
 
     private static async Task ReadExactlyAsync(
         Stream input,

@@ -1,5 +1,6 @@
 using DevBitsLab.Mcp.SourceGraph.Core;
 using DevBitsLab.Mcp.SourceGraph.Interop;
+using DevBitsLab.Mcp.SourceGraph.Indexing.Clang;
 using DevBitsLab.Mcp.SourceGraph.Server.Interop;
 using DevBitsLab.Mcp.SourceGraph.Storage;
 using FluentAssertions;
@@ -234,6 +235,171 @@ public sealed class NativeInteropSnapshotPublisherTests : IAsyncLifetime
             .Facts.Should().BeEmpty();
     }
 
+    [Fact]
+    public async Task Complete_snapshot_publishes_exact_native_function_call_edges()
+    {
+        var exportPath = PathFor("native/exports.cpp");
+        var algorithmPath = PathFor("native/algorithm.cpp");
+        var nativeExport = Export(
+            "c:E:native/exports.cpp::calculate",
+            "native.dll",
+            binaryVerified: false,
+            exportPath);
+        var function = Function(
+            "cpp:F:native/algorithm.cpp::Algorithm::Calculate(int)",
+            "c:@S@Algorithm@F@Calculate#I#",
+            "Calculate",
+            "Algorithm::Calculate",
+            algorithmPath,
+            isMethod: true);
+        var call = new NativeCallFact(
+            nativeExport.SymbolCanonicalKey,
+            function.DeclarationUsr,
+            function.GraphCanonicalKey,
+            Target,
+            new Evidence(
+                1,
+                new SourceLocation(exportPath, 4, 12, 4, 34),
+                EvidenceConfidence.Exact,
+                "clang-native-call",
+                new Dictionary<string, string>(StringComparer.Ordinal)
+                {
+                    ["callKind"] = "direct",
+                    ["target"] = Target.RuntimeIdentifier,
+                }));
+
+        var result = await Publisher().PublishAsync(Snapshot(
+            hashes:
+            [
+                ContentHash(exportPath, Hash(8)),
+                ContentHash(algorithmPath, Hash(9)),
+            ],
+            sourceExports: [nativeExport],
+            functions: [function],
+            calls: [call]));
+
+        result.IsComplete.Should().BeTrue();
+        result.SymbolsPublished.Should().Be(2);
+        result.EdgesPublished.Should().Be(1);
+        var keys = await _store!.GetAllSymbolKeysAsync();
+        var source = keys.Single(item =>
+            item.CanonicalKey == nativeExport.SymbolCanonicalKey);
+        var edge = (await _store.ListCalleesAsync(
+                source.Id,
+                edgeKind: "calls"))
+            .Should().ContainSingle().Subject;
+        edge.CanonicalKey.Should().Be(function.SymbolCanonicalKey);
+        (await _store.ListEdgeEvidenceAsync(
+                source.Id,
+                edge.Id,
+                "calls"))
+            .Should().ContainSingle()
+            .Which.Producer.Should().Be("clang-native-call");
+
+        var partial = await Publisher().PublishAsync(Snapshot(
+            hashes: [],
+            sourceExports: [],
+            complete: false,
+            failures:
+            [
+                new NativeInteropSnapshotFailure(
+                    NativeInteropSnapshotFailureKind.CallGraphIncomplete,
+                    0,
+                    "native/exports.cpp",
+                    "indirect call"),
+            ]));
+        partial.IsComplete.Should().BeFalse();
+        (await _store.ListCalleesAsync(source.Id, edgeKind: "calls"))
+            .Should().ContainSingle(
+                "a partial candidate must retain the last-good native call graph");
+
+        var managedPath = PathFor("Managed.cs");
+        Directory.CreateDirectory(Path.GetDirectoryName(managedPath)!);
+        await File.WriteAllTextAsync(managedPath, "// managed");
+        var managedFileId = await _store.UpsertFileAsync(
+            managedPath,
+            Hash(10),
+            DateTimeOffset.UtcNow);
+        var managedSourceId = await _store.UpsertSymbolAsync(
+            "csharp:M:Managed.Source",
+            new Symbol(
+                0,
+                "Source",
+                "Managed.Source",
+                "method",
+                managedFileId,
+                1,
+                1,
+                1,
+                5,
+                null,
+                null));
+        var managedTargetId = await _store.UpsertSymbolAsync(
+            "csharp:M:Managed.Target",
+            new Symbol(
+                0,
+                "Target",
+                "Managed.Target",
+                "method",
+                managedFileId,
+                2,
+                1,
+                2,
+                5,
+                null,
+                null));
+        var legacyTargetId = await _store.UpsertSymbolAsync(
+            "csharp:M:Managed.LegacyTarget",
+            new Symbol(
+                0,
+                "LegacyTarget",
+                "Managed.LegacyTarget",
+                "method",
+                managedFileId,
+                3,
+                1,
+                3,
+                5,
+                null,
+                null));
+        await _store.BulkInsertEdgesAsync(
+        [
+            new Edge(
+                managedSourceId,
+                managedTargetId,
+                "calls")
+            {
+                Evidence = new Evidence(
+                    managedFileId,
+                    new SourceLocation(managedPath, 1, 1, 1, 5),
+                    EvidenceConfidence.Exact,
+                    "roslyn-call"),
+            },
+            new Edge(
+                managedSourceId,
+                legacyTargetId,
+                "calls"),
+        ]);
+
+        var cleared = await Publisher().ClearAsync();
+        cleared.IsComplete.Should().BeTrue();
+        cleared.StaleCanonicalKeys.Should().BeEquivalentTo(
+            nativeExport.SymbolCanonicalKey,
+            function.SymbolCanonicalKey);
+        (await _store.ListCalleesAsync(source.Id, edgeKind: "calls"))
+            .Should().BeEmpty();
+        (await _store.ListCalleesAsync(
+                 managedSourceId,
+                 edgeKind: "calls"))
+            .Should().HaveCount(2)
+            .And.Contain(
+                symbol => symbol.Id == managedTargetId,
+                "native replacement cannot remove independently evidenced managed calls")
+            .And.Contain(
+                symbol => symbol.Id == legacyTargetId,
+                "native replacement cannot remove unrelated legacy calls without evidence");
+    }
+
     private NativeInteropSnapshotPublisher Publisher() =>
         new(_store!);
 
@@ -242,6 +408,8 @@ public sealed class NativeInteropSnapshotPublisherTests : IAsyncLifetime
         IReadOnlyList<NativeExport> sourceExports,
         IReadOnlyList<NativeExport>? verifiedExports = null,
         IReadOnlyList<AbiRecordLayout>? records = null,
+        IReadOnlyList<NativeFunctionFact>? functions = null,
+        IReadOnlyList<NativeCallFact>? calls = null,
         bool complete = true,
         IReadOnlyList<NativeInteropSnapshotFailure>? failures = null)
     {
@@ -265,7 +433,11 @@ public sealed class NativeInteropSnapshotPublisherTests : IAsyncLifetime
             IsSourceComplete: complete,
             IsExportUniverseComplete: complete,
             IsComplete: complete,
-            Failures: failures ?? []);
+            Failures: failures ?? [])
+        {
+            Functions = functions ?? [],
+            Calls = calls ?? [],
+        };
     }
 
     private static NativeInteropFileContentHash ContentHash(
@@ -325,6 +497,36 @@ public sealed class NativeInteropSnapshotPublisherTests : IAsyncLifetime
             Target,
             evidence);
     }
+
+    private static NativeFunctionFact Function(
+        string key,
+        string usr,
+        string name,
+        string qualifiedName,
+        string path,
+        bool isMethod) =>
+        new(
+            key,
+            name,
+            qualifiedName,
+            InteropCallingConvention.Cdecl,
+            new AbiTypeRef(
+                "int",
+                AbiTypeCategory.SignedInteger,
+                sizeBytes: 4,
+                alignmentBytes: 4,
+                isSigned: true),
+            [],
+            HasCLinkage: false,
+            IsExported: false,
+            IsDefinition: true,
+            EvidenceAt(path))
+        {
+            DeclarationUsr = usr,
+            GraphCanonicalKey = key,
+            IsMethod = isMethod,
+            Target = Target,
+        };
 
     private static Evidence EvidenceAt(string path) =>
         new(

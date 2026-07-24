@@ -166,7 +166,6 @@ public sealed class NativeInteropStaleSymbolCleanupTests : IAsyncLifetime
 
     [Theory]
     [InlineData("csharp:M:Managed.Run")]
-    [InlineData("c:F:native.c::helper")]
     [InlineData("c:E:native.h")]
     [InlineData("c:E:../native.h::run")]
     [InlineData("cpp:T:/native.hpp::Payload")]
@@ -183,6 +182,29 @@ public sealed class NativeInteropStaleSymbolCleanupTests : IAsyncLifetime
         await act.Should().ThrowAsync<ArgumentException>();
         (await _store!.GetSymbolByIdAsync(existing.SymbolId))
             .Should().NotBeNull();
+    }
+
+    [Theory]
+    [InlineData("c:F:native.c::helper(int)", SymbolKinds.Function)]
+    [InlineData(
+        "cpp:F:native.cpp::medical::Algorithm::Run(int)",
+        SymbolKinds.Method)]
+    public async Task Deletes_proven_orphaned_native_function_symbols(
+        string canonicalKey,
+        string kind)
+    {
+        var symbol = await SeedSymbolAsync(
+            kind == SymbolKinds.Method
+                ? "native.cpp"
+                : "native.c",
+            canonicalKey,
+            kind);
+
+        var result = await _store!.DeleteOrphanedNativeInteropSymbolsAsync(
+            [canonicalKey]);
+
+        result.DeletedCanonicalKeys.Should().Equal(canonicalKey);
+        (await _store.GetSymbolByIdAsync(symbol.SymbolId)).Should().BeNull();
     }
 
     [Fact]

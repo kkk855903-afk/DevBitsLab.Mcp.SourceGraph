@@ -48,8 +48,8 @@ public sealed class NativeWorkerProtocolTests : IDisposable
             NativeWorkerProtocol.EncodeRequest(Request()));
         var malformed = Encoding.UTF8.GetBytes(
             json.Replace(
-                "\"version\":1",
-                "\"unexpected\":true,\"version\":1",
+                $"\"version\":{NativeWorkerProtocol.CurrentVersion}",
+                $"\"unexpected\":true,\"version\":{NativeWorkerProtocol.CurrentVersion}",
                 StringComparison.Ordinal));
 
         var act = () => NativeWorkerProtocol.DecodeRequest(malformed);
@@ -65,8 +65,9 @@ public sealed class NativeWorkerProtocolTests : IDisposable
             NativeWorkerProtocol.EncodeRequest(Request()));
         var malformed = Encoding.UTF8.GetBytes(
             json.Replace(
-                "\"version\":1",
-                "\"version\":1,\"version\":1",
+                $"\"version\":{NativeWorkerProtocol.CurrentVersion}",
+                $"\"version\":{NativeWorkerProtocol.CurrentVersion},"
+                    + $"\"version\":{NativeWorkerProtocol.CurrentVersion}",
                 StringComparison.Ordinal));
 
         var act = () => NativeWorkerProtocol.DecodeRequest(malformed);
@@ -284,6 +285,51 @@ public sealed class NativeWorkerProtocolTests : IDisposable
         response.Failure!.Code.Should().Be("frame-too-large");
     }
 
+    [Fact]
+    public void ResponseCodec_roundTrips_strict_direct_call_identity()
+    {
+        var caller = FunctionFact(
+            "cpp:F:medical.cpp::caller()",
+            "c:@F@caller#",
+            "caller");
+        var callee = FunctionFact(
+            "cpp:F:medical.cpp::callee()",
+            "c:@F@callee#",
+            "callee");
+        var call = new NativeCallFact(
+            caller.GraphCanonicalKey,
+            callee.DeclarationUsr,
+            callee.GraphCanonicalKey,
+            InteropTarget.WindowsX64Msvc,
+            new Evidence(
+                41,
+                new SourceLocation(_source, 1, 1, 1, 2),
+                EvidenceConfidence.Exact,
+                "clang-native-call"));
+        var extraction = EmptyExtraction() with
+        {
+            Functions = [caller, callee],
+            Calls = [call],
+        };
+        var response = new NativeWorkerResponseEnvelope(
+            NativeWorkerProtocol.CurrentVersion,
+            NativeWorkerProtocol.ResponseKind,
+            Success: true,
+            extraction,
+            Failure: null,
+            NativeWorkerIsolationCapabilities.Baseline);
+
+        var payload = NativeWorkerProtocol.EncodeWorkerResponse(
+            response,
+            Request());
+        var decoded = NativeWorkerProtocol.DecodeResponse(
+            payload,
+            Request());
+
+        decoded.Result!.Calls.Should().ContainSingle()
+            .Which.Should().BeEquivalentTo(call);
+    }
+
     public void Dispose()
     {
         try
@@ -329,6 +375,27 @@ public sealed class NativeWorkerProtocolTests : IDisposable
             new SourceLocation(path, 1, 1, 1, 2),
             EvidenceConfidence.Exact,
             "clang-native");
+
+    private NativeFunctionFact FunctionFact(
+        string key,
+        string usr,
+        string name) =>
+        new(
+            key,
+            name,
+            name,
+            InteropCallingConvention.Cdecl,
+            IntType(),
+            [],
+            HasCLinkage: false,
+            IsExported: false,
+            IsDefinition: true,
+            Evidence(_source))
+        {
+            DeclarationUsr = usr,
+            GraphCanonicalKey = key,
+            Target = InteropTarget.WindowsX64Msvc,
+        };
 
     private static AbiTypeRef IntType() =>
         new(

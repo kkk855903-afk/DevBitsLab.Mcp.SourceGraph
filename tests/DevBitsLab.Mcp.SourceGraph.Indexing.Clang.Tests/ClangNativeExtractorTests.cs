@@ -26,6 +26,9 @@ public sealed class ClangNativeExtractorTests
         workspace.Write(
             "native/src/algorithm.hpp",
             File.ReadAllText(Path.Combine(fixtureNativeRoot, "src", "algorithm.hpp")));
+        var algorithmPath = workspace.Write(
+            "native/src/algorithm.cpp",
+            File.ReadAllText(Path.Combine(fixtureNativeRoot, "src", "algorithm.cpp")));
         workspace.Write(
             "native/include/medalgo.h",
             File.ReadAllText(Path.Combine(fixtureNativeRoot, "include", "medalgo.h")));
@@ -85,6 +88,38 @@ public sealed class ClangNativeExtractorTests
         nativeExport.Evidence.Producer.Should().Be("clang-native");
         nativeExport.Evidence.Location.FilePath.Should().Be(sourcePath);
         nativeExport.Evidence.Location.StartLine.Should().Be(3);
+        result.IsCallGraphComplete.Should().BeTrue();
+        var directCall = result.Calls.Should()
+            .ContainSingle(call =>
+                call.ReferencedDeclarationUsr.Contains(
+                    "Calculate",
+                    StringComparison.Ordinal))
+            .Subject;
+        directCall.CallerSymbolCanonicalKey.Should().Be(
+            nativeExport.SymbolCanonicalKey);
+        directCall.CalleeSymbolCanonicalKey.Should().BeNull(
+            "the referenced definition lives in another translation unit");
+        directCall.Evidence.Producer.Should().Be("clang-native-call");
+
+        var algorithm = ClangNativeExtractor.Extract(
+            new ClangNativeExtractionRequest(
+                algorithmPath,
+                nativeRoot,
+                ProducingFileId: 42,
+                InteropTarget.WindowsX64Msvc,
+                WindowsX64Arguments(
+                    Path.GetDirectoryName(cstdintPath)!,
+                    Path.Combine(nativeRoot, "include"),
+                    Path.Combine(nativeRoot, "src")),
+                LibraryName: "medalgo.dll"));
+        var calculateDefinition = algorithm.Functions.Should()
+            .ContainSingle(function =>
+                function.IsDefinition
+                && function.QualifiedName == "Algorithm::Calculate")
+            .Subject;
+        directCall.ReferencedDeclarationUsr.Should().Be(
+            calculateDefinition.DeclarationUsr,
+            "Clang USRs bind a referenced declaration to its out-of-line definition");
 
         var input = result.RecordLayouts.Single(
             layout => layout.SymbolCanonicalKey.EndsWith(
@@ -110,6 +145,67 @@ public sealed class ClangNativeExtractorTests
             field.Name == "value"
             && field.OffsetBytes == 0
             && field.SizeBytes == 4);
+    }
+
+    [Fact]
+    public void Indirect_call_is_diagnostic_only_and_marks_projection_partial()
+    {
+        using var workspace = new NativeTestWorkspace();
+        var sourcePath = workspace.Write(
+            "native/indirect.cpp",
+            """
+            using Callback = int(*)(int);
+            int invoke(Callback callback, int value)
+            {
+                return callback(value);
+            }
+            """);
+
+        var result = ExtractWindows(workspace.Root, sourcePath);
+
+        result.Calls.Should().BeEmpty(
+            "an indirect target must never be guessed from its spelling or type");
+        result.IsCallGraphComplete.Should().BeFalse();
+        result.Diagnostics.Should().Contain(diagnostic =>
+            diagnostic.Code == "CLANG2000"
+            && diagnostic.Severity
+                == ClangExtractionDiagnosticSeverity.Warning);
+    }
+
+    [Fact]
+    public void Uninvoked_lambda_calls_are_not_attributed_to_enclosing_function()
+    {
+        using var workspace = new NativeTestWorkspace();
+        var sourcePath = workspace.Write(
+            "native/lambda.cpp",
+            """
+            int deferred_work() { return 7; }
+            int configure()
+            {
+                auto deferred = []() { return deferred_work(); };
+                return 0;
+            }
+            """);
+
+        var result = ExtractWindows(workspace.Root, sourcePath);
+
+        result.Diagnostics.Should().NotContain(diagnostic =>
+            diagnostic.Severity == ClangExtractionDiagnosticSeverity.Error
+            || diagnostic.Severity
+                == ClangExtractionDiagnosticSeverity.Fatal);
+        var deferredWork = result.Functions.Should()
+            .ContainSingle(function =>
+                function.Name == "deferred_work" && function.IsDefinition)
+            .Subject;
+        var configure = result.Functions.Should()
+            .ContainSingle(function =>
+                function.Name == "configure" && function.IsDefinition)
+            .Subject;
+        result.Calls.Should().NotContain(call =>
+            call.CallerSymbolCanonicalKey == configure.GraphCanonicalKey
+            && call.CalleeSymbolCanonicalKey
+                == deferredWork.GraphCanonicalKey);
+        result.IsCallGraphComplete.Should().BeTrue();
     }
 
     [Fact]
@@ -192,6 +288,97 @@ public sealed class ClangNativeExtractorTests
         result.RecordLayouts.Should().NotContain(
             layout => layout.SymbolCanonicalKey.EndsWith(
                 "::Opaque",
+                StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void Cpp_method_cv_and_ref_qualifiers_keep_distinct_keys_and_calls()
+    {
+        using var workspace = new NativeTestWorkspace();
+        var sourcePath = workspace.Write(
+            "native/qualified-methods.cpp",
+            """
+            struct Qualified {
+                int f() { return 1; }
+                int f() const { return 2; }
+                int ref() & { return 3; }
+                int ref() && { return 4; }
+            };
+
+            int call_qualified(
+                Qualified& left,
+                Qualified&& right,
+                const Qualified& constant)
+            {
+                return left.f()
+                    + constant.f()
+                    + left.ref()
+                    + static_cast<Qualified&&>(right).ref();
+            }
+            """);
+
+        var result = ExtractWindows(workspace.Root, sourcePath);
+
+        var mutableF = result.Functions.Single(function =>
+            function.SymbolCanonicalKey.EndsWith(
+                "::Qualified::f()",
+                StringComparison.Ordinal));
+        var constF = result.Functions.Single(function =>
+            function.SymbolCanonicalKey.EndsWith(
+                "::Qualified::f() const",
+                StringComparison.Ordinal));
+        var lvalueRef = result.Functions.Single(function =>
+            function.SymbolCanonicalKey.EndsWith(
+                "::Qualified::ref() &",
+                StringComparison.Ordinal));
+        var rvalueRef = result.Functions.Single(function =>
+            function.SymbolCanonicalKey.EndsWith(
+                "::Qualified::ref() &&",
+                StringComparison.Ordinal));
+        var caller = result.Functions.Single(function =>
+            function.Name == "call_qualified");
+
+        result.Functions.Where(function => function.Name == "f")
+            .Should().HaveCount(2);
+        result.Functions.Where(function => function.Name == "ref")
+            .Should().HaveCount(2);
+        result.Calls
+            .Where(call =>
+                call.CallerSymbolCanonicalKey == caller.GraphCanonicalKey)
+            .Select(call => call.CalleeSymbolCanonicalKey)
+            .Should().BeEquivalentTo(
+                mutableF.GraphCanonicalKey,
+                constF.GraphCanonicalKey,
+                lvalueRef.GraphCanonicalKey,
+                rvalueRef.GraphCanonicalKey);
+        result.IsCallGraphComplete.Should().BeTrue();
+    }
+
+    [Fact]
+    public void Forward_declaration_and_definition_keep_the_definition_projection()
+    {
+        using var workspace = new NativeTestWorkspace();
+        var sourcePath = workspace.Write(
+            "native/forward.cpp",
+            """
+            int helper(int value);
+            int helper(int value) { return value; }
+            int run() { return helper(1); }
+            """);
+
+        var result = ExtractWindows(workspace.Root, sourcePath);
+
+        result.Diagnostics.Should().NotContain(
+            diagnostic =>
+                diagnostic.Severity == ClangExtractionDiagnosticSeverity.Error
+                || diagnostic.Severity
+                    == ClangExtractionDiagnosticSeverity.Fatal);
+        result.Functions.Should().ContainSingle(function =>
+            function.Name == "helper" && function.IsDefinition);
+        result.Calls.Should().ContainSingle(call =>
+            call.CalleeSymbolCanonicalKey != null
+            && call.CalleeSymbolCanonicalKey.Contains(
+                "::helper(",
                 StringComparison.Ordinal));
     }
 

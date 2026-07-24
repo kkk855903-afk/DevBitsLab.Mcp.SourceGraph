@@ -1,5 +1,7 @@
 using DevBitsLab.Mcp.SourceGraph.Core;
+using DevBitsLab.Mcp.SourceGraph.Indexing.Clang;
 using DevBitsLab.Mcp.SourceGraph.Storage;
+using EdgeKinds = DevBitsLab.Mcp.SourceGraph.Sdk.EdgeKinds;
 using SymbolKinds = DevBitsLab.Mcp.SourceGraph.Sdk.SymbolKinds;
 
 namespace DevBitsLab.Mcp.SourceGraph.Server.Interop;
@@ -11,7 +13,10 @@ internal sealed record NativeInteropSnapshotPublicationResult(
     int AnnotationsPublished,
     IReadOnlyList<string> StaleCanonicalKeys,
     IReadOnlyList<NativeInteropSnapshotFailure> SnapshotFailures,
-    string? Failure);
+    string? Failure)
+{
+    public int EdgesPublished { get; init; }
+}
 
 /// <summary>
 /// Converts one complete, content-bound native snapshot into storage facts and replaces every
@@ -91,7 +96,10 @@ internal sealed class NativeInteropSnapshotPublisher
                 result.AnnotationsUpdated,
                 stale,
                 SnapshotFailures: [],
-                Failure: null);
+                Failure: null)
+            {
+                EdgesPublished = result.EdgesUpdated,
+            };
         }
         catch (OperationCanceledException)
         {
@@ -105,6 +113,61 @@ internal sealed class NativeInteropSnapshotPublisher
         {
             return Failed(snapshot, ex);
         }
+    }
+
+    /// <summary>
+    /// Clears the native projection when interop configuration is removed. The replacement and
+    /// call-evidence cleanup are atomic; a second fail-closed orphan pass removes only native
+    /// declarations that no surviving managed/proto fact still references.
+    /// </summary>
+    public async Task<NativeInteropSnapshotPublicationResult> ClearAsync(
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var analysisClear = await new InteropAnalysisPublisher(_store)
+            .ClearAsync(cancellationToken)
+            .ConfigureAwait(false);
+        if (!analysisClear.IsComplete)
+        {
+            var failure = analysisClear.Failures.FirstOrDefault();
+            return new NativeInteropSnapshotPublicationResult(
+                IsComplete: false,
+                FilesPublished: 0,
+                SymbolsPublished: 0,
+                AnnotationsPublished: 0,
+                StaleCanonicalKeys: [],
+                SnapshotFailures: [],
+                Failure: failure is null
+                    ? "The managed/native analysis projection could not be cleared."
+                    : "The managed/native analysis projection could not be cleared "
+                      + $"({failure.Stage}: {failure.Message}).");
+        }
+
+        var replacement = new NativeInteropSnapshotReplacement(
+            _annotationFlavors,
+            []);
+        var result = await _store.ReplaceNativeInteropSnapshotAsync(
+                replacement,
+                cancellationToken)
+            .ConfigureAwait(false);
+        if (result.PriorCanonicalKeys.Count > 0)
+        {
+            await _store.DeleteOrphanedNativeInteropSymbolsAsync(
+                    result.PriorCanonicalKeys,
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
+        return new NativeInteropSnapshotPublicationResult(
+            IsComplete: true,
+            FilesPublished: 0,
+            SymbolsPublished: 0,
+            AnnotationsPublished: 0,
+            StaleCanonicalKeys: result.PriorCanonicalKeys,
+            SnapshotFailures: [],
+            Failure: null)
+        {
+            EdgesPublished = 0,
+        };
     }
 
     private static NativeInteropSnapshotReplacement Compile(
@@ -149,7 +212,7 @@ internal sealed class NativeInteropSnapshotPublisher
         {
             cancellationToken.ThrowIfCancellationRequested();
             var file = ResolveOwner(files, export.Evidence.Location.FilePath);
-            file.Add(
+            file.AddAnnotatedSymbol(
                 ExportSymbol(export),
                 new FileAnnotationFact(
                     export.SymbolCanonicalKey,
@@ -166,7 +229,7 @@ internal sealed class NativeInteropSnapshotPublisher
         {
             cancellationToken.ThrowIfCancellationRequested();
             var file = ResolveOwner(files, record.Evidence.Location.FilePath);
-            file.Add(
+            file.AddAnnotatedSymbol(
                 RecordSymbol(record),
                 new FileAnnotationFact(
                     record.SymbolCanonicalKey,
@@ -175,6 +238,48 @@ internal sealed class NativeInteropSnapshotPublisher
                     InteropAnnotationFlavors.AbiRecord,
                     InteropFactPayloadCodec.EncodeAbiRecord(record),
                     AttributeCanonicalKey: null));
+        }
+        foreach (var function in snapshot.Functions
+                     .OrderBy(
+                         function => function.SymbolCanonicalKey,
+                         StringComparer.Ordinal))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var file = ResolveOwner(
+                files,
+                function.Evidence.Location.FilePath);
+            file.AddSymbol(FunctionSymbol(function));
+        }
+        foreach (var call in snapshot.Calls
+                     .OrderBy(
+                         call => call.CallerSymbolCanonicalKey,
+                         StringComparer.Ordinal)
+                     .ThenBy(
+                         call => call.CalleeSymbolCanonicalKey,
+                         StringComparer.Ordinal)
+                     .ThenBy(
+                         call => call.Evidence.Location.FilePath,
+                         PathComparer)
+                     .ThenBy(call => call.Evidence.Location.StartLine)
+                     .ThenBy(call => call.Evidence.Location.StartColumn))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (string.IsNullOrWhiteSpace(call.CalleeSymbolCanonicalKey))
+            {
+                throw new InvalidOperationException(
+                    "A published native call has no exact definition endpoint.");
+            }
+            var file = ResolveOwner(files, call.Evidence.Location.FilePath);
+            file.AddEdge(new FileEdgeFact(
+                call.CallerSymbolCanonicalKey,
+                call.CalleeSymbolCanonicalKey,
+                EdgeKinds.Calls,
+                call.Evidence.Metadata,
+                new FileEvidenceFact(
+                    call.Evidence.Location,
+                    call.Evidence.Confidence,
+                    call.Evidence.Producer,
+                    call.Evidence.Metadata)));
         }
 
         var indexedAt = DateTimeOffset.UtcNow;
@@ -250,6 +355,32 @@ internal sealed class NativeInteropSnapshotPublisher
             XmlSummary: null);
     }
 
+    private static FileSymbolFact FunctionSymbol(NativeFunctionFact function)
+    {
+        var location = function.Evidence.Location;
+        var parameters = string.Join(
+            ", ",
+            function.Parameters
+                .OrderBy(parameter => parameter.Position)
+                .Select(parameter =>
+                    $"{parameter.Type.CanonicalName} {parameter.Name}"));
+        return new FileSymbolFact(
+            function.SymbolCanonicalKey,
+            function.Name,
+            function.QualifiedName,
+            function.IsMethod ? SymbolKinds.Method : SymbolKinds.Function,
+            location.StartLine,
+            location.StartColumn,
+            location.EndLine,
+            location.EndColumn,
+            $"{function.ReturnType.CanonicalName} "
+                + $"{function.QualifiedName}({parameters})",
+            ContainerCanonicalKey: null,
+            Modifiers: function.HasCLinkage ? "extern-c" : null,
+            Accessibility: 0,
+            XmlSummary: null);
+    }
+
     private static string NativeName(string canonicalKey)
     {
         var separator = canonicalKey.LastIndexOf(
@@ -307,6 +438,7 @@ internal sealed class NativeInteropSnapshotPublisher
     {
         private readonly List<FileSymbolFact> _symbols = [];
         private readonly List<FileAnnotationFact> _annotations = [];
+        private readonly List<FileEdgeFact> _edges = [];
         private readonly HashSet<string> _keys = new(StringComparer.Ordinal);
 
         public MutableNativeFile(string path, byte[] contentSha256)
@@ -318,9 +450,15 @@ internal sealed class NativeInteropSnapshotPublisher
         public string Path { get; }
         public byte[] ContentSha256 { get; }
 
-        public void Add(
+        public void AddAnnotatedSymbol(
             FileSymbolFact symbol,
             FileAnnotationFact annotation)
+        {
+            AddSymbol(symbol);
+            _annotations.Add(annotation);
+        }
+
+        public void AddSymbol(FileSymbolFact symbol)
         {
             if (!_keys.Add(symbol.CanonicalKey))
             {
@@ -328,8 +466,9 @@ internal sealed class NativeInteropSnapshotPublisher
                     $"Native snapshot key `{symbol.CanonicalKey}` is duplicated.");
             }
             _symbols.Add(symbol);
-            _annotations.Add(annotation);
         }
+
+        public void AddEdge(FileEdgeFact edge) => _edges.Add(edge);
 
         public NativeInteropFileFacts ToFacts(DateTimeOffset indexedAt) =>
             new(
@@ -348,6 +487,20 @@ internal sealed class NativeInteropSnapshotPublisher
                     .ThenBy(
                         annotation => annotation.Flavor,
                         StringComparer.Ordinal)
-                    .ToArray());
+                    .ToArray())
+            {
+                Edges = _edges
+                    .OrderBy(
+                        edge => edge.SourceCanonicalKey,
+                        StringComparer.Ordinal)
+                    .ThenBy(
+                        edge => edge.TargetCanonicalKey,
+                        StringComparer.Ordinal)
+                    .ThenBy(
+                        edge => edge.Evidence?.Location.StartLine ?? 0)
+                    .ThenBy(
+                        edge => edge.Evidence?.Location.StartColumn ?? 0)
+                    .ToArray(),
+            };
     }
 }

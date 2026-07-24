@@ -70,7 +70,13 @@ public sealed partial class SqliteGraphStore
                     FROM native_stale_cleanup_keys requested
                     JOIN symbols symbol
                       ON symbol.canonical_key = requested.canonical_key
-                    WHERE symbol.kind_name = requested.expected_kind
+                    WHERE (
+                            symbol.kind_name = requested.expected_kind
+                            OR (
+                                requested.expected_kind = @NativeFunctionKind
+                                AND symbol.kind_name IN @FunctionKinds
+                            )
+                          )
                       AND NOT EXISTS (
                           SELECT 1
                           FROM annotations annotation
@@ -115,6 +121,15 @@ public sealed partial class SqliteGraphStore
                           WHERE child.container_id = symbol.id
                       );
                     """,
+                    new
+                    {
+                        NativeFunctionKind = "native-function",
+                        FunctionKinds = new[]
+                        {
+                            SymbolKinds.Function,
+                            SymbolKinds.Method,
+                        },
+                    },
                     transaction: tx,
                     cancellationToken: ct))
                 .ConfigureAwait(false);
@@ -282,10 +297,20 @@ public sealed partial class SqliteGraphStore
             expectedKind = SymbolKinds.Struct;
             pathStart = 6;
         }
+        else if (key.StartsWith("c:F:", StringComparison.Ordinal))
+        {
+            expectedKind = "native-function";
+            pathStart = 4;
+        }
+        else if (key.StartsWith("cpp:F:", StringComparison.Ordinal))
+        {
+            expectedKind = "native-function";
+            pathStart = 6;
+        }
         else
         {
             throw new ArgumentException(
-                "Stale native-symbol cleanup accepts only c/cpp export or type keys.",
+                "Stale native-symbol cleanup accepts only c/cpp export, type, or function keys.",
                 nameof(source));
         }
 

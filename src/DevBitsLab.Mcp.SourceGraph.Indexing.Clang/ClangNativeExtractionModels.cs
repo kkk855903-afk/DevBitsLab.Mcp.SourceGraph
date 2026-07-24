@@ -35,6 +35,39 @@ public sealed record NativeFunctionFact(
     bool HasCLinkage,
     bool IsExported,
     bool IsDefinition,
+    Evidence Evidence)
+{
+    /// <summary>
+    /// Clang's declaration identity. Unlike a spelling, the USR binds an out-of-line definition
+    /// to the declaration referenced by a call in another translation unit.
+    /// </summary>
+    public string DeclarationUsr { get; init; } = string.Empty;
+
+    /// <summary>
+    /// Graph endpoint used by direct calls. Exported C definitions use their <c>c:E:</c> key so
+    /// a managed P/Invoke edge can continue through the native call graph; all other definitions
+    /// use <see cref="SymbolCanonicalKey"/>.
+    /// </summary>
+    public string GraphCanonicalKey { get; init; } = SymbolCanonicalKey;
+
+    /// <summary>Whether this declaration is a C++ member function rather than a free function.</summary>
+    public bool IsMethod { get; init; }
+
+    /// <summary>The ABI target under which Clang parsed this declaration.</summary>
+    public InteropTarget? Target { get; init; }
+}
+
+/// <summary>
+/// One source-backed direct call. <see cref="ReferencedDeclarationUsr"/> is always the exact
+/// declaration referenced by Clang. <see cref="CalleeSymbolCanonicalKey"/> remains null when the
+/// definition is in another translation unit and is resolved only by the content-bound snapshot
+/// aggregator; indirect and unresolved calls are never represented by this record.
+/// </summary>
+public sealed record NativeCallFact(
+    string CallerSymbolCanonicalKey,
+    string ReferencedDeclarationUsr,
+    string? CalleeSymbolCanonicalKey,
+    InteropTarget Target,
     Evidence Evidence);
 
 /// <summary>
@@ -79,6 +112,16 @@ public sealed record ClangNativeExtractionResult(
     IReadOnlyList<AbiRecordLayout> RecordLayouts,
     IReadOnlyList<ClangExtractionDiagnostic> Diagnostics)
 {
+    /// <summary>Direct, source-backed call occurrences discovered in this translation unit.</summary>
+    public IReadOnlyList<NativeCallFact> Calls { get; init; } =
+        Array.Empty<NativeCallFact>();
+
+    /// <summary>
+    /// False when traversal encountered an indirect/unresolved call or exceeded a hard bound.
+    /// Consumers must retain their prior complete call projection in that case.
+    /// </summary>
+    public bool IsCallGraphComplete { get; init; } = true;
+
     /// <summary>
     /// Stable, deduplicated physical paths that own this translation unit's dependency graph.
     /// A successful extraction includes the translation-unit source file itself as well as every
