@@ -38,6 +38,48 @@ public sealed class ProducerEdgeEvidenceReplacementTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task ProducerEvidenceProbe_isExactAndBounded()
+    {
+        (await _store!.HasEdgeEvidenceByProducerAsync(Producer))
+            .Should().BeFalse();
+
+        var producingPath = Path.Join(_tempDir, "Managed.cs");
+        var targetPath = Path.Join(_tempDir, "native.h");
+        var producingFileId = await SeedFileAsync(producingPath);
+        var targetFileId = await SeedFileAsync(targetPath);
+        var sourceId = await SeedSymbolAsync(
+            producingFileId,
+            "csharp:M:NativeMethods.Probe",
+            "Probe");
+        var targetId = await SeedSymbolAsync(
+            targetFileId,
+            "native:function:probe",
+            "probe");
+        await _store.BulkInsertEdgesAsync(
+        [
+            EdgeWithEvidence(
+                sourceId,
+                targetId,
+                producingFileId,
+                producingPath,
+                line: 3,
+                Producer,
+                "owned"),
+        ]);
+
+        (await _store.HasEdgeEvidenceByProducerAsync(Producer))
+            .Should().BeTrue();
+        (await _store.HasEdgeEvidenceByProducerAsync("Interop-resolver"))
+            .Should().BeFalse("producer identity is exact and ordinal");
+
+        var blank = () => _store.HasEdgeEvidenceByProducerAsync(" ");
+        var excessive = () => _store.HasEdgeEvidenceByProducerAsync(
+            new string('p', 257));
+        await blank.Should().ThrowAsync<ArgumentException>();
+        await excessive.Should().ThrowAsync<ArgumentOutOfRangeException>();
+    }
+
+    [Fact]
     public async Task ReplaceProducerEdgeEvidence_unresolved_endpoint_rolls_back_old_result()
     {
         var producingPath = Path.Join(_tempDir, "Managed.cs");

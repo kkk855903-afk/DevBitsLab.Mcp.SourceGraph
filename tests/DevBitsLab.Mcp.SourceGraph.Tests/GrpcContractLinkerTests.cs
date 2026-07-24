@@ -225,6 +225,12 @@ public sealed class GrpcContractLinkerTests : IAsyncLifetime
                 _graph.RpcId,
                 EdgeKinds.ImplementsRpc))
             .Should().BeEmpty();
+        (await _store.ListEdgeEvidenceAsync(
+                _graph.RpcId,
+                _graph.ServerOverrideId,
+                EdgeKinds.RpcDispatchesTo))
+            .Should().BeEmpty(
+                "a complete replacement must clean the prior execution-direction dispatch");
     }
 
     [Fact]
@@ -239,6 +245,38 @@ public sealed class GrpcContractLinkerTests : IAsyncLifetime
         result.State.ServerLinks.Should().Be(0);
         result.State.Failures.Should().Contain(failure =>
             failure.Code == "grpc-contract-ambiguous");
+    }
+
+    [Fact]
+    public async Task First_incomplete_pass_does_not_claim_a_last_good_projection()
+    {
+        var result = await new GrpcContractLinker(_store!).RunAsync(
+            sourceUniverseComplete: false);
+
+        result.State.Status.Should().Be(GrpcLinkRuntimeStatus.Partial);
+        result.State.RetainedLastGood.Should().BeFalse();
+        result.State.Failures.Should().ContainSingle(failure =>
+            failure.Code == "grpc-input-incomplete");
+        (await _store!.HasEdgeEvidenceByProducerAsync(
+                GrpcContractLinker.Producer))
+            .Should().BeFalse();
+    }
+
+    [Fact]
+    public async Task First_malformed_contract_does_not_claim_a_last_good_projection()
+    {
+        await UpdateRpcPayloadAsync("""{"version":1,"kind":""");
+
+        var result = await new GrpcContractLinker(_store!).RunAsync(
+            sourceUniverseComplete: true);
+
+        result.State.Status.Should().Be(GrpcLinkRuntimeStatus.Partial);
+        result.State.RetainedLastGood.Should().BeFalse();
+        result.State.Failures.Should().Contain(failure =>
+            failure.Code == "grpc-payload-malformed");
+        (await _store!.HasEdgeEvidenceByProducerAsync(
+                GrpcContractLinker.Producer))
+            .Should().BeFalse();
     }
 
     [Theory]
@@ -285,7 +323,7 @@ public sealed class GrpcContractLinkerTests : IAsyncLifetime
             ]);
         }
 
-        var result = await linker.RunAsync(true);
+        var result = await new GrpcContractLinker(_store!).RunAsync(true);
 
         result.State.Status.Should().Be(GrpcLinkRuntimeStatus.Partial);
         result.State.RetainedLastGood.Should().BeTrue();
@@ -309,6 +347,11 @@ public sealed class GrpcContractLinkerTests : IAsyncLifetime
                 _graph.RpcId,
                 EdgeKinds.ImplementsRpc))
             .Should().HaveCount(2);
+        (await _store.ListEdgeEvidenceAsync(
+                _graph.RpcId,
+                _graph.ServerOverrideId,
+                EdgeKinds.RpcDispatchesTo))
+            .Should().HaveCount(2);
     }
 
     [Fact]
@@ -317,9 +360,12 @@ public sealed class GrpcContractLinkerTests : IAsyncLifetime
         var linker = new GrpcContractLinker(_store!);
         await linker.RunAsync(true);
 
-        var result = await linker.RunAsync(sourceUniverseComplete: false);
+        var result = await new GrpcContractLinker(_store!).RunAsync(
+            sourceUniverseComplete: false);
 
         result.State.Status.Should().Be(GrpcLinkRuntimeStatus.Partial);
+        result.State.RetainedLastGood.Should().BeTrue(
+            "a restarted linker must discover the persisted prior projection");
         result.State.Failures.Should().ContainSingle(failure =>
             failure.Code == "grpc-input-incomplete");
         (await _store!.ListEdgeEvidenceAsync(
@@ -327,6 +373,13 @@ public sealed class GrpcContractLinkerTests : IAsyncLifetime
                 _graph.RpcId,
                 EdgeKinds.GrpcCalls))
             .Should().HaveCount(2);
+        (await _store.ListEdgeEvidenceAsync(
+                _graph.RpcId,
+                _graph.ServerOverrideId,
+                EdgeKinds.RpcDispatchesTo))
+            .Should().HaveCount(
+                2,
+                "an incomplete pass must retain execution-direction dispatch evidence");
     }
 
     [Fact]
@@ -370,6 +423,13 @@ public sealed class GrpcContractLinkerTests : IAsyncLifetime
             EdgeKinds.GrpcCalls);
         evidence.Should().ContainSingle();
         evidence[0].Producer.Should().Be("independent-grpc-analyzer");
+        (await _store.ListEdgeEvidenceAsync(
+                _graph.RpcId,
+                _graph.ServerOverrideId,
+                EdgeKinds.RpcDispatchesTo))
+            .Should().HaveCount(
+                2,
+                "the independently valid server dispatch is republished by the complete rebuild");
     }
 
     [Fact]

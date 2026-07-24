@@ -2294,6 +2294,37 @@ public sealed partial class SqliteGraphStore : IGraphStore
             .ToList();
     }
 
+    public async Task<bool> HasEdgeEvidenceByProducerAsync(
+        string producer,
+        CancellationToken ct = default)
+    {
+        const int maximumProducerCharacters = 256;
+
+        ArgumentException.ThrowIfNullOrWhiteSpace(producer);
+        if (producer.Length > maximumProducerCharacters)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(producer),
+                producer.Length,
+                $"Evidence producer cannot exceed {maximumProducerCharacters} characters.");
+        }
+
+        const string sql = """
+            SELECT EXISTS (
+                SELECT 1
+                FROM edge_evidence
+                WHERE producer = @producer
+                LIMIT 1
+            );
+            """;
+        var exists = await _connection.ExecuteScalarAsync<long>(
+            new CommandDefinition(
+                sql,
+                new { producer },
+                cancellationToken: ct)).ConfigureAwait(false);
+        return exists != 0;
+    }
+
     private static string? SerializeMetadata(IReadOnlyDictionary<string, string>? metadata)
     {
         if (metadata is null || metadata.Count == 0) return null;

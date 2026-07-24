@@ -68,8 +68,12 @@ public sealed class GrpcContractLinker
         {
             failures.Add(
                 "grpc-input-incomplete",
-                "The managed/protobuf indexing pass was incomplete; the prior gRPC projection was retained.");
-            return Partial(failures, protoContracts: 0);
+                "The managed/protobuf indexing pass was incomplete; persisted gRPC projection evidence was left unchanged.");
+            return await PartialAsync(
+                    failures,
+                    protoContracts: 0,
+                    ct)
+                .ConfigureAwait(false);
         }
 
         try
@@ -77,7 +81,11 @@ public sealed class GrpcContractLinker
             var snapshot = await ReadSnapshotAsync(failures, ct).ConfigureAwait(false);
             if (snapshot is null)
             {
-                return Partial(failures, protoContracts: 0);
+                return await PartialAsync(
+                        failures,
+                        protoContracts: 0,
+                        ct)
+                    .ConfigureAwait(false);
             }
 
             var candidate = await BuildCandidateAsync(
@@ -87,7 +95,11 @@ public sealed class GrpcContractLinker
                 .ConfigureAwait(false);
             if (candidate is null)
             {
-                return Partial(failures, snapshot.Rpcs.Count);
+                return await PartialAsync(
+                        failures,
+                        snapshot.Rpcs.Count,
+                        ct)
+                    .ConfigureAwait(false);
             }
 
             await EnsureBaselinesAsync(snapshot.Facts, ct)
@@ -114,7 +126,11 @@ public sealed class GrpcContractLinker
             failures.Add(
                 "grpc-projection-failed",
                 $"The gRPC projection could not be rebuilt: {ex.Message}");
-            return Partial(failures, protoContracts: 0);
+            return await PartialAsync(
+                    failures,
+                    protoContracts: 0,
+                    ct)
+                .ConfigureAwait(false);
         }
     }
 
@@ -1343,19 +1359,41 @@ public sealed class GrpcContractLinker
             ? StringComparer.OrdinalIgnoreCase
             : StringComparer.Ordinal;
 
-    private static GrpcLinkProjectionResult Partial(
+    private async Task<GrpcLinkProjectionResult> PartialAsync(
         FailureCollector failures,
-        int protoContracts) =>
-        new(
+        int protoContracts,
+        CancellationToken ct)
+    {
+        var retainedLastGood = false;
+        try
+        {
+            retainedLastGood = await _store.HasEdgeEvidenceByProducerAsync(
+                    Producer,
+                    ct)
+                .ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            failures.Add(
+                "grpc-last-good-probe-failed",
+                $"Persisted gRPC projection evidence could not be checked: {ex.Message}");
+        }
+
+        return new GrpcLinkProjectionResult(
             new GrpcLinkRuntimeState(
                 GrpcLinkRuntimeStatus.Partial,
                 protoContracts,
                 ClientLinks: 0,
                 ServerLinks: 0,
-                RetainedLastGood: true,
+                RetainedLastGood: retainedLastGood,
                 failures.TotalCount,
                 failures.OmittedCount,
                 failures.Items));
+    }
 
     private sealed record Snapshot(
         IReadOnlyList<SymbolKeyRow> SymbolKeys,

@@ -262,6 +262,17 @@ public interface IGraphStore : IAsyncDisposable
             "This graph-store implementation predates occurrence-level edge evidence.");
 
     /// <summary>
+    /// Returns whether at least one persisted edge-evidence occurrence is owned by the exact
+    /// <paramref name="producer"/>. The concrete store validates the bounded producer identity
+    /// and uses an existence probe; no evidence payloads are materialized.
+    /// </summary>
+    Task<bool> HasEdgeEvidenceByProducerAsync(
+        string producer,
+        CancellationToken ct = default) =>
+        throw new NotSupportedException(
+            "This graph-store implementation cannot probe edge evidence by producer.");
+
+    /// <summary>
     /// Bulk-insert the annotations attached to a set of symbols. Run after the symbols
     /// themselves are upserted, so <c>symbol_id</c> already resolves to a stable row.
     /// <see cref="AnnotationRecord.Flavor"/> discriminates annotation patterns across languages.

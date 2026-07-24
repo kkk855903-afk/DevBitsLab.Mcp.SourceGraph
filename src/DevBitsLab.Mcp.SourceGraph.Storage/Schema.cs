@@ -134,6 +134,8 @@ public static class Schema
             ON edge_evidence(src, dst, kind_name);
         CREATE INDEX IF NOT EXISTS idx_edge_evidence_file
             ON edge_evidence(producing_file_id);
+        CREATE INDEX IF NOT EXISTS idx_edge_evidence_producer
+            ON edge_evidence(producer);
 
         CREATE TABLE IF NOT EXISTS annotations (
             id INTEGER PRIMARY KEY,
