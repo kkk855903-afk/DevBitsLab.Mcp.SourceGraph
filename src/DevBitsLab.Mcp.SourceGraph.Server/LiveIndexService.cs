@@ -1555,6 +1555,49 @@ public sealed class LiveIndexService : BackgroundService
         bool sourceUniverseComplete,
         CancellationToken ct)
     {
+        var prior = host.GrpcLinkState;
+        var retainedLastGood = prior is
+            {
+                Status: GrpcLinkRuntimeStatus.Complete,
+            } || (prior?.RetainedLastGood ?? false);
+        if (!retainedLastGood)
+        {
+            try
+            {
+                retainedLastGood =
+                    await host.Store.HasEdgeEvidenceByProducerAsync(
+                            GrpcContractLinker.Producer,
+                            ct)
+                        .ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(
+                    ex,
+                    "Scope `{Id}` could not probe prior gRPC evidence before refresh",
+                    host.Scope.Id);
+            }
+        }
+        host.GrpcLinkState = new GrpcLinkRuntimeState(
+            GrpcLinkRuntimeStatus.Partial,
+            prior?.ProtoContracts ?? 0,
+            prior?.ClientLinks ?? 0,
+            prior?.ServerLinks ?? 0,
+            retainedLastGood,
+            FailureCount: 1,
+            OmittedFailures: 0,
+            Failures:
+            [
+                new GrpcLinkFailure(
+                    "grpc-projection-refreshing",
+                    "The gRPC projection is being refreshed; absence conclusions are temporarily unavailable.",
+                    SymbolCanonicalKey: null),
+            ]);
+
         var result = await new GrpcContractLinker(host.Store)
             .RunAsync(sourceUniverseComplete, ct)
             .ConfigureAwait(false);
