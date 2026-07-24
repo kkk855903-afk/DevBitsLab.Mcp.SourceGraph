@@ -14,7 +14,9 @@ public sealed record NativeInteropFileFacts(
 
 /// <summary>
 /// Complete native declaration projection replaced in one database transaction. An empty file
-/// list is a valid zero-fact snapshot and clears the selected annotation flavors.
+/// list is a valid zero-fact snapshot and clears the selected annotation flavors only from
+/// lower-case <c>c:</c>/<c>cpp:</c> owners; managed ABI-record annotations are not part of this
+/// projection.
 /// </summary>
 public sealed record NativeInteropSnapshotReplacement(
     IReadOnlyCollection<string> AnnotationFlavors,

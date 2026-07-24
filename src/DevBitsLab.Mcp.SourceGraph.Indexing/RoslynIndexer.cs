@@ -52,6 +52,10 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
     private const string ManagedInteropAnnotationName = "ManagedImportV1";
     private const string ManagedInteropAnnotationFullName =
         "MedInterop.ManagedImport.v1";
+    private const string ManagedAbiRecordAnnotationName = "InteropFact";
+    private const string ManagedAbiRecordAnnotationFullName =
+        "MedInterop.AbiRecord";
+    private const int MaximumManagedAbiRecordsPerFile = 4096;
     /// <inheritdoc />
     IReadOnlyCollection<string> ILanguageIndexer.FileExtensions => _fileExtensions;
 
@@ -646,36 +650,63 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         CancellationToken ct)
     {
         const int pageSize = 1000;
-        var paths = new HashSet<string>(_pathComparer);
-        long afterId = 0;
-        while (true)
+        var flavorsByPath = new Dictionary<string, HashSet<string>>(
+            _pathComparer);
+        foreach (var flavor in new[]
+                 {
+                     InteropAnnotationFlavors.ManagedImport,
+                     InteropAnnotationFlavors.AbiRecord,
+                 })
         {
-            ct.ThrowIfCancellationRequested();
-            var page = await _store.ListAnnotationsByFlavorAsync(
-                    InteropAnnotationFlavors.ManagedImport,
-                    afterId,
-                    pageSize,
-                    ct)
-                .ConfigureAwait(false);
-            foreach (var row in page)
+            long afterId = 0;
+            while (true)
             {
-                paths.Add(row.FilePath);
+                ct.ThrowIfCancellationRequested();
+                var page = await _store.ListAnnotationsByFlavorAsync(
+                        flavor,
+                        afterId,
+                        pageSize,
+                        ct)
+                    .ConfigureAwait(false);
+                foreach (var row in page)
+                {
+                    if (!row.SymbolCanonicalKey.StartsWith(
+                            SymbolMapping.CanonicalKeyScheme,
+                            StringComparison.Ordinal))
+                    {
+                        continue;
+                    }
+                    if (!flavorsByPath.TryGetValue(
+                            row.FilePath,
+                            out var fileFlavors))
+                    {
+                        fileFlavors = new HashSet<string>(
+                            StringComparer.Ordinal);
+                        flavorsByPath.Add(row.FilePath, fileFlavors);
+                    }
+                    fileFlavors.Add(flavor);
+                }
+                if (page.Count < pageSize) break;
+                afterId = page[^1].AnnotationId;
             }
-            if (page.Count < pageSize) break;
-            afterId = page[^1].AnnotationId;
         }
 
-        foreach (var path in paths.OrderBy(
-                     value => value,
-                     _pathComparer))
+        foreach (var pair in flavorsByPath
+                     .OrderBy(item => item.Key, _pathComparer)
+                     .ThenBy(item => item.Key, StringComparer.Ordinal))
         {
-            ct.ThrowIfCancellationRequested();
-            await _store.ReplaceAnnotationsForFileByFlavorAsync(
-                    path,
-                    InteropAnnotationFlavors.ManagedImport,
-                    [],
-                    ct)
-                .ConfigureAwait(false);
+            foreach (var flavor in pair.Value.OrderBy(
+                         value => value,
+                         StringComparer.Ordinal))
+            {
+                ct.ThrowIfCancellationRequested();
+                await _store.ReplaceAnnotationsForFileByFlavorAsync(
+                        pair.Key,
+                        flavor,
+                        [],
+                        ct)
+                    .ConfigureAwait(false);
+            }
         }
     }
 
@@ -1741,6 +1772,11 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
             var pendingAttrs = new List<PendingAnnotation>();
             var interopPayloadByKey =
                 new Dictionary<string, string>(StringComparer.Ordinal);
+            // A null value is a real per-TFM observation: the declaration exists but has no
+            // publishable layout (for example LayoutKind.Auto). Retaining it lets a later TFM
+            // with a payload conflict fail closed instead of silently winning.
+            var abiRecordPayloadByKey =
+                new Dictionary<string, string?>(StringComparer.Ordinal);
             var attrSeen = new HashSet<string>(StringComparer.Ordinal);
             var path = changedFileMeta.TryGetValue(fileId, out var meta) ? meta.Path : "<unknown>";
 
@@ -1800,6 +1836,45 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                                 interopPayloadByKey[import.SymbolCanonicalKey] =
                                     payload;
                             }
+                        }
+                        if (_interopTarget is not null
+                            && symbol is INamedTypeSymbol
+                            {
+                                TypeKind: TypeKind.Struct,
+                            } interopRecord)
+                        {
+                            var layout =
+                                ManagedRecordLayoutExtractor.TryExtract(
+                                    interopRecord,
+                                    _interopTarget,
+                                    fileId);
+                            var payload = layout is null
+                                ? null
+                                : InteropFactPayloadCodec.EncodeAbiRecord(
+                                    layout);
+                            if (abiRecordPayloadByKey.TryGetValue(
+                                    key,
+                                    out var previousPayload)
+                                && !string.Equals(
+                                    previousPayload,
+                                    payload,
+                                    StringComparison.Ordinal))
+                            {
+                                throw new InvalidOperationException(
+                                    "Managed ABI record "
+                                    + $"`{key}` has conflicting "
+                                    + "target-framework projections.");
+                            }
+                            if (!abiRecordPayloadByKey.ContainsKey(key)
+                                && abiRecordPayloadByKey.Count
+                                    >= MaximumManagedAbiRecordsPerFile)
+                            {
+                                throw new InvalidOperationException(
+                                    "Managed ABI record count exceeds the "
+                                    + $"{MaximumManagedAbiRecordsPerFile}-item "
+                                    + "per-file limit.");
+                            }
+                            abiRecordPayloadByKey[key] = payload;
                         }
 
                         if (!isFirstSymbolIteration) continue;
@@ -1872,7 +1947,7 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                 pendingAttrsByFile[fileId] = pendingAttrs;
                 if (_interopTarget is not null)
                 {
-                    pendingInteropByFile[fileId] = interopPayloadByKey
+                    var interopAnnotations = interopPayloadByKey
                         .OrderBy(pair => pair.Key, StringComparer.Ordinal)
                         .Select(pair => new FileAnnotationFact(
                             pair.Key,
@@ -1882,6 +1957,17 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                             pair.Value,
                             AttributeCanonicalKey: null))
                         .ToList();
+                    interopAnnotations.AddRange(abiRecordPayloadByKey
+                        .Where(pair => pair.Value is not null)
+                        .OrderBy(pair => pair.Key, StringComparer.Ordinal)
+                        .Select(pair => new FileAnnotationFact(
+                            pair.Key,
+                            ManagedAbiRecordAnnotationName,
+                            ManagedAbiRecordAnnotationFullName,
+                            InteropAnnotationFlavors.AbiRecord,
+                            pair.Value,
+                            AttributeCanonicalKey: null)));
+                    pendingInteropByFile[fileId] = interopAnnotations;
                 }
                 seenSymbolForAttr[fileId] = attrSeen;
                 walkedFileIds.Add(fileId);

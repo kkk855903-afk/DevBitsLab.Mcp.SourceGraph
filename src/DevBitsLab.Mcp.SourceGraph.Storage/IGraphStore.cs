@@ -91,10 +91,11 @@ public interface IGraphStore : IAsyncDisposable
             "This graph-store implementation predates atomic file-facts replacement.");
 
     /// <summary>
-    /// Atomically replaces all annotations in the selected native interop flavors and upserts
-    /// their physical-file declarations. Existing non-interop facts in those files are
-    /// preserved. Prior native symbols are deliberately retained until the caller has
-    /// successfully refreshed every managed boundary, so last-good interop edges remain
+    /// Atomically replaces all annotations owned by lower-case <c>c:</c>/<c>cpp:</c>
+    /// declarations in the selected native interop flavors and upserts their physical-file
+    /// declarations. Managed <c>csharp:</c> ABI-record annotations and existing non-interop
+    /// facts are preserved. Prior native symbols are deliberately retained until the caller
+    /// has successfully refreshed every managed boundary, so last-good interop edges remain
     /// resolvable if downstream analysis fails.
     /// </summary>
     Task<NativeInteropSnapshotReplacementResult>

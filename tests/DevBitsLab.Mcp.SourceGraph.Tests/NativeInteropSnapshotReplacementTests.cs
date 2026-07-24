@@ -126,6 +126,47 @@ public sealed class NativeInteropSnapshotReplacementTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task Native_snapshot_replacement_preserves_managed_abi_record()
+    {
+        var managed = await SeedManagedRecordAnnotationAsync(
+            "Managed.cs",
+            "csharp:T:Managed.Payload");
+        var oldNative = await SeedNativeAnnotationAsync(
+            "old.h",
+            "c:E:old.h::old");
+
+        var result = await _store!.ReplaceNativeInteropSnapshotAsync(
+            Replacement());
+
+        result.PriorCanonicalKeys.Should().Equal(oldNative.Key);
+        result.CurrentCanonicalKeys.Should().BeEmpty();
+        var records = await InteropFactStoreReader.ReadAbiRecordsAsync(_store);
+        records.IsComplete.Should().BeTrue();
+        records.Facts.Should().ContainSingle()
+            .Which.Fact.SymbolCanonicalKey.Should().Be(managed.Key);
+        (await _store.GetAnnotationsForSymbolAsync(managed.SymbolId))
+            .Should().ContainSingle()
+            .Which.Flavor.Should().Be(InteropAnnotationFlavors.AbiRecord);
+        (await InteropFactStoreReader.ReadNativeExportsAsync(_store))
+            .Facts.Should().BeEmpty();
+    }
+
+    [Fact]
+    public async Task Candidate_with_managed_canonical_key_is_rejected()
+    {
+        var record = RecordFact(
+            "csharp:T:Managed.Payload",
+            PathFor("Managed.cs"));
+        var candidate = NativeFile("Managed.cs", record);
+
+        var act = () => _store!.ReplaceNativeInteropSnapshotAsync(
+            Replacement(candidate));
+
+        await act.Should().ThrowAsync<ArgumentException>()
+            .WithMessage("*c: or cpp:*");
+    }
+
+    [Fact]
     public async Task Database_failure_after_cleanup_rolls_back_entire_snapshot()
     {
         var old = await SeedNativeAnnotationAsync(
@@ -236,6 +277,40 @@ public sealed class NativeInteropSnapshotReplacementTests : IAsyncLifetime
                             ProducingFileId = owner.FileId,
                         },
                     }),
+                AttributeSymbolId: null),
+        ]);
+        return owner;
+    }
+
+    private async Task<Owner> SeedManagedRecordAnnotationAsync(
+        string relativePath,
+        string canonicalKey)
+    {
+        var owner = await SeedOwnerAsync(
+            relativePath,
+            canonicalKey,
+            "Payload",
+            "struct");
+        var fact = new AbiRecordLayout(
+            canonicalKey,
+            AbiRecordKind.Sequential,
+            SizeBytes: 4,
+            AlignmentBytes: 4,
+            Pack: 8,
+            Fields: [],
+            Target,
+            Evidence(owner.Path) with
+            {
+                ProducingFileId = owner.FileId,
+            });
+        await _store!.BulkInsertAnnotationsAsync(
+        [
+            new AnnotationRecord(
+                owner.SymbolId,
+                "InteropFact",
+                "MedInterop.AbiRecord",
+                InteropAnnotationFlavors.AbiRecord,
+                InteropFactPayloadCodec.EncodeAbiRecord(fact),
                 AttributeSymbolId: null),
         ]);
         return owner;

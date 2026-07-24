@@ -88,6 +88,10 @@ public sealed partial class SqliteGraphStore
                         FROM annotations annotation
                         JOIN symbols symbol ON symbol.id = annotation.symbol_id
                         WHERE annotation.flavor IN @Flavors
+                          AND (
+                              symbol.canonical_key GLOB 'c:*'
+                              OR symbol.canonical_key GLOB 'cpp:*'
+                          )
                         ORDER BY symbol.canonical_key;
                         """,
                         new { Flavors = flavors },
@@ -159,7 +163,13 @@ public sealed partial class SqliteGraphStore
             await _connection.ExecuteAsync(new CommandDefinition(
                     """
                     DELETE FROM annotations
-                    WHERE flavor IN @Flavors;
+                    WHERE flavor IN @Flavors
+                      AND symbol_id IN (
+                          SELECT id
+                          FROM symbols
+                          WHERE canonical_key GLOB 'c:*'
+                             OR canonical_key GLOB 'cpp:*'
+                      );
                     """,
                     new { Flavors = flavors },
                     transaction: tx,
@@ -350,6 +360,13 @@ public sealed partial class SqliteGraphStore
         IReadOnlyList<NativeInteropFileFacts> source)
     {
         CanonicalKeyValidator.Validate(symbol.CanonicalKey, nameof(source));
+        if (!IsNativeCanonicalKey(symbol.CanonicalKey))
+        {
+            throw new ArgumentException(
+                "Native interop declarations must use a lower-case c: or cpp: "
+                + "canonical-key scheme.",
+                nameof(source));
+        }
         ArgumentException.ThrowIfNullOrWhiteSpace(symbol.Name);
         ArgumentException.ThrowIfNullOrWhiteSpace(symbol.Fqn);
         KebabCaseValidator.Validate(symbol.Kind, nameof(source));
@@ -426,6 +443,10 @@ public sealed partial class SqliteGraphStore
         OperatingSystem.IsWindows()
             ? StringComparer.OrdinalIgnoreCase
             : StringComparer.Ordinal;
+
+    private static bool IsNativeCanonicalKey(string canonicalKey) =>
+        canonicalKey.StartsWith("c:", StringComparison.Ordinal)
+        || canonicalKey.StartsWith("cpp:", StringComparison.Ordinal);
 
     private sealed record ResolvedNativeInteropSymbol(
         long SymbolId,

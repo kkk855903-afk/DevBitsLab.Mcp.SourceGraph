@@ -201,6 +201,240 @@ public sealed class ManagedInteropProjectionIndexingTests
     }
 
     [Fact]
+    public async Task Cold_index_persists_target_complete_managed_record_and_rebuild_cleans_it()
+    {
+        var root = CreateTempRoot();
+        try
+        {
+            var (solutionPath, sourcePath) =
+                await WriteSingleProjectSolutionAsync(root);
+            await File.WriteAllTextAsync(sourcePath, RecordSource());
+            await using var store =
+                new SqliteGraphStore(Path.Join(root, "graph.db"));
+            await using var indexer = CreateIndexer(store, root);
+            await indexer.OpenAsync(solutionPath);
+
+            var cold = await indexer.IndexAllAsync();
+
+            cold.FailedFiles.Should().BeEmpty();
+            var row = (await ReadRecordsAsync(store))
+                .Should().ContainSingle().Subject;
+            row.SymbolCanonicalKey.Should().Be("csharp:T:Fixture.Packet");
+            var record = InteropFactPayloadCodec.DecodeAbiRecord(
+                row.ArgsJson!,
+                row.FileId);
+            record.SymbolCanonicalKey.Should().Be(row.SymbolCanonicalKey);
+            record.Kind.Should().Be(AbiRecordKind.Sequential);
+            record.Pack.Should().Be(1);
+            record.AlignmentBytes.Should().Be(1);
+            record.SizeBytes.Should().Be(15);
+            record.Fields.Select(field => field.Name).Should().Equal(
+                "Code",
+                "Enabled",
+                "Count",
+                "Values");
+            record.Fields.Select(field => field.OffsetBytes).Should().Equal(
+                0,
+                1,
+                5,
+                9);
+            record.Fields[1].Type.Category.Should().Be(
+                AbiTypeCategory.Boolean);
+            record.Fields[1].SizeBytes.Should().Be(4);
+            record.Fields[3].Type.FixedArrayLength.Should().Be(3);
+            record.Target.Should().BeEquivalentTo(
+                InteropTarget.WindowsX64Msvc);
+            record.Target.RuntimeIdentifier.Should().Be("win-x64");
+            record.Target.Architecture.Should().Be(
+                InteropArchitecture.X64);
+            record.Target.CompilerAbi.Should().Be(
+                InteropCompilerAbi.Msvc);
+            record.Target.PointerSizeBytes.Should().Be(8);
+            record.Target.DefaultPack.Should().Be(8);
+            record.Evidence.ProducingFileId.Should().Be(row.FileId);
+            record.Evidence.Location.FilePath.Should().Be(sourcePath);
+            record.Fields.Should().OnlyContain(field =>
+                field.Evidence.ProducingFileId == row.FileId
+                && field.Evidence.Location.FilePath == sourcePath);
+
+            await File.WriteAllTextAsync(
+                sourcePath,
+                """
+                using System.Runtime.InteropServices;
+
+                namespace Fixture;
+
+                [StructLayout(LayoutKind.Auto)]
+                internal struct Packet
+                {
+                    public int Value;
+                }
+                """);
+            var changed = await indexer.IndexChangedFilesAsync([sourcePath]);
+
+            changed.FailedFiles.Should().BeEmpty();
+            (await ReadRecordsAsync(store)).Should().BeEmpty(
+                "a successful no-layout rebuild replaces the prior managed projection");
+        }
+        finally
+        {
+            TryDeleteDirectory(root);
+        }
+    }
+
+    [Fact]
+    public async Task Deleted_file_cleans_managed_record_projection()
+    {
+        var root = CreateTempRoot();
+        try
+        {
+            var (solutionPath, sourcePath) =
+                await WriteSingleProjectSolutionAsync(root);
+            await File.WriteAllTextAsync(sourcePath, RecordSource());
+            await using var store =
+                new SqliteGraphStore(Path.Join(root, "graph.db"));
+            await using var indexer = CreateIndexer(store, root);
+            await indexer.OpenAsync(solutionPath);
+            (await indexer.IndexAllAsync()).FailedFiles.Should().BeEmpty();
+            (await ReadRecordsAsync(store)).Should().ContainSingle();
+
+            File.Delete(sourcePath);
+            var changed = await indexer.IndexChangedFilesAsync([sourcePath]);
+
+            changed.FailedFiles.Should().BeEmpty();
+            (await ReadRecordsAsync(store)).Should().BeEmpty();
+        }
+        finally
+        {
+            TryDeleteDirectory(root);
+        }
+    }
+
+    [Fact]
+    public async Task Conflicting_record_target_framework_projections_fail_closed()
+    {
+        var root = CreateTempRoot();
+        try
+        {
+            var (solutionPath, sourcePath) =
+                await WriteSingleProjectSolutionAsync(
+                    root,
+                    multiTarget: true);
+            await File.WriteAllTextAsync(sourcePath, RecordSource());
+            await using var store =
+                new SqliteGraphStore(Path.Join(root, "graph.db"));
+            await using var indexer = CreateIndexer(store, root);
+            await indexer.OpenAsync(solutionPath);
+            (await indexer.IndexAllAsync()).FailedFiles.Should().BeEmpty();
+            var oldPayload = (await ReadRecordsAsync(store))
+                .Should().ContainSingle().Subject.ArgsJson;
+
+            await File.WriteAllTextAsync(
+                sourcePath,
+                """
+                using System.Runtime.InteropServices;
+
+                namespace Fixture;
+
+                #if SECOND_TFM
+                [StructLayout(LayoutKind.Sequential, Pack = 1)]
+                #else
+                [StructLayout(LayoutKind.Sequential, Pack = 8)]
+                #endif
+                internal struct Packet
+                {
+                    public byte Code;
+                    public int Count;
+                }
+                """);
+
+            var changed = await indexer.IndexChangedFilesAsync([sourcePath]);
+
+            changed.FailedFiles.Should().ContainSingle(failure =>
+                failure.Path == sourcePath
+                && failure.Reason.Contains(
+                    "Managed ABI record",
+                    StringComparison.Ordinal)
+                && failure.Reason.Contains(
+                    "conflicting target-framework projections",
+                    StringComparison.Ordinal));
+            (await ReadRecordsAsync(store)).Should().ContainSingle()
+                .Which.ArgsJson.Should().Be(oldPayload);
+
+            await File.WriteAllTextAsync(
+                sourcePath,
+                """
+                using System.Runtime.InteropServices;
+
+                namespace Fixture;
+
+                #if SECOND_TFM
+                [StructLayout(LayoutKind.Auto)]
+                #else
+                [StructLayout(LayoutKind.Sequential, Pack = 8)]
+                #endif
+                internal struct Packet
+                {
+                    public int Count;
+                }
+                """);
+
+            var presenceConflict =
+                await indexer.IndexChangedFilesAsync([sourcePath]);
+
+            presenceConflict.FailedFiles.Should().ContainSingle(failure =>
+                failure.Path == sourcePath
+                && failure.Reason.Contains(
+                    "conflicting target-framework projections",
+                    StringComparison.Ordinal));
+            (await ReadRecordsAsync(store)).Should().ContainSingle()
+                .Which.ArgsJson.Should().Be(oldPayload);
+        }
+        finally
+        {
+            TryDeleteDirectory(root);
+        }
+    }
+
+    [Fact]
+    public async Task Disabling_target_clears_stale_record_projection_without_source_edit()
+    {
+        var root = CreateTempRoot();
+        try
+        {
+            var (solutionPath, sourcePath) =
+                await WriteSingleProjectSolutionAsync(root);
+            await File.WriteAllTextAsync(sourcePath, RecordSource());
+            await using var store =
+                new SqliteGraphStore(Path.Join(root, "graph.db"));
+
+            await using (var enabled = CreateIndexer(store, root))
+            {
+                await enabled.OpenAsync(solutionPath);
+                (await enabled.IndexAllAsync()).FailedFiles.Should().BeEmpty();
+            }
+            (await ReadRecordsAsync(store)).Should().ContainSingle();
+
+            await using (var disabled = new RoslynIndexer(
+                             store,
+                             logger: null,
+                             embeddingsSink: null,
+                             privacyRoot: root,
+                             excludePatterns: []))
+            {
+                await disabled.OpenAsync(solutionPath);
+                (await disabled.IndexAllAsync()).FailedFiles.Should().BeEmpty();
+            }
+
+            (await ReadRecordsAsync(store)).Should().BeEmpty();
+        }
+        finally
+        {
+            TryDeleteDirectory(root);
+        }
+    }
+
+    [Fact]
     public async Task Storage_failure_retains_prior_attribute_and_interop_projection()
     {
         var root = CreateTempRoot();
@@ -293,6 +527,16 @@ public sealed class ManagedInteropProjectionIndexingTests
             InteropAnnotationFlavors.ManagedImport);
 
     private static async Task<IReadOnlyList<StoredAnnotationRow>>
+        ReadRecordsAsync(IGraphStore store) =>
+        (await ReadFlavorAsync(
+                store,
+                InteropAnnotationFlavors.AbiRecord))
+            .Where(row => row.SymbolCanonicalKey.StartsWith(
+                SymbolMapping.CanonicalKeyScheme,
+                StringComparison.Ordinal))
+            .ToArray();
+
+    private static async Task<IReadOnlyList<StoredAnnotationRow>>
         ReadFlavorAsync(
             IGraphStore store,
             string flavor) =>
@@ -315,6 +559,30 @@ public sealed class ManagedInteropProjectionIndexingTests
                 CallingConvention = CallingConvention.Cdecl,
                 ExactSpelling = true)]
             internal static extern int Run(int value);
+        }
+        """;
+
+    private static string RecordSource() =>
+        """
+        using System.Runtime.InteropServices;
+
+        namespace Fixture;
+
+        [StructLayout(LayoutKind.Sequential, Pack = 1)]
+        internal struct Packet
+        {
+            public byte Code;
+
+            [MarshalAs(UnmanagedType.Bool)]
+            public bool Enabled;
+
+            public int Count;
+
+            [MarshalAs(
+                UnmanagedType.ByValArray,
+                SizeConst = 3,
+                ArraySubType = UnmanagedType.U2)]
+            public ushort[] Values;
         }
         """;
 
