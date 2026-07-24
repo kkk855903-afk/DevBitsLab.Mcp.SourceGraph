@@ -207,6 +207,32 @@ public sealed class NativeInteropStaleSymbolCleanupTests : IAsyncLifetime
         (await _store.GetSymbolByIdAsync(symbol.SymbolId)).Should().BeNull();
     }
 
+    [Theory]
+    [InlineData(
+        "cpp:T:native/types.hpp::Value",
+        SymbolKinds.Union)]
+    [InlineData(
+        "cpp:T:native/types.hpp::Status",
+        SymbolKinds.Enum)]
+    [InlineData(
+        "cpp:A:native/types.hpp::StatusCode",
+        SymbolKinds.TypeAlias)]
+    public async Task Deletes_proven_orphaned_native_type_symbols(
+        string canonicalKey,
+        string kind)
+    {
+        var symbol = await SeedSymbolAsync(
+            "native/types.hpp",
+            canonicalKey,
+            kind);
+
+        var result = await _store!.DeleteOrphanedNativeInteropSymbolsAsync(
+            [canonicalKey]);
+
+        result.DeletedCanonicalKeys.Should().Equal(canonicalKey);
+        (await _store.GetSymbolByIdAsync(symbol.SymbolId)).Should().BeNull();
+    }
+
     [Fact]
     public async Task Rejects_duplicate_keys_before_mutating_the_store()
     {

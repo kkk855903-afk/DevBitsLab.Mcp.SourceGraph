@@ -8,6 +8,9 @@ public sealed partial class SqliteGraphStore
 {
     private const int MaximumStaleNativeInteropSymbols = 100_000;
     private const int MaximumNativeInteropCanonicalKeyLength = 16_384;
+    private const string NativeFunctionStaleKind = "native-function";
+    private const string NativeTypeStaleKind = "native-type";
+    private const string NativeTypeAliasStaleKind = "native-type-alias";
 
     public async Task<NativeInteropStaleSymbolCleanupResult>
         DeleteOrphanedNativeInteropSymbolsAsync(
@@ -76,6 +79,14 @@ public sealed partial class SqliteGraphStore
                                 requested.expected_kind = @NativeFunctionKind
                                 AND symbol.kind_name IN @FunctionKinds
                             )
+                            OR (
+                                requested.expected_kind = @NativeTypeKind
+                                AND symbol.kind_name IN @TypeKinds
+                            )
+                            OR (
+                                requested.expected_kind = @NativeTypeAliasKind
+                                AND symbol.kind_name = @TypeAliasKind
+                            )
                           )
                       AND NOT EXISTS (
                           SELECT 1
@@ -123,11 +134,20 @@ public sealed partial class SqliteGraphStore
                     """,
                     new
                     {
-                        NativeFunctionKind = "native-function",
+                        NativeFunctionKind = NativeFunctionStaleKind,
+                        NativeTypeKind = NativeTypeStaleKind,
+                        NativeTypeAliasKind = NativeTypeAliasStaleKind,
+                        TypeAliasKind = SymbolKinds.TypeAlias,
                         FunctionKinds = new[]
                         {
                             SymbolKinds.Function,
                             SymbolKinds.Method,
+                        },
+                        TypeKinds = new[]
+                        {
+                            SymbolKinds.Struct,
+                            SymbolKinds.Union,
+                            SymbolKinds.Enum,
                         },
                     },
                     transaction: tx,
@@ -289,28 +309,39 @@ public sealed partial class SqliteGraphStore
         }
         else if (key.StartsWith("c:T:", StringComparison.Ordinal))
         {
-            expectedKind = SymbolKinds.Struct;
+            expectedKind = NativeTypeStaleKind;
             pathStart = 4;
         }
         else if (key.StartsWith("cpp:T:", StringComparison.Ordinal))
         {
-            expectedKind = SymbolKinds.Struct;
+            expectedKind = NativeTypeStaleKind;
+            pathStart = 6;
+        }
+        else if (key.StartsWith("c:A:", StringComparison.Ordinal))
+        {
+            expectedKind = NativeTypeAliasStaleKind;
+            pathStart = 4;
+        }
+        else if (key.StartsWith("cpp:A:", StringComparison.Ordinal))
+        {
+            expectedKind = NativeTypeAliasStaleKind;
             pathStart = 6;
         }
         else if (key.StartsWith("c:F:", StringComparison.Ordinal))
         {
-            expectedKind = "native-function";
+            expectedKind = NativeFunctionStaleKind;
             pathStart = 4;
         }
         else if (key.StartsWith("cpp:F:", StringComparison.Ordinal))
         {
-            expectedKind = "native-function";
+            expectedKind = NativeFunctionStaleKind;
             pathStart = 6;
         }
         else
         {
             throw new ArgumentException(
-                "Stale native-symbol cleanup accepts only c/cpp export, type, or function keys.",
+                "Stale native-symbol cleanup accepts only c/cpp export, type, "
+                + "type-alias, or function keys.",
                 nameof(source));
         }
 

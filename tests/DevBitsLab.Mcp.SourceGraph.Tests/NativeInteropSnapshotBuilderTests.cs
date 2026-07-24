@@ -183,6 +183,181 @@ public sealed class NativeInteropSnapshotBuilderTests : IDisposable
     }
 
     [Fact]
+    public async Task Complete_snapshot_carries_content_bound_native_types()
+    {
+        Write("native/types.hpp");
+        var builder = new NativeInteropSnapshotBuilder(
+            (request, _) => Task.FromResult(Extraction(
+                request,
+                types:
+                [
+                    Type(
+                        request,
+                        "cpp:T:native/types.hpp::Payload",
+                        NativeTypeDeclarationKind.Struct,
+                        "Payload"),
+                    Type(
+                        request,
+                        "cpp:T:native/types.hpp::Value",
+                        NativeTypeDeclarationKind.Union,
+                        "Value"),
+                    Type(
+                        request,
+                        "cpp:T:native/types.hpp::Status",
+                        NativeTypeDeclarationKind.Enum,
+                        "Status"),
+                    Type(
+                        request,
+                        "cpp:A:native/types.hpp::PayloadHandle",
+                        NativeTypeDeclarationKind.Typedef,
+                        "PayloadHandle"),
+                ])));
+
+        var snapshot = await builder.BuildAsync(
+            _root,
+            Config(new InteropTranslationUnitConfig(
+                "native/types.hpp",
+                "native.dll",
+                ["-x", "c++"],
+                BinaryPath: null)),
+            new ScopePathPolicy(_root),
+            CancellationToken.None);
+
+        snapshot.IsComplete.Should().BeTrue();
+        snapshot.Types.Select(type => type.Kind).Should().Equal(
+            NativeTypeDeclarationKind.Typedef,
+            NativeTypeDeclarationKind.Struct,
+            NativeTypeDeclarationKind.Enum,
+            NativeTypeDeclarationKind.Union);
+        snapshot.Contributions.Should().ContainSingle()
+            .Which.Types.Should().HaveCount(4);
+        snapshot.Types.Should().OnlyContain(type =>
+            type.Evidence.Confidence == EvidenceConfidence.Exact
+            && type.Evidence.Producer == "clang-native"
+            && type.Evidence.Location.FilePath
+                == Path.GetFullPath(Path.Join(_root, "native/types.hpp")));
+    }
+
+    [Fact]
+    public async Task Changed_native_type_between_double_parse_is_rejected()
+    {
+        Write("native/types.hpp");
+        var extractionCount = 0;
+        var builder = new NativeInteropSnapshotBuilder(
+            (request, _) =>
+            {
+                extractionCount++;
+                var type = Type(
+                    request,
+                    "cpp:T:native/types.hpp::Payload",
+                    NativeTypeDeclarationKind.Struct,
+                    "Payload") with
+                {
+                    DeclaredType = new AbiTypeRef(
+                        "Payload",
+                        AbiTypeCategory.Record,
+                        sizeBytes: extractionCount == 1 ? 4 : 8,
+                        alignmentBytes: 4),
+                };
+                return Task.FromResult(Extraction(
+                    request,
+                    types: [type]));
+            });
+
+        var snapshot = await builder.BuildAsync(
+            _root,
+            Config(new InteropTranslationUnitConfig(
+                "native/types.hpp",
+                "native.dll",
+                ["-x", "c++"],
+                BinaryPath: null)),
+            new ScopePathPolicy(_root),
+            CancellationToken.None);
+
+        snapshot.IsComplete.Should().BeFalse();
+        snapshot.Types.Should().BeEmpty();
+        snapshot.Failures.Should().ContainSingle(failure =>
+            failure.Kind == NativeInteropSnapshotFailureKind.FactSetChanged);
+    }
+
+    [Fact]
+    public async Task Identical_native_type_declarations_are_deduplicated()
+    {
+        Write("native/types.hpp");
+        var builder = new NativeInteropSnapshotBuilder(
+            (request, _) =>
+            {
+                var type = Type(
+                    request,
+                    "cpp:T:native/types.hpp::Payload",
+                    NativeTypeDeclarationKind.Struct,
+                    "Payload");
+                return Task.FromResult(Extraction(
+                    request,
+                    types: [type, type]));
+            });
+
+        var snapshot = await builder.BuildAsync(
+            _root,
+            Config(new InteropTranslationUnitConfig(
+                "native/types.hpp",
+                "native.dll",
+                ["-x", "c++"],
+                BinaryPath: null)),
+            new ScopePathPolicy(_root),
+            CancellationToken.None);
+
+        snapshot.IsComplete.Should().BeTrue();
+        snapshot.Types.Should().ContainSingle()
+            .Which.SymbolCanonicalKey.Should().Be(
+                "cpp:T:native/types.hpp::Payload");
+    }
+
+    [Fact]
+    public async Task Conflicting_native_type_duplicates_are_rejected()
+    {
+        Write("native/types.hpp");
+        var builder = new NativeInteropSnapshotBuilder(
+            (request, _) =>
+            {
+                var type = Type(
+                    request,
+                    "cpp:T:native/types.hpp::Payload",
+                    NativeTypeDeclarationKind.Struct,
+                    "Payload");
+                return Task.FromResult(Extraction(
+                    request,
+                    types:
+                    [
+                        type,
+                        type with
+                        {
+                            DeclaredType = new AbiTypeRef(
+                                "Payload",
+                                AbiTypeCategory.Record,
+                                sizeBytes: 8,
+                                alignmentBytes: 4),
+                        },
+                    ]));
+            });
+
+        var snapshot = await builder.BuildAsync(
+            _root,
+            Config(new InteropTranslationUnitConfig(
+                "native/types.hpp",
+                "native.dll",
+                ["-x", "c++"],
+                BinaryPath: null)),
+            new ScopePathPolicy(_root),
+            CancellationToken.None);
+
+        snapshot.IsComplete.Should().BeFalse();
+        snapshot.Types.Should().BeEmpty();
+        snapshot.Failures.Should().ContainSingle(failure =>
+            failure.Kind == NativeInteropSnapshotFailureKind.TypeConflict);
+    }
+
+    [Fact]
     public async Task Decorated_binary_name_is_unsupported_partial_and_never_guessed()
     {
         Write("native/api.cpp");
@@ -1408,6 +1583,7 @@ public sealed class NativeInteropSnapshotBuilderTests : IDisposable
     [InlineData("included-files")]
     [InlineData("exports")]
     [InlineData("records")]
+    [InlineData("types")]
     [InlineData("diagnostics")]
     public async Task Top_level_extraction_collection_over_limit_is_rejected(
         string collectionKind)
@@ -1425,6 +1601,11 @@ public sealed class NativeInteropSnapshotBuilderTests : IDisposable
                     request,
                     "c:T:native/api.cpp::Payload",
                     TestEvidence(request, request.SourceFilePath));
+                var type = Type(
+                    request,
+                    "cpp:T:native/api.cpp::Payload",
+                    NativeTypeDeclarationKind.Struct,
+                    "Payload");
                 return Task.FromResult(collectionKind switch
                 {
                     "included-files" => Extraction(
@@ -1447,6 +1628,13 @@ public sealed class NativeInteropSnapshotBuilderTests : IDisposable
                                 record,
                                 NativeInteropSnapshotBuilder
                                     .MaximumRecordLayoutsPerTranslationUnit + 1)
+                            .ToArray()),
+                    "types" => Extraction(
+                        request,
+                        types: Enumerable.Repeat(
+                                type,
+                                NativeInteropSnapshotBuilder
+                                    .MaximumTypesPerTranslationUnit + 1)
                             .ToArray()),
                     "diagnostics" => Extraction(
                         request,
@@ -1951,10 +2139,11 @@ public sealed class NativeInteropSnapshotBuilderTests : IDisposable
         IReadOnlyList<string>? includedFiles = null,
         IReadOnlyList<NativeFunctionFact>? functions = null,
         IReadOnlyList<NativeCallFact>? calls = null,
-        bool callGraphComplete = true) =>
+        bool callGraphComplete = true,
+        IReadOnlyList<NativeTypeDeclarationFact>? types = null) =>
         new(
             functions ?? [],
-            [],
+            types ?? [],
             exports ?? [],
             records ?? [],
             diagnostics ?? [])
@@ -1963,6 +2152,49 @@ public sealed class NativeInteropSnapshotBuilderTests : IDisposable
             Calls = calls ?? [],
             IsCallGraphComplete = callGraphComplete,
         };
+
+    private static NativeTypeDeclarationFact Type(
+        ClangNativeExtractionRequest request,
+        string canonicalKey,
+        NativeTypeDeclarationKind kind,
+        string name,
+        bool isDefinition = true)
+    {
+        var declarationKind = kind switch
+        {
+            NativeTypeDeclarationKind.Struct => "record",
+            NativeTypeDeclarationKind.Union => "union",
+            NativeTypeDeclarationKind.Enum => "enum",
+            NativeTypeDeclarationKind.Typedef => "typedef",
+            _ => throw new InvalidOperationException(),
+        };
+        return new NativeTypeDeclarationFact(
+            canonicalKey,
+            kind,
+            name,
+            name,
+            new AbiTypeRef(
+                name,
+                kind == NativeTypeDeclarationKind.Enum
+                    ? AbiTypeCategory.Enum
+                    : kind == NativeTypeDeclarationKind.Typedef
+                        ? AbiTypeCategory.Opaque
+                        : AbiTypeCategory.Record,
+                sizeBytes: 4,
+                alignmentBytes: 4),
+            isDefinition,
+            new Evidence(
+                request.ProducingFileId,
+                TestLocation(request.SourceFilePath),
+                EvidenceConfidence.Exact,
+                "clang-native",
+                new Dictionary<string, string>(StringComparer.Ordinal)
+                {
+                    ["declarationKind"] = declarationKind,
+                    ["isDefinition"] = isDefinition ? "true" : "false",
+                    ["target"] = request.Target.RuntimeIdentifier,
+                }));
+    }
 
     private static NativeExport Export(
         ClangNativeExtractionRequest request,

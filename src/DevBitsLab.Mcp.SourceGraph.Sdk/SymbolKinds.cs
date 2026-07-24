@@ -14,6 +14,7 @@ public static class SymbolKinds
     public const string Class = "class";
     public const string Interface = "interface";
     public const string Struct = "struct";
+    public const string Union = "union";
     public const string Enum = "enum";
     public const string Delegate = "delegate";
     public const string Method = "method";

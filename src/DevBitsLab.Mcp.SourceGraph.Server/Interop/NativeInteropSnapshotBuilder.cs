@@ -33,6 +33,7 @@ internal enum NativeInteropSnapshotFailureKind
     InvalidFact,
     ExportConflict,
     RecordConflict,
+    TypeConflict,
     FunctionConflict,
     CallConflict,
     CallGraphIncomplete,
@@ -71,6 +72,7 @@ internal sealed record NativeInteropTranslationUnitContribution(
     bool IsComplete,
     IReadOnlyList<NativeInteropSnapshotFailure> Failures)
 {
+    public IReadOnlyList<NativeTypeDeclarationFact> Types { get; init; } = [];
     public IReadOnlyList<NativeFunctionFact> Functions { get; init; } = [];
     public IReadOnlyList<NativeCallFact> Calls { get; init; } = [];
 }
@@ -90,6 +92,7 @@ internal sealed record NativeInteropSnapshot(
     bool IsComplete,
     IReadOnlyList<NativeInteropSnapshotFailure> Failures)
 {
+    public IReadOnlyList<NativeTypeDeclarationFact> Types { get; init; } = [];
     public IReadOnlyList<NativeFunctionFact> Functions { get; init; } = [];
     public IReadOnlyList<NativeCallFact> Calls { get; init; } = [];
 }
@@ -117,6 +120,7 @@ internal sealed class NativeInteropSnapshotBuilder
     internal const int MaximumCompilerArguments = 4096;
     internal const int MaximumIncludedFilesPerTranslationUnit = 4096;
     internal const int MaximumDiagnosticsPerTranslationUnit = 4096;
+    internal const int MaximumTypesPerTranslationUnit = 4096;
     internal const int MaximumFunctionsPerTranslationUnit = 4096;
     internal const int MaximumCallsPerTranslationUnit = 8192;
     internal const int MaximumSymbolsPerSnapshot = 100_000;
@@ -262,6 +266,7 @@ internal sealed class NativeInteropSnapshotBuilder
             {
                 nextSymbolCount = checked(
                     symbolCount
+                    + contribution.Types.Count
                     + contribution.Functions.Count
                     + contribution.SourceExports.Count
                     + contribution.RecordLayouts.Count);
@@ -357,7 +362,8 @@ internal sealed class NativeInteropSnapshotBuilder
         NativeInteropTranslationUnitContribution contribution,
         CancellationToken cancellationToken)
     {
-        var count = contribution.Calls.Count;
+        var count = checked(
+            contribution.Types.Count + contribution.Calls.Count);
         for (var index = 0;
              index < contribution.Functions.Count;
              index++)
@@ -680,8 +686,43 @@ internal sealed class NativeInteropSnapshotBuilder
             includedFiles,
             _pathComparer);
         var diagnostics = reparse.Diagnostics;
+        NativeTypeDeclarationFact[] types = [];
         NativeFunctionFact[] functions = [];
         NativeCallFact[] calls = [];
+        var discoveryTypeProjectionValid = TryBuildTypeProjection(
+            discoveryAttempt.Extraction!,
+            includedFileSet,
+            pathPolicy,
+            target,
+            cancellationToken,
+            out var discoveryTypes,
+            out var discoveryTypeProjectionKind,
+            out var discoveryTypeProjectionMessage);
+        if (!discoveryTypeProjectionValid)
+        {
+            failures.Add(Failure(
+                discoveryTypeProjectionKind,
+                index,
+                translationUnit.Path,
+                discoveryTypeProjectionMessage));
+        }
+        var reparseTypeProjectionValid = TryBuildTypeProjection(
+            extraction,
+            includedFileSet,
+            pathPolicy,
+            target,
+            cancellationToken,
+            out types,
+            out var reparseTypeProjectionKind,
+            out var reparseTypeProjectionMessage);
+        if (!reparseTypeProjectionValid)
+        {
+            failures.Add(Failure(
+                reparseTypeProjectionKind,
+                index,
+                translationUnit.Path,
+                reparseTypeProjectionMessage));
+        }
         var discoveryProjectionValid = TryBuildCallProjection(
             discoveryAttempt.Extraction!,
             includedFileSet,
@@ -720,7 +761,10 @@ internal sealed class NativeInteropSnapshotBuilder
         }
         if (discoveryProjectionValid
             && reparseProjectionValid
-            && (!CallProjectionsEqual(
+            && discoveryTypeProjectionValid
+            && reparseTypeProjectionValid
+            && (!TypeProjectionsEqual(discoveryTypes, types)
+                || !CallProjectionsEqual(
                     discoveryFunctions,
                     discoveryCalls,
                     functions,
@@ -733,7 +777,8 @@ internal sealed class NativeInteropSnapshotBuilder
                 NativeInteropSnapshotFailureKind.FactSetChanged,
                 index,
                 translationUnit.Path,
-                "Native function, direct-call, or risk facts changed between the two content-bound parses."));
+                "Native type, function, direct-call, or risk facts changed between the two content-bound parses."));
+            types = [];
             functions = [];
             calls = [];
         }
@@ -934,6 +979,7 @@ internal sealed class NativeInteropSnapshotBuilder
             sourceExports = [];
             verifiedExports = [];
             records = [];
+            types = [];
             functions = [];
             calls = [];
         }
@@ -949,6 +995,7 @@ internal sealed class NativeInteropSnapshotBuilder
             sourceExports = [];
             verifiedExports = [];
             records = [];
+            types = [];
             functions = [];
             calls = [];
         }
@@ -972,6 +1019,7 @@ internal sealed class NativeInteropSnapshotBuilder
             failures.Count == 0,
             OrderFailures(failures))
         {
+            Types = types,
             Functions = functions,
             Calls = calls,
         };
@@ -1335,6 +1383,7 @@ internal sealed class NativeInteropSnapshotBuilder
         if (extraction.Diagnostics is null
             || extraction.Functions is null
             || extraction.Calls is null
+            || extraction.Types is null
             || extraction.Exports is null
             || extraction.RecordLayouts is null)
         {
@@ -1361,6 +1410,15 @@ internal sealed class NativeInteropSnapshotBuilder
                 configuredPath,
                 "Native function",
                 MaximumFunctionsPerTranslationUnit);
+            return false;
+        }
+        if (extraction.Types.Count > MaximumTypesPerTranslationUnit)
+        {
+            failure = CollectionLimitFailure(
+                index,
+                configuredPath,
+                "Native type",
+                MaximumTypesPerTranslationUnit);
             return false;
         }
         if (extraction.Calls.Count > MaximumCallsPerTranslationUnit)
@@ -1414,7 +1472,16 @@ internal sealed class NativeInteropSnapshotBuilder
         CancellationToken cancellationToken,
         out NativeInteropSnapshotFailure failure)
     {
-        long nestedFactCount = 0;
+        long nestedFactCount = extraction.Types.Count;
+        if (nestedFactCount > MaximumNestedFactsPerTranslationUnit)
+        {
+            failure = CollectionLimitFailure(
+                index,
+                configuredPath,
+                "Nested native fact",
+                MaximumNestedFactsPerTranslationUnit);
+            return false;
+        }
         for (var functionIndex = 0;
              functionIndex < extraction.Functions.Count;
              functionIndex++)
@@ -1529,6 +1596,161 @@ internal sealed class NativeInteropSnapshotBuilder
         }
 
         failure = null!;
+        return true;
+    }
+
+    private static bool TryBuildTypeProjection(
+        ClangNativeExtractionResult extraction,
+        IReadOnlySet<string> includedFiles,
+        ScopePathPolicy pathPolicy,
+        InteropTarget target,
+        CancellationToken cancellationToken,
+        out NativeTypeDeclarationFact[] types,
+        out NativeInteropSnapshotFailureKind rejectionKind,
+        out string rejectionMessage)
+    {
+        types = [];
+        var normalizedTypes = new List<NativeTypeDeclarationFact>(
+            extraction.Types.Count);
+        foreach (var type in extraction.Types)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (type is null)
+            {
+                rejectionKind = NativeInteropSnapshotFailureKind.InvalidFact;
+                rejectionMessage =
+                    "Native type collection contains a null item.";
+                return false;
+            }
+            if (!TryNormalizeType(
+                    type,
+                    includedFiles,
+                    pathPolicy,
+                    target,
+                    cancellationToken,
+                    out var normalized,
+                    out rejectionKind,
+                    out rejectionMessage))
+            {
+                return false;
+            }
+            normalizedTypes.Add(normalized);
+        }
+
+        var deduplicated = new List<NativeTypeDeclarationFact>();
+        foreach (var group in normalizedTypes
+                     .GroupBy(
+                         type => type.SymbolCanonicalKey,
+                         StringComparer.Ordinal)
+                     .OrderBy(group => group.Key, StringComparer.Ordinal))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (group
+                    .Select(TypeFingerprint)
+                    .Distinct(StringComparer.Ordinal)
+                    .Skip(1)
+                    .Any())
+            {
+                rejectionKind =
+                    NativeInteropSnapshotFailureKind.TypeConflict;
+                rejectionMessage =
+                    "A native type canonical key has conflicting declarations.";
+                return false;
+            }
+            deduplicated.Add(group
+                .OrderByDescending(type => type.IsDefinition)
+                .ThenBy(
+                    type => type.Evidence.Location.FilePath,
+                    _pathComparer)
+                .ThenBy(type => type.Evidence.Location.StartLine)
+                .ThenBy(type => type.Evidence.Location.StartColumn)
+                .First());
+        }
+
+        types = deduplicated.ToArray();
+        rejectionKind = default;
+        rejectionMessage = string.Empty;
+        return true;
+    }
+
+    private static bool TryNormalizeType(
+        NativeTypeDeclarationFact type,
+        IReadOnlySet<string> includedFiles,
+        ScopePathPolicy pathPolicy,
+        InteropTarget target,
+        CancellationToken cancellationToken,
+        out NativeTypeDeclarationFact normalized,
+        out NativeInteropSnapshotFailureKind rejectionKind,
+        out string rejectionMessage)
+    {
+        normalized = null!;
+        var expectedDeclarationKind = type.Kind switch
+        {
+            NativeTypeDeclarationKind.Struct => "record",
+            NativeTypeDeclarationKind.Union => "union",
+            NativeTypeDeclarationKind.Enum => "enum",
+            NativeTypeDeclarationKind.Typedef => "typedef",
+            _ => null,
+        };
+        var keyMatchesKind = type.Kind == NativeTypeDeclarationKind.Typedef
+            ? IsNativeTypeAliasKey(type.SymbolCanonicalKey)
+            : IsNativeTypeKey(type.SymbolCanonicalKey);
+        if (expectedDeclarationKind is null
+            || !keyMatchesKind
+            || string.IsNullOrWhiteSpace(type.Name)
+            || string.IsNullOrWhiteSpace(type.QualifiedName)
+            || type.DeclaredType is null
+            || string.IsNullOrWhiteSpace(type.DeclaredType.CanonicalName)
+            || (type.Kind == NativeTypeDeclarationKind.Typedef
+                && !type.IsDefinition)
+            || type.Evidence is null
+            || type.Evidence.Confidence != EvidenceConfidence.Exact
+            || !string.Equals(
+                type.Evidence.Producer,
+                "clang-native",
+                StringComparison.Ordinal)
+            || type.Evidence.Metadata is null
+            || !type.Evidence.Metadata.TryGetValue(
+                "declarationKind",
+                out var declarationKind)
+            || !string.Equals(
+                declarationKind,
+                expectedDeclarationKind,
+                StringComparison.Ordinal)
+            || !type.Evidence.Metadata.TryGetValue(
+                "isDefinition",
+                out var isDefinition)
+            || !string.Equals(
+                isDefinition,
+                type.IsDefinition ? "true" : "false",
+                StringComparison.Ordinal)
+            || !type.Evidence.Metadata.TryGetValue(
+                "target",
+                out var evidenceTarget)
+            || !string.Equals(
+                evidenceTarget,
+                target.RuntimeIdentifier,
+                StringComparison.Ordinal))
+        {
+            rejectionKind = NativeInteropSnapshotFailureKind.InvalidFact;
+            rejectionMessage = "A native type declaration is malformed.";
+            return false;
+        }
+        if (!TryNormalizeEvidence(
+                type.Evidence,
+                includedFiles,
+                pathPolicy,
+                cancellationToken,
+                out var evidence,
+                out rejectionKind,
+                out rejectionMessage))
+        {
+            return false;
+        }
+
+        normalized = type with { Evidence = evidence };
+        rejectionKind = default;
+        rejectionMessage = string.Empty;
         return true;
     }
 
@@ -1809,6 +2031,27 @@ internal sealed class NativeInteropSnapshotBuilder
         return string.Equals(first, second, StringComparison.Ordinal);
     }
 
+    private static bool TypeProjectionsEqual(
+        IReadOnlyList<NativeTypeDeclarationFact> first,
+        IReadOnlyList<NativeTypeDeclarationFact> second)
+    {
+        if (first.Count != second.Count)
+        {
+            return false;
+        }
+        for (var index = 0; index < first.Count; index++)
+        {
+            if (!string.Equals(
+                    TypeFingerprint(first[index]),
+                    TypeFingerprint(second[index]),
+                    StringComparison.Ordinal))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
     private static bool NativeRiskFactSetsEqual(
         IReadOnlyList<NativeExport> firstExports,
         IReadOnlyList<NativeExport> secondExports)
@@ -1842,6 +2085,15 @@ internal sealed class NativeInteropSnapshotBuilder
             },
         });
 
+    private static string TypeFingerprint(NativeTypeDeclarationFact type) =>
+        JsonSerializer.Serialize(type with
+        {
+            Evidence = type.Evidence with
+            {
+                ProducingFileId = 0,
+            },
+        });
+
     private static string CallOccurrenceIdentity(NativeCallFact call)
     {
         var location = call.Evidence.Location;
@@ -1863,6 +2115,14 @@ internal sealed class NativeInteropSnapshotBuilder
     private static bool IsNativeExportKey(string key) =>
         key.StartsWith("c:E:", StringComparison.Ordinal)
         || key.StartsWith("cpp:E:", StringComparison.Ordinal);
+
+    private static bool IsNativeTypeKey(string key) =>
+        key.StartsWith("c:T:", StringComparison.Ordinal)
+        || key.StartsWith("cpp:T:", StringComparison.Ordinal);
+
+    private static bool IsNativeTypeAliasKey(string key) =>
+        key.StartsWith("c:A:", StringComparison.Ordinal)
+        || key.StartsWith("cpp:A:", StringComparison.Ordinal);
 
     private static bool TryNormalizeDiagnostics(
         IReadOnlyList<ClangExtractionDiagnostic> diagnostics,
@@ -2583,6 +2843,14 @@ internal sealed class NativeInteropSnapshotBuilder
             failures,
             cancellationToken,
             out _);
+        var types = AggregateFacts(
+            contributions.SelectMany(contribution => contribution.Types),
+            type => type.SymbolCanonicalKey,
+            TypeFingerprint,
+            NativeInteropSnapshotFailureKind.TypeConflict,
+            failures,
+            cancellationToken,
+            out _);
         var functions = AggregateFacts(
             contributions.SelectMany(contribution => contribution.Functions),
             function => function.SymbolCanonicalKey,
@@ -2785,6 +3053,7 @@ internal sealed class NativeInteropSnapshotBuilder
             && !orderedFailures.Any(failure => failure.Kind
                 is NativeInteropSnapshotFailureKind.ExportConflict
                 or NativeInteropSnapshotFailureKind.RecordConflict
+                or NativeInteropSnapshotFailureKind.TypeConflict
                 or NativeInteropSnapshotFailureKind.FunctionConflict
                 or NativeInteropSnapshotFailureKind.CallConflict
                 or NativeInteropSnapshotFailureKind.InputContentChanged);
@@ -2819,6 +3088,7 @@ internal sealed class NativeInteropSnapshotBuilder
             sourceComplete && exportUniverseComplete && orderedFailures.Length == 0,
             orderedFailures)
         {
+            Types = types,
             Functions = functions,
             Calls = calls
                 .OrderBy(

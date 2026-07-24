@@ -6,6 +6,7 @@ using DevBitsLab.Mcp.SourceGraph.Storage;
 using FluentAssertions;
 using Microsoft.Data.Sqlite;
 using Xunit;
+using SymbolKinds = DevBitsLab.Mcp.SourceGraph.Sdk.SymbolKinds;
 
 namespace DevBitsLab.Mcp.SourceGraph.Tests;
 
@@ -104,6 +105,230 @@ public sealed class NativeInteropSnapshotPublisherTests : IAsyncLifetime
             .Should().Equal(headerHash);
         (await _store.GetFileContentHashAsync(types))
             .Should().Equal(typesHash);
+    }
+
+    [Fact]
+    public async Task Complete_snapshot_publishes_queryable_native_type_symbols()
+    {
+        var path = PathFor("native/types.hpp");
+        var declarations = new[]
+        {
+            Type(
+                "cpp:T:native/types.hpp::Payload",
+                NativeTypeDeclarationKind.Struct,
+                "Payload",
+                path,
+                line: 2),
+            Type(
+                "cpp:T:native/types.hpp::Value",
+                NativeTypeDeclarationKind.Union,
+                "Value",
+                path,
+                line: 4),
+            Type(
+                "cpp:T:native/types.hpp::Status",
+                NativeTypeDeclarationKind.Enum,
+                "Status",
+                path,
+                line: 6),
+            Type(
+                "cpp:A:native/types.hpp::PayloadHandle",
+                NativeTypeDeclarationKind.Typedef,
+                "PayloadHandle",
+                path,
+                line: 8),
+        };
+        var record = Record(
+            declarations[0].SymbolCanonicalKey,
+            path) with
+        {
+            Evidence = declarations[0].Evidence,
+        };
+
+        var result = await Publisher().PublishAsync(Snapshot(
+            hashes: [ContentHash(path, Hash(21))],
+            sourceExports: [],
+            records: [record],
+            types: declarations));
+
+        result.IsComplete.Should().BeTrue();
+        result.SymbolsPublished.Should().Be(4,
+            "the ABI layout shares its struct declaration symbol");
+        result.AnnotationsPublished.Should().Be(1);
+        var expectedKinds = new Dictionary<string, string>(
+            StringComparer.Ordinal)
+        {
+            ["Payload"] = SymbolKinds.Struct,
+            ["Value"] = SymbolKinds.Union,
+            ["Status"] = SymbolKinds.Enum,
+            ["PayloadHandle"] = SymbolKinds.TypeAlias,
+        };
+        foreach (var expected in expectedKinds)
+        {
+            var hit = (await _store!.FindSymbolsAsync(expected.Key))
+                .Single(item => item.Name == expected.Key);
+            hit.Kind.Should().Be(expected.Value);
+            hit.FilePath.Should().Be(path);
+        }
+        (await _store!.SearchSymbolsAsync("PayloadHandle"))
+            .Should().ContainSingle(hit =>
+                hit.CanonicalKey
+                    == "cpp:A:native/types.hpp::PayloadHandle");
+        (await InteropFactStoreReader.ReadAbiRecordsAsync(_store))
+            .Facts.Should().ContainSingle()
+            .Which.Fact.SymbolCanonicalKey.Should().Be(
+                declarations[0].SymbolCanonicalKey);
+    }
+
+    [Fact]
+    public async Task Extractor_result_types_flow_through_builder_and_publisher()
+    {
+        var path = PathFor("native/extracted.hpp");
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        await File.WriteAllTextAsync(path, "// content-bound extractor input");
+        var builder = new NativeInteropSnapshotBuilder(
+            (request, cancellationToken) =>
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                return Task.FromResult(new ClangNativeExtractionResult(
+                    Functions: [],
+                    Types:
+                    [
+                        Type(
+                            "cpp:T:native/extracted.hpp::Payload",
+                            NativeTypeDeclarationKind.Struct,
+                            "Payload",
+                            request.SourceFilePath,
+                            line: 2),
+                        Type(
+                            "cpp:T:native/extracted.hpp::Value",
+                            NativeTypeDeclarationKind.Union,
+                            "Value",
+                            request.SourceFilePath,
+                            line: 4),
+                        Type(
+                            "cpp:T:native/extracted.hpp::Status",
+                            NativeTypeDeclarationKind.Enum,
+                            "Status",
+                            request.SourceFilePath,
+                            line: 6),
+                        Type(
+                            "cpp:A:native/extracted.hpp::StatusCode",
+                            NativeTypeDeclarationKind.Typedef,
+                            "StatusCode",
+                            request.SourceFilePath,
+                            line: 8),
+                    ],
+                    Exports: [],
+                    RecordLayouts: [],
+                    Diagnostics: [])
+                {
+                    IncludedFiles = [request.SourceFilePath],
+                });
+            });
+
+        var snapshot = await builder.BuildAsync(
+            _temporaryDirectory,
+            new ScopeInteropConfig(
+                Target,
+                [
+                    new InteropTranslationUnitConfig(
+                        "native/extracted.hpp",
+                        "native.dll",
+                        [
+                            "-x",
+                            "c++",
+                        ],
+                        BinaryPath: null),
+                ]),
+            new ScopePathPolicy(_temporaryDirectory));
+
+        snapshot.IsComplete.Should().BeTrue(
+            string.Join(
+                "; ",
+                snapshot.Failures.Select(failure => failure.Message)
+                    .Concat(snapshot.Diagnostics.Select(diagnostic =>
+                        $"{diagnostic.Diagnostic.Code}: "
+                        + diagnostic.Diagnostic.Message))));
+        snapshot.Types.Select(type => type.Name).Should().BeEquivalentTo(
+            "Payload",
+            "Value",
+            "Status",
+            "StatusCode");
+        snapshot.Types.Should().OnlyContain(type =>
+            type.Evidence.Confidence == EvidenceConfidence.Exact
+            && type.Evidence.Producer == "clang-native");
+
+        var publication = await Publisher().PublishAsync(snapshot);
+
+        publication.IsComplete.Should().BeTrue();
+        publication.SymbolsPublished.Should().Be(4);
+        (await _store!.FindSymbolsAsync("Payload"))
+            .Should().Contain(hit =>
+                hit.Name == "Payload"
+                && hit.Kind == SymbolKinds.Struct);
+        (await _store.SearchSymbolsAsync("StatusCode"))
+            .Should().Contain(hit =>
+                hit.Name == "StatusCode"
+                && hit.Kind == SymbolKinds.TypeAlias);
+    }
+
+    [Fact]
+    public async Task Native_type_replacement_reports_and_cleans_stale_aliases()
+    {
+        var path = PathFor("native/types.hpp");
+        var enumType = Type(
+            "cpp:T:native/types.hpp::Status",
+            NativeTypeDeclarationKind.Enum,
+            "Status",
+            path,
+            line: 2);
+        var alias = Type(
+            "cpp:A:native/types.hpp::StatusCode",
+            NativeTypeDeclarationKind.Typedef,
+            "StatusCode",
+            path,
+            line: 4);
+        (await Publisher().PublishAsync(Snapshot(
+            hashes: [ContentHash(path, Hash(22))],
+            sourceExports: [],
+            types: [enumType, alias])))
+            .IsComplete.Should().BeTrue();
+
+        var updatedEnum = enumType with
+        {
+            IsDefinition = false,
+            Evidence = enumType.Evidence with
+            {
+                Location = new SourceLocation(path, 12, 1, 12, 8),
+                Metadata = new Dictionary<string, string>(
+                    StringComparer.Ordinal)
+                {
+                    ["declarationKind"] = "enum",
+                    ["isDefinition"] = "false",
+                    ["target"] = Target.RuntimeIdentifier,
+                },
+            },
+        };
+        var replacement = await Publisher().PublishAsync(Snapshot(
+            hashes: [ContentHash(path, Hash(23))],
+            sourceExports: [],
+            types: [updatedEnum]));
+
+        replacement.IsComplete.Should().BeTrue();
+        replacement.StaleCanonicalKeys.Should().Equal(
+            alias.SymbolCanonicalKey);
+        var current = (await _store!.FindSymbolsAsync("Status"))
+            .Single(hit => hit.CanonicalKey == enumType.SymbolCanonicalKey);
+        current.StartLine.Should().Be(12);
+        current.Modifiers.Should().Be("declaration");
+
+        var cleanup =
+            await _store.DeleteOrphanedNativeInteropSymbolsAsync(
+                replacement.StaleCanonicalKeys);
+        cleanup.DeletedCanonicalKeys.Should().Equal(alias.SymbolCanonicalKey);
+        (await _store.GetSymbolByCanonicalKeyAsync(alias.SymbolCanonicalKey))
+            .Should().BeNull();
     }
 
     [Fact]
@@ -484,7 +709,8 @@ public sealed class NativeInteropSnapshotPublisherTests : IAsyncLifetime
         IReadOnlyList<NativeFunctionFact>? functions = null,
         IReadOnlyList<NativeCallFact>? calls = null,
         bool complete = true,
-        IReadOnlyList<NativeInteropSnapshotFailure>? failures = null)
+        IReadOnlyList<NativeInteropSnapshotFailure>? failures = null,
+        IReadOnlyList<NativeTypeDeclarationFact>? types = null)
     {
         var byPath = hashes.ToDictionary(
             item => item.FilePath,
@@ -508,6 +734,7 @@ public sealed class NativeInteropSnapshotPublisherTests : IAsyncLifetime
             IsComplete: complete,
             Failures: failures ?? [])
         {
+            Types = types ?? [],
             Functions = functions ?? [],
             Calls = calls ?? [],
         };
@@ -658,6 +885,50 @@ public sealed class NativeInteropSnapshotPublisherTests : IAsyncLifetime
             ],
             Target,
             evidence);
+    }
+
+    private static NativeTypeDeclarationFact Type(
+        string key,
+        NativeTypeDeclarationKind kind,
+        string name,
+        string path,
+        int line,
+        bool isDefinition = true)
+    {
+        var declarationKind = kind switch
+        {
+            NativeTypeDeclarationKind.Struct => "record",
+            NativeTypeDeclarationKind.Union => "union",
+            NativeTypeDeclarationKind.Enum => "enum",
+            NativeTypeDeclarationKind.Typedef => "typedef",
+            _ => throw new InvalidOperationException(),
+        };
+        return new NativeTypeDeclarationFact(
+            key,
+            kind,
+            name,
+            name,
+            new AbiTypeRef(
+                name,
+                kind == NativeTypeDeclarationKind.Enum
+                    ? AbiTypeCategory.Enum
+                    : kind == NativeTypeDeclarationKind.Typedef
+                        ? AbiTypeCategory.Opaque
+                        : AbiTypeCategory.Record,
+                sizeBytes: 4,
+                alignmentBytes: 4),
+            isDefinition,
+            new Evidence(
+                ProducingFileId: 1,
+                new SourceLocation(path, line, 1, line, 8),
+                EvidenceConfidence.Exact,
+                "clang-native",
+                new Dictionary<string, string>(StringComparer.Ordinal)
+                {
+                    ["declarationKind"] = declarationKind,
+                    ["isDefinition"] = isDefinition ? "true" : "false",
+                    ["target"] = Target.RuntimeIdentifier,
+                }));
     }
 
     private static NativeFunctionFact Function(

@@ -222,6 +222,20 @@ internal sealed class NativeInteropSnapshotPublisher
                     InteropFactPayloadCodec.EncodeNativeExport(export),
                     AttributeCanonicalKey: null));
         }
+        var typesByKey = snapshot.Types.ToDictionary(
+            type => type.SymbolCanonicalKey,
+            StringComparer.Ordinal);
+        foreach (var type in typesByKey.Values
+                     .OrderBy(
+                         type => type.SymbolCanonicalKey,
+                         StringComparer.Ordinal))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var file = ResolveOwner(
+                files,
+                type.Evidence.Location.FilePath);
+            file.AddSymbol(TypeSymbol(type));
+        }
         foreach (var record in snapshot.RecordLayouts
                      .OrderBy(
                          record => record.SymbolCanonicalKey,
@@ -229,15 +243,33 @@ internal sealed class NativeInteropSnapshotPublisher
         {
             cancellationToken.ThrowIfCancellationRequested();
             var file = ResolveOwner(files, record.Evidence.Location.FilePath);
-            file.AddAnnotatedSymbol(
-                RecordSymbol(record),
-                new FileAnnotationFact(
+            var annotation = new FileAnnotationFact(
+                record.SymbolCanonicalKey,
+                "InteropFact",
+                "MedInterop.AbiRecord",
+                InteropAnnotationFlavors.AbiRecord,
+                InteropFactPayloadCodec.EncodeAbiRecord(record),
+                AttributeCanonicalKey: null);
+            if (typesByKey.TryGetValue(
                     record.SymbolCanonicalKey,
-                    "InteropFact",
-                    "MedInterop.AbiRecord",
-                    InteropAnnotationFlavors.AbiRecord,
-                    InteropFactPayloadCodec.EncodeAbiRecord(record),
-                    AttributeCanonicalKey: null));
+                    out var declaredType))
+            {
+                var typeFile = ResolveOwner(
+                    files,
+                    declaredType.Evidence.Location.FilePath);
+                if (!ReferenceEquals(file, typeFile))
+                {
+                    throw new InvalidOperationException(
+                        "A native ABI record and its type declaration have different owners.");
+                }
+                file.AddAnnotation(annotation);
+            }
+            else
+            {
+                file.AddAnnotatedSymbol(
+                    RecordSymbol(record),
+                    annotation);
+            }
         }
         foreach (var function in snapshot.Functions
                      .OrderBy(
@@ -355,6 +387,47 @@ internal sealed class NativeInteropSnapshotPublisher
             XmlSummary: null);
     }
 
+    private static FileSymbolFact TypeSymbol(
+        NativeTypeDeclarationFact type)
+    {
+        var location = type.Evidence.Location;
+        var keyword = type.Kind switch
+        {
+            NativeTypeDeclarationKind.Struct => "struct",
+            NativeTypeDeclarationKind.Union => "union",
+            NativeTypeDeclarationKind.Enum => "enum",
+            NativeTypeDeclarationKind.Typedef => "typedef",
+            _ => throw new InvalidOperationException(
+                "A native type declaration kind is invalid."),
+        };
+        var kind = type.Kind switch
+        {
+            NativeTypeDeclarationKind.Struct => SymbolKinds.Struct,
+            NativeTypeDeclarationKind.Union => SymbolKinds.Union,
+            NativeTypeDeclarationKind.Enum => SymbolKinds.Enum,
+            NativeTypeDeclarationKind.Typedef => SymbolKinds.TypeAlias,
+            _ => throw new InvalidOperationException(
+                "A native type declaration kind is invalid."),
+        };
+        var signature = type.Kind == NativeTypeDeclarationKind.Typedef
+            ? $"typedef {type.DeclaredType.CanonicalName} {type.QualifiedName}"
+            : $"{keyword} {type.QualifiedName}";
+        return new FileSymbolFact(
+            type.SymbolCanonicalKey,
+            type.Name,
+            type.QualifiedName,
+            kind,
+            location.StartLine,
+            location.StartColumn,
+            location.EndLine,
+            location.EndColumn,
+            signature,
+            ContainerCanonicalKey: null,
+            Modifiers: type.IsDefinition ? "definition" : "declaration",
+            Accessibility: 0,
+            XmlSummary: null);
+    }
+
     private static FileSymbolFact FunctionSymbol(NativeFunctionFact function)
     {
         var location = function.Evidence.Location;
@@ -466,6 +539,16 @@ internal sealed class NativeInteropSnapshotPublisher
                     $"Native snapshot key `{symbol.CanonicalKey}` is duplicated.");
             }
             _symbols.Add(symbol);
+        }
+
+        public void AddAnnotation(FileAnnotationFact annotation)
+        {
+            if (!_keys.Contains(annotation.SymbolCanonicalKey))
+            {
+                throw new InvalidOperationException(
+                    "A native annotation host is not declared by its owner file.");
+            }
+            _annotations.Add(annotation);
         }
 
         public void AddEdge(FileEdgeFact edge) => _edges.Add(edge);

@@ -94,7 +94,7 @@ public sealed partial class SqliteGraphStore
                                 OR symbol.canonical_key GLOB 'cpp:*'
                               )
                           AND (
-                                symbol.kind_name IN @FunctionKinds
+                                symbol.kind_name IN @ProjectionKinds
                                 OR EXISTS (
                                     SELECT 1
                                     FROM annotations annotation
@@ -107,10 +107,14 @@ public sealed partial class SqliteGraphStore
                         new
                         {
                             Flavors = flavors,
-                            FunctionKinds = new[]
+                            ProjectionKinds = new[]
                             {
                                 SymbolKinds.Function,
                                 SymbolKinds.Method,
+                                SymbolKinds.Struct,
+                                SymbolKinds.Union,
+                                SymbolKinds.Enum,
+                                SymbolKinds.TypeAlias,
                             },
                         },
                         transaction: tx,
@@ -489,8 +493,7 @@ public sealed partial class SqliteGraphStore
                         + $"`{symbol.CanonicalKey}` is duplicated.",
                         nameof(source));
                 }
-                if (symbol.Kind is not (
-                    SymbolKinds.Function or SymbolKinds.Method))
+                if (symbol.Kind == SymbolKinds.NativeExport)
                 {
                     requiredAnnotationKeys.Add(symbol.CanonicalKey);
                 }
@@ -512,7 +515,13 @@ public sealed partial class SqliteGraphStore
                     localKeys,
                     expectedFlavors,
                     source);
-                annotationHostKeys.Add(annotation.SymbolCanonicalKey);
+                if (!annotationHostKeys.Add(
+                        annotation.SymbolCanonicalKey))
+                {
+                    throw new ArgumentException(
+                        "A native interop annotation host is duplicated.",
+                        nameof(source));
+                }
                 annotations[annotationIndex] = annotation with { };
             }
 
@@ -563,11 +572,11 @@ public sealed partial class SqliteGraphStore
             };
         }
 
-        if (!requiredAnnotationKeys.SetEquals(annotationHostKeys))
+        if (!requiredAnnotationKeys.IsSubsetOf(annotationHostKeys))
         {
             throw new ArgumentException(
-                "Every non-function native interop declaration must own exactly one "
-                + "selected interop annotation.",
+                "Every native export declaration must own one selected "
+                + "interop annotation.",
                 nameof(source));
         }
         foreach (var edge in result.SelectMany(file => file.Edges))
@@ -596,6 +605,24 @@ public sealed partial class SqliteGraphStore
             throw new ArgumentException(
                 "Native interop declarations must use a lower-case c: or cpp: "
                 + "canonical-key scheme.",
+                nameof(source));
+        }
+        var kindMatchesKey =
+            (IsNativeKey(symbol.CanonicalKey, "E")
+                && symbol.Kind == SymbolKinds.NativeExport)
+            || (IsNativeKey(symbol.CanonicalKey, "F")
+                && symbol.Kind is SymbolKinds.Function or SymbolKinds.Method)
+            || (IsNativeKey(symbol.CanonicalKey, "T")
+                && symbol.Kind is
+                    SymbolKinds.Struct
+                    or SymbolKinds.Union
+                    or SymbolKinds.Enum)
+            || (IsNativeKey(symbol.CanonicalKey, "A")
+                && symbol.Kind == SymbolKinds.TypeAlias);
+        if (!kindMatchesKey)
+        {
+            throw new ArgumentException(
+                "A native interop declaration kind does not match its canonical-key prefix.",
                 nameof(source));
         }
         ArgumentException.ThrowIfNullOrWhiteSpace(symbol.Name);
@@ -643,6 +670,15 @@ public sealed partial class SqliteGraphStore
             throw new ArgumentException(
                 $"Native interop annotation flavor `{annotation.Flavor}` "
                 + "is not selected.",
+                nameof(source));
+        }
+        if ((annotation.Flavor == InteropAnnotationFlavors.NativeExport
+                && !IsNativeKey(annotation.SymbolCanonicalKey, "E"))
+            || (annotation.Flavor == InteropAnnotationFlavors.AbiRecord
+                && !IsNativeKey(annotation.SymbolCanonicalKey, "T")))
+        {
+            throw new ArgumentException(
+                "A native interop annotation flavor does not match its host declaration.",
                 nameof(source));
         }
         if (annotation.AttributeCanonicalKey is not null)
@@ -767,6 +803,16 @@ public sealed partial class SqliteGraphStore
     private static bool IsNativeCanonicalKey(string canonicalKey) =>
         canonicalKey.StartsWith("c:", StringComparison.Ordinal)
         || canonicalKey.StartsWith("cpp:", StringComparison.Ordinal);
+
+    private static bool IsNativeKey(
+        string canonicalKey,
+        string kindPrefix) =>
+        canonicalKey.StartsWith(
+            $"c:{kindPrefix}:",
+            StringComparison.Ordinal)
+        || canonicalKey.StartsWith(
+            $"cpp:{kindPrefix}:",
+            StringComparison.Ordinal);
 
     private sealed record ResolvedNativeInteropSymbol(
         long SymbolId,
