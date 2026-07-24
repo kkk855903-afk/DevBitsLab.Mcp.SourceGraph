@@ -105,6 +105,20 @@ public interface IGraphStore : IAsyncDisposable
             "This graph-store implementation predates atomic native interop snapshots.");
 
     /// <summary>
+    /// Transactionally deletes only the requested stale C/C++ native-export or struct
+    /// declarations that are proven orphaned. A declaration is retained when it still owns or
+    /// participates in any stored fact, including a <c>pinvoke-maps-to</c> edge targeting it.
+    /// Callers must invoke this only after a complete native snapshot publication and a
+    /// successful refresh of every managed boundary.
+    /// </summary>
+    Task<NativeInteropStaleSymbolCleanupResult>
+        DeleteOrphanedNativeInteropSymbolsAsync(
+            IReadOnlyCollection<string> staleCanonicalKeys,
+            CancellationToken ct = default) =>
+        throw new NotSupportedException(
+            "This graph-store implementation predates stale native-symbol cleanup.");
+
+    /// <summary>
     /// Atomically replaces annotations of one exact <paramref name="flavor"/> on declarations
     /// owned by the indexed <paramref name="filePath"/>. Every annotation host is resolved by
     /// canonical key and verified to belong to that file before prior rows are changed. An empty
