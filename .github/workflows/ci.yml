@@ -93,7 +93,7 @@ jobs:
         run: dotnet build -c Release --no-restore /p:ContinuousIntegrationBuild=true
 
       - name: Pack tool
-        run: dotnet pack src/DevBitsLab.Mcp.SourceGraph.Server -c Release --no-build -o ./out
+        run: dotnet pack src/DevBitsLab.Mcp.SourceGraph.Server -c Release --no-restore /p:ContinuousIntegrationBuild=true -o ./out
 
       - name: Pack SDK
         run: dotnet pack src/DevBitsLab.Mcp.SourceGraph.Sdk -c Release --no-build -o ./out

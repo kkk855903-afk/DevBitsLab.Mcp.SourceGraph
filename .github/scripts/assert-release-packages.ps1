@@ -20,9 +20,11 @@ $toolPackageId = 'DevBitsLab.Mcp.SourceGraph.Tool'
 $sdkPackageId = 'DevBitsLab.Mcp.SourceGraph.Sdk'
 $repositoryUrl =
     'https://github.com/Jak3b0/DevBitsLab.Mcp.SourceGraph.git'
+$repositoryCommitPattern = '^[0-9a-f]{40}$'
 $sourceLinkUrlPattern =
     '^https://raw\.githubusercontent\.com/' +
-    'Jak3b0/DevBitsLab\.Mcp\.SourceGraph/[0-9a-fA-F]{40}/\*$'
+    'Jak3b0/DevBitsLab\.Mcp\.SourceGraph/' +
+    '(?<commit>[0-9a-f]{40})/\*$'
 $packageDirectoryPath = (Resolve-Path -LiteralPath $PackageDirectory).Path
 $repositoryRoot = (
     Resolve-Path -LiteralPath (
@@ -64,15 +66,45 @@ if (-not ('ReleasePackagePortablePdbInspector' -as [type])) {
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.IO.Compression;
 using System.Reflection.Metadata;
 using System.Text;
+
+public sealed class ReleasePackagePortablePdbInspection
+{
+    public ReleasePackagePortablePdbInspection(
+        string[] documents,
+        string[] embeddedDocuments,
+        string[] moduleSourceLinkDocuments,
+        int nonModuleSourceLinkDocumentCount)
+    {
+        Documents = documents;
+        EmbeddedDocuments = embeddedDocuments;
+        ModuleSourceLinkDocuments = moduleSourceLinkDocuments;
+        NonModuleSourceLinkDocumentCount = nonModuleSourceLinkDocumentCount;
+    }
+
+    public string[] Documents { get; }
+
+    public string[] EmbeddedDocuments { get; }
+
+    public string[] ModuleSourceLinkDocuments { get; }
+
+    public int NonModuleSourceLinkDocumentCount { get; }
+}
 
 public static class ReleasePackagePortablePdbInspector
 {
     private static readonly Guid SourceLinkKind =
         new Guid("CC110556-A091-4D38-9FEC-25AB9A351A6A");
+    private static readonly Guid EmbeddedSourceKind =
+        new Guid("0E8A571B-6926-466E-B4AD-8AB04611F5FE");
+    private static readonly Encoding StrictUtf8 =
+        new UTF8Encoding(
+            encoderShouldEmitUTF8Identifier: false,
+            throwOnInvalidBytes: true);
 
-    public static string[] ReadSourceLinkDocuments(Stream source)
+    public static ReleasePackagePortablePdbInspection Inspect(Stream source)
     {
         using (var stream = new MemoryStream())
         {
@@ -80,26 +112,113 @@ public static class ReleasePackagePortablePdbInspector
             stream.Position = 0;
 
             var documents = new List<string>();
+            var embeddedDocuments = new HashSet<string>(
+                StringComparer.Ordinal);
+            var moduleSourceLinkDocuments = new List<string>();
+            var nonModuleSourceLinkDocumentCount = 0;
             using (var provider =
                 MetadataReaderProvider.FromPortablePdbStream(
                     stream,
                     MetadataStreamOptions.LeaveOpen))
             {
                 var reader = provider.GetMetadataReader();
+                foreach (var handle in reader.Documents)
+                {
+                    var document = reader.GetDocument(handle);
+                    documents.Add(reader.GetString(document.Name));
+                }
+
                 foreach (var handle in reader.CustomDebugInformation)
                 {
                     var information =
                         reader.GetCustomDebugInformation(handle);
-                    if (reader.GetGuid(information.Kind) == SourceLinkKind)
+                    var kind = reader.GetGuid(information.Kind);
+                    if (kind == SourceLinkKind)
                     {
-                        documents.Add(
-                            Encoding.UTF8.GetString(
+                        if (information.Parent.Kind !=
+                            HandleKind.ModuleDefinition)
+                        {
+                            nonModuleSourceLinkDocumentCount++;
+                            continue;
+                        }
+
+                        moduleSourceLinkDocuments.Add(
+                            StrictUtf8.GetString(
                                 reader.GetBlobBytes(information.Value)));
+                        continue;
+                    }
+
+                    if (kind == EmbeddedSourceKind)
+                    {
+                        if (information.Parent.Kind != HandleKind.Document)
+                        {
+                            throw new BadImageFormatException(
+                                "Embedded source is not attached to a document.");
+                        }
+
+                        var documentHandle =
+                            (DocumentHandle)information.Parent;
+                        var document = reader.GetDocument(documentHandle);
+                        var documentName = reader.GetString(document.Name);
+                        ValidateEmbeddedSource(
+                            reader.GetBlobBytes(information.Value));
+                        if (!embeddedDocuments.Add(documentName))
+                        {
+                            throw new BadImageFormatException(
+                                "A document contains duplicate embedded source.");
+                        }
                     }
                 }
             }
 
-            return documents.ToArray();
+            return new ReleasePackagePortablePdbInspection(
+                documents.ToArray(),
+                new List<string>(embeddedDocuments).ToArray(),
+                moduleSourceLinkDocuments.ToArray(),
+                nonModuleSourceLinkDocumentCount);
+        }
+    }
+
+    private static void ValidateEmbeddedSource(byte[] value)
+    {
+        if (value.Length < sizeof(int))
+        {
+            throw new BadImageFormatException(
+                "Embedded source is shorter than its length prefix.");
+        }
+
+        var uncompressedSize =
+            value[0] |
+            value[1] << 8 |
+            value[2] << 16 |
+            value[3] << 24;
+        if (uncompressedSize < 0)
+        {
+            throw new BadImageFormatException(
+                "Embedded source has a negative uncompressed length.");
+        }
+
+        if (uncompressedSize == 0)
+        {
+            return;
+        }
+
+        using (var compressed = new MemoryStream(
+            value,
+            sizeof(int),
+            value.Length - sizeof(int),
+            writable: false))
+        using (var deflate = new DeflateStream(
+            compressed,
+            CompressionMode.Decompress))
+        using (var uncompressed = new MemoryStream())
+        {
+            deflate.CopyTo(uncompressed);
+            if (uncompressed.Length != uncompressedSize)
+            {
+                throw new BadImageFormatException(
+                    "Embedded source length does not match its prefix.");
+            }
         }
     }
 }
@@ -209,6 +328,7 @@ function Read-NuspecMetadata {
         Metadata = $metadata[0]
         RepositoryUrl = [string] $repositoryElement.GetAttribute('url')
         RepositoryType = [string] $repositoryElement.GetAttribute('type')
+        RepositoryCommit = [string] $repositoryElement.GetAttribute('commit')
     }
 }
 
@@ -230,6 +350,15 @@ function Assert-RepositoryMetadata {
         throw (
             "Package $PackageName has repository type " +
             "'$($Metadata.RepositoryType)'; expected 'git'.")
+    }
+    if (-not [Text.RegularExpressions.Regex]::IsMatch(
+        $Metadata.RepositoryCommit,
+        $repositoryCommitPattern,
+        [Text.RegularExpressions.RegexOptions]::CultureInvariant)) {
+        throw (
+            "Package $PackageName has invalid repository commit " +
+            "'$($Metadata.RepositoryCommit)'; expected 40 lowercase " +
+            "hexadecimal characters.")
     }
 }
 
@@ -287,6 +416,16 @@ function Assert-SourceLinkDocument {
         [string] $Json,
 
         [Parameter(Mandatory)]
+        [string[]] $DocumentNames,
+
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [string[]] $EmbeddedDocumentNames,
+
+        [Parameter(Mandatory)]
+        [string] $ExpectedCommit,
+
+        [Parameter(Mandatory)]
         [string] $PackageName,
 
         [Parameter(Mandatory)]
@@ -313,23 +452,131 @@ function Assert-SourceLinkDocument {
             "'documents' object.")
     }
 
+    $documents = [Collections.Generic.HashSet[string]]::new(
+        [StringComparer]::Ordinal)
+    foreach ($documentName in $DocumentNames) {
+        if ([string]::IsNullOrWhiteSpace($documentName)) {
+            throw (
+                "Package $PackageName PDB '$PdbEntryName' contains an " +
+                "empty document name.")
+        }
+
+        $null = $documents.Add($documentName)
+    }
+    if ($documents.Count -eq 0) {
+        throw (
+            "Package $PackageName PDB '$PdbEntryName' contains no " +
+            "debuggable documents.")
+    }
+
+    $embeddedDocuments = [Collections.Generic.HashSet[string]]::new(
+        [StringComparer]::Ordinal)
+    foreach ($embeddedDocumentName in $EmbeddedDocumentNames) {
+        if (-not $documents.Contains($embeddedDocumentName)) {
+            throw (
+                "Package $PackageName PDB '$PdbEntryName' embeds unknown " +
+                "document '$embeddedDocumentName'.")
+        }
+
+        $null = $embeddedDocuments.Add($embeddedDocumentName)
+    }
+
+    $coveredDocuments = [Collections.Generic.HashSet[string]]::new(
+        [StringComparer]::Ordinal)
     $verifiedMappings = 0
     foreach ($mapping in $sourceLink['documents'].GetEnumerator()) {
         $sourcePattern = [string] $mapping.Key
         $targetPattern = $mapping.Value
+        $firstWildcard = $sourcePattern.IndexOf(
+            '*',
+            [StringComparison]::Ordinal)
         if ([string]::IsNullOrWhiteSpace($sourcePattern) -or
-            -not $sourcePattern.EndsWith(
+            $firstWildcard -lt 0 -or
+            $firstWildcard -ne $sourcePattern.LastIndexOf(
                 '*',
                 [StringComparison]::Ordinal) -or
+            $firstWildcard -ne ($sourcePattern.Length - 1) -or
             $targetPattern -isnot [string] -or
-            -not [Text.RegularExpressions.Regex]::IsMatch(
+            -not (
+                $targetMatch = [Text.RegularExpressions.Regex]::Match(
                 $targetPattern,
                 $sourceLinkUrlPattern,
-                [Text.RegularExpressions.RegexOptions]::CultureInvariant)) {
+                [Text.RegularExpressions.RegexOptions]::CultureInvariant)
+            ).Success) {
             throw (
                 "Package $PackageName PDB '$PdbEntryName' contains an " +
                 "unverifiable SourceLink mapping '$sourcePattern' -> " +
                 "'$targetPattern'.")
+        }
+
+        $targetCommit = $targetMatch.Groups['commit'].Value
+        if ($targetCommit -cne $ExpectedCommit) {
+            throw (
+                "Package $PackageName PDB '$PdbEntryName' SourceLink " +
+                "target commit '$targetCommit' does not match repository " +
+                "commit '$ExpectedCommit'.")
+        }
+
+        $prefix = $sourcePattern.Substring(0, $firstWildcard)
+        $mappingDocumentCount = 0
+        foreach ($documentName in $documents) {
+            if (-not $documentName.StartsWith(
+                    $prefix,
+                    [StringComparison]::Ordinal)) {
+                continue
+            }
+
+            $capture = $documentName.Substring($prefix.Length)
+            if ([string]::IsNullOrEmpty($capture) -or
+                $capture.StartsWith(
+                    '/',
+                    [StringComparison]::Ordinal) -or
+                $capture.Contains(
+                    '\',
+                    [StringComparison]::Ordinal) -or
+                $capture.Contains(
+                    '?',
+                    [StringComparison]::Ordinal) -or
+                $capture.Contains(
+                    '#',
+                    [StringComparison]::Ordinal) -or
+                $capture.Contains(
+                    '%',
+                    [StringComparison]::Ordinal) -or
+                @(
+                    $capture.ToCharArray() |
+                        Where-Object { [char]::IsControl($_) }
+                ).Count -gt 0) {
+                throw (
+                    "Package $PackageName PDB '$PdbEntryName' mapping " +
+                    "'$sourcePattern' captures unsafe path '$capture'.")
+            }
+
+            $captureSegments = $capture.Split(
+                '/',
+                [StringSplitOptions]::None)
+            if (@(
+                $captureSegments |
+                    Where-Object {
+                        [string]::IsNullOrEmpty($_) -or
+                        $_ -ceq '.' -or
+                        $_ -ceq '..'
+                    }
+            ).Count -gt 0) {
+                throw (
+                    "Package $PackageName PDB '$PdbEntryName' mapping " +
+                    "'$sourcePattern' captures unsafe path '$capture'.")
+            }
+
+            $mappingDocumentCount++
+            $null = $coveredDocuments.Add($documentName)
+        }
+
+        if ($mappingDocumentCount -eq 0) {
+            throw (
+                "Package $PackageName PDB '$PdbEntryName' SourceLink " +
+                "source mapping '$sourcePattern' does not cover any PDB " +
+                "document.")
         }
 
         $verifiedMappings++
@@ -341,7 +588,19 @@ function Assert-SourceLinkDocument {
             "SourceLink documents map.")
     }
 
-    return $verifiedMappings
+    $unresolvedDocuments = @(
+        $documents |
+            Where-Object {
+                -not $coveredDocuments.Contains($_) -and
+                -not $embeddedDocuments.Contains($_)
+            }
+    )
+    if ($unresolvedDocuments.Count -gt 0) {
+        throw (
+            "Package $PackageName PDB '$PdbEntryName' contains documents " +
+            "without SourceLink or embedded source: " +
+            "$($unresolvedDocuments -join ', ').")
+    }
 }
 
 $expectedVersions = [Collections.Generic.Dictionary[string, string]]::new(
@@ -378,6 +637,7 @@ if ($packages.Count -ne $expectedVersions.Count) {
 
 $actualPackageIds = [Collections.Generic.HashSet[string]]::new(
     [StringComparer]::OrdinalIgnoreCase)
+$releaseRepositoryCommit = $null
 foreach ($package in $packages) {
     $archive = [IO.Compression.ZipFile]::OpenRead($package.FullName)
     try {
@@ -387,6 +647,15 @@ foreach ($package in $packages) {
         Assert-RepositoryMetadata `
             -Metadata $metadata `
             -PackageName $package.Name
+        if ($null -eq $releaseRepositoryCommit) {
+            $releaseRepositoryCommit = $metadata.RepositoryCommit
+        }
+        elseif ($metadata.RepositoryCommit -cne $releaseRepositoryCommit) {
+            throw (
+                "Package $($package.Name) has repository commit " +
+                "'$($metadata.RepositoryCommit)'; expected release commit " +
+                "'$releaseRepositoryCommit'.")
+        }
 
         $licenseElement = Get-SingleXmlElement `
             -Parent $metadata.Metadata `
@@ -477,6 +746,12 @@ foreach ($symbolPackage in $symbolPackages) {
         Assert-RepositoryMetadata `
             -Metadata $metadata `
             -PackageName $symbolPackage.Name
+        if ($metadata.RepositoryCommit -cne $releaseRepositoryCommit) {
+            throw (
+                "Symbol package $($symbolPackage.Name) has repository " +
+                "commit '$($metadata.RepositoryCommit)'; expected release " +
+                "commit '$releaseRepositoryCommit'.")
+        }
 
         $id = $metadata.Id
         $version = $metadata.Version
@@ -518,7 +793,6 @@ foreach ($symbolPackage in $symbolPackages) {
 
         $pdbEntryNames = [Collections.Generic.HashSet[string]]::new(
             [StringComparer]::OrdinalIgnoreCase)
-        $verifiedSourceLinkMappings = 0
         foreach ($pdbEntry in $pdbEntries) {
             if (-not $pdbEntryNames.Add($pdbEntry.FullName)) {
                 throw (
@@ -534,9 +808,9 @@ foreach ($symbolPackage in $symbolPackages) {
             $stream = $pdbEntry.Open()
             try {
                 try {
-                    $sourceLinkDocuments =
+                    $inspection =
                         [ReleasePackagePortablePdbInspector]::
-                            ReadSourceLinkDocuments($stream)
+                            Inspect($stream)
                 }
                 catch {
                     throw (
@@ -549,19 +823,28 @@ foreach ($symbolPackage in $symbolPackages) {
                 $stream.Dispose()
             }
 
-            foreach ($sourceLinkDocument in $sourceLinkDocuments) {
-                $verifiedSourceLinkMappings +=
-                    Assert-SourceLinkDocument `
-                        -Json $sourceLinkDocument `
-                        -PackageName $symbolPackage.Name `
-                        -PdbEntryName $pdbEntry.FullName
+            if ($inspection.NonModuleSourceLinkDocumentCount -ne 0) {
+                throw (
+                    "Symbol package $($symbolPackage.Name) PDB " +
+                    "'$($pdbEntry.FullName)' contains " +
+                    "$($inspection.NonModuleSourceLinkDocumentCount) " +
+                    "non-module SourceLink documents.")
             }
-        }
+            if ($inspection.ModuleSourceLinkDocuments.Count -ne 1) {
+                throw (
+                    "Symbol package $($symbolPackage.Name) PDB " +
+                    "'$($pdbEntry.FullName)' contains " +
+                    "$($inspection.ModuleSourceLinkDocuments.Count) " +
+                    "module-level SourceLink documents; expected exactly one.")
+            }
 
-        if ($verifiedSourceLinkMappings -eq 0) {
-            throw (
-                "Symbol package $($symbolPackage.Name) contains no " +
-                "verifiable SourceLink mapping.")
+            Assert-SourceLinkDocument `
+                -Json $inspection.ModuleSourceLinkDocuments[0] `
+                -DocumentNames $inspection.Documents `
+                -EmbeddedDocumentNames $inspection.EmbeddedDocuments `
+                -ExpectedCommit $releaseRepositoryCommit `
+                -PackageName $symbolPackage.Name `
+                -PdbEntryName $pdbEntry.FullName
         }
     }
     finally {

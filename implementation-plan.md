@@ -171,7 +171,7 @@ dotnet restore DevBitsLab.Mcp.SourceGraph.slnx --locked-mode
 dotnet build DevBitsLab.Mcp.SourceGraph.slnx -c Release --no-restore
 dotnet test DevBitsLab.Mcp.SourceGraph.slnx -c Release --no-build
 dotnet package list --project DevBitsLab.Mcp.SourceGraph.slnx --vulnerable --include-transitive --format json --output-version 1 --no-restore
-dotnet pack src/DevBitsLab.Mcp.SourceGraph.Server/DevBitsLab.Mcp.SourceGraph.Server.csproj -c Release --no-build
+dotnet pack src/DevBitsLab.Mcp.SourceGraph.Server/DevBitsLab.Mcp.SourceGraph.Server.csproj -c Release --no-restore /p:ContinuousIntegrationBuild=true
 dotnet pack src/DevBitsLab.Mcp.SourceGraph.Sdk/DevBitsLab.Mcp.SourceGraph.Sdk.csproj -c Release --no-build
 ```
 
