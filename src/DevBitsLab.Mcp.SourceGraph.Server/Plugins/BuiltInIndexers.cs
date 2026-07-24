@@ -11,6 +11,7 @@ namespace DevBitsLab.Mcp.SourceGraph.Server.Plugins;
 /// <para>The current list (in registration order):</para>
 /// <list type="bullet">
 /// <item><see cref="BuiltInRoslynLanguageIndexerStub"/> for <c>.cs</c>.</item>
+/// <item><see cref="DevBitsLab.Mcp.SourceGraph.Indexing.Protobuf.ProtobufLanguageIndexer"/> for <c>.proto</c>.</item>
 /// <item><see cref="DevBitsLab.Mcp.SourceGraph.Indexing.Xaml.XamlLanguageIndexer"/> for <c>.xaml</c>.</item>
 /// <item><see cref="DevBitsLab.Mcp.SourceGraph.Indexing.TypeScript.TypeScriptLanguageIndexer"/> for <c>.ts</c> / <c>.tsx</c> / <c>.js</c> / <c>.jsx</c>.</item>
 /// </list>
@@ -28,6 +29,7 @@ internal static class BuiltInIndexers
         var indexers = new ILanguageIndexer[]
         {
             new BuiltInRoslynLanguageIndexerStub(),
+            new DevBitsLab.Mcp.SourceGraph.Indexing.Protobuf.ProtobufLanguageIndexer(),
             new DevBitsLab.Mcp.SourceGraph.Indexing.Xaml.XamlLanguageIndexer(),
             new DevBitsLab.Mcp.SourceGraph.Indexing.TypeScript.TypeScriptLanguageIndexer(),
         };

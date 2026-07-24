@@ -1,0 +1,32 @@
+syntax = "proto3";
+
+package medical.imaging.v1;
+
+import "google/protobuf/empty.proto";
+
+message ScanRequest {
+  optional string patient_id = 1;
+  repeated Frame frames = 2;
+
+  oneof source {
+    bytes dicom = 3;
+    string study_uid = 4;
+  }
+
+  message Frame {
+    bytes payload = 1;
+  }
+}
+
+message ScanReply {
+  int32 accepted_frames = 1;
+}
+
+service Scanner {
+  rpc Upload(stream ScanRequest) returns (ScanReply);
+  rpc Watch(ScanRequest) returns (stream ScanReply);
+  rpc Duplex(stream ScanRequest) returns (stream ScanReply) {
+    option deprecated = true;
+  }
+  rpc Ping(google.protobuf.Empty) returns (google.protobuf.Empty);
+}

@@ -37,6 +37,17 @@ public interface ILanguageIndexer
 }
 
 /// <summary>
+/// Optional capability for an <see cref="ILanguageIndexer"/> that requires the host to enforce a
+/// hard byte limit while reading its source file. Hosts that understand this capability reject a
+/// growing or oversized file before allocating or forwarding bytes beyond the declared limit.
+/// </summary>
+public interface IBoundedSourceLanguageIndexer
+{
+    /// <summary>Maximum source bytes accepted for one document. Must be positive.</summary>
+    int MaximumSourceSizeBytes { get; }
+}
+
+/// <summary>
 /// Helper base class with sensible no-op defaults. A plugin that handles <c>.txt</c> can derive
 /// from <see cref="LanguageIndexerBase"/>, override <see cref="LanguageIndexerBase.FileExtensions"/>
 /// and <see cref="LanguageIndexerBase.IndexAsync"/>, and skip the boilerplate.

@@ -964,7 +964,10 @@ public sealed class LanguageIndexerDispatcher
         byte[] contents;
         try
         {
-            contents = await File.ReadAllBytesAsync(filePath, ct).ConfigureAwait(false);
+            contents = await ReadSourceBytesAsync(
+                filePath,
+                indexer,
+                ct).ConfigureAwait(false);
         }
         catch (FileNotFoundException)
         {
@@ -1056,6 +1059,71 @@ public sealed class LanguageIndexerDispatcher
             || replacement.Annotations.Count > 0
             || replacement.References.Count > 0;
         return new DispatchFileOutcome(Replaced: true, HasUsableOutput: hasUsableOutput);
+    }
+
+    private static async Task<byte[]> ReadSourceBytesAsync(
+        string filePath,
+        ILanguageIndexer indexer,
+        CancellationToken ct)
+    {
+        if (indexer is not IBoundedSourceLanguageIndexer bounded)
+        {
+            return await File.ReadAllBytesAsync(
+                filePath,
+                ct).ConfigureAwait(false);
+        }
+
+        var limit = bounded.MaximumSourceSizeBytes;
+        if (limit <= 0)
+        {
+            throw new InvalidOperationException(
+                $"Indexer `{indexer.GetType().FullName}` declared an invalid "
+                + $"maximum source size of {limit} bytes.");
+        }
+
+        await using var stream = new FileStream(
+            filePath,
+            new FileStreamOptions
+            {
+                Mode = FileMode.Open,
+                Access = FileAccess.Read,
+                Share = FileShare.Read,
+                BufferSize = 81_920,
+                Options = FileOptions.Asynchronous
+                    | FileOptions.SequentialScan,
+            });
+        if (stream.CanSeek && stream.Length > limit)
+        {
+            throw new InvalidDataException(
+                $"Source exceeds the indexer's {limit}-byte limit.");
+        }
+
+        var capacity = stream.CanSeek
+            && stream.Length > 0
+            && stream.Length <= limit
+                ? checked((int)stream.Length)
+                : 0;
+        using var output = new MemoryStream(capacity);
+        var buffer = new byte[Math.Min(81_920, limit)];
+        var total = 0;
+        while (true)
+        {
+            ct.ThrowIfCancellationRequested();
+            var read = await stream.ReadAsync(
+                buffer,
+                ct).ConfigureAwait(false);
+            if (read == 0) break;
+            if (read > limit - total)
+            {
+                throw new InvalidDataException(
+                    $"Source exceeds the indexer's {limit}-byte limit.");
+            }
+            await output.WriteAsync(
+                buffer.AsMemory(0, read),
+                ct).ConfigureAwait(false);
+            total += read;
+        }
+        return output.ToArray();
     }
 
     private static ILanguageProject? SelectLanguageProject(
