@@ -12,6 +12,8 @@ public static class InteropAnnotationFlavors
     public const string ManagedImport = "interop-managed-import";
     public const string NativeExport = "interop-native-export";
     public const string AbiRecord = "interop-abi-record";
+    public const string Match = "interop-match";
+    public const string Finding = "interop-finding";
 }
 
 /// <summary>
@@ -19,7 +21,7 @@ public static class InteropAnnotationFlavors
 /// SQLite ownership is intentionally not part of the wire format: every decoded
 /// <see cref="Evidence"/> receives the annotation owner's file id supplied by the caller.
 /// </summary>
-public static class InteropFactPayloadCodec
+public static partial class InteropFactPayloadCodec
 {
     public const int CurrentVersion = 1;
     public const int MaximumPayloadBytes = 256 * 1024;
