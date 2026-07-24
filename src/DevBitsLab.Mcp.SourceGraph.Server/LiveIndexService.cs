@@ -867,7 +867,8 @@ public sealed class LiveIndexService : BackgroundService
         var perScopeFactories = new LanguageProjectFactoryRegistry();
         perScopeFactories.Register(
             new DevBitsLab.Mcp.SourceGraph.Indexing.Xaml.XamlLanguageProjectFactory(
-                () => host.Indexer.SanitizedSolution));
+                () => host.Indexer.SanitizedSolution,
+                host.Indexer.IsProjectSemanticInputComplete));
         foreach (var factory in _projectFactories.All())
         {
             // Replace the process-wide discovery-only XAML factory with this scope's
@@ -916,33 +917,47 @@ public sealed class LiveIndexService : BackgroundService
 
         ct.ThrowIfCancellationRequested();
         LanguageDispatchResult languageResult;
-        try
+        var roslynPassFailed =
+            roslynFailure is not null
+            || (roslynResult is not null
+                && (roslynResult.FailedProjects.Count > 0
+                    || roslynResult.FailedFiles.Count > 0));
+        if (roslynPassFailed)
         {
-            languageResult = await languageAction(ct).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException) { throw; }
-        catch (Exception ex)
-        {
+            roslynFailure ??= new ProjectFailure(
+                "roslyn-reload",
+                "Roslyn reconciliation reported incomplete project or file output; "
+                + "registered-language facts were retained.");
             languageResult = LanguageDispatchResult.Empty with
             {
-                FailedProjects =
-                [
-                    new ProjectFailure(
-                        "registered-language-reconciliation",
-                        FailureMessage.Truncate(ex.Message)),
-                ],
-            };
-        }
-
-        if (roslynFailure is not null)
-        {
-            languageResult = languageResult with
-            {
-                FailedProjects = languageResult.FailedProjects
+                FailedProjects = (roslynResult?.FailedProjects
+                        ?? Array.Empty<ProjectFailure>())
                     .Prepend(roslynFailure)
                     .Distinct()
                     .ToArray(),
+                FailedFiles = roslynResult?.FailedFiles
+                    ?? Array.Empty<FileFailure>(),
             };
+        }
+        else
+        {
+            try
+            {
+                languageResult = await languageAction(ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex)
+            {
+                languageResult = LanguageDispatchResult.Empty with
+                {
+                    FailedProjects =
+                    [
+                        new ProjectFailure(
+                            "registered-language-reconciliation",
+                            FailureMessage.Truncate(ex.Message)),
+                    ],
+                };
+            }
         }
 
         return new LiveControlReconciliationResult(
@@ -1069,7 +1084,7 @@ public sealed class LiveIndexService : BackgroundService
                             if (reconciliation.RoslynFailure is not null)
                             {
                                 _logger.LogWarning(
-                                    "Scope `{Id}` Roslyn reload failed during git HEAD reconciliation: {Reason}; registered-language reconciliation still ran",
+                                    "Scope `{Id}` Roslyn reload failed during git HEAD reconciliation: {Reason}; prior registered-language facts were retained",
                                     host.Scope.Id,
                                     reconciliation.RoslynFailure.Reason);
                             }
@@ -1124,7 +1139,7 @@ public sealed class LiveIndexService : BackgroundService
                                 if (reconciliation.RoslynFailure is not null)
                                 {
                                     _logger.LogWarning(
-                                        "Scope `{Id}` Roslyn reload failed for project-control event: {Reason}; registered-language reconciliation still ran",
+                                        "Scope `{Id}` Roslyn reload failed for project-control event: {Reason}; prior registered-language facts were retained",
                                         host.Scope.Id,
                                         reconciliation.RoslynFailure.Reason);
                                 }
@@ -1138,12 +1153,37 @@ public sealed class LiveIndexService : BackgroundService
                                             stoppingToken)
                                         .ConfigureAwait(false)
                                     : null;
-                                languageResult = await dispatcher
-                                    .DispatchChangedFilesAsync(
-                                        host,
-                                        batch.Paths,
-                                        stoppingToken)
-                                    .ConfigureAwait(false);
+                                var csharpSemanticUpdateSucceeded =
+                                    roslynResult is not null
+                                    && roslynResult.FailedProjects.Count == 0
+                                    && roslynResult.FailedFiles.Count == 0;
+                                if (csharpPaths.Length > 0
+                                    && !csharpSemanticUpdateSucceeded)
+                                {
+                                    // A mixed C#/XAML batch is one semantic transaction. If the
+                                    // Roslyn half is incomplete, reindexing only the XAML paths
+                                    // would replace last-known-good edges with facts derived from
+                                    // stale or partial compilations.
+                                    languageResult = LanguageDispatchResult.Empty with
+                                    {
+                                        FailedProjects =
+                                            roslynResult?.FailedProjects
+                                            ?? Array.Empty<ProjectFailure>(),
+                                        FailedFiles =
+                                            roslynResult?.FailedFiles
+                                            ?? Array.Empty<FileFailure>(),
+                                    };
+                                }
+                                else
+                                {
+                                    languageResult = await dispatcher
+                                        .DispatchChangedFilesAsync(
+                                            host,
+                                            batch.Paths,
+                                            stoppingToken,
+                                            csharpSemanticUpdateSucceeded)
+                                        .ConfigureAwait(false);
+                                }
                             }
                             await RecordLiveLanguageFailuresAsync(
                                 host,

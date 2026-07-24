@@ -632,7 +632,8 @@ static async Task<int> RunIndexAsync(CommandLine cli)
         var projectFactoryRegistry = new LanguageProjectFactoryRegistry();
         projectFactoryRegistry.Register(
             new DevBitsLab.Mcp.SourceGraph.Indexing.Xaml.XamlLanguageProjectFactory(
-                () => indexer.SanitizedSolution));
+                () => indexer.SanitizedSolution,
+                indexer.IsProjectSemanticInputComplete));
         foreach (var record in pluginHost.Plugins.Where(p => p.Status == PluginStatus.Loaded))
         {
             foreach (var lpf in record.LanguageProjectFactories) projectFactoryRegistry.Register(lpf, record);
@@ -672,7 +673,8 @@ static async Task<int> RunIndexAsync(CommandLine cli)
                 projectMapResult.ProjectByFilePath,
                 excludePatterns,
                 ct: CancellationToken.None,
-                projectSet: selectedScope.ProjectSet).ConfigureAwait(false)
+                projectSet: selectedScope.ProjectSet,
+                projects: projectMapResult.Projects).ConfigureAwait(false)
             : LanguageDispatchResult.Empty with
             {
                 FailedProjects = projectMapResult.FailedProjects,

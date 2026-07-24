@@ -233,7 +233,7 @@ public sealed class LanguageDispatcherResilienceTests : IDisposable
     }
 
     [Fact]
-    public async Task ProjectAnchorDeletePurgesOldGraph_andCreateIndexesNewProject()
+    public async Task ProjectAnchorDeleteRetainsOldGraphWhenRoslynReloadFails()
     {
         var projectPath = await PlantAsync("src/App/App.csproj", "<Project />");
         var sourcePath = await PlantAsync("src/App/app.residx", "v1");
@@ -253,26 +253,33 @@ public sealed class LanguageDispatcherResilienceTests : IDisposable
                 .Should().ContainSingle(file => file.Path == sourcePath);
 
             File.Delete(projectPath);
+            var languageCalled = false;
             var reconciliation =
                 await LiveIndexService.RunControlReconciliationAsync(
                     _ => Task.FromException<IndexResult?>(
                         new InvalidOperationException(
                             "synthetic Roslyn reload failure")),
-                    ct => dispatcher.DispatchChangedFilesAsync(
-                        host,
-                        [projectPath],
-                        ct),
+                    async ct =>
+                    {
+                        languageCalled = true;
+                        return await dispatcher.DispatchChangedFilesAsync(
+                            host,
+                            [projectPath],
+                            ct);
+                    },
                     CancellationToken.None);
             var removed = reconciliation.LanguageResult;
 
-            removed.DeletedFiles.Should().Be(1);
+            languageCalled.Should().BeFalse();
+            removed.DeletedFiles.Should().Be(0);
             removed.FailedFiles.Should().BeEmpty();
             removed.FailedProjects.Should().ContainSingle(failure =>
                 failure.Name == "roslyn-reload"
                 && failure.Reason.Contains(
                     "synthetic Roslyn reload failure",
                     StringComparison.Ordinal));
-            (await host.Store.GetAllFilesAsync()).Should().BeEmpty();
+            (await host.Store.GetAllFilesAsync())
+                .Should().ContainSingle(file => file.Path == sourcePath);
             LiveIndexService.ApplyLiveLanguageFailures(host, removed)
                 .Should().BeTrue();
             host.Status.Should().Be("partial");
@@ -317,6 +324,40 @@ public sealed class LanguageDispatcherResilienceTests : IDisposable
             && failure.Reason.Contains(
                 "synthetic registered-language failure",
                 StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task ControlReconciliation_partialRoslynResultRetainsLanguageFacts()
+    {
+        var roslyn = new IndexResult(
+            FilesIndexed: 1,
+            SymbolsIndexed: 2,
+            ReferencesIndexed: 3,
+            Elapsed: TimeSpan.Zero)
+        {
+            FailedFiles =
+            [
+                new FileFailure("Broken.cs", "synthetic Roslyn file failure"),
+            ],
+        };
+        var languageCalled = false;
+
+        var result = await LiveIndexService.RunControlReconciliationAsync(
+            _ => Task.FromResult<IndexResult?>(roslyn),
+            _ =>
+            {
+                languageCalled = true;
+                return Task.FromResult(LanguageDispatchResult.Empty);
+            },
+            CancellationToken.None);
+
+        languageCalled.Should().BeFalse();
+        result.RoslynResult.Should().BeSameAs(roslyn);
+        result.RoslynFailure.Should().NotBeNull();
+        result.LanguageResult.IndexedFiles.Should().Be(0);
+        result.LanguageResult.DeletedFiles.Should().Be(0);
+        result.LanguageResult.FailedFiles.Should().Equal(
+            roslyn.FailedFiles);
     }
 
     [Fact]

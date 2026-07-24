@@ -118,6 +118,15 @@ public sealed class ScopeHost : IAsyncDisposable
     public Dictionary<string, ILanguageProject> ProjectByFilePath { get; } = new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>
+    /// Every project returned by the last complete discovery pass, including projects that share
+    /// every source path with another project. The single-value file map remains the document
+    /// indexing compatibility view; invalidation uses this collection so shared XAML contributors
+    /// can fan out to all owners.
+    /// </summary>
+    public IReadOnlyList<ILanguageProject> LanguageProjects { get; internal set; } =
+        Array.Empty<ILanguageProject>();
+
+    /// <summary>
     /// Whether <see cref="ProjectByFilePath"/> reflects a complete successful discovery pass.
     /// A failed cold/control-plane discovery keeps the prior dictionary for query safety but
     /// clears this flag so the next ordinary source event retries discovery before indexing.

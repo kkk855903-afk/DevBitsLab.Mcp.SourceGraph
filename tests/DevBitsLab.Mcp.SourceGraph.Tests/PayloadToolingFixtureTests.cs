@@ -333,7 +333,9 @@ public sealed class PayloadToolingFixtureTests : IAsyncLifetime, IDisposable
         var langRegistry = new LanguageIndexerRegistry();
         langRegistry.Register(new XamlLanguageIndexer());
         var factories = new LanguageProjectFactoryRegistry();
-        factories.Register(new XamlLanguageProjectFactory(() => roslyn.SanitizedSolution));
+        factories.Register(new XamlLanguageProjectFactory(
+            () => roslyn.SanitizedSolution,
+            roslyn.IsProjectSemanticInputComplete));
         var dispatcher = new LanguageIndexerDispatcher(langRegistry, factories);
 
         var projectMap = new Dictionary<string, ILanguageProject>(StringComparer.OrdinalIgnoreCase);

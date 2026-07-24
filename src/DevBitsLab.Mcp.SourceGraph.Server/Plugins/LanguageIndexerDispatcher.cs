@@ -6,6 +6,7 @@ using System.Security.Cryptography;
 using System.Threading;
 using System.Threading.Tasks;
 using DevBitsLab.Mcp.SourceGraph.Core;
+using DevBitsLab.Mcp.SourceGraph.Indexing.Xaml;
 using DevBitsLab.Mcp.SourceGraph.Sdk;
 using DevBitsLab.Mcp.SourceGraph.Server.Scoping;
 using DevBitsLab.Mcp.SourceGraph.Storage;
@@ -110,6 +111,7 @@ public sealed class LanguageIndexerDispatcher
         {
             host.ProjectByFilePath[pair.Key] = pair.Value;
         }
+        host.LanguageProjects = result.Projects;
         host.ProjectMapReady = true;
         return result;
     }
@@ -128,6 +130,10 @@ public sealed class LanguageIndexerDispatcher
         var pathPolicy = new ScopePathPolicy(normalizedRoot, projectSet.Exclude);
         var projectSetMatcher = new ScopeProjectSetPathMatcher(normalizedRoot, projectSet);
         var temporary = new Dictionary<string, ILanguageProject>(
+            OperatingSystem.IsWindows()
+                ? StringComparer.OrdinalIgnoreCase
+                : StringComparer.Ordinal);
+        var discoveredProjects = new Dictionary<string, ILanguageProject>(
             OperatingSystem.IsWindows()
                 ? StringComparer.OrdinalIgnoreCase
                 : StringComparer.Ordinal);
@@ -181,6 +187,13 @@ public sealed class LanguageIndexerDispatcher
 
                 foreach (var project in projects)
                 {
+                    var projectIdentity =
+                        (project.GetType().AssemblyQualifiedName
+                         ?? project.GetType().FullName
+                         ?? project.GetType().Name)
+                        + "\0"
+                        + project.Id;
+                    discoveredProjects.TryAdd(projectIdentity, project);
                     foreach (var path in project.FilePaths)
                     {
                         if (string.IsNullOrWhiteSpace(path)
@@ -198,7 +211,10 @@ public sealed class LanguageIndexerDispatcher
             }
         }
 
-        return new ProjectMapBuildResult(temporary, failures);
+        return new ProjectMapBuildResult(temporary, failures)
+        {
+            Projects = discoveredProjects.Values.ToArray(),
+        };
     }
 
     /// <summary>
@@ -235,7 +251,8 @@ public sealed class LanguageIndexerDispatcher
         IReadOnlyDictionary<string, ILanguageProject> projectMap,
         IReadOnlyList<string> excludePatterns,
         CancellationToken ct,
-        ScopeProjectSet? projectSet = null)
+        ScopeProjectSet? projectSet = null,
+        IReadOnlyList<ILanguageProject>? projects = null)
     {
         if (!HasNonCSharpIndexers) return LanguageDispatchResult.Empty;
         if (string.IsNullOrEmpty(repoRoot) || !Directory.Exists(repoRoot))
@@ -272,13 +289,14 @@ public sealed class LanguageIndexerDispatcher
             fileIdByPath,
             ct).ConfigureAwait(false);
 
-        var indexed = 0;
-        var usableOutput = 0;
+        var indexedPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var usableOutputPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var skipped = staleDeletion.FailedFiles.Count;
         var failedFiles = new List<FileFailure>(staleDeletion.FailedFiles);
         foreach (var file in OrderDispatchFiles(
                      EnumerateFiles(repoRoot, extensions, pathPolicy, projectSetMatcher),
-                     projectMap))
+                     projectMap,
+                     projects))
         {
             ct.ThrowIfCancellationRequested();
             var ext = Path.GetExtension(file);
@@ -291,6 +309,7 @@ public sealed class LanguageIndexerDispatcher
                     scopeId,
                     repoRoot,
                     projectMap,
+                    projects,
                     file,
                     indexerHit.Value.Indexer,
                     symbolIdByKey,
@@ -298,8 +317,8 @@ public sealed class LanguageIndexerDispatcher
                     fileIdByPath,
                     pathPolicy,
                     ct).ConfigureAwait(false);
-                if (outcome.Replaced) indexed++;
-                if (outcome.HasUsableOutput) usableOutput++;
+                if (outcome.Replaced) indexedPaths.Add(file);
+                if (outcome.HasUsableOutput) usableOutputPaths.Add(file);
                 if (outcome.WasSkipped) skipped++;
             }
             catch (OperationCanceledException) { throw; }
@@ -316,8 +335,8 @@ public sealed class LanguageIndexerDispatcher
             }
         }
         return new LanguageDispatchResult(
-            indexed,
-            usableOutput,
+            indexedPaths.Count,
+            usableOutputPaths.Count,
             staleDeletion.DeletedFiles,
             skipped,
             failedFiles);
@@ -381,8 +400,8 @@ public sealed class LanguageIndexerDispatcher
             fileIdByPath,
             ct).ConfigureAwait(false);
 
-        var indexed = 0;
-        var usableOutput = 0;
+        var indexedPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var usableOutputPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var skipped = staleDeletion.FailedFiles.Count;
         var failedFiles = new List<FileFailure>(staleDeletion.FailedFiles);
         foreach (var file in OrderDispatchFiles(
@@ -391,7 +410,8 @@ public sealed class LanguageIndexerDispatcher
                          extensions,
                          pathPolicy,
                          projectSetMatcher),
-                     host.ProjectByFilePath))
+                     host.ProjectByFilePath,
+                     host.LanguageProjects))
         {
             ct.ThrowIfCancellationRequested();
             var ext = Path.GetExtension(file);
@@ -410,8 +430,8 @@ public sealed class LanguageIndexerDispatcher
                     fileIdByPath,
                     pathPolicy,
                     ct).ConfigureAwait(false);
-                if (outcome.Replaced) indexed++;
-                if (outcome.HasUsableOutput) usableOutput++;
+                if (outcome.Replaced) indexedPaths.Add(file);
+                if (outcome.HasUsableOutput) usableOutputPaths.Add(file);
                 if (outcome.WasSkipped) skipped++;
             }
             catch (OperationCanceledException) { throw; }
@@ -429,8 +449,8 @@ public sealed class LanguageIndexerDispatcher
             }
         }
         return new LanguageDispatchResult(
-            indexed,
-            usableOutput,
+            indexedPaths.Count,
+            usableOutputPaths.Count,
             staleDeletion.DeletedFiles,
             skipped,
             failedFiles);
@@ -446,7 +466,8 @@ public sealed class LanguageIndexerDispatcher
     public async Task<LanguageDispatchResult> DispatchChangedFilesAsync(
         ScopeHost host,
         IReadOnlyCollection<string> paths,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        bool csharpSemanticUpdateSucceeded = false)
     {
         ArgumentNullException.ThrowIfNull(host);
         ArgumentNullException.ThrowIfNull(paths);
@@ -462,8 +483,19 @@ public sealed class LanguageIndexerDispatcher
         var skipped = 0;
         var failedFiles = new List<FileFailure>();
         var projectAnchorChanged = false;
+        var projectMapRebuilt = false;
 
-        foreach (var suppliedPath in paths.Distinct(StringComparer.OrdinalIgnoreCase))
+        var suppliedPaths = csharpSemanticUpdateSucceeded
+            && paths.Any(path => string.Equals(
+                Path.GetExtension(path),
+                ".cs",
+                StringComparison.OrdinalIgnoreCase))
+            ? paths
+                .Concat(GetXamlProjects(host).SelectMany(project => project.FilePaths))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+            : paths.Distinct(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var suppliedPath in suppliedPaths)
         {
             ct.ThrowIfCancellationRequested();
             if (!TryNormalizePath(root, suppliedPath, out var fullPath)
@@ -554,7 +586,68 @@ public sealed class LanguageIndexerDispatcher
         var existingCandidates = candidates
             .Where(item => item.State == SourcePathState.File)
             .ToArray();
-        if (existingCandidates.Length > 0 && !host.ProjectMapReady)
+        var resourceProjectIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var resourceEdits =
+            new Dictionary<string, (XamlLanguageProject Project, string TriggerPath)>(
+                StringComparer.OrdinalIgnoreCase);
+        var newXamlPaths = new List<string>();
+        var xamlMembershipChanged = false;
+        var knownXamlProjects = GetXamlProjects(host);
+        foreach (var candidate in candidates.Where(candidate =>
+                     IsXamlPath(candidate.Path)))
+        {
+            var owningProjects = knownXamlProjects
+                .Where(project => project.FilePaths.Contains(
+                    candidate.Path,
+                    StringComparer.OrdinalIgnoreCase))
+                .ToArray();
+            var declarationOwners = owningProjects
+                .Where(project => IsDeclarationPath(project, candidate.Path))
+                .ToArray();
+            if (declarationOwners.Length > 0)
+            {
+                foreach (var xamlProject in declarationOwners)
+                {
+                    resourceProjectIds.Add(xamlProject.Id);
+                    if (candidate.State == SourcePathState.File)
+                    {
+                        resourceEdits.TryAdd(
+                            xamlProject.Id,
+                            (xamlProject, candidate.Path));
+                    }
+                }
+
+                if (candidate.State == SourcePathState.Missing)
+                {
+                    xamlMembershipChanged = true;
+                }
+                continue;
+            }
+
+            if (owningProjects.Length > 0)
+            {
+                // A vanished consumer still changes the immutable project membership. Refresh
+                // the complete map before deleting its graph facts so later resource snapshot
+                // rebuilds cannot retain and attempt to read the stale path.
+                if (candidate.State == SourcePathState.Missing)
+                {
+                    xamlMembershipChanged = true;
+                }
+                continue;
+            }
+
+            if (candidate.State == SourcePathState.File)
+            {
+                // A newly-created/renamed XAML file is not present in the immutable project
+                // membership captured by the prior discovery pass. Refresh the temporary map
+                // before deciding whether the new file contributes to the resource cascade.
+                xamlMembershipChanged = true;
+                newXamlPaths.Add(candidate.Path);
+            }
+        }
+
+        if ((existingCandidates.Length > 0 || xamlMembershipChanged)
+            && !host.ProjectMapReady)
         {
             // Discover into a temporary map before mutating any file in this batch. A factory
             // failure retains both the previous project map and every prior file graph. Once a
@@ -574,6 +667,140 @@ public sealed class LanguageIndexerDispatcher
                     FailedProjects = projectMapResult.FailedProjects,
                 };
             }
+            projectMapRebuilt = true;
+        }
+
+        if (xamlMembershipChanged && !projectMapRebuilt)
+        {
+            // XAML membership changes are structural for the project resource snapshot. Build
+            // and publish a complete replacement map before deleting the vanished contributor
+            // or indexing its replacement. Discovery failure leaves both the old map and every
+            // prior consumer fact untouched.
+            var projectMapResult =
+                await BuildProjectMapAsync(host, ct).ConfigureAwait(false);
+            if (!projectMapResult.Succeeded)
+            {
+                return new LanguageDispatchResult(
+                    IndexedFiles: 0,
+                    UsableOutputFiles: 0,
+                    DeletedFiles: 0,
+                    SkippedFiles: skipped + candidates.Count,
+                    FailedFiles: failedFiles)
+                {
+                    FailedProjects = projectMapResult.FailedProjects,
+                };
+            }
+            projectMapRebuilt = true;
+        }
+
+        var affectedResourceProjects =
+            new Dictionary<string, XamlLanguageProject>(
+                StringComparer.OrdinalIgnoreCase);
+        if (projectMapRebuilt)
+        {
+            foreach (var project in GetXamlProjects(host)
+                .Where(project => resourceProjectIds.Contains(project.Id)))
+            {
+                affectedResourceProjects[project.Id] = project;
+            }
+            foreach (var path in newXamlPaths)
+            {
+                foreach (var xamlProject in GetXamlProjects(host)
+                             .Where(project =>
+                                 IsDeclarationPath(project, path)))
+                {
+                    affectedResourceProjects[xamlProject.Id] = xamlProject;
+                }
+            }
+        }
+        else
+        {
+            var preparedSnapshots =
+                new List<(string ProjectId, XamlLanguageProject Project,
+                    XamlResourceSnapshot Snapshot)>();
+            foreach (var entry in resourceEdits
+                         .OrderBy(pair => pair.Key, StringComparer.OrdinalIgnoreCase)
+                         .ThenBy(pair => pair.Key, StringComparer.Ordinal))
+            {
+                ct.ThrowIfCancellationRequested();
+                try
+                {
+                    // Prepare every affected project before publishing any replacement. This
+                    // prevents a later project's read/parse failure from leaving an earlier
+                    // project's in-memory snapshot ahead of its unchanged stored graph.
+                    preparedSnapshots.Add((
+                        entry.Key,
+                        entry.Value.Project,
+                        entry.Value.Project.PrepareResourceSnapshot()));
+                }
+                catch (OperationCanceledException) { throw; }
+                catch (Exception ex)
+                {
+                    failedFiles.Add(new FileFailure(
+                        entry.Value.TriggerPath,
+                        FailureMessage.Truncate(ex.Message)));
+                    _logger.LogWarning(
+                        ex,
+                        "Failed to rebuild XAML resource snapshot for project {Project}; "
+                        + "keeping prior consumer graph facts",
+                        entry.Key);
+                    return new LanguageDispatchResult(
+                        IndexedFiles: 0,
+                        UsableOutputFiles: 0,
+                        DeletedFiles: 0,
+                        SkippedFiles: skipped + candidates.Count,
+                        FailedFiles: failedFiles);
+                }
+            }
+
+            // All builders succeeded. Publishing an already-built immutable snapshot performs no
+            // I/O and cannot be cancelled halfway through the affected-project set.
+            foreach (var prepared in preparedSnapshots)
+            {
+                prepared.Project.PublishResourceSnapshot(prepared.Snapshot);
+                affectedResourceProjects[prepared.ProjectId] = prepared.Project;
+            }
+        }
+
+        if (affectedResourceProjects.Count > 0)
+        {
+            var candidatePaths = candidates
+                .Select(candidate => candidate.Path)
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+            foreach (var project in affectedResourceProjects.Values
+                         .OrderBy(project => project.Id, StringComparer.OrdinalIgnoreCase)
+                         .ThenBy(project => project.Id, StringComparer.Ordinal))
+            {
+                foreach (var projectPath in project.FilePaths
+                             .OrderBy(
+                                 NormalizePathForOrdering,
+                                 StringComparer.OrdinalIgnoreCase)
+                             .ThenBy(path => path, StringComparer.Ordinal))
+                {
+                    ct.ThrowIfCancellationRequested();
+                    if (!IsXamlPath(projectPath)
+                        || candidatePaths.Contains(projectPath)
+                        || pathPolicy.IsExcluded(projectPath)
+                        || !projectSetMatcher.Includes(projectPath)
+                        || GetSourcePathState(projectPath) != SourcePathState.File)
+                    {
+                        continue;
+                    }
+
+                    var indexerHit = _indexers.TryGet(
+                        Path.GetExtension(projectPath));
+                    if (indexerHit is null) continue;
+                    candidates.Add(new DispatchCandidate(
+                        projectPath,
+                        indexerHit.Value.Indexer,
+                        indexerHit.Value.Owner,
+                        SourcePathState.File));
+                    candidatePaths.Add(projectPath);
+                }
+            }
+            existingCandidates = candidates
+                .Where(item => item.State == SourcePathState.File)
+                .ToArray();
         }
 
         var deleted = 0;
@@ -612,11 +839,21 @@ public sealed class LanguageIndexerDispatcher
 
         var existing = existingCandidates
             .OrderBy(
-                candidate => GetDispatchPriority(candidate.Path, host.ProjectByFilePath))
+                candidate => GetDispatchPriority(
+                    candidate.Path,
+                    host.ProjectByFilePath,
+                    host.LanguageProjects))
             .ThenBy(
                 candidate => NormalizePathForOrdering(candidate.Path),
                 StringComparer.OrdinalIgnoreCase)
             .ThenBy(candidate => candidate.Path, StringComparer.Ordinal)
+            .ToArray();
+        var dispatchCandidates = existing
+            .Concat(existing.Where(candidate =>
+                ShouldRetryDeclarationFile(
+                    candidate.Path,
+                    host.ProjectByFilePath,
+                    host.LanguageProjects)))
             .ToArray();
 
         var symbolIdByKey = new Dictionary<string, long>(StringComparer.Ordinal);
@@ -629,9 +866,9 @@ public sealed class LanguageIndexerDispatcher
             fileIdByPath,
             ct).ConfigureAwait(false);
 
-        var indexed = 0;
-        var usableOutput = 0;
-        foreach (var candidate in existing)
+        var indexedPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var usableOutputPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var candidate in dispatchCandidates)
         {
             ct.ThrowIfCancellationRequested();
             try
@@ -646,8 +883,8 @@ public sealed class LanguageIndexerDispatcher
                     fileIdByPath,
                     pathPolicy,
                     ct).ConfigureAwait(false);
-                if (outcome.Replaced) indexed++;
-                if (outcome.HasUsableOutput) usableOutput++;
+                if (outcome.Replaced) indexedPaths.Add(candidate.Path);
+                if (outcome.HasUsableOutput) usableOutputPaths.Add(candidate.Path);
                 if (outcome.WasSkipped) skipped++;
             }
             catch (OperationCanceledException) { throw; }
@@ -671,8 +908,8 @@ public sealed class LanguageIndexerDispatcher
         }
 
         return new LanguageDispatchResult(
-            indexed,
-            usableOutput,
+            indexedPaths.Count,
+            usableOutputPaths.Count,
             deleted,
             skipped,
             failedFiles);
@@ -699,6 +936,7 @@ public sealed class LanguageIndexerDispatcher
             host.Scope.Id,
             host.Scope.Root,
             host.ProjectByFilePath,
+            host.LanguageProjects,
             filePath,
             indexer,
             symbolIdByKey,
@@ -712,6 +950,7 @@ public sealed class LanguageIndexerDispatcher
         string scopeId,
         string repoRoot,
         IReadOnlyDictionary<string, ILanguageProject> projectMap,
+        IReadOnlyList<ILanguageProject>? projects,
         string filePath,
         ILanguageIndexer indexer,
         Dictionary<string, long> symbolIdByKey,
@@ -741,7 +980,7 @@ public sealed class LanguageIndexerDispatcher
             return DispatchFileOutcome.Skipped;
         }
         var sha = SHA256.HashData(contents);
-        projectMap.TryGetValue(filePath, out var project);
+        var project = SelectLanguageProject(filePath, projectMap, projects);
         var ctx = new IndexContext(filePath, contents, scopeId, repoRoot, project);
         var languageEvents =
             await indexer.IndexAsync(ctx, ct).ConfigureAwait(false);
@@ -811,6 +1050,37 @@ public sealed class LanguageIndexerDispatcher
             || replacement.Annotations.Count > 0
             || replacement.References.Count > 0;
         return new DispatchFileOutcome(Replaced: true, HasUsableOutput: hasUsableOutput);
+    }
+
+    private static ILanguageProject? SelectLanguageProject(
+        string filePath,
+        IReadOnlyDictionary<string, ILanguageProject> projectMap,
+        IReadOnlyList<ILanguageProject>? projects)
+    {
+        projectMap.TryGetValue(filePath, out var mappedProject);
+        if (!IsXamlPath(filePath) || projects is null)
+        {
+            return mappedProject;
+        }
+
+        var normalizedPath = NormalizePathForOrdering(filePath);
+        var xamlOwners = projects
+            .OfType<XamlLanguageProject>()
+            .Where(project => project.FilePaths.Any(path =>
+                string.Equals(
+                    NormalizePathForOrdering(path),
+                    normalizedPath,
+                    StringComparison.OrdinalIgnoreCase)))
+            .GroupBy(project => project.Id, StringComparer.OrdinalIgnoreCase)
+            .Select(group => group.First())
+            .Take(2)
+            .ToArray();
+        return xamlOwners.Length switch
+        {
+            0 => mappedProject,
+            1 => xamlOwners[0],
+            _ => null,
+        };
     }
 
     private static async Task PopulateSymbolKeyMapAsync(
@@ -944,23 +1214,75 @@ public sealed class LanguageIndexerDispatcher
     /// </summary>
     private static IEnumerable<string> OrderDispatchFiles(
         IEnumerable<string> files,
-        IReadOnlyDictionary<string, ILanguageProject> projectMap) =>
-        files
-            .OrderBy(path => GetDispatchPriority(path, projectMap))
+        IReadOnlyDictionary<string, ILanguageProject> projectMap,
+        IReadOnlyList<ILanguageProject>? projects = null)
+    {
+        var ordered = files
+            .OrderBy(path => GetDispatchPriority(path, projectMap, projects))
             .ThenBy(NormalizePathForOrdering, StringComparer.OrdinalIgnoreCase)
-            .ThenBy(path => path, StringComparer.Ordinal);
+            .ThenBy(path => path, StringComparer.Ordinal)
+            .ToArray();
+
+        // Declaration files can themselves consume declarations from another contributor.
+        // On an empty graph their first pass publishes every declaration symbol; retrying just
+        // those files after the complete declaration set exists preserves cross-declaration
+        // edges without double-counting physical files in the dispatch result.
+        return ordered.Concat(ordered.Where(path =>
+            ShouldRetryDeclarationFile(path, projectMap, projects)));
+    }
+
+    private static bool ShouldRetryDeclarationFile(
+        string path,
+        IReadOnlyDictionary<string, ILanguageProject> projectMap,
+        IReadOnlyList<ILanguageProject>? projects)
+    {
+        // The second pass closes XAML resource-dictionary declaration-to-declaration edges.
+        // IDeclarationFirstLanguageProject is a general scheduling contract; retrying every
+        // implementation would invoke unrelated third-party indexers twice and can duplicate
+        // their side effects.
+        if (!IsXamlPath(path))
+        {
+            return false;
+        }
+
+        if (projects is not null
+            && projects
+                .OfType<XamlLanguageProject>()
+                .Any(project => IsDeclarationPath(project, path)))
+        {
+            return true;
+        }
+
+        return projectMap.TryGetValue(path, out var mappedProject)
+            && mappedProject is XamlLanguageProject xamlProject
+            && IsDeclarationPath(xamlProject, path);
+    }
 
     private static int GetDispatchPriority(
         string path,
-        IReadOnlyDictionary<string, ILanguageProject> projectMap)
+        IReadOnlyDictionary<string, ILanguageProject> projectMap,
+        IReadOnlyList<ILanguageProject>? projects = null)
     {
-        if (!projectMap.TryGetValue(path, out var project)
-            || project is not IDeclarationFirstLanguageProject declarationFirst)
+        var normalizedPath = NormalizePathForOrdering(path);
+        if (projects is not null
+            && projects
+                .OfType<IDeclarationFirstLanguageProject>()
+                .Any(project => project.DeclarationFilePaths.Any(
+                    declarationPath =>
+                        string.Equals(
+                            NormalizePathForOrdering(declarationPath),
+                            normalizedPath,
+                            StringComparison.OrdinalIgnoreCase))))
+        {
+            return 0;
+        }
+
+        if (!projectMap.TryGetValue(path, out var mappedProject)
+            || mappedProject is not IDeclarationFirstLanguageProject declarationFirst)
         {
             return 1;
         }
 
-        var normalizedPath = NormalizePathForOrdering(path);
         return declarationFirst.DeclarationFilePaths.Any(declarationPath =>
                 string.Equals(
                     NormalizePathForOrdering(declarationPath),
@@ -968,6 +1290,37 @@ public sealed class LanguageIndexerDispatcher
                     StringComparison.OrdinalIgnoreCase))
             ? 0
             : 1;
+    }
+
+    private static bool IsXamlPath(string path) =>
+        string.Equals(
+            Path.GetExtension(path),
+            ".xaml",
+            StringComparison.OrdinalIgnoreCase);
+
+    private static IReadOnlyList<XamlLanguageProject> GetXamlProjects(
+        ScopeHost host)
+    {
+        var source = host.LanguageProjects.Count > 0
+            ? host.LanguageProjects
+            : host.ProjectByFilePath.Values.ToArray();
+        return source
+            .OfType<XamlLanguageProject>()
+            .GroupBy(project => project.Id, StringComparer.OrdinalIgnoreCase)
+            .Select(group => group.First())
+            .ToArray();
+    }
+
+    private static bool IsDeclarationPath(
+        IDeclarationFirstLanguageProject project,
+        string path)
+    {
+        var normalizedPath = NormalizePathForOrdering(path);
+        return project.DeclarationFilePaths.Any(declarationPath =>
+            string.Equals(
+                NormalizePathForOrdering(declarationPath),
+                normalizedPath,
+                StringComparison.OrdinalIgnoreCase));
     }
 
     private static string NormalizePathForOrdering(string? path)
@@ -1116,5 +1469,12 @@ public sealed record ProjectMapBuildResult(
     IReadOnlyDictionary<string, ILanguageProject> ProjectByFilePath,
     IReadOnlyList<ProjectFailure> FailedProjects)
 {
+    /// <summary>
+    /// Complete discovered project set. Unlike <see cref="ProjectByFilePath"/>, this retains every
+    /// owner when one physical document belongs to multiple projects.
+    /// </summary>
+    public IReadOnlyList<ILanguageProject> Projects { get; init; } =
+        Array.Empty<ILanguageProject>();
+
     public bool Succeeded => FailedProjects.Count == 0;
 }
