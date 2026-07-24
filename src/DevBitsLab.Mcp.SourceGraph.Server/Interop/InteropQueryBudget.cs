@@ -7,15 +7,26 @@ internal static class InteropQueryBudget
 {
     public const int MaximumSerializedCharacters = 50_000;
 
-    public static BoundedInteropScopeQuery Apply(InteropScopeQueryResult result)
+    public static BoundedInteropScopeQuery Apply(
+        InteropScopeQueryResult result,
+        int maximumSerializedCharacters = MaximumSerializedCharacters)
     {
         ArgumentNullException.ThrowIfNull(result);
+        if (maximumSerializedCharacters is < 1_500
+            or > MaximumSerializedCharacters)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(maximumSerializedCharacters),
+                maximumSerializedCharacters,
+                $"Interop scope output budgets must be between 1500 and "
+                + $"{MaximumSerializedCharacters} characters.");
+        }
 
         result = Limit(result, Limits.Initial);
         var json = Serialize(result);
         foreach (var limits in Limits.ReductionStages)
         {
-            if (json.Length <= MaximumSerializedCharacters)
+            if (json.Length <= maximumSerializedCharacters)
             {
                 break;
             }
@@ -26,10 +37,10 @@ internal static class InteropQueryBudget
         // The last reduction keeps the scope, target, status, at least one reason for every
         // retained match, and the minimum candidate cardinality needed to preserve ambiguity.
         // If that fixed core ever exceeds the budget, fail rather than return host-truncated JSON.
-        if (json.Length > MaximumSerializedCharacters)
+        if (json.Length > maximumSerializedCharacters)
         {
             throw new InvalidOperationException(
-                "The required interop query core exceeds the 50K-character output budget.");
+                "The required interop query core exceeds its allocated output budget.");
         }
 
         return new BoundedInteropScopeQuery(result, json);
@@ -372,7 +383,7 @@ internal static class InteropQueryBudget
             Initial with
             {
                 MetadataPerEvidence = 0,
-                EvidencePerRow = 1,
+                EvidencePerRow = 0,
                 Findings = 0,
                 Matches = 1,
                 SelectionCandidates = 2,
@@ -386,6 +397,24 @@ internal static class InteropQueryBudget
                 IdentifierCharacters = 128,
                 MetadataKeyCharacters = 128,
                 MetadataValueCharacters = 256,
+            },
+            Initial with
+            {
+                MetadataPerEvidence = 0,
+                EvidencePerRow = 0,
+                Findings = 0,
+                Matches = 1,
+                SelectionCandidates = 2,
+                Failures = 1,
+                ReasonsPerMatch = 1,
+                QueryCharacters = 128,
+                CanonicalKeyCharacters = 512,
+                PathCharacters = 256,
+                DisplayCharacters = 128,
+                MessageCharacters = 128,
+                IdentifierCharacters = 64,
+                MetadataKeyCharacters = 64,
+                MetadataValueCharacters = 128,
             },
         ];
     }
