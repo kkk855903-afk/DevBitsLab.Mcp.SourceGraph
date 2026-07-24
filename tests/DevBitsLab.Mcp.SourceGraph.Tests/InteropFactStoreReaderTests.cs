@@ -303,6 +303,104 @@ public sealed class InteropFactStoreReaderTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task Managed_usage_identity_normalizes_rid_and_uses_owner_range()
+    {
+        var owner = await SeedOwnerAsync(
+            "aliased-caller.cs",
+            "csharp:M:Caller.Aliased",
+            "Aliased");
+        var equivalentPath = Path.Join(
+            Path.GetDirectoryName(owner.Path)!,
+            ".",
+            Path.GetFileName(owner.Path));
+        var aliasedTarget = new InteropTarget(
+            "WIN-X64",
+            InteropArchitecture.X64,
+            InteropCompilerAbi.Msvc,
+            pointerSizeBytes: 8,
+            defaultPack: 8);
+        var callback = new ManagedCallbackUsageProjection(
+            "csharp:M:Native.Register",
+            new ManagedCallbackUsage(
+                0,
+                owner.Key,
+                CallbackGcRooting.Unrooted,
+                InteropTarget.WindowsX64Msvc,
+                EvidenceFor(owner.FileId, owner.Path)));
+        var release = new ManagedReturnReleaseProjection(
+            "csharp:M:Native.Allocate",
+            new ManagedReturnRelease(
+                owner.Key,
+                InteropAllocatorFamily.CoTaskMem,
+                InteropTarget.WindowsX64Msvc,
+                EvidenceFor(owner.FileId, owner.Path)));
+        await _store!.BulkInsertAnnotationsAsync(
+        [
+            Annotation(
+                owner.SymbolId,
+                InteropAnnotationFlavors.ManagedCallbackUsage,
+                InteropFactPayloadCodec.EncodeManagedCallbackUsage(
+                    callback)),
+            Annotation(
+                owner.SymbolId,
+                InteropAnnotationFlavors.ManagedCallbackUsage,
+                InteropFactPayloadCodec.EncodeManagedCallbackUsage(
+                    callback with
+                    {
+                        Usage = callback.Usage with
+                        {
+                            Rooting = CallbackGcRooting.Rooted,
+                            Target = aliasedTarget,
+                            Evidence = EvidenceFor(
+                                owner.FileId,
+                                equivalentPath),
+                        },
+                    })),
+            Annotation(
+                owner.SymbolId,
+                InteropAnnotationFlavors.ManagedReturnRelease,
+                InteropFactPayloadCodec.EncodeManagedReturnRelease(
+                    release)),
+            Annotation(
+                owner.SymbolId,
+                InteropAnnotationFlavors.ManagedReturnRelease,
+                InteropFactPayloadCodec.EncodeManagedReturnRelease(
+                    release with
+                    {
+                        Release = release.Release with
+                        {
+                            ReleaseFamily =
+                                InteropAllocatorFamily.HGlobal,
+                            Target = aliasedTarget,
+                            Evidence = EvidenceFor(
+                                owner.FileId,
+                                equivalentPath),
+                        },
+                    })),
+        ]);
+
+        var callbacks =
+            await InteropFactStoreReader.ReadManagedCallbackUsagesAsync(
+                _store);
+        var releases =
+            await InteropFactStoreReader.ReadManagedReturnReleasesAsync(
+                _store);
+
+        callbacks.IsComplete.Should().BeFalse();
+        callbacks.Facts.Should().BeEmpty();
+        callbacks.Failures.Should().ContainSingle(failure =>
+            failure.Reason.Contains(
+                "Conflicting",
+                StringComparison.Ordinal));
+        releases.IsComplete.Should().BeFalse();
+        releases.Facts.Should().BeEmpty();
+        releases.Failures.Should().ContainSingle(failure =>
+            failure.Reason.Contains(
+                "Conflicting",
+                StringComparison.Ordinal));
+    }
+
+    [Fact]
     public async Task Row_bound_is_reported_as_truncation_instead_of_completeness()
     {
         for (var index = 0; index < 3; index++)

@@ -323,7 +323,7 @@ public static class InteropFactStoreReader
             projection.Usage.ParameterPosition.ToString(
                 System.Globalization.CultureInfo.InvariantCulture),
             projection.Usage.Target,
-            projection.Usage.Evidence.Location);
+            projection.Usage.Evidence);
 
     private static string ManagedReturnReleaseIdentity(
         ManagedReturnReleaseProjection projection) =>
@@ -332,21 +332,22 @@ public static class InteropFactStoreReader
             projection.Release.CallerSymbolCanonicalKey,
             parameterPosition: string.Empty,
             projection.Release.Target,
-            projection.Release.Evidence.Location);
+            projection.Release.Evidence);
 
     private static string BuildManagedUsageIdentity(
         string importCanonicalKey,
         string callerCanonicalKey,
         string parameterPosition,
         InteropTarget target,
-        SourceLocation location)
+        Evidence evidence)
     {
+        var location = evidence.Location;
         var components = new[]
         {
             importCanonicalKey,
             callerCanonicalKey,
             parameterPosition,
-            target.RuntimeIdentifier,
+            target.RuntimeIdentifier.ToUpperInvariant(),
             ((int)target.Architecture).ToString(
                 System.Globalization.CultureInfo.InvariantCulture),
             ((int)target.CompilerAbi).ToString(
@@ -355,7 +356,8 @@ public static class InteropFactStoreReader
                 System.Globalization.CultureInfo.InvariantCulture),
             target.DefaultPack.ToString(
                 System.Globalization.CultureInfo.InvariantCulture),
-            location.FilePath,
+            evidence.ProducingFileId.ToString(
+                System.Globalization.CultureInfo.InvariantCulture),
             location.StartLine.ToString(
                 System.Globalization.CultureInfo.InvariantCulture),
             location.StartColumn.ToString(
