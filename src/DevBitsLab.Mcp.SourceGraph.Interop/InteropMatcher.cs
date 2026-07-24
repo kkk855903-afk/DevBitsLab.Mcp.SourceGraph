@@ -51,10 +51,18 @@ public sealed class InteropMatcher
         }
 
         var candidatesWithLibrary = sameTarget
-            .Where(native => !string.IsNullOrWhiteSpace(native.LibraryName))
+            .Where(native =>
+                !string.IsNullOrWhiteSpace(native.LibraryName)
+                && (native.IsBinaryVerified
+                    || native.ModuleIdentitySource
+                        != NativeModuleIdentitySource.Unknown))
             .ToArray();
         var candidatesWithoutLibrary = sameTarget
-            .Where(native => string.IsNullOrWhiteSpace(native.LibraryName))
+            .Where(native =>
+                string.IsNullOrWhiteSpace(native.LibraryName)
+                || (!native.IsBinaryVerified
+                    && native.ModuleIdentitySource
+                        == NativeModuleIdentitySource.Unknown))
             .ToArray();
         if (candidatesWithLibrary.Length == 0)
         {
@@ -124,18 +132,26 @@ public sealed class InteropMatcher
         }
         var native = libraryMatches[0];
         var evidence = Combine(managed.Evidence, [native.Evidence]);
+        var isFinalBinaryMatch = native.IsBinaryVerified;
         return Result(
             managed,
             native,
-            InteropMatchStatus.Matched,
-            Weakest(evidence),
+            isFinalBinaryMatch
+                ? InteropMatchStatus.Matched
+                : InteropMatchStatus.SourceMatched,
+            isFinalBinaryMatch
+                ? Weakest(evidence)
+                : EvidenceConfidence.Inferred,
             [
                 $"Entry point matches exactly: {managed.EntryPoint}.",
-                $"Module matches after target-aware normalization: {managed.LibraryName} -> {native.LibraryName}.",
+                native.ModuleIdentitySource == NativeModuleIdentitySource.Configuration
+                    && !native.IsBinaryVerified
+                    ? $"Module matches configured build context after target-aware normalization: {managed.LibraryName} -> {native.LibraryName}."
+                    : $"Module matches after target-aware normalization: {managed.LibraryName} -> {native.LibraryName}.",
                 $"Target ABI matches: {managed.Target.RuntimeIdentifier}/{managed.Target.CompilerAbi}.",
                 native.IsBinaryVerified
                     ? "The export was verified in the native binary."
-                    : "The export is source-derived and has not been verified in a native binary.",
+                    : "A unique source export matches, but it has not been verified in the final native binary.",
             ],
             evidence);
     }

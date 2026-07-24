@@ -53,6 +53,29 @@ public sealed class InteropMatcherTests
     }
 
     [Fact]
+    public void SourceOnlyConfiguredModule_isNotReportedAsBinaryVerifiedMatch()
+    {
+        var native = Native(
+            "medalgo.dll",
+            "run",
+            "c:E:native.cpp::run") with
+        {
+            IsBinaryVerified = false,
+            ModuleIdentitySource = NativeModuleIdentitySource.Configuration,
+        };
+
+        var match = new InteropMatcher().Match(
+            Managed("medalgo", "run"),
+            [native]);
+
+        match.Status.Should().Be(InteropMatchStatus.SourceMatched);
+        match.NativeSymbolCanonicalKey.Should().Be(native.SymbolCanonicalKey);
+        match.Reasons.Should().Contain(reason => reason.Contains(
+            "not been verified",
+            StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
     public void UnknownModuleCandidate_preventsFalseUniqueMatch()
     {
         var match = new InteropMatcher().Match(

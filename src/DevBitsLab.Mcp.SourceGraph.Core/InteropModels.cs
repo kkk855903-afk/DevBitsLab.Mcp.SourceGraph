@@ -53,6 +53,7 @@ public enum AbiTypeCategory
 
 public enum AbiParameterDirection
 {
+    Unknown,
     In,
     Out,
     InOut,
@@ -68,9 +69,21 @@ public enum AbiRecordKind
 public enum InteropMatchStatus
 {
     Matched,
+    SourceMatched,
     Unmatched,
     Ambiguous,
     Unknown,
+}
+
+/// <summary>
+/// Provenance of the native module identity associated with an export. A configured module name
+/// narrows source candidates but does not prove that the final binary contains that export.
+/// </summary>
+public enum NativeModuleIdentitySource
+{
+    Unknown,
+    Configuration,
+    Binary,
 }
 
 public enum InteropCompatibility
@@ -187,7 +200,10 @@ public sealed record AbiTypeRef
         int? alignmentBytes = null,
         bool? isSigned = null,
         string? stringEncoding = null,
-        int? fixedArrayLength = null)
+        int? fixedArrayLength = null,
+        AbiTypeRef? pointeeType = null,
+        AbiTypeRef? elementType = null,
+        bool? isPointeeConst = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(canonicalName);
         ArgumentOutOfRangeException.ThrowIfNegative(pointerDepth);
@@ -221,6 +237,9 @@ public sealed record AbiTypeRef
         IsSigned = isSigned;
         StringEncoding = stringEncoding;
         FixedArrayLength = fixedArrayLength;
+        PointeeType = pointeeType;
+        ElementType = elementType;
+        IsPointeeConst = isPointeeConst;
     }
 
     public string CanonicalName { get; }
@@ -231,6 +250,9 @@ public sealed record AbiTypeRef
     public bool? IsSigned { get; }
     public string? StringEncoding { get; }
     public int? FixedArrayLength { get; }
+    public AbiTypeRef? PointeeType { get; }
+    public AbiTypeRef? ElementType { get; }
+    public bool? IsPointeeConst { get; }
 }
 
 public sealed record AbiParameter(
@@ -315,6 +337,12 @@ public sealed record NativeExport(
     /// unknown; matchers must not infer a DLL from source folder or project-name similarity.
     /// </summary>
     public string? LibraryName { get; init; }
+
+    /// <summary>
+    /// Source of <see cref="LibraryName"/>. Configuration narrows matching but is not final binary
+    /// export proof.
+    /// </summary>
+    public NativeModuleIdentitySource ModuleIdentitySource { get; init; }
 
     /// <summary>
     /// Callback parameters proven to be retained by this export. Empty means no retention fact is

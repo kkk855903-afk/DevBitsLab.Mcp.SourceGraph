@@ -46,6 +46,8 @@ public sealed class ClangNativeExtractorTests
         nativeExport.SymbolCanonicalKey.Should()
             .Be("c:E:src/exports.cpp::medalgo_calculate");
         nativeExport.LibraryName.Should().Be("medalgo.dll");
+        nativeExport.ModuleIdentitySource.Should()
+            .Be(NativeModuleIdentitySource.Configuration);
         nativeExport.HasCLinkage.Should().BeTrue();
         nativeExport.IsBinaryVerified.Should().BeFalse();
         nativeExport.CallingConvention.Should().Be(InteropCallingConvention.Cdecl);
@@ -62,7 +64,13 @@ public sealed class ClangNativeExtractorTests
                 && parameter.Type.PointerDepth == 1
                 && parameter.Type.SizeBytes == 8);
         nativeExport.Parameters[0].Direction.Should().Be(AbiParameterDirection.In);
-        nativeExport.Parameters[1].Direction.Should().Be(AbiParameterDirection.InOut);
+        nativeExport.Parameters[0].Type.PointeeType!.Category.Should()
+            .Be(AbiTypeCategory.Record);
+        nativeExport.Parameters[0].Type.IsPointeeConst.Should().BeTrue();
+        nativeExport.Parameters[1].Direction.Should().Be(AbiParameterDirection.Unknown);
+        nativeExport.Parameters[1].Type.PointeeType!.Category.Should()
+            .Be(AbiTypeCategory.Record);
+        nativeExport.Parameters[1].Type.IsPointeeConst.Should().BeFalse();
         nativeExport.Evidence.Confidence.Should().Be(EvidenceConfidence.Exact);
         nativeExport.Evidence.Producer.Should().Be("clang-native");
         nativeExport.Evidence.Location.FilePath.Should().Be(sourcePath);

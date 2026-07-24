@@ -485,6 +485,9 @@ public static class ClangNativeExtractor
                 evidence)
             {
                 LibraryName = _request.LibraryName,
+                ModuleIdentitySource = _request.LibraryName is null
+                    ? NativeModuleIdentitySource.Unknown
+                    : NativeModuleIdentitySource.Configuration,
             };
             var usr = function.Handle.Usr.ToString();
             _exportCandidates.Add(new NativeExportCandidate(
@@ -721,7 +724,7 @@ public static class ClangNativeExtractor
             }
             return canonical.PointeeType.IsConstQualified
                 ? AbiParameterDirection.In
-                : AbiParameterDirection.InOut;
+                : AbiParameterDirection.Unknown;
         }
 
         private string SchemeForSource(string filePath)
@@ -777,12 +780,15 @@ public static class ClangNativeExtractor
 
         var pointerDepth = 0;
         var pointed = canonical;
+        bool? isPointeeConst = null;
         while (pointed.kind is CXTypeKind.CXType_Pointer
             or CXTypeKind.CXType_LValueReference
             or CXTypeKind.CXType_RValueReference)
         {
             pointerDepth++;
-            pointed = pointed.PointeeType.CanonicalType;
+            var pointee = pointed.PointeeType.CanonicalType;
+            isPointeeConst = pointee.IsConstQualified;
+            pointed = pointee;
         }
 
         var category = MapTypeCategory(canonical, pointed, pointerDepth);
@@ -806,7 +812,46 @@ public static class ClangNativeExtractor
             KnownPositive(original.AlignOf),
             signed,
             stringEncoding: null,
-            fixedArrayLength);
+            fixedArrayLength,
+            pointeeType: pointerDepth > 0
+                ? MapTerminalType(pointed)
+                : null,
+            elementType: canonical.kind is CXTypeKind.CXType_ConstantArray
+                or CXTypeKind.CXType_IncompleteArray
+                or CXTypeKind.CXType_VariableArray
+                or CXTypeKind.CXType_DependentSizedArray
+                    ? MapTerminalType(canonical.ArrayElementType)
+                    : null,
+            isPointeeConst: isPointeeConst);
+    }
+
+    private static AbiTypeRef MapTerminalType(CXType type)
+    {
+        var canonical = type.CanonicalType;
+        var category = MapTypeCategory(canonical, canonical, pointerDepth: 0);
+        bool? signed = category switch
+        {
+            AbiTypeCategory.SignedInteger => true,
+            AbiTypeCategory.UnsignedInteger => false,
+            AbiTypeCategory.Enum when canonical.IsSigned => true,
+            AbiTypeCategory.Enum when canonical.IsUnsigned => false,
+            _ => null,
+        };
+        var name = type.Spelling.ToString();
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            name = canonical.Spelling.ToString();
+        }
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            name = "<unknown>";
+        }
+        return new AbiTypeRef(
+            name,
+            category,
+            sizeBytes: KnownPositive(type.SizeOf),
+            alignmentBytes: KnownPositive(type.AlignOf),
+            isSigned: signed);
     }
 
     private static AbiTypeCategory MapTypeCategory(

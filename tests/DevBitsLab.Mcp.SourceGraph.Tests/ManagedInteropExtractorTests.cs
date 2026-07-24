@@ -146,10 +146,117 @@ public sealed class ManagedInteropExtractorTests
             .Should().BeNull();
     }
 
+    [Fact]
+    public void UnsupportedMarshalAs_remainsOpaque()
+    {
+        const string source = """
+            using System;
+            using System.Runtime.InteropServices;
+
+            namespace Fixture;
+
+            internal static class Native
+            {
+                [DllImport("medalgo")]
+                internal static extern void Run(
+                    [MarshalAs(UnmanagedType.Currency)] decimal value);
+            }
+            """;
+        var method = CompileMethod(source, "Fixture.Native", "Run");
+
+        var import = ManagedInteropExtractor.TryExtract(
+            method,
+            InteropTarget.WindowsX64Msvc,
+            producingFileId: 31);
+
+        import.Should().NotBeNull();
+        import!.Parameters.Should().ContainSingle();
+        import.Parameters[0].Type.Category.Should().Be(AbiTypeCategory.Opaque);
+    }
+
+    [Fact]
+    public void DuplicateMarshalAs_remainsOpaque_insteadOfUsingClrDefault()
+    {
+        const string source = """
+            using System.Runtime.InteropServices;
+
+            namespace Fixture;
+
+            internal static class Native
+            {
+                [DllImport("medalgo")]
+                internal static extern void Run(
+                    [MarshalAs(UnmanagedType.I1)]
+                    [MarshalAs(UnmanagedType.I4)]
+                    int value);
+            }
+            """;
+        var method = CompileMethod(
+            source,
+            "Fixture.Native",
+            "Run",
+            "CS0579");
+
+        var import = ManagedInteropExtractor.TryExtract(
+            method,
+            InteropTarget.WindowsX64Msvc,
+            producingFileId: 32);
+
+        import.Should().NotBeNull();
+        import!.Parameters.Should().ContainSingle();
+        import.Parameters[0].Type.Category.Should().Be(AbiTypeCategory.Opaque);
+        import.Parameters[0].Type.SizeBytes.Should().BeNull();
+    }
+
+    [Fact]
+    public void OverflowingByValTStr_remainsUnknown_withoutThrowing()
+    {
+        const string source = """
+            using System.Runtime.InteropServices;
+
+            namespace Fixture;
+
+            internal struct NativeBuffer
+            {
+                [MarshalAs(UnmanagedType.ByValTStr, SizeConst = int.MaxValue)]
+                internal string Text;
+            }
+            """;
+        var field = Compile(source, "CS0599")
+            .GetTypeByMetadataName("Fixture.NativeBuffer")!
+            .GetMembers("Text")
+            .OfType<IFieldSymbol>()
+            .Should().ContainSingle().Subject;
+
+        var action = () => ManagedInteropExtractor.MapType(
+            field.Type,
+            ManagedInteropExtractor.FindMarshalInfo(field.GetAttributes()),
+            characterSet: "utf-16",
+            InteropTarget.WindowsX64Msvc);
+
+        var type = action.Should().NotThrow().Which;
+        type.SizeBytes.Should().BeNull();
+        type.FixedArrayLength.Should().Be(int.MaxValue);
+    }
+
     private static IMethodSymbol CompileMethod(
         string source,
         string containingType,
-        string methodName)
+        string methodName,
+        params string[] ignoredErrorIds)
+    {
+        var compilation = Compile(source, ignoredErrorIds);
+        return compilation.GetTypeByMetadataName(containingType)!
+            .GetMembers(methodName)
+            .OfType<IMethodSymbol>()
+            .Should()
+            .ContainSingle()
+            .Subject;
+    }
+
+    private static CSharpCompilation Compile(
+        string source,
+        params string[] ignoredErrorIds)
     {
         var tree = CSharpSyntaxTree.ParseText(
             source,
@@ -172,14 +279,12 @@ public sealed class ManagedInteropExtractorTests
         var errors = compilation.GetDiagnostics()
             .Where(diagnostic =>
                 diagnostic.Severity == DiagnosticSeverity.Error
-                && diagnostic.Id != "CS8795")
+                && diagnostic.Id != "CS8795"
+                && !ignoredErrorIds.Contains(
+                    diagnostic.Id,
+                    StringComparer.Ordinal))
             .ToArray();
         errors.Should().BeEmpty();
-        return compilation.GetTypeByMetadataName(containingType)!
-            .GetMembers(methodName)
-            .OfType<IMethodSymbol>()
-            .Should()
-            .ContainSingle()
-            .Subject;
+        return compilation;
     }
 }

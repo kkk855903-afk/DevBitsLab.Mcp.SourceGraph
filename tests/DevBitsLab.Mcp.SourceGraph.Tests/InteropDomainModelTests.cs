@@ -42,6 +42,36 @@ public sealed class InteropDomainModelTests
     }
 
     [Fact]
+    public void IndirectedAndInlineTypes_keepPointeeElementAndConstIdentity()
+    {
+        var record = new AbiTypeRef("NativeInput", AbiTypeCategory.Record);
+        var pointer = new AbiTypeRef(
+            "const NativeInput*",
+            AbiTypeCategory.Pointer,
+            pointerDepth: 1,
+            sizeBytes: 8,
+            alignmentBytes: 8,
+            pointeeType: record,
+            isPointeeConst: true);
+        var array = new AbiTypeRef(
+            "int32[4]",
+            AbiTypeCategory.Array,
+            sizeBytes: 16,
+            alignmentBytes: 4,
+            fixedArrayLength: 4,
+            elementType: new AbiTypeRef(
+                "int32",
+                AbiTypeCategory.SignedInteger,
+                sizeBytes: 4,
+                alignmentBytes: 4,
+                isSigned: true));
+
+        pointer.PointeeType.Should().Be(record);
+        pointer.IsPointeeConst.Should().BeTrue();
+        array.ElementType!.CanonicalName.Should().Be("int32");
+    }
+
+    [Fact]
     public void DomainFacts_keepTargetAndEvidenceProvenance()
     {
         var evidence = new Evidence(

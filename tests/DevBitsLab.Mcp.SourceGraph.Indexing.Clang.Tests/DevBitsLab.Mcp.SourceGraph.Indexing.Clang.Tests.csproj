@@ -13,6 +13,11 @@
       <PrivateAssets>all</PrivateAssets>
     </PackageReference>
     <PackageReference Include="FluentAssertions" />
+    <PackageReference Include="Microsoft.Build" ExcludeAssets="runtime" PrivateAssets="all" />
+    <PackageReference Include="Microsoft.Build.Framework" ExcludeAssets="runtime" PrivateAssets="all" />
+    <PackageReference Include="Microsoft.Build.Tasks.Core" ExcludeAssets="runtime" PrivateAssets="all" />
+    <PackageReference Include="Microsoft.Build.Utilities.Core" ExcludeAssets="runtime" PrivateAssets="all" />
+    <PackageReference Include="System.Security.Cryptography.Xml" ExcludeAssets="runtime" PrivateAssets="all" />
     <PackageReference Include="coverlet.collector">
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
       <PrivateAssets>all</PrivateAssets>
@@ -21,5 +26,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\DevBitsLab.Mcp.SourceGraph.Indexing.Clang\DevBitsLab.Mcp.SourceGraph.Indexing.Clang.csproj" />
+    <ProjectReference Include="..\..\src\DevBitsLab.Mcp.SourceGraph.Indexing\DevBitsLab.Mcp.SourceGraph.Indexing.csproj" />
+    <ProjectReference Include="..\..\src\DevBitsLab.Mcp.SourceGraph.Interop\DevBitsLab.Mcp.SourceGraph.Interop.csproj" />
   </ItemGroup>
 </Project>

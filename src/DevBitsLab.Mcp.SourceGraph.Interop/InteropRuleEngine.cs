@@ -238,7 +238,9 @@ public sealed class ParameterTypeRiskRule : IInteropRule
                     native.Evidence.Confidence,
                     native.Evidence.Producer));
 
-            if (managedParameter.Direction != nativeParameter.Direction)
+            if (managedParameter.Direction != AbiParameterDirection.Unknown
+                && nativeParameter.Direction != AbiParameterDirection.Unknown
+                && managedParameter.Direction != nativeParameter.Direction)
             {
                 findings.Add(RuleEvidence.Finding(
                     RuleId,
@@ -376,22 +378,29 @@ public sealed class ParameterTypeRiskRule : IInteropRule
                 evidence));
         }
 
+        var managedCategory = ComparableCategory(managedType);
+        var nativeCategory = ComparableCategory(nativeType);
         var comparableCategories =
-            managedType.Category is not AbiTypeCategory.Opaque
-            && nativeType.Category is not AbiTypeCategory.Opaque;
+            managedCategory is not AbiTypeCategory.Opaque
+            && nativeCategory is not AbiTypeCategory.Opaque;
         if (comparableCategories
-            && !CategoriesCompatible(managedType.Category, nativeType.Category))
+            && !CategoriesCompatible(managedCategory, nativeCategory))
         {
             findings.Add(RuleEvidence.Finding(
                 RuleId,
                 InteropFindingSeverity.Error,
-                $"{subject} category mismatch: managed={managedType.Category}, native={nativeType.Category}.",
+                $"{subject} category mismatch: managed={managedCategory}, native={nativeCategory}.",
                 managed,
                 native,
                 RuleEvidence.WeakestEvidence(evidence),
                 evidence));
         }
     }
+
+    private static AbiTypeCategory ComparableCategory(AbiTypeRef type) =>
+        type.PointerDepth > 0 && type.PointeeType is not null
+            ? type.PointeeType.Category
+            : type.Category;
 
     private static bool CategoriesCompatible(AbiTypeCategory left, AbiTypeCategory right)
     {

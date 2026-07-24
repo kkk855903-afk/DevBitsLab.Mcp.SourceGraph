@@ -106,7 +106,10 @@ internal static class ManagedInteropExtractor
             target);
         if (parameter.RefKind != RefKind.None)
         {
-            type = AddIndirection(type, target);
+            type = AddIndirection(
+                type,
+                target,
+                isPointeeConst: parameter.RefKind == RefKind.In);
         }
 
         var hasIn = attributes.Any(attribute => IsAttribute(attribute, InAttribute));
@@ -138,14 +141,27 @@ internal static class ManagedInteropExtractor
         string? characterSet,
         InteropTarget target)
     {
+        if (marshal?.IsInvalid == true)
+        {
+            return new AbiTypeRef(
+                DisplayName(type),
+                AbiTypeCategory.Opaque);
+        }
         var marshaled = MapExplicitMarshal(type, marshal, characterSet, target);
         if (marshaled is not null) return marshaled;
+        if (marshal is not null)
+        {
+            return new AbiTypeRef(
+                DisplayName(type),
+                AbiTypeCategory.Opaque);
+        }
 
         if (type is IPointerTypeSymbol pointer)
         {
             return AddIndirection(
                 MapType(pointer.PointedAtType, null, characterSet, target),
-                target);
+                target,
+                isPointeeConst: false);
         }
         if (type is IFunctionPointerTypeSymbol)
         {
@@ -157,11 +173,17 @@ internal static class ManagedInteropExtractor
         }
         if (type is IArrayTypeSymbol array)
         {
+            var elementType = MapType(
+                array.ElementType,
+                marshal: null,
+                characterSet,
+                target);
             return new AbiTypeRef(
                 DisplayName(array.ElementType) + "[]",
                 AbiTypeCategory.Array,
                 pointerDepth: 1,
-                sizeBytes: target.PointerSizeBytes);
+                sizeBytes: target.PointerSizeBytes,
+                elementType: elementType);
         }
         if (type.TypeKind == TypeKind.Delegate)
         {
@@ -362,7 +384,8 @@ internal static class ManagedInteropExtractor
             sizeBytes: size,
             alignmentBytes: element?.AlignmentBytes,
             isSigned: element?.IsSigned,
-            fixedArrayLength: marshal.SizeConst);
+            fixedArrayLength: marshal.SizeConst,
+            elementType: element);
     }
 
     private static AbiTypeRef InlineString(
@@ -379,7 +402,9 @@ internal static class ManagedInteropExtractor
         return new AbiTypeRef(
             name,
             AbiTypeCategory.String,
-            sizeBytes: length is null ? null : checked(length.Value * bytesPerCharacter),
+            sizeBytes: length is null
+                ? null
+                : TryMultiply(length.Value, bytesPerCharacter),
             alignmentBytes: bytesPerCharacter,
             stringEncoding: characterSet,
             fixedArrayLength: length);
@@ -387,7 +412,8 @@ internal static class ManagedInteropExtractor
 
     private static AbiTypeRef AddIndirection(
         AbiTypeRef type,
-        InteropTarget target) =>
+        InteropTarget target,
+        bool? isPointeeConst) =>
         new(
             type.CanonicalName,
             type.Category,
@@ -396,7 +422,10 @@ internal static class ManagedInteropExtractor
             alignmentBytes: target.PointerSizeBytes,
             isSigned: type.IsSigned,
             stringEncoding: type.StringEncoding,
-            fixedArrayLength: type.FixedArrayLength);
+            fixedArrayLength: type.FixedArrayLength,
+            pointeeType: type,
+            elementType: type.ElementType,
+            isPointeeConst: isPointeeConst);
 
     private static AbiTypeRef Scalar(
         ITypeSymbol type,
@@ -453,14 +482,15 @@ internal static class ManagedInteropExtractor
         var matches = attributes
             .Where(attribute => IsAttribute(attribute, MarshalAsAttribute))
             .ToArray();
-        if (matches.Length != 1) return null;
+        if (matches.Length == 0) return null;
+        if (matches.Length != 1) return MarshalInfo.Invalid;
 
         var attribute = matches[0];
         var unmanagedType = attribute.ConstructorArguments.Length == 0
             ? null
             : GetEnumName(attribute.ConstructorArguments[0]);
         return unmanagedType is null
-            ? null
+            ? MarshalInfo.Invalid
             : new MarshalInfo(
                 unmanagedType,
                 NormalizePositive(GetNamedInt32(attribute, "SizeConst")),
@@ -648,5 +678,10 @@ internal static class ManagedInteropExtractor
     internal sealed record MarshalInfo(
         string UnmanagedType,
         int? SizeConst,
-        string? ArraySubType);
+        string? ArraySubType,
+        bool IsInvalid = false)
+    {
+        public static MarshalInfo Invalid { get; } =
+            new(string.Empty, null, null, IsInvalid: true);
+    }
 }
