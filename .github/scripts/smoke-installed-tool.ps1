@@ -114,13 +114,17 @@ $codexPreview = (& $appHost.FullName init `
 if ($LASTEXITCODE -ne 0) {
     throw "Installed tool Codex init preview failed with exit code $LASTEXITCODE.`n$codexPreview"
 }
+$codexFixtureRootToml = $codexFixtureRoot.Replace('\', '\\')
+$codexSolutionPathToml = $codexSolutionPath.Replace('\', '\\')
 foreach ($expectedCodexText in @(
         '.codex',
         'config.toml',
         '[mcp_servers.sourcegraph]',
         'command = "sourcegraph-mcp"',
-        '"--solution", "Fixture.slnx"',
-        'cwd = ".."')) {
+        "`"--solution`", `"$codexSolutionPathToml`"",
+        "`"--root`", `"$codexFixtureRootToml`"",
+        '"--codex-compat"',
+        "cwd = `"$codexFixtureRootToml`"")) {
     if (-not $codexPreview.Contains(
             $expectedCodexText,
             [StringComparison]::Ordinal)) {
