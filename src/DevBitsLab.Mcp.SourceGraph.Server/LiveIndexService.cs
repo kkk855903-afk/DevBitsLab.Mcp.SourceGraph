@@ -481,7 +481,8 @@ public sealed class LiveIndexService : BackgroundService
                 _loggerFactory.CreateLogger<RoslynIndexer>(),
                 indexerSink,
                 scope.Root,
-                scope.ProjectSet.Exclude);
+                scope.ProjectSet.Exclude,
+                scope.Interop?.Target);
             if (!_historyOptions.Disabled)
             {
                 indexer.OnFileIndexed = (fileId, path, sha) =>

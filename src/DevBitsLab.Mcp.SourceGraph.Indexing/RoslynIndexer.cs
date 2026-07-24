@@ -57,6 +57,7 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
     private readonly SemaphoreSlim _lock = new(1, 1);
     private readonly string? _configuredPrivacyRoot;
     private readonly IReadOnlyList<string> _configuredExcludePatterns;
+    private readonly InteropTarget? _interopTarget;
     private readonly TestHooks? _testHooks;
     private readonly ConcurrentDictionary<
         MSBuildWorkspace,
@@ -128,14 +129,16 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         ILogger<RoslynIndexer>? logger,
         IEmbeddingsRequestSink? embeddingsSink,
         string? privacyRoot,
-        IReadOnlyList<string>? excludePatterns)
+        IReadOnlyList<string>? excludePatterns,
+        InteropTarget? interopTarget = null)
         : this(
             store,
             logger,
             embeddingsSink,
             privacyRoot,
             excludePatterns,
-            testHooks: null)
+            testHooks: null,
+            interopTarget: interopTarget)
     {
     }
 
@@ -145,13 +148,15 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         IEmbeddingsRequestSink? embeddingsSink,
         string? privacyRoot,
         IReadOnlyList<string>? excludePatterns,
-        TestHooks? testHooks)
+        TestHooks? testHooks,
+        InteropTarget? interopTarget = null)
     {
         _store = store;
         _logger = logger ?? NullLogger<RoslynIndexer>.Instance;
         _embeddingsSink = embeddingsSink ?? new NoOpEmbeddingsRequestSink();
         _configuredPrivacyRoot = privacyRoot is null ? null : Path.GetFullPath(privacyRoot);
         _configuredExcludePatterns = excludePatterns?.ToArray() ?? Array.Empty<string>();
+        _interopTarget = interopTarget;
         _testHooks = testHooks;
     }
 

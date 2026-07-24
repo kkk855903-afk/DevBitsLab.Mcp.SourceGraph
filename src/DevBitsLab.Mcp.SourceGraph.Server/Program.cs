@@ -583,7 +583,8 @@ static async Task<int> RunIndexAsync(CommandLine cli)
         loggerFactory.CreateLogger<RoslynIndexer>(),
         sink,
         repoRootForIndex,
-        excludePatterns);
+        excludePatterns,
+        selectedScope.Interop?.Target);
     if (!historyDisabled)
     {
         indexer.OnFileIndexed = (fileId, path, sha) =>
