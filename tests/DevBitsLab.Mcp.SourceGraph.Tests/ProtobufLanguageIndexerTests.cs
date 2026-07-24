@@ -89,13 +89,10 @@ public sealed class ProtobufLanguageIndexerTests : IDisposable
             .ToArray();
         facts.Should().HaveCount(13);
         facts.Should().OnlyContain(fact =>
-            fact.Status == ProtoContractStatus.Partial
+            fact.Status == ProtoContractStatus.Complete
             && fact.ImportCount == 1
-            && fact.IncompleteReasons.SequenceEqual(
-                new[]
-                {
-                    ProtoContractPayloadCodec.ImportsNotResolvedReason,
-                }));
+            && fact.IncompleteReasons.Count == 0,
+            "protoc resolves the staged well-known-type import before reflection projection");
 
         var oneof = facts.Single(fact =>
             fact.SymbolCanonicalKey
@@ -110,8 +107,10 @@ public sealed class ProtobufLanguageIndexerTests : IDisposable
             fact.SymbolCanonicalKey
             == "proto:R:medical.imaging.v1.Scanner.Upload");
         upload.Rpc.Should().NotBeNull();
-        upload.Rpc!.InputType.Should().Be("ScanRequest");
-        upload.Rpc.OutputType.Should().Be("ScanReply");
+        upload.Rpc!.InputType.Should()
+            .Be("medical.imaging.v1.ScanRequest");
+        upload.Rpc.OutputType.Should()
+            .Be("medical.imaging.v1.ScanReply");
         upload.Rpc.ClientStreaming.Should().BeTrue();
         upload.Rpc.ServerStreaming.Should().BeFalse();
 
@@ -164,6 +163,86 @@ public sealed class ProtobufLanguageIndexerTests : IDisposable
             .Be(ProtoFieldCardinality.Optional);
         fields[1].Field!.Cardinality.Should()
             .Be(ProtoFieldCardinality.Repeated);
+    }
+
+    [Fact]
+    public async Task Official_descriptor_projection_resolves_import_map_enum_and_rpc_types()
+    {
+        Plant(
+            "common/types.proto",
+            """
+            syntax = "proto3";
+            package common.v1;
+            enum State { STATE_UNSPECIFIED = 0; STATE_READY = 1; }
+            message Reply { State state = 1; }
+            """);
+        var (path, contents) = Plant(
+            "api/service.proto",
+            """
+            syntax = "proto3";
+            package api.v1;
+            import "common/types.proto";
+            message Request {
+              map<string, int32> counters = 1;
+              common.v1.State state = 2;
+            }
+            service Api {
+              rpc Call(Request) returns (common.v1.Reply);
+            }
+            """);
+
+        var facts = (await Index(path, contents))
+            .OfType<IndexEvent.AnnotationAttached>()
+            .Select(annotation =>
+                ProtoContractPayloadCodec.Decode(annotation.ArgsJson!))
+            .ToArray();
+
+        facts.Should().OnlyContain(fact =>
+            fact.Status == ProtoContractStatus.Complete
+            && fact.ImportCount == 1
+            && fact.IncompleteReasons.Count == 0);
+        facts.Single(fact =>
+                fact.SymbolCanonicalKey
+                == "proto:F:api.v1.Request.counters")
+            .Field!.Type.Should().Be("map<string,int32>");
+        facts.Single(fact =>
+                fact.SymbolCanonicalKey
+                == "proto:F:api.v1.Request.state")
+            .Field!.Type.Should().Be("common.v1.State");
+        var rpc = facts.Single(fact =>
+            fact.SymbolCanonicalKey == "proto:R:api.v1.Api.Call");
+        rpc.Rpc!.InputType.Should().Be("api.v1.Request");
+        rpc.Rpc.OutputType.Should().Be("common.v1.Reply");
+    }
+
+    [Fact]
+    public async Task Excluded_import_is_never_available_to_protoc()
+    {
+        Plant(
+            "PatientData/secret.proto",
+            """
+            syntax = "proto3";
+            package private.v1;
+            // sentinel-patient-name-must-not-appear-in-diagnostics
+            message Secret {}
+            """);
+        var (path, contents) = Plant(
+            "api/public.proto",
+            """
+            syntax = "proto3";
+            package public.v1;
+            import "PatientData/secret.proto";
+            message Request { private.v1.Secret secret = 1; }
+            """);
+
+        Func<Task> act = async () => await Index(path, contents);
+
+        var failure = await act.Should()
+            .ThrowAsync<ProtobufSourceIndexingException>();
+        failure.Which.Kind.Should()
+            .Be(ProtobufSourceFailureKind.CompilerFailed);
+        failure.Which.Message.Should()
+            .NotContain("sentinel-patient-name");
     }
 
     [Theory]
@@ -357,7 +436,7 @@ public sealed class ProtobufLanguageIndexerTests : IDisposable
     }
 
     [Fact]
-    public async Task Malicious_nesting_fails_at_the_parser_budget()
+    public async Task Malicious_nesting_is_rejected_by_the_bounded_compiler_pipeline()
     {
         var source = new StringBuilder("""syntax = "proto3";""");
         for (var i = 0;
@@ -382,7 +461,9 @@ public sealed class ProtobufLanguageIndexerTests : IDisposable
         var exception = await act.Should()
             .ThrowAsync<ProtobufSourceIndexingException>();
         exception.Which.Kind.Should()
-            .Be(ProtobufSourceFailureKind.LimitExceeded);
+            .BeOneOf(
+                ProtobufSourceFailureKind.CompilerFailed,
+                ProtobufSourceFailureKind.LimitExceeded);
     }
 
     [Fact]
@@ -404,7 +485,7 @@ public sealed class ProtobufLanguageIndexerTests : IDisposable
         var exception = await act.Should()
             .ThrowAsync<ProtobufSourceIndexingException>();
         exception.Which.Kind.Should()
-            .Be(ProtobufSourceFailureKind.SyntaxError);
+            .Be(ProtobufSourceFailureKind.CompilerFailed);
         exception.Which.Line.Should().NotBeNull();
         exception.Which.Column.Should().NotBeNull();
     }

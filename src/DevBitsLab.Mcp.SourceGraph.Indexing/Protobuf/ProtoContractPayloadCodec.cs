@@ -51,10 +51,10 @@ public sealed record ProtoRpcContract(
     bool ServerStreaming);
 
 /// <summary>
-/// Analyzer-neutral protobuf declaration fact persisted through an annotation. Imports are not
-/// followed by the source-only indexer; affected documents therefore carry
-/// <see cref="ProtoContractStatus.Partial"/> instead of implying that an unobserved type or
-/// declaration is absent.
+/// Analyzer-neutral protobuf declaration fact persisted through an annotation. The official
+/// compiler resolves imports inside a privacy-filtered staging tree before reflection data is
+/// projected, so <see cref="ProtoContractStatus.Complete"/> may legitimately carry a non-zero
+/// <see cref="ProtoContractFact.ImportCount"/>.
 /// </summary>
 public sealed record ProtoContractFact(
     ProtoContractKind Kind,
@@ -259,15 +259,6 @@ public static class ProtoContractPayloadCodec
         {
             throw Invalid(
                 "A partial protobuf contract payload requires an incomplete reason.");
-        }
-        if (fact.ImportCount > 0
-            && (fact.Status != ProtoContractStatus.Partial
-                || !reasons.Contains(
-                    ImportsNotResolvedReason,
-                    StringComparer.Ordinal)))
-        {
-            throw Invalid(
-                "A document with imports must be partial with imports-not-resolved.");
         }
         if (!reasons.SequenceEqual(
                 reasons

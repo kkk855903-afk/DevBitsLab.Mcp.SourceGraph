@@ -122,11 +122,6 @@
           "libClangSharp": "21.1.8.2"
         }
       },
-      "Google.Protobuf": {
-        "type": "Transitive",
-        "resolved": "3.30.2",
-        "contentHash": "Y2aOVLIt75yeeEWigg9V9YnjsEm53sADtLGq0gLhwaXpk3iu8tYSoauolyhenagA2sWno2TQ2WujI0HQd6s1Vw=="
-      },
       "Humanizer.Core": {
         "type": "Transitive",
         "resolved": "2.14.1",
@@ -450,6 +445,7 @@
           "DevBitsLab.Mcp.SourceGraph.Embeddings": "[1.0.0, )",
           "DevBitsLab.Mcp.SourceGraph.Sdk": "[2.4.0, )",
           "DevBitsLab.Mcp.SourceGraph.Storage": "[1.0.0, )",
+          "Google.Protobuf": "[3.35.1, )",
           "Microsoft.Build.Locator": "[1.11.2, )",
           "Microsoft.CodeAnalysis.CSharp.Workspaces": "[5.3.0, )",
           "Microsoft.CodeAnalysis.Workspaces.MSBuild": "[5.3.0, )",
@@ -468,7 +464,8 @@
       "devbitslab.mcp.sourcegraph.interop": {
         "type": "Project",
         "dependencies": {
-          "DevBitsLab.Mcp.SourceGraph.Core": "[1.0.0, )"
+          "DevBitsLab.Mcp.SourceGraph.Core": "[1.0.0, )",
+          "DevBitsLab.Mcp.SourceGraph.Storage": "[1.0.0, )"
         }
       },
       "devbitslab.mcp.sourcegraph.sdk": {
@@ -499,6 +496,12 @@
         "requested": "[2.1.72, )",
         "resolved": "2.1.72",
         "contentHash": "ns4mGqQd9a/MhP8m6w556vVlZIa0/MfUu03zrxjZC/jlr1uVCsUac8bkdB+Fs98Llbd56rRSo1eZH5VVmeGZyw=="
+      },
+      "Google.Protobuf": {
+        "type": "CentralTransitive",
+        "requested": "[3.35.1, )",
+        "resolved": "3.35.1",
+        "contentHash": "pxtkuXhR8svkvDTQrYew9GZQt6eWhblz/V/WKUFrQgkHYlQPsumJTeF6ppHRJpe6j9ffukkd5lQULiiKaek4xA=="
       },
       "libclang": {
         "type": "CentralTransitive",

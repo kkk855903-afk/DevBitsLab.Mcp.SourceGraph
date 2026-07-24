@@ -60,6 +60,12 @@
     <PackageVersion Include="ClangSharp" Version="21.1.8.4" />
     <PackageVersion Include="libclang" Version="21.1.8" />
 
+    <!-- Protobuf contracts are compiled by the official protoc binary and projected from its
+         descriptor set. Grpc.Tools supplies the pinned compiler payload; Google.Protobuf supplies
+         the descriptor/reflection model consumed by the indexer. -->
+    <PackageVersion Include="Grpc.Tools" Version="2.82.0" />
+    <PackageVersion Include="Google.Protobuf" Version="3.35.1" />
+
     <!-- Tests -->
     <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="18.5.1" />
     <PackageVersion Include="xunit" Version="2.9.3" />
