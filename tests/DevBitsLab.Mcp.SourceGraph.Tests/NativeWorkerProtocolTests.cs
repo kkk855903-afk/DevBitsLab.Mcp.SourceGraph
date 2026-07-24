@@ -330,6 +330,128 @@ public sealed class NativeWorkerProtocolTests : IDisposable
             .Which.Should().BeEquivalentTo(call);
     }
 
+    [Fact]
+    public void ResponseCodec_roundTrips_exact_native_risk_facts()
+    {
+        var export = RiskExport();
+        var extraction = EmptyExtraction() with
+        {
+            Exports = [export],
+        };
+        var response = new NativeWorkerResponseEnvelope(
+            NativeWorkerProtocol.CurrentVersion,
+            NativeWorkerProtocol.ResponseKind,
+            Success: true,
+            extraction,
+            Failure: null,
+            NativeWorkerIsolationCapabilities.Baseline);
+
+        var payload = NativeWorkerProtocol.EncodeWorkerResponse(
+            response,
+            Request());
+        var decoded = NativeWorkerProtocol.DecodeResponse(
+            payload,
+            Request());
+
+        decoded.Result!.Exports.Should().ContainSingle()
+            .Which.Should().BeEquivalentTo(export);
+    }
+
+    [Theory]
+    [InlineData("position")]
+    [InlineData("parameter-kind")]
+    [InlineData("target")]
+    [InlineData("allocator")]
+    [InlineData("evidence")]
+    [InlineData("duplicate-parameter-position")]
+    public void ResponseCodec_rejects_malformed_native_risk_facts(
+        string malformedKind)
+    {
+        var export = RiskExport();
+        export = malformedKind switch
+        {
+            "position" => export with
+            {
+                RetainedCallbacks =
+                [
+                    export.RetainedCallbacks[0] with
+                    {
+                        ParameterPosition = 1,
+                    },
+                ],
+            },
+            "parameter-kind" => export with
+            {
+                Parameters =
+                [
+                    export.Parameters[0] with { Type = IntType() },
+                ],
+            },
+            "target" => export with
+            {
+                ExceptionEscape = export.ExceptionEscape! with
+                {
+                    Target = InteropTarget.WindowsX86Msvc,
+                },
+            },
+            "allocator" => export with
+            {
+                ReturnAllocation = export.ReturnAllocation! with
+                {
+                    AllocatorFamily = InteropAllocatorFamily.Unknown,
+                },
+            },
+            "evidence" => export with
+            {
+                RetainedCallbacks =
+                [
+                    export.RetainedCallbacks[0] with
+                    {
+                        Evidence = export.RetainedCallbacks[0].Evidence
+                            with
+                            {
+                                Confidence =
+                                    EvidenceConfidence.Semantic,
+                            },
+                    },
+                ],
+            },
+            "duplicate-parameter-position" => export with
+            {
+                Parameters =
+                [
+                    export.Parameters[0],
+                    new AbiParameter(
+                        0,
+                        "value",
+                        IntType(),
+                        AbiParameterDirection.In,
+                        new SourceLocation(
+                            _source,
+                            1,
+                            1,
+                            1,
+                            2)),
+                ],
+            },
+            _ => throw new InvalidOperationException(),
+        };
+        var response = new NativeWorkerResponseEnvelope(
+            NativeWorkerProtocol.CurrentVersion,
+            NativeWorkerProtocol.ResponseKind,
+            Success: true,
+            EmptyExtraction() with { Exports = [export] },
+            Failure: null,
+            NativeWorkerIsolationCapabilities.Baseline);
+
+        var act = () => NativeWorkerProtocol.EncodeWorkerResponse(
+            response,
+            Request());
+
+        act.Should().Throw<NativeWorkerProtocolException>()
+            .Which.Code.Should().Be("invalid-response");
+    }
+
     public void Dispose()
     {
         try
@@ -376,6 +498,80 @@ public sealed class NativeWorkerProtocolTests : IDisposable
             EvidenceConfidence.Exact,
             "clang-native");
 
+    private NativeExport RiskExport()
+    {
+        var callback = new AbiParameter(
+            0,
+            "callback",
+            FunctionPointerType(),
+            AbiParameterDirection.In,
+            new SourceLocation(_source, 1, 1, 1, 2));
+        return new NativeExport(
+            "c:E:medical.cpp::risk",
+            "risk",
+            InteropCallingConvention.Cdecl,
+            IntType(),
+            [callback],
+            HasCLinkage: true,
+            IsBinaryVerified: false,
+            InteropTarget.WindowsX64Msvc,
+            Evidence(_source))
+        {
+            LibraryName = "medical.dll",
+            ModuleIdentitySource =
+                NativeModuleIdentitySource.Configuration,
+            RetainedCallbacks =
+            [
+                new NativeCallbackRetention(
+                    0,
+                    InteropTarget.WindowsX64Msvc,
+                    NativeRiskEvidence(
+                        "clang-native-retention",
+                        "parameterPosition",
+                        "0")),
+            ],
+            ExceptionEscape = new NativeExceptionEscape(
+                InteropTarget.WindowsX64Msvc,
+                NativeRiskEvidence(
+                    "clang-native-exception",
+                    "escapeKind",
+                    "direct-throw")),
+            ReturnAllocation = new NativeReturnAllocation(
+                InteropAllocatorFamily.CrtHeap,
+                InteropTarget.WindowsX64Msvc,
+                NativeRiskEvidence(
+                    "clang-native-allocation",
+                    "allocatorFamily",
+                    "crt_heap",
+                    ("allocator", "malloc"))),
+        };
+    }
+
+    private Evidence NativeRiskEvidence(
+        string producer,
+        string factKey,
+        string factValue,
+        params (string Key, string Value)[] extraMetadata)
+    {
+        var metadata = new Dictionary<string, string>(
+            StringComparer.Ordinal)
+        {
+            ["target"] =
+                InteropTarget.WindowsX64Msvc.RuntimeIdentifier,
+            [factKey] = factValue,
+        };
+        foreach (var item in extraMetadata)
+        {
+            metadata.Add(item.Key, item.Value);
+        }
+        return new Evidence(
+            ProducingFileId: 41,
+            new SourceLocation(_source, 1, 1, 1, 2),
+            EvidenceConfidence.Exact,
+            producer,
+            metadata);
+    }
+
     private NativeFunctionFact FunctionFact(
         string key,
         string usr,
@@ -404,4 +600,12 @@ public sealed class NativeWorkerProtocolTests : IDisposable
             sizeBytes: 4,
             alignmentBytes: 4,
             isSigned: true);
+
+    private static AbiTypeRef FunctionPointerType() =>
+        new(
+            "void (*)(int)",
+            AbiTypeCategory.FunctionPointer,
+            pointerDepth: 1,
+            sizeBytes: 8,
+            alignmentBytes: 8);
 }

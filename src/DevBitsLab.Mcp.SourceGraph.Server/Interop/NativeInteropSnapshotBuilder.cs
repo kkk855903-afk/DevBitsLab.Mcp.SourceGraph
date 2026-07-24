@@ -110,6 +110,9 @@ internal delegate Task<BinaryExportVerificationResult> NativeInteropBinaryVerifi
 /// </summary>
 internal sealed class NativeInteropSnapshotBuilder
 {
+    private const string RetentionProducer = "clang-native-retention";
+    private const string ExceptionProducer = "clang-native-exception";
+    private const string AllocationProducer = "clang-native-allocation";
     internal const int MaximumTranslationUnits = 256;
     internal const int MaximumCompilerArguments = 4096;
     internal const int MaximumIncludedFilesPerTranslationUnit = 4096;
@@ -118,6 +121,7 @@ internal sealed class NativeInteropSnapshotBuilder
     internal const int MaximumCallsPerTranslationUnit = 8192;
     internal const int MaximumSymbolsPerSnapshot = 100_000;
     internal const int MaximumCallsPerSnapshot = 200_000;
+    internal const int MaximumNestedFactsPerSnapshot = 1_000_000;
     internal const int MaximumExportsPerTranslationUnit = 4096;
     internal const int MaximumRecordLayoutsPerTranslationUnit = 4096;
     internal const int MaximumParametersPerExport = 4096;
@@ -135,6 +139,7 @@ internal sealed class NativeInteropSnapshotBuilder
 
     private readonly NativeInteropExtractor _extractor;
     private readonly NativeInteropBinaryVerifier _binaryVerifier;
+    private readonly int _maximumNestedFactsPerSnapshot;
 
     private sealed record ExtractionAttempt(
         ClangNativeExtractionResult? Extraction,
@@ -149,6 +154,12 @@ internal sealed class NativeInteropSnapshotBuilder
         IReadOnlyList<NativeInteropFileContentHash> Hashes,
         NativeInteropSnapshotFailure? Failure);
 
+    private sealed record NativeRiskFactProjection(
+        string SymbolCanonicalKey,
+        IReadOnlyList<NativeCallbackRetention> RetainedCallbacks,
+        NativeExceptionEscape? ExceptionEscape,
+        NativeReturnAllocation? ReturnAllocation);
+
     private static readonly StringComparer _pathComparer =
         OperatingSystem.IsWindows()
             ? StringComparer.OrdinalIgnoreCase
@@ -157,9 +168,27 @@ internal sealed class NativeInteropSnapshotBuilder
     public NativeInteropSnapshotBuilder(
         NativeInteropExtractor? extractor = null,
         NativeInteropBinaryVerifier? binaryVerifier = null)
+        : this(
+            extractor,
+            binaryVerifier,
+            MaximumNestedFactsPerSnapshot)
     {
+    }
+
+    internal NativeInteropSnapshotBuilder(
+        NativeInteropExtractor? extractor,
+        NativeInteropBinaryVerifier? binaryVerifier,
+        int maximumNestedFactsPerSnapshot)
+    {
+        if (maximumNestedFactsPerSnapshot is < 1
+            or > MaximumNestedFactsPerSnapshot)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(maximumNestedFactsPerSnapshot));
+        }
         _extractor = extractor ?? ExtractAsync;
         _binaryVerifier = binaryVerifier ?? BinaryExportVerifier.VerifyAsync;
+        _maximumNestedFactsPerSnapshot = maximumNestedFactsPerSnapshot;
     }
 
     public async Task<NativeInteropSnapshot> BuildAsync(
@@ -213,6 +242,7 @@ internal sealed class NativeInteropSnapshotBuilder
                 configuration.TranslationUnits.Count);
         var symbolCount = 0;
         var callCount = 0;
+        var nestedFactCount = 0;
         for (var index = 0;
              index < configuration.TranslationUnits.Count;
              index++)
@@ -251,6 +281,28 @@ internal sealed class NativeInteropSnapshotBuilder
                     ]);
             }
 
+            int nextNestedFactCount;
+            try
+            {
+                nextNestedFactCount = checked(
+                    nestedFactCount
+                    + CountNestedFacts(
+                        contribution,
+                        cancellationToken));
+            }
+            catch (OverflowException)
+            {
+                return EmptySnapshot(
+                    configuration.Target,
+                    [
+                        CollectionLimitFailure(
+                            index,
+                            configuration.TranslationUnits[index]?.Path,
+                            "Native snapshot nested fact",
+                            _maximumNestedFactsPerSnapshot),
+                    ]);
+            }
+
             if (nextSymbolCount > MaximumSymbolsPerSnapshot)
             {
                 return EmptySnapshot(
@@ -275,9 +327,22 @@ internal sealed class NativeInteropSnapshotBuilder
                             MaximumCallsPerSnapshot),
                     ]);
             }
+            if (nextNestedFactCount > _maximumNestedFactsPerSnapshot)
+            {
+                return EmptySnapshot(
+                    configuration.Target,
+                    [
+                        CollectionLimitFailure(
+                            index,
+                            configuration.TranslationUnits[index]?.Path,
+                            "Native snapshot nested fact",
+                            _maximumNestedFactsPerSnapshot),
+                    ]);
+            }
 
             symbolCount = nextSymbolCount;
             callCount = nextCallCount;
+            nestedFactCount = nextNestedFactCount;
             contributions.Add(contribution);
         }
 
@@ -286,6 +351,62 @@ internal sealed class NativeInteropSnapshotBuilder
             configuration.Target,
             contributions,
             cancellationToken);
+    }
+
+    private static int CountNestedFacts(
+        NativeInteropTranslationUnitContribution contribution,
+        CancellationToken cancellationToken)
+    {
+        var count = contribution.Calls.Count;
+        for (var index = 0;
+             index < contribution.Functions.Count;
+             index++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            count = checked(
+                count
+                + 1
+                + contribution.Functions[index].Parameters.Count);
+        }
+        count = checked(
+            count + CountNestedExportFacts(
+                contribution.SourceExports,
+                cancellationToken));
+        count = checked(
+            count + CountNestedExportFacts(
+                contribution.VerifiedExports,
+                cancellationToken));
+        for (var index = 0;
+             index < contribution.RecordLayouts.Count;
+             index++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            count = checked(
+                count
+                + 1
+                + contribution.RecordLayouts[index].Fields.Count);
+        }
+        return count;
+    }
+
+    private static int CountNestedExportFacts(
+        IReadOnlyList<NativeExport> exports,
+        CancellationToken cancellationToken)
+    {
+        var count = 0;
+        for (var index = 0; index < exports.Count; index++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var export = exports[index];
+            count = checked(
+                count
+                + 1
+                + export.Parameters.Count
+                + export.RetainedCallbacks.Count
+                + (export.ExceptionEscape is null ? 0 : 1)
+                + (export.ReturnAllocation is null ? 0 : 1));
+        }
+        return count;
     }
 
     private async Task<NativeInteropTranslationUnitContribution>
@@ -599,17 +720,20 @@ internal sealed class NativeInteropSnapshotBuilder
         }
         if (discoveryProjectionValid
             && reparseProjectionValid
-            && !CallProjectionsEqual(
-                discoveryFunctions,
-                discoveryCalls,
-                functions,
-                calls))
+            && (!CallProjectionsEqual(
+                    discoveryFunctions,
+                    discoveryCalls,
+                    functions,
+                    calls)
+                || !NativeRiskFactSetsEqual(
+                    discoveryAttempt.Extraction!.Exports,
+                    extraction.Exports)))
         {
             failures.Add(Failure(
                 NativeInteropSnapshotFailureKind.FactSetChanged,
                 index,
                 translationUnit.Path,
-                "Native function or direct-call facts changed between the two content-bound parses."));
+                "Native function, direct-call, or risk facts changed between the two content-bound parses."));
             functions = [];
             calls = [];
         }
@@ -645,6 +769,7 @@ internal sealed class NativeInteropSnapshotBuilder
                     export,
                     includedFileSet,
                     pathPolicy,
+                    target,
                     cancellationToken,
                     out var normalizedExport,
                     out var rejectionKind,
@@ -1684,6 +1809,30 @@ internal sealed class NativeInteropSnapshotBuilder
         return string.Equals(first, second, StringComparison.Ordinal);
     }
 
+    private static bool NativeRiskFactSetsEqual(
+        IReadOnlyList<NativeExport> firstExports,
+        IReadOnlyList<NativeExport> secondExports)
+    {
+        static string Fingerprint(IReadOnlyList<NativeExport> exports) =>
+            JsonSerializer.Serialize(exports
+                .Select(export => export is null
+                    ? null
+                    : new NativeRiskFactProjection(
+                        export.SymbolCanonicalKey,
+                        export.RetainedCallbacks,
+                        export.ExceptionEscape,
+                        export.ReturnAllocation))
+                .OrderBy(
+                    projection => projection?.SymbolCanonicalKey,
+                    StringComparer.Ordinal)
+                .ToArray());
+
+        return string.Equals(
+            Fingerprint(firstExports),
+            Fingerprint(secondExports),
+            StringComparison.Ordinal);
+    }
+
     private static string FunctionFingerprint(NativeFunctionFact function) =>
         JsonSerializer.Serialize(function with
         {
@@ -1758,6 +1907,7 @@ internal sealed class NativeInteropSnapshotBuilder
         NativeExport export,
         IReadOnlySet<string> includedFiles,
         ScopePathPolicy pathPolicy,
+        InteropTarget target,
         CancellationToken cancellationToken,
         out NativeExport normalized,
         out NativeInteropSnapshotFailureKind rejectionKind,
@@ -1808,11 +1958,14 @@ internal sealed class NativeInteropSnapshotBuilder
         {
             cancellationToken.ThrowIfCancellationRequested();
             var parameter = export.Parameters[parameterIndex];
-            if (parameter is null || parameter.Location is null)
+            if (parameter is null
+                || parameter.Position != parameterIndex
+                || parameter.Type is null
+                || parameter.Location is null)
             {
                 rejectionKind = NativeInteropSnapshotFailureKind.InvalidFact;
                 rejectionMessage =
-                    "Native export contains a null parameter or parameter location.";
+                    "Native export contains a malformed parameter or parameter location.";
                 return false;
             }
             if (!TryNormalizeLocation(
@@ -1832,6 +1985,7 @@ internal sealed class NativeInteropSnapshotBuilder
 
         var retainedCallbacks = new List<NativeCallbackRetention>(
             export.RetainedCallbacks.Count);
+        var retainedParameterPositions = new HashSet<int>();
         for (var retentionIndex = 0;
              retentionIndex < export.RetainedCallbacks.Count;
              retentionIndex++)
@@ -1854,6 +2008,31 @@ internal sealed class NativeInteropSnapshotBuilder
                     out rejectionKind,
                     out rejectionMessage))
             {
+                return false;
+            }
+            if (retention.ParameterPosition < 0
+                || retention.ParameterPosition >= parameters.Count
+                || parameters[retention.ParameterPosition].Position
+                    != retention.ParameterPosition
+                || parameters[retention.ParameterPosition].Type.Category
+                    != AbiTypeCategory.FunctionPointer
+                || !retainedParameterPositions.Add(
+                    retention.ParameterPosition)
+                || retention.Target is null
+                || !retention.Target.IsAbiEquivalentTo(export.Target)
+                || !retention.Target.IsAbiEquivalentTo(target)
+                || !HasExactNativeFactEvidence(
+                    retentionEvidence,
+                    RetentionProducer,
+                    target,
+                    "parameterPosition",
+                    retention.ParameterPosition.ToString(
+                        System.Globalization.CultureInfo
+                            .InvariantCulture)))
+            {
+                rejectionKind = NativeInteropSnapshotFailureKind.InvalidFact;
+                rejectionMessage =
+                    "Native callback retention does not identify one exact callback parameter assignment for the export target.";
                 return false;
             }
             retainedCallbacks.Add(
@@ -1879,6 +2058,22 @@ internal sealed class NativeInteropSnapshotBuilder
                     out rejectionKind,
                     out rejectionMessage))
             {
+                return false;
+            }
+            if (export.ExceptionEscape.Target is null
+                || !export.ExceptionEscape.Target.IsAbiEquivalentTo(
+                    export.Target)
+                || !export.ExceptionEscape.Target.IsAbiEquivalentTo(target)
+                || !HasExactNativeFactEvidence(
+                    exceptionEvidence,
+                    ExceptionProducer,
+                    target,
+                    "escapeKind",
+                    "direct-throw"))
+            {
+                rejectionKind = NativeInteropSnapshotFailureKind.InvalidFact;
+                rejectionMessage =
+                    "Native exception escape is not an exact direct-throw proof for the export target.";
                 return false;
             }
             exceptionEscape = export.ExceptionEscape with
@@ -1908,6 +2103,25 @@ internal sealed class NativeInteropSnapshotBuilder
             {
                 return false;
             }
+            if (export.ReturnAllocation.AllocatorFamily
+                    != InteropAllocatorFamily.CrtHeap
+                || export.ReturnAllocation.Target is null
+                || !export.ReturnAllocation.Target.IsAbiEquivalentTo(
+                    export.Target)
+                || !export.ReturnAllocation.Target.IsAbiEquivalentTo(target)
+                || !HasExactNativeFactEvidence(
+                    allocationEvidence,
+                    AllocationProducer,
+                    target,
+                    "allocatorFamily",
+                    "crt_heap")
+                || !HasKnownCrtAllocatorMetadata(allocationEvidence))
+            {
+                rejectionKind = NativeInteropSnapshotFailureKind.InvalidFact;
+                rejectionMessage =
+                    "Native return allocation is not an exact known allocator proof for the export target.";
+                return false;
+            }
             returnAllocation = export.ReturnAllocation with
             {
                 Evidence = allocationEvidence,
@@ -1926,6 +2140,44 @@ internal sealed class NativeInteropSnapshotBuilder
         rejectionMessage = string.Empty;
         return true;
     }
+
+    private static bool HasExactNativeFactEvidence(
+        Evidence evidence,
+        string producer,
+        InteropTarget target,
+        string factMetadataKey,
+        string factMetadataValue) =>
+        evidence.Confidence == EvidenceConfidence.Exact
+        && string.Equals(
+            evidence.Producer,
+            producer,
+            StringComparison.Ordinal)
+        && evidence.Metadata is not null
+        && evidence.Metadata.TryGetValue("target", out var evidenceTarget)
+        && string.Equals(
+            evidenceTarget,
+            target.RuntimeIdentifier,
+            StringComparison.OrdinalIgnoreCase)
+        && evidence.Metadata.TryGetValue(
+            factMetadataKey,
+            out var factMetadata)
+        && string.Equals(
+            factMetadata,
+            factMetadataValue,
+            StringComparison.Ordinal);
+
+    private static bool HasKnownCrtAllocatorMetadata(Evidence evidence) =>
+        evidence.Metadata is not null
+        && evidence.Metadata.TryGetValue(
+            "allocator",
+            out var allocator)
+        && allocator is
+            "malloc"
+            or "std::malloc"
+            or "calloc"
+            or "std::calloc"
+            or "realloc"
+            or "std::realloc";
 
     private static bool TryNormalizeRecord(
         AbiRecordLayout record,
@@ -2083,7 +2335,15 @@ internal sealed class NativeInteropSnapshotBuilder
         out SourceLocation normalized)
     {
         normalized = null!;
-        if (!TryAuthorizeExistingAbsoluteFile(
+        if (location is null
+            || location.StartLine <= 0
+            || location.StartColumn <= 0
+            || location.EndLine <= 0
+            || location.EndColumn <= 0
+            || location.EndLine < location.StartLine
+            || (location.EndLine == location.StartLine
+                && location.EndColumn < location.StartColumn)
+            || !TryAuthorizeExistingAbsoluteFile(
                 location.FilePath,
                 pathPolicy,
                 out var physicalPath)

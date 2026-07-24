@@ -107,6 +107,28 @@ public sealed class NativeInteropSnapshotPublisherTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task Complete_snapshot_round_trips_native_risk_fact_payload()
+    {
+        var sourcePath = PathFor("native/risk.cpp");
+        var source = RiskExport(sourcePath);
+
+        var result = await Publisher().PublishAsync(Snapshot(
+            hashes: [ContentHash(sourcePath, Hash(11))],
+            sourceExports: [source]));
+
+        result.IsComplete.Should().BeTrue();
+        var stored =
+            (await InteropFactStoreReader.ReadNativeExportsAsync(_store!))
+            .Facts.Should().ContainSingle().Subject.Fact;
+        stored.RetainedCallbacks.Should().BeEquivalentTo(
+            source.RetainedCallbacks);
+        stored.ExceptionEscape.Should().BeEquivalentTo(
+            source.ExceptionEscape);
+        stored.ReturnAllocation.Should().BeEquivalentTo(
+            source.ReturnAllocation);
+    }
+
+    [Fact]
     public async Task Complete_replacement_reports_stale_keys_and_clears_old_annotations()
     {
         var oldPath = PathFor("native/old.h");
@@ -175,6 +197,57 @@ public sealed class NativeInteropSnapshotPublisherTests : IAsyncLifetime
             await InteropFactStoreReader.ReadNativeExportsAsync(_store!);
         stored.Facts.Should().ContainSingle()
             .Which.Fact.Should().BeEquivalentTo(prior);
+    }
+
+    [Fact]
+    public async Task Incomplete_candidate_retains_all_native_risk_payloads_and_annotation()
+    {
+        var path = PathFor("native/risk.cpp");
+        var prior = RiskExport(path);
+        (await Publisher().PublishAsync(Snapshot(
+            hashes: [ContentHash(path, Hash(12))],
+            sourceExports: [prior])))
+            .IsComplete.Should().BeTrue();
+        var symbol = (await _store!.GetAllSymbolKeysAsync())
+            .Single(item =>
+                item.CanonicalKey == prior.SymbolCanonicalKey);
+        var priorAnnotation =
+            (await _store.GetAnnotationsForSymbolAsync(symbol.Id))
+            .Should().ContainSingle(annotation =>
+                annotation.Flavor
+                    == InteropAnnotationFlavors.NativeExport)
+            .Subject;
+        priorAnnotation.ArgsJson.Should().NotBeNullOrWhiteSpace();
+        var failure = new NativeInteropSnapshotFailure(
+            NativeInteropSnapshotFailureKind.ExtractionFailed,
+            TranslationUnitIndex: 0,
+            ConfiguredPath: "native/risk.cpp",
+            Message: "candidate incomplete");
+
+        var result = await Publisher().PublishAsync(Snapshot(
+            hashes: [],
+            sourceExports: [],
+            complete: false,
+            failures: [failure]));
+
+        result.IsComplete.Should().BeFalse();
+        result.SnapshotFailures.Should().Equal(failure);
+        var retainedAnnotation =
+            (await _store.GetAnnotationsForSymbolAsync(symbol.Id))
+            .Should().ContainSingle(annotation =>
+                annotation.Flavor
+                    == InteropAnnotationFlavors.NativeExport)
+            .Subject;
+        retainedAnnotation.Should().Be(priorAnnotation);
+        var retained =
+            (await InteropFactStoreReader.ReadNativeExportsAsync(_store))
+            .Facts.Should().ContainSingle().Subject.Fact;
+        retained.RetainedCallbacks.Should().BeEquivalentTo(
+            prior.RetainedCallbacks);
+        retained.ExceptionEscape.Should().BeEquivalentTo(
+            prior.ExceptionEscape);
+        retained.ReturnAllocation.Should().BeEquivalentTo(
+            prior.ReturnAllocation);
     }
 
     [Fact]
@@ -470,6 +543,95 @@ public sealed class NativeInteropSnapshotPublisherTests : IAsyncLifetime
                 ? NativeModuleIdentitySource.Binary
                 : NativeModuleIdentitySource.Configuration,
         };
+
+    private static NativeExport RiskExport(string path)
+    {
+        var location = new SourceLocation(path, 1, 1, 1, 8);
+        return new NativeExport(
+            "c:E:native/risk.cpp::risk",
+            "risk",
+            InteropCallingConvention.Cdecl,
+            new AbiTypeRef(
+                "int",
+                AbiTypeCategory.SignedInteger,
+                sizeBytes: 4,
+                alignmentBytes: 4,
+                isSigned: true),
+            [
+                new AbiParameter(
+                    0,
+                    "callback",
+                    new AbiTypeRef(
+                        "void (*)(int)",
+                        AbiTypeCategory.FunctionPointer,
+                        pointerDepth: 1,
+                        sizeBytes: 8,
+                        alignmentBytes: 8),
+                    AbiParameterDirection.In,
+                    location),
+            ],
+            HasCLinkage: true,
+            IsBinaryVerified: false,
+            Target,
+            EvidenceAt(path))
+        {
+            LibraryName = "native.dll",
+            ModuleIdentitySource =
+                NativeModuleIdentitySource.Configuration,
+            RetainedCallbacks =
+            [
+                new NativeCallbackRetention(
+                    0,
+                    Target,
+                    NativeRiskEvidence(
+                        path,
+                        "clang-native-retention",
+                        "parameterPosition",
+                        "0")),
+            ],
+            ExceptionEscape = new NativeExceptionEscape(
+                Target,
+                NativeRiskEvidence(
+                    path,
+                    "clang-native-exception",
+                    "escapeKind",
+                    "direct-throw")),
+            ReturnAllocation = new NativeReturnAllocation(
+                InteropAllocatorFamily.CrtHeap,
+                Target,
+                NativeRiskEvidence(
+                    path,
+                    "clang-native-allocation",
+                    "allocatorFamily",
+                    "crt_heap",
+                    ("allocator", "malloc"))),
+        };
+    }
+
+    private static Evidence NativeRiskEvidence(
+        string path,
+        string producer,
+        string factKey,
+        string factValue,
+        params (string Key, string Value)[] extraMetadata)
+    {
+        var metadata = new Dictionary<string, string>(
+            StringComparer.Ordinal)
+        {
+            ["target"] = Target.RuntimeIdentifier,
+            [factKey] = factValue,
+        };
+        foreach (var item in extraMetadata)
+        {
+            metadata.Add(item.Key, item.Value);
+        }
+        return new Evidence(
+            ProducingFileId: 1,
+            new SourceLocation(path, 1, 1, 1, 8),
+            EvidenceConfidence.Exact,
+            producer,
+            metadata);
+    }
 
     private static AbiRecordLayout Record(string key, string path)
     {

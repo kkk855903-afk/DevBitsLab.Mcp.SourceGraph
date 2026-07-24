@@ -535,6 +535,235 @@ public sealed class NativeInteropSnapshotBuilderTests : IDisposable
     }
 
     [Fact]
+    public async Task Exact_native_risk_facts_survive_double_parse_and_aggregation()
+    {
+        Write("native/api.cpp");
+        var builder = new NativeInteropSnapshotBuilder(
+            (request, _) => Task.FromResult(Extraction(
+                request,
+                exports: [RiskExport(request)])));
+
+        var snapshot = await builder.BuildAsync(
+            _root,
+            Config(new InteropTranslationUnitConfig(
+                "native/api.cpp",
+                "native.dll",
+                ["-x", "c++"],
+                BinaryPath: null)),
+            new ScopePathPolicy(_root),
+            CancellationToken.None);
+
+        snapshot.IsComplete.Should().BeTrue();
+        var export = snapshot.SourceExports.Should()
+            .ContainSingle()
+            .Subject;
+        export.RetainedCallbacks.Should().ContainSingle(retention =>
+            retention.ParameterPosition == 0
+            && retention.Target.IsAbiEquivalentTo(export.Target));
+        export.ExceptionEscape.Should().NotBeNull();
+        export.ExceptionEscape!.Target.IsAbiEquivalentTo(export.Target)
+            .Should().BeTrue();
+        export.ReturnAllocation.Should().Match<NativeReturnAllocation>(
+            allocation =>
+                allocation.AllocatorFamily
+                    == InteropAllocatorFamily.CrtHeap
+                && allocation.Target.IsAbiEquivalentTo(export.Target));
+    }
+
+    [Theory]
+    [InlineData("position")]
+    [InlineData("parameter-kind")]
+    [InlineData("target")]
+    [InlineData("allocator")]
+    [InlineData("duplicate-parameter-position")]
+    [InlineData("null-parameter-type")]
+    public async Task Malformed_native_risk_fact_is_rejected(
+        string malformedKind)
+    {
+        Write("native/api.cpp");
+        var builder = new NativeInteropSnapshotBuilder(
+            (request, _) =>
+            {
+                var export = RiskExport(request);
+                export = malformedKind switch
+                {
+                    "position" => export with
+                    {
+                        RetainedCallbacks =
+                        [
+                            export.RetainedCallbacks[0] with
+                            {
+                                ParameterPosition = 1,
+                            },
+                        ],
+                    },
+                    "parameter-kind" => export with
+                    {
+                        Parameters =
+                        [
+                            export.Parameters[0] with
+                            {
+                                Type = IntType(),
+                            },
+                        ],
+                    },
+                    "target" => export with
+                    {
+                        ExceptionEscape =
+                            export.ExceptionEscape! with
+                            {
+                                Target = InteropTarget.WindowsX86Msvc,
+                            },
+                    },
+                    "allocator" => export with
+                    {
+                        ReturnAllocation =
+                            export.ReturnAllocation! with
+                            {
+                                AllocatorFamily =
+                                    InteropAllocatorFamily.Unknown,
+                            },
+                    },
+                    "duplicate-parameter-position" => export with
+                    {
+                        Parameters =
+                        [
+                            export.Parameters[0],
+                            new AbiParameter(
+                                0,
+                                "value",
+                                IntType(),
+                                AbiParameterDirection.In,
+                                TestLocation(request.SourceFilePath)),
+                        ],
+                    },
+                    "null-parameter-type" => export with
+                    {
+                        Parameters =
+                        [
+                            export.Parameters[0] with
+                            {
+                                Type = null!,
+                            },
+                        ],
+                    },
+                    _ => throw new InvalidOperationException(),
+                };
+                return Task.FromResult(Extraction(
+                    request,
+                    exports: [export]));
+            });
+
+        var snapshot = await builder.BuildAsync(
+            _root,
+            Config(new InteropTranslationUnitConfig(
+                "native/api.cpp",
+                "native.dll",
+                ["-x", "c++"],
+                BinaryPath: null)),
+            new ScopePathPolicy(_root),
+            CancellationToken.None);
+
+        snapshot.IsComplete.Should().BeFalse();
+        snapshot.SourceExports.Should().BeEmpty();
+        snapshot.Failures.Should().ContainSingle(failure =>
+            failure.Kind == NativeInteropSnapshotFailureKind.InvalidFact);
+    }
+
+    [Theory]
+    [InlineData("non-positive")]
+    [InlineData("reversed")]
+    public async Task Invalid_native_fact_coordinates_are_rejected(
+        string malformedKind)
+    {
+        Write("native/api.cpp");
+        var builder = new NativeInteropSnapshotBuilder(
+            (request, _) =>
+            {
+                var export = RiskExport(request);
+                var location = malformedKind switch
+                {
+                    "non-positive" => new SourceLocation(
+                        request.SourceFilePath,
+                        0,
+                        1,
+                        1,
+                        2),
+                    "reversed" => new SourceLocation(
+                        request.SourceFilePath,
+                        2,
+                        8,
+                        2,
+                        4),
+                    _ => throw new InvalidOperationException(),
+                };
+                export = export with
+                {
+                    Parameters =
+                    [
+                        export.Parameters[0] with
+                        {
+                            Location = location,
+                        },
+                    ],
+                };
+                return Task.FromResult(Extraction(
+                    request,
+                    exports: [export]));
+            });
+
+        var snapshot = await builder.BuildAsync(
+            _root,
+            Config(new InteropTranslationUnitConfig(
+                "native/api.cpp",
+                "native.dll",
+                ["-x", "c++"],
+                BinaryPath: null)),
+            new ScopePathPolicy(_root),
+            CancellationToken.None);
+
+        snapshot.IsComplete.Should().BeFalse();
+        snapshot.SourceExports.Should().BeEmpty();
+        snapshot.Failures.Should().ContainSingle(failure =>
+            failure.Kind
+                == NativeInteropSnapshotFailureKind.FactLocationRejected);
+    }
+
+    [Fact]
+    public async Task Changed_native_risk_fact_between_double_parse_is_rejected()
+    {
+        Write("native/api.cpp");
+        var extractionCount = 0;
+        var builder = new NativeInteropSnapshotBuilder(
+            (request, _) =>
+            {
+                extractionCount++;
+                var export = RiskExport(request);
+                if (extractionCount == 2)
+                {
+                    export = export with { RetainedCallbacks = [] };
+                }
+                return Task.FromResult(Extraction(
+                    request,
+                    exports: [export]));
+            });
+
+        var snapshot = await builder.BuildAsync(
+            _root,
+            Config(new InteropTranslationUnitConfig(
+                "native/api.cpp",
+                "native.dll",
+                ["-x", "c++"],
+                BinaryPath: null)),
+            new ScopePathPolicy(_root),
+            CancellationToken.None);
+
+        snapshot.IsComplete.Should().BeFalse();
+        snapshot.Failures.Should().ContainSingle(failure =>
+            failure.Kind == NativeInteropSnapshotFailureKind.FactSetChanged);
+    }
+
+    [Fact]
     public async Task Approved_location_is_normalized_to_its_physical_path()
     {
         var sourcePath = Write("native/api.cpp");
@@ -1023,6 +1252,156 @@ public sealed class NativeInteropSnapshotBuilderTests : IDisposable
                 == NativeInteropSnapshotFailureKind.CollectionLimitExceeded
             && failure.TranslationUnitIndex
                 == attemptedContributions - 1);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Snapshot_nested_fact_budget_accepts_boundary_and_rejects_overflow(
+        bool exceedLimit)
+    {
+        Write("native/api.cpp");
+        const int exactFactCount = 15;
+        var builder = new NativeInteropSnapshotBuilder(
+            (request, _) =>
+            {
+                var caller = Function(
+                    request,
+                    "cpp:F:native/api.cpp::caller()",
+                    "usr:caller",
+                    "caller",
+                    "caller",
+                    graphKey: null,
+                    isMethod: false);
+                var callee = Function(
+                    request,
+                    "cpp:F:native/api.cpp::callee()",
+                    "usr:callee",
+                    "callee",
+                    "callee",
+                    graphKey: null,
+                    isMethod: false);
+                var functions = exceedLimit
+                    ? new[]
+                    {
+                        caller,
+                        callee,
+                        Function(
+                            request,
+                            "cpp:F:native/api.cpp::extra()",
+                            "usr:extra",
+                            "extra",
+                            "extra",
+                            graphKey: null,
+                            isMethod: false),
+                    }
+                    : [caller, callee];
+                return Task.FromResult(Extraction(
+                    request,
+                    exports: [RiskExport(request)],
+                    records:
+                    [
+                        Record(
+                            request,
+                            "cpp:T:native/api.cpp::Payload",
+                            TestEvidence(
+                                request,
+                                request.SourceFilePath)),
+                    ],
+                    functions: functions,
+                    calls:
+                    [
+                        DirectCall(
+                            request,
+                            caller.GraphCanonicalKey,
+                            callee.DeclarationUsr,
+                            callee.GraphCanonicalKey,
+                            line: 2),
+                    ]));
+            },
+            (_, _, _) => Task.FromResult(
+                CompleteBinary("medical.dll", "risk")),
+            maximumNestedFactsPerSnapshot: exactFactCount);
+
+        var snapshot = await builder.BuildAsync(
+            _root,
+            Config(Tu(
+                "native/api.cpp",
+                "medical",
+                "artifacts/medical.dll")),
+            new ScopePathPolicy(_root),
+            CancellationToken.None);
+
+        if (!exceedLimit)
+        {
+            snapshot.IsComplete.Should().BeTrue();
+            snapshot.Contributions.Should().ContainSingle();
+            snapshot.Failures.Should().BeEmpty();
+            return;
+        }
+
+        snapshot.IsComplete.Should().BeFalse();
+        snapshot.IsSourceComplete.Should().BeFalse();
+        snapshot.Contributions.Should().BeEmpty();
+        snapshot.SourceExports.Should().BeEmpty();
+        snapshot.VerifiedExports.Should().BeEmpty();
+        snapshot.RecordLayouts.Should().BeEmpty();
+        snapshot.Functions.Should().BeEmpty();
+        snapshot.Calls.Should().BeEmpty();
+        snapshot.Failures.Should().ContainSingle(failure =>
+            failure.Kind
+                == NativeInteropSnapshotFailureKind.CollectionLimitExceeded
+            && failure.TranslationUnitIndex == 0
+            && failure.Message.Contains(
+                exactFactCount.ToString(
+                    System.Globalization.CultureInfo.InvariantCulture),
+                StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task Cumulative_nested_fact_budget_stops_on_second_translation_unit()
+    {
+        Write("native/first.cpp");
+        Write("native/second.cpp");
+        var extractionCalls = 0;
+        var builder = new NativeInteropSnapshotBuilder(
+            (request, _) =>
+            {
+                extractionCalls++;
+                return Task.FromResult(Extraction(
+                    request,
+                    exports: [RiskExport(request)]));
+            },
+            binaryVerifier: null,
+            maximumNestedFactsPerSnapshot: 9);
+
+        var snapshot = await builder.BuildAsync(
+            _root,
+            Config(
+                new InteropTranslationUnitConfig(
+                    "native/first.cpp",
+                    "medical.dll",
+                    ["-x", "c++"],
+                    BinaryPath: null),
+                new InteropTranslationUnitConfig(
+                    "native/second.cpp",
+                    "medical.dll",
+                    ["-x", "c++"],
+                    BinaryPath: null)),
+            new ScopePathPolicy(_root),
+            CancellationToken.None);
+
+        extractionCalls.Should().Be(
+            4,
+            "each translation unit is double-parsed before the cumulative budget is evaluated");
+        snapshot.IsComplete.Should().BeFalse();
+        snapshot.IsSourceComplete.Should().BeFalse();
+        snapshot.Contributions.Should().BeEmpty();
+        snapshot.SourceExports.Should().BeEmpty();
+        snapshot.Failures.Should().ContainSingle(failure =>
+            failure.Kind
+                == NativeInteropSnapshotFailureKind.CollectionLimitExceeded
+            && failure.TranslationUnitIndex == 1);
     }
 
     [Theory]
@@ -1620,6 +1999,81 @@ public sealed class NativeInteropSnapshotBuilderTests : IDisposable
             ModuleIdentitySource = NativeModuleIdentitySource.Configuration,
         };
 
+    private static NativeExport RiskExport(
+        ClangNativeExtractionRequest request)
+    {
+        var retentionEvidence = NativeRiskEvidence(
+            request,
+            "clang-native-retention",
+            "parameterPosition",
+            "0");
+        var exceptionEvidence = NativeRiskEvidence(
+            request,
+            "clang-native-exception",
+            "escapeKind",
+            "direct-throw");
+        var allocationEvidence = NativeRiskEvidence(
+            request,
+            "clang-native-allocation",
+            "allocatorFamily",
+            "crt_heap",
+            ("allocator", "malloc"));
+        return Export(
+            request,
+            "c:E:native/api.cpp::risk",
+            "risk") with
+        {
+            Parameters =
+            [
+                new AbiParameter(
+                    0,
+                    "callback",
+                    FunctionPointerType(),
+                    AbiParameterDirection.In,
+                    TestLocation(request.SourceFilePath)),
+            ],
+            RetainedCallbacks =
+            [
+                new NativeCallbackRetention(
+                    0,
+                    request.Target,
+                    retentionEvidence),
+            ],
+            ExceptionEscape = new NativeExceptionEscape(
+                request.Target,
+                exceptionEvidence),
+            ReturnAllocation = new NativeReturnAllocation(
+                InteropAllocatorFamily.CrtHeap,
+                request.Target,
+                allocationEvidence),
+        };
+    }
+
+    private static Evidence NativeRiskEvidence(
+        ClangNativeExtractionRequest request,
+        string producer,
+        string factKey,
+        string factValue,
+        params (string Key, string Value)[] extraMetadata)
+    {
+        var metadata = new Dictionary<string, string>(
+            StringComparer.Ordinal)
+        {
+            ["target"] = request.Target.RuntimeIdentifier,
+            [factKey] = factValue,
+        };
+        foreach (var item in extraMetadata)
+        {
+            metadata.Add(item.Key, item.Value);
+        }
+        return new Evidence(
+            request.ProducingFileId,
+            TestLocation(request.SourceFilePath),
+            EvidenceConfidence.Exact,
+            producer,
+            metadata);
+    }
+
     private static AbiRecordLayout Record(
         ClangNativeExtractionRequest request,
         string canonicalKey,
@@ -1649,6 +2103,14 @@ public sealed class NativeInteropSnapshotBuilderTests : IDisposable
             sizeBytes: 4,
             alignmentBytes: 4,
             isSigned: true);
+
+    private static AbiTypeRef FunctionPointerType() =>
+        new(
+            "void (*)(int)",
+            AbiTypeCategory.FunctionPointer,
+            pointerDepth: 1,
+            sizeBytes: 8,
+            alignmentBytes: 8);
 
     private static NativeFunctionFact Function(
         ClangNativeExtractionRequest request,

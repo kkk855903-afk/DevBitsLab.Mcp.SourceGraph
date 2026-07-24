@@ -90,6 +90,7 @@ internal static class NativeWorkerProtocol
     private const int MaximumCollectionItems = 16 * 1024;
     private const int MaximumFunctions = 4096;
     private const int MaximumCalls = 8192;
+    private const int MaximumRetainedCallbacks = 4096;
     private const int MaximumCompilerArguments = 4096;
     private const int MaximumExcludePatterns = 1024;
     private const int MaximumMetadataEntries = 256;
@@ -745,46 +746,83 @@ internal static class NativeWorkerProtocol
             ValidateEnum(export.ModuleIdentitySource, "Export module identity source");
             ValidateCollection(
                 export.RetainedCallbacks,
-                MaximumCollectionItems,
+                MaximumRetainedCallbacks,
                 "RetainedCallbacks");
+            var retainedParameterPositions = new HashSet<int>();
             foreach (var retention in export.RetainedCallbacks)
             {
-                if (retention.ParameterPosition < 0)
+                if (retention.ParameterPosition < 0
+                    || retention.ParameterPosition
+                        >= export.Parameters.Count
+                    || export.Parameters[retention.ParameterPosition]
+                            .Position
+                        != retention.ParameterPosition
+                    || export.Parameters[retention.ParameterPosition]
+                            .Type.Category
+                        != AbiTypeCategory.FunctionPointer
+                    || !retainedParameterPositions.Add(
+                        retention.ParameterPosition))
                 {
                     throw InvalidResponse("Callback parameter position is invalid.");
                 }
                 ValidateTargetEquivalent(
                     retention.Target,
-                    request.Target,
+                    export.Target,
                     "Callback target");
-                ValidateEvidence(retention.Evidence, request, policy, included);
+                ValidateNativeFactEvidence(
+                    retention.Evidence,
+                    request,
+                    policy,
+                    included,
+                    "clang-native-retention",
+                    "parameterPosition",
+                    retention.ParameterPosition.ToString(
+                        System.Globalization.CultureInfo.InvariantCulture));
             }
             if (export.ExceptionEscape is not null)
             {
                 ValidateTargetEquivalent(
                     export.ExceptionEscape.Target,
-                    request.Target,
+                    export.Target,
                     "Exception target");
-                ValidateEvidence(
+                ValidateNativeFactEvidence(
                     export.ExceptionEscape.Evidence,
                     request,
                     policy,
-                    included);
+                    included,
+                    "clang-native-exception",
+                    "escapeKind",
+                    "direct-throw");
             }
             if (export.ReturnAllocation is not null)
             {
                 ValidateEnum(
                     export.ReturnAllocation.AllocatorFamily,
                     "Allocation family");
+                if (export.ReturnAllocation.AllocatorFamily
+                    != InteropAllocatorFamily.CrtHeap)
+                {
+                    throw InvalidResponse(
+                        "A native return allocation has no supported exact allocator family.");
+                }
                 ValidateTargetEquivalent(
                     export.ReturnAllocation.Target,
-                    request.Target,
+                    export.Target,
                     "Allocation target");
-                ValidateEvidence(
+                ValidateNativeFactEvidence(
                     export.ReturnAllocation.Evidence,
                     request,
                     policy,
-                    included);
+                    included,
+                    "clang-native-allocation",
+                    "allocatorFamily",
+                    "crt_heap");
+                if (!HasKnownCrtAllocatorMetadata(
+                        export.ReturnAllocation.Evidence))
+                {
+                    throw InvalidResponse(
+                        "A native return allocation has no exact known allocator identity.");
+                }
             }
         }
         foreach (var record in result.RecordLayouts)
@@ -852,9 +890,13 @@ internal static class NativeWorkerProtocol
         IReadOnlySet<string> included)
     {
         ValidateCollection(parameters, MaximumCollectionItems, "Parameters");
-        foreach (var parameter in parameters)
+        for (var parameterIndex = 0;
+             parameterIndex < parameters.Count;
+             parameterIndex++)
         {
-            if (parameter.Position < 0)
+            var parameter = parameters[parameterIndex];
+            if (parameter is null
+                || parameter.Position != parameterIndex)
             {
                 throw InvalidResponse("A parameter position is invalid.");
             }
@@ -922,6 +964,55 @@ internal static class NativeWorkerProtocol
             ValidateString(item.Value, "Evidence metadata value");
         }
     }
+
+    private static void ValidateNativeFactEvidence(
+        Evidence evidence,
+        ClangNativeExtractionRequest request,
+        ScopePathPolicy policy,
+        IReadOnlySet<string> included,
+        string producer,
+        string factMetadataKey,
+        string factMetadataValue)
+    {
+        ValidateEvidence(evidence, request, policy, included);
+        if (evidence.Confidence != EvidenceConfidence.Exact
+            || !string.Equals(
+                evidence.Producer,
+                producer,
+                StringComparison.Ordinal)
+            || evidence.Metadata is null
+            || !evidence.Metadata.TryGetValue(
+                "target",
+                out var evidenceTarget)
+            || !string.Equals(
+                evidenceTarget,
+                request.Target.RuntimeIdentifier,
+                StringComparison.OrdinalIgnoreCase)
+            || !evidence.Metadata.TryGetValue(
+                factMetadataKey,
+                out var factMetadata)
+            || !string.Equals(
+                factMetadata,
+                factMetadataValue,
+                StringComparison.Ordinal))
+        {
+            throw InvalidResponse(
+                "A native risk fact does not carry exact target-bound evidence.");
+        }
+    }
+
+    private static bool HasKnownCrtAllocatorMetadata(Evidence evidence) =>
+        evidence.Metadata is not null
+        && evidence.Metadata.TryGetValue(
+            "allocator",
+            out var allocator)
+        && allocator is
+            "malloc"
+            or "std::malloc"
+            or "calloc"
+            or "std::calloc"
+            or "realloc"
+            or "std::realloc";
 
     private static void ValidateLocation(
         SourceLocation location,
