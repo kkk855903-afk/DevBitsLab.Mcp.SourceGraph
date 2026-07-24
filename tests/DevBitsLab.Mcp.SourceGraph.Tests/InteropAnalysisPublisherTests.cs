@@ -393,6 +393,302 @@ public sealed class InteropAnalysisPublisherTests : IAsyncLifetime
         findings[0].RuleId.Should().Be(InteropRuleIds.NativeException);
     }
 
+    [Fact]
+    public async Task Caller_owned_usage_facts_publish_query_and_clean_up_Interop004_and_Interop006()
+    {
+        const string callbackImportKey =
+            "csharp:M:Fixture.NativeMethods.Register";
+        const string allocationImportKey =
+            "csharp:M:Fixture.NativeMethods.Allocate";
+        const string callerKey =
+            "csharp:M:Fixture.NativeService.RunRisks";
+        const string callbackNativeKey =
+            "c:E:native/interop.h::register";
+        const string allocationNativeKey =
+            "c:E:native/interop.h::allocate";
+
+        var callbackType = new AbiTypeRef(
+            "callback_t",
+            AbiTypeCategory.FunctionPointer,
+            pointerDepth: 1,
+            sizeBytes: 4,
+            alignmentBytes: 4);
+        var pointerType = new AbiTypeRef(
+            "void*",
+            AbiTypeCategory.Pointer,
+            pointerDepth: 1,
+            sizeBytes: 4,
+            alignmentBytes: 4,
+            pointeeType: VoidType);
+        var importOwner = await SeedOwnerAsync(
+            "managed/NativeMethods.cs",
+            callbackImportKey,
+            "Register",
+            "method");
+        var allocationOwner = await SeedOwnerAsync(
+            "managed/NativeMethods.cs",
+            allocationImportKey,
+            "Allocate",
+            "method");
+        var callerOwner = await SeedOwnerAsync(
+            "managed/NativeService.cs",
+            callerKey,
+            "RunRisks",
+            "method");
+        var callbackNativeOwner = await SeedOwnerAsync(
+            "native/interop.h",
+            callbackNativeKey,
+            "register",
+            "native-export");
+        var allocationNativeOwner = await SeedOwnerAsync(
+            "native/interop.h",
+            allocationNativeKey,
+            "allocate",
+            "native-export");
+
+        var callbackParameter = new AbiParameter(
+            0,
+            "callback",
+            callbackType,
+            AbiParameterDirection.In,
+            new SourceLocation(importOwner.Path, 4, 1, 4, 20));
+        var callbackImport = new ManagedImport(
+            callbackImportKey,
+            ManagedImportKind.DllImport,
+            "native.dll",
+            "register",
+            InteropCallingConvention.Cdecl,
+            VoidType,
+            [callbackParameter],
+            CharacterSet: null,
+            SetLastError: false,
+            Target,
+            EvidenceAt(
+                importOwner.FileId,
+                importOwner.Path,
+                "roslyn-managed-interop"))
+        {
+            ExactSpelling = true,
+        };
+        var allocationImport = new ManagedImport(
+            allocationImportKey,
+            ManagedImportKind.DllImport,
+            "native.dll",
+            "allocate",
+            InteropCallingConvention.Cdecl,
+            pointerType,
+            [],
+            CharacterSet: null,
+            SetLastError: false,
+            Target,
+            EvidenceAt(
+                allocationOwner.FileId,
+                allocationOwner.Path,
+                "roslyn-managed-interop"))
+        {
+            ExactSpelling = true,
+        };
+        await _store!.BulkInsertAnnotationsAsync(
+        [
+            Annotation(
+                importOwner.SymbolId,
+                InteropAnnotationFlavors.ManagedImport,
+                InteropFactPayloadCodec.EncodeManagedImport(callbackImport)),
+            Annotation(
+                allocationOwner.SymbolId,
+                InteropAnnotationFlavors.ManagedImport,
+                InteropFactPayloadCodec.EncodeManagedImport(allocationImport)),
+        ]);
+
+        var callbackNative = new NativeExport(
+            callbackNativeKey,
+            "register",
+            InteropCallingConvention.Cdecl,
+            VoidType,
+            [
+                callbackParameter with
+                {
+                    Location = new SourceLocation(
+                        callbackNativeOwner.Path,
+                        2,
+                        1,
+                        2,
+                        20),
+                },
+            ],
+            HasCLinkage: true,
+            IsBinaryVerified: true,
+            Target,
+            EvidenceAt(
+                callbackNativeOwner.FileId,
+                callbackNativeOwner.Path,
+                "clang-native-interop"))
+        {
+            LibraryName = "native.dll",
+            ModuleIdentitySource = NativeModuleIdentitySource.Binary,
+            RetainedCallbacks =
+            [
+                new NativeCallbackRetention(
+                    0,
+                    Target,
+                    EvidenceAt(
+                        callbackNativeOwner.FileId,
+                        callbackNativeOwner.Path,
+                        "clang-native-callback-retention")),
+            ],
+        };
+        var allocationNative = new NativeExport(
+            allocationNativeKey,
+            "allocate",
+            InteropCallingConvention.Cdecl,
+            pointerType,
+            [],
+            HasCLinkage: true,
+            IsBinaryVerified: true,
+            Target,
+            EvidenceAt(
+                allocationNativeOwner.FileId,
+                allocationNativeOwner.Path,
+                "clang-native-interop"))
+        {
+            LibraryName = "native.dll",
+            ModuleIdentitySource = NativeModuleIdentitySource.Binary,
+            ReturnAllocation = new NativeReturnAllocation(
+                InteropAllocatorFamily.CrtHeap,
+                Target,
+                EvidenceAt(
+                    allocationNativeOwner.FileId,
+                    allocationNativeOwner.Path,
+                    "clang-native-return-allocation")),
+        };
+        await _store.BulkInsertAnnotationsAsync(
+        [
+            Annotation(
+                callbackNativeOwner.SymbolId,
+                InteropAnnotationFlavors.NativeExport,
+                InteropFactPayloadCodec.EncodeNativeExport(callbackNative)),
+            Annotation(
+                allocationNativeOwner.SymbolId,
+                InteropAnnotationFlavors.NativeExport,
+                InteropFactPayloadCodec.EncodeNativeExport(allocationNative)),
+        ]);
+
+        var callbackUsage = new ManagedCallbackUsageProjection(
+            callbackImportKey,
+            new ManagedCallbackUsage(
+                0,
+                callerKey,
+                CallbackGcRooting.Unrooted,
+                Target,
+                EvidenceAt(
+                    callerOwner.FileId,
+                    callerOwner.Path,
+                    "roslyn-managed-interop-usage")));
+        var releaseUsage = new ManagedReturnReleaseProjection(
+            allocationImportKey,
+            new ManagedReturnRelease(
+                callerKey,
+                InteropAllocatorFamily.CoTaskMem,
+                Target,
+                EvidenceAt(
+                    callerOwner.FileId,
+                    callerOwner.Path,
+                    "roslyn-managed-interop-usage")));
+        var callbackPayload =
+            InteropFactPayloadCodec.EncodeManagedCallbackUsage(callbackUsage);
+        var releasePayload =
+            InteropFactPayloadCodec.EncodeManagedReturnRelease(releaseUsage);
+        await _store.BulkInsertAnnotationsAsync(
+        [
+            Annotation(
+                callerOwner.SymbolId,
+                InteropAnnotationFlavors.ManagedCallbackUsage,
+                callbackPayload),
+            Annotation(
+                callerOwner.SymbolId,
+                InteropAnnotationFlavors.ManagedReturnRelease,
+                releasePayload),
+        ]);
+
+        var published = await Publisher().PublishAsync(Target, true);
+
+        published.IsComplete.Should().BeTrue();
+        published.MatchesPublished.Should().Be(2);
+        published.FindingsPublished.Should().Be(2);
+        var findings = (await InteropFactStoreReader.ReadFindingsAsync(_store))
+            .Facts;
+        findings.Should().HaveCount(2);
+        findings.Should().OnlyContain(item =>
+            item.Row.FilePath == callerOwner.Path
+            && item.Fact.ManagedSymbolCanonicalKey == callerKey);
+        findings.Should().ContainSingle(item =>
+            item.Fact.RuleId == InteropRuleIds.CallbackGcRisk
+            && item.Fact.BoundaryManagedSymbolCanonicalKey
+                == callbackImportKey);
+        findings.Should().ContainSingle(item =>
+            item.Fact.RuleId == InteropRuleIds.AllocatorMismatch
+            && item.Fact.BoundaryManagedSymbolCanonicalKey
+                == allocationImportKey);
+
+        var queryService = new InteropQueryService();
+        var callbackQuery = await queryService.QueryAsync(
+            "scope-a",
+            _store,
+            CompleteState(),
+            callbackImportKey,
+            InteropQuerySelectionMode.ManagedImportOnly,
+            includeFindings: true);
+        callbackQuery.Result.Findings.Should().ContainSingle()
+            .Which.ManagedSymbol.Should().Be(callerKey);
+        callbackQuery.Result.Findings[0].RuleId.Should().Be(
+            InteropRuleIds.CallbackGcRisk);
+        var allocationQuery = await queryService.QueryAsync(
+            "scope-a",
+            _store,
+            CompleteState(),
+            allocationImportKey,
+            InteropQuerySelectionMode.ManagedImportOnly,
+            includeFindings: true);
+        allocationQuery.Result.Findings.Should().ContainSingle()
+            .Which.RuleId.Should().Be(InteropRuleIds.AllocatorMismatch);
+
+        await _store.ReplaceAnnotationsForFileByFlavorAsync(
+            callerOwner.Path,
+            InteropAnnotationFlavors.ManagedCallbackUsage,
+            [
+                new FileAnnotationFact(
+                    callerKey,
+                    "ManagedCallbackUsageV1",
+                    "MedInterop.ManagedCallbackUsage.v1",
+                    InteropAnnotationFlavors.ManagedCallbackUsage,
+                    "{}",
+                    AttributeCanonicalKey: null),
+            ]);
+        var malformed = await Publisher().PublishAsync(Target, true);
+
+        malformed.IsComplete.Should().BeFalse();
+        malformed.FilesPublished.Should().Be(0);
+        malformed.Failures.Should().Contain(failure =>
+            failure.Stage == "managed-callback-usages");
+        (await InteropFactStoreReader.ReadFindingsAsync(_store))
+            .Facts.Should().HaveCount(2);
+
+        await _store.ReplaceAnnotationsForFileByFlavorAsync(
+            callerOwner.Path,
+            InteropAnnotationFlavors.ManagedCallbackUsage,
+            []);
+        await _store.ReplaceAnnotationsForFileByFlavorAsync(
+            callerOwner.Path,
+            InteropAnnotationFlavors.ManagedReturnRelease,
+            []);
+        var cleaned = await Publisher().PublishAsync(Target, true);
+
+        cleaned.IsComplete.Should().BeTrue();
+        cleaned.FindingsPublished.Should().Be(0);
+        (await InteropFactStoreReader.ReadFindingsAsync(_store))
+            .Facts.Should().BeEmpty();
+    }
+
     private InteropAnalysisPublisher Publisher() => new(_store!);
 
     private async Task<Owner> SeedManagedAsync(
@@ -551,6 +847,23 @@ public sealed class InteropAnalysisPublisherTests : IAsyncLifetime
 
     private static AbiTypeRef VoidType { get; } =
         new("void", AbiTypeCategory.Void);
+
+    private static NativeInteropRuntimeState CompleteState() =>
+        new(
+            NativeInteropRuntimeStatus.Complete,
+            Target,
+            DateTimeOffset.UtcNow,
+            DateTimeOffset.UtcNow,
+            RetainedLastGood: false,
+            IsExportUniverseComplete: true,
+            TranslationUnits: 1,
+            IncludedFiles: 2,
+            NativeSymbols: 2,
+            ManagedMatches: 2,
+            Findings: 2,
+            BoundaryEdges: 2,
+            PendingStaleSymbols: 0,
+            Failures: []);
 
     private static InteropTarget Target { get; } =
         InteropTarget.WindowsX86Msvc;

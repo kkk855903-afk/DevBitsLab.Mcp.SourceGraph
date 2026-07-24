@@ -564,7 +564,7 @@ internal sealed class InteropQueryService
             var relevant = findings
                 .Where(item =>
                     string.Equals(
-                        item.Fact.ManagedSymbolCanonicalKey,
+                        item.Fact.BoundaryManagedSymbolCanonicalKey,
                         projection.ManagedSymbolCanonicalKey,
                         StringComparison.Ordinal)
                     && Phase2RuleIds.Contains(item.Fact.RuleId))

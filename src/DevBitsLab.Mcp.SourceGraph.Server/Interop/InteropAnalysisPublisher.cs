@@ -25,7 +25,7 @@ internal sealed record InteropAnalysisPublicationResult(
 /// </summary>
 internal sealed class InteropAnalysisPublisher
 {
-    internal const string Producer = "interop-analysis";
+    internal const string Producer = InteropFactProducers.Analysis;
     private const int ProjectionScanPageSize = 1_000;
     private const int MaximumProjectionRows = 100_000;
     private static readonly string[] _annotationFlavors =
@@ -64,6 +64,16 @@ internal sealed class InteropAnalysisPublisher
                     _store,
                     cancellationToken: cancellationToken)
                 .ConfigureAwait(false);
+            var callbackUsages =
+                await InteropFactStoreReader.ReadManagedCallbackUsagesAsync(
+                        _store,
+                        cancellationToken: cancellationToken)
+                    .ConfigureAwait(false);
+            var returnReleases =
+                await InteropFactStoreReader.ReadManagedReturnReleasesAsync(
+                        _store,
+                        cancellationToken: cancellationToken)
+                    .ConfigureAwait(false);
             var native = await InteropFactStoreReader.ReadNativeExportsAsync(
                     _store,
                     cancellationToken: cancellationToken)
@@ -79,6 +89,8 @@ internal sealed class InteropAnalysisPublisher
 
             var inputFailures = LoadFailures(
                 managed,
+                callbackUsages,
+                returnReleases,
                 native,
                 previousMatches,
                 previousFindings);
@@ -99,6 +111,8 @@ internal sealed class InteropAnalysisPublisher
             var targetFailures = ValidateTargets(
                 target,
                 managed.Facts,
+                callbackUsages.Facts,
+                returnReleases.Facts,
                 native.Facts);
             if (targetFailures.Count > 0)
             {
@@ -111,6 +125,8 @@ internal sealed class InteropAnalysisPublisher
                 projections = BuildProjections(
                     target,
                     managed.Facts,
+                    callbackUsages.Facts,
+                    returnReleases.Facts,
                     native.Facts,
                     previousMatches.Facts,
                     previousFindings.Facts);
@@ -134,53 +150,47 @@ internal sealed class InteropAnalysisPublisher
                 ]);
             }
 
-            var failures = new List<InteropAnalysisPublicationFailure>();
-            var filesPublished = 0;
-            var matchesPublished = 0;
-            var findingsPublished = 0;
-            var edgesPublished = 0;
-            foreach (var projection in projections)
+            try
             {
-                cancellationToken.ThrowIfCancellationRequested();
-                try
-                {
-                    await _store.ReplaceFileDerivedProjectionAsync(
-                            projection.FilePath,
-                            Producer,
-                            _annotationFlavors,
-                            projection.Annotations,
-                            projection.Edges,
-                            cancellationToken)
-                        .ConfigureAwait(false);
-                    filesPublished++;
-                    matchesPublished += projection.MatchCount;
-                    findingsPublished += projection.FindingCount;
-                    edgesPublished += projection.Edges.Count;
-                }
-                catch (OperationCanceledException)
-                {
-                    throw;
-                }
-                catch (Exception ex) when (
-                    ex is ArgumentException
-                        or InvalidOperationException
-                        or NotSupportedException
-                        or OverflowException)
-                {
-                    failures.Add(new InteropAnalysisPublicationFailure(
-                        projection.FilePath,
-                        "storage",
-                        BoundedMessage(ex)));
-                }
+                await _store.ReplaceFileDerivedProjectionsAsync(
+                        projections
+                            .Select(projection =>
+                                new FileDerivedProjectionReplacement(
+                                    projection.FilePath,
+                                    Producer,
+                                    _annotationFlavors,
+                                    projection.Annotations,
+                                    projection.Edges))
+                            .ToArray(),
+                        cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex) when (
+                ex is ArgumentException
+                    or InvalidOperationException
+                    or NotSupportedException
+                    or OverflowException)
+            {
+                return Failed(
+                [
+                    new InteropAnalysisPublicationFailure(
+                        FilePath: null,
+                        Stage: "storage",
+                        Message: BoundedMessage(ex)),
+                ]);
             }
 
             return new InteropAnalysisPublicationResult(
-                failures.Count == 0,
-                filesPublished,
-                matchesPublished,
-                findingsPublished,
-                edgesPublished,
-                OrderFailures(failures));
+                IsComplete: true,
+                FilesPublished: projections.Count,
+                MatchesPublished: projections.Sum(item => item.MatchCount),
+                FindingsPublished: projections.Sum(item => item.FindingCount),
+                EdgesPublished: projections.Sum(item => item.Edges.Count),
+                Failures: []);
         }
         finally
         {
@@ -207,47 +217,47 @@ internal sealed class InteropAnalysisPublisher
                 return Failed([ownerScan.Failure]);
             }
 
-            var failures = new List<InteropAnalysisPublicationFailure>();
-            var filesPublished = 0;
-            foreach (var filePath in ownerScan.FilePaths)
+            try
             {
-                cancellationToken.ThrowIfCancellationRequested();
-                try
-                {
-                    await _store.ReplaceFileDerivedProjectionAsync(
-                            filePath,
-                            Producer,
-                            _annotationFlavors,
-                            annotations: [],
-                            edges: [],
-                            cancellationToken)
-                        .ConfigureAwait(false);
-                    filesPublished++;
-                }
-                catch (OperationCanceledException)
-                {
-                    throw;
-                }
-                catch (Exception ex) when (
-                    ex is ArgumentException
-                        or InvalidOperationException
-                        or NotSupportedException
-                        or OverflowException)
-                {
-                    failures.Add(new InteropAnalysisPublicationFailure(
-                        filePath,
-                        "clear-storage",
-                        BoundedMessage(ex)));
-                }
+                await _store.ReplaceFileDerivedProjectionsAsync(
+                        ownerScan.FilePaths
+                            .Select(filePath =>
+                                new FileDerivedProjectionReplacement(
+                                    filePath,
+                                    Producer,
+                                    _annotationFlavors,
+                                    Annotations: [],
+                                    Edges: []))
+                            .ToArray(),
+                        cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex) when (
+                ex is ArgumentException
+                    or InvalidOperationException
+                    or NotSupportedException
+                    or OverflowException)
+            {
+                return Failed(
+                [
+                    new InteropAnalysisPublicationFailure(
+                        FilePath: null,
+                        Stage: "clear-storage",
+                        Message: BoundedMessage(ex)),
+                ]);
             }
 
             return new InteropAnalysisPublicationResult(
-                failures.Count == 0,
-                filesPublished,
+                IsComplete: true,
+                FilesPublished: ownerScan.FilePaths.Count,
                 MatchesPublished: 0,
                 FindingsPublished: 0,
                 EdgesPublished: 0,
-                OrderFailures(failures));
+                Failures: []);
         }
         finally
         {
@@ -329,6 +339,10 @@ internal sealed class InteropAnalysisPublisher
     private IReadOnlyList<ManagedFileProjection> BuildProjections(
         InteropTarget target,
         IReadOnlyList<StoredInteropFact<ManagedImport>> managedFacts,
+        IReadOnlyList<StoredInteropFact<ManagedCallbackUsageProjection>>
+            callbackUsageFacts,
+        IReadOnlyList<StoredInteropFact<ManagedReturnReleaseProjection>>
+            returnReleaseFacts,
         IReadOnlyList<StoredInteropFact<NativeExport>> nativeFacts,
         IReadOnlyList<StoredInteropFact<InteropMatchProjection>> previousMatches,
         IReadOnlyList<StoredInteropFact<InteropFindingProjection>> previousFindings)
@@ -340,163 +354,237 @@ internal sealed class InteropAnalysisPublisher
         var nativeByKey = nativeExports.ToDictionary(
             item => item.SymbolCanonicalKey,
             StringComparer.Ordinal);
-        var managedByPath = managedFacts
-            .GroupBy(item => item.Row.FilePath, PathComparer)
+        var callbacksByImport = callbackUsageFacts
+            .GroupBy(
+                item => item.Fact.ManagedImportSymbolCanonicalKey,
+                StringComparer.Ordinal)
             .ToDictionary(
                 group => group.Key,
                 group => group
                     .OrderBy(
-                        item => item.Fact.SymbolCanonicalKey,
+                        item => item.Fact.Usage.CallerSymbolCanonicalKey,
                         StringComparer.Ordinal)
+                    .ThenBy(item => item.Fact.Usage.ParameterPosition)
+                    .ThenBy(item => item.Row.AnnotationId)
                     .ToArray(),
-                PathComparer);
+                StringComparer.Ordinal);
+        var releasesByImport = returnReleaseFacts
+            .GroupBy(
+                item => item.Fact.ManagedImportSymbolCanonicalKey,
+                StringComparer.Ordinal)
+            .ToDictionary(
+                group => group.Key,
+                group => group
+                    .OrderBy(
+                        item => item.Fact.Release.CallerSymbolCanonicalKey,
+                        StringComparer.Ordinal)
+                    .ThenBy(item => item.Row.AnnotationId)
+                    .ToArray(),
+                StringComparer.Ordinal);
 
-        var allFilePaths = managedByPath.Keys
-            .Concat(previousMatches.Select(item => item.Row.FilePath))
-            .Concat(previousFindings.Select(item => item.Row.FilePath))
-            .Distinct(PathComparer)
-            .OrderBy(path => path, PathComparer)
-            .ThenBy(path => path, StringComparer.Ordinal)
-            .ToArray();
-        var projections = new List<ManagedFileProjection>(allFilePaths.Length);
-        foreach (var filePath in allFilePaths)
+        var annotationsByPath =
+            new Dictionary<string, List<FileAnnotationFact>>(PathComparer);
+        var edgesByPath =
+            new Dictionary<string, List<ProducerEdgeEvidenceFact>>(PathComparer);
+        var matchCounts = new Dictionary<string, int>(PathComparer);
+        var findingCounts = new Dictionary<string, int>(PathComparer);
+        var allFilePaths = new HashSet<string>(PathComparer);
+
+        void EnsureFile(string filePath)
         {
-            managedByPath.TryGetValue(filePath, out var fileFacts);
-            var annotations = new List<FileAnnotationFact>();
-            var edges = new List<ProducerEdgeEvidenceFact>();
-            var matchCount = 0;
-            var findingCount = 0;
-            foreach (var stored in fileFacts ?? [])
-            {
-                ValidateManagedOwnership(stored);
-                var managed = stored.Fact;
-                var match = _matcher.Match(
-                    managed,
-                    nativeExports,
-                    isExportUniverseComplete: true);
-                var matchProjection = new InteropMatchProjection(
-                    match.ManagedSymbolCanonicalKey,
-                    match.NativeSymbolCanonicalKey,
-                    match.Status,
-                    match.Confidence,
-                    match.Reasons,
-                    target,
-                    match.CandidateCount,
-                    SnapshotComplete: true,
-                    ProjectEvidence(match.Evidence));
-                annotations.Add(new FileAnnotationFact(
-                    managed.SymbolCanonicalKey,
-                    "InteropMatch",
-                    "MedInterop.InteropMatch",
-                    InteropAnnotationFlavors.Match,
-                    InteropFactPayloadCodec.EncodeMatch(matchProjection),
-                    AttributeCanonicalKey: null));
-                matchCount++;
+            allFilePaths.Add(filePath);
+            annotationsByPath.TryAdd(filePath, []);
+            edgesByPath.TryAdd(filePath, []);
+            matchCounts.TryAdd(filePath, 0);
+            findingCounts.TryAdd(filePath, 0);
+        }
 
-                if (match.Status != InteropMatchStatus.Matched)
-                {
-                    continue;
-                }
-                if (match.NativeSymbolCanonicalKey is null
-                    || !nativeByKey.TryGetValue(
-                        match.NativeSymbolCanonicalKey,
-                        out var native))
+        foreach (var path in managedFacts.Select(item => item.Row.FilePath)
+                     .Concat(previousMatches.Select(item => item.Row.FilePath))
+                     .Concat(previousFindings.Select(item => item.Row.FilePath)))
+        {
+            EnsureFile(path);
+        }
+
+        foreach (var stored in managedFacts
+                     .OrderBy(
+                         item => item.Fact.SymbolCanonicalKey,
+                         StringComparer.Ordinal))
+        {
+            ValidateManagedOwnership(stored);
+            var managed = stored.Fact;
+            var importFilePath = stored.Row.FilePath;
+            EnsureFile(importFilePath);
+            var match = _matcher.Match(
+                managed,
+                nativeExports,
+                isExportUniverseComplete: true);
+            var matchProjection = new InteropMatchProjection(
+                match.ManagedSymbolCanonicalKey,
+                match.NativeSymbolCanonicalKey,
+                match.Status,
+                match.Confidence,
+                match.Reasons,
+                target,
+                match.CandidateCount,
+                SnapshotComplete: true,
+                ProjectEvidence(match.Evidence));
+            annotationsByPath[importFilePath].Add(new FileAnnotationFact(
+                managed.SymbolCanonicalKey,
+                "InteropMatch",
+                "MedInterop.InteropMatch",
+                InteropAnnotationFlavors.Match,
+                InteropFactPayloadCodec.EncodeMatch(matchProjection),
+                AttributeCanonicalKey: null));
+            matchCounts[importFilePath]++;
+
+            if (match.Status != InteropMatchStatus.Matched)
+            {
+                continue;
+            }
+            if (match.NativeSymbolCanonicalKey is null
+                || !nativeByKey.TryGetValue(
+                    match.NativeSymbolCanonicalKey,
+                    out var native))
+            {
+                throw new InvalidOperationException(
+                    "A matched result did not resolve to one stored native export.");
+            }
+
+            var metadata = new Dictionary<string, string>(
+                StringComparer.Ordinal)
+            {
+                ["runtimeIdentifier"] = target.RuntimeIdentifier,
+                ["status"] = "matched",
+                ["confidence"] = ConfidenceToken(match.Confidence),
+            };
+            edgesByPath[importFilePath].Add(new ProducerEdgeEvidenceFact(
+                managed.SymbolCanonicalKey,
+                native.SymbolCanonicalKey,
+                EdgeKinds.PInvokeMapsTo,
+                metadata,
+                new FileEvidenceFact(
+                    managed.Evidence.Location,
+                    match.Confidence,
+                    Producer,
+                    metadata)));
+
+            callbacksByImport.TryGetValue(
+                managed.SymbolCanonicalKey,
+                out var callbackRows);
+            releasesByImport.TryGetValue(
+                managed.SymbolCanonicalKey,
+                out var releaseRows);
+            var boundary = new InteropBoundary(managed, native)
+            {
+                CallbackUsages = (callbackRows ?? [])
+                    .Select(item => item.Fact.Usage)
+                    .ToArray(),
+                ReturnReleases = (releaseRows ?? [])
+                    .Select(item => item.Fact.Release)
+                    .ToArray(),
+            };
+            var findings = _rules.Evaluate(boundary)
+                .Where(finding => finding.RuleId
+                    is InteropRuleIds.CallingConvention
+                        or InteropRuleIds.ParameterTypeRisk
+                        or InteropRuleIds.CallbackGcRisk
+                        or InteropRuleIds.NativeException
+                        or InteropRuleIds.AllocatorMismatch)
+                .OrderBy(finding => finding.RuleId, StringComparer.Ordinal)
+                .ThenBy(finding => finding.Message, StringComparer.Ordinal)
+                .ToArray();
+            foreach (var finding in findings)
+            {
+                if (string.IsNullOrWhiteSpace(
+                        finding.ManagedSymbolCanonicalKey)
+                    || !string.Equals(
+                        finding.NativeSymbolCanonicalKey,
+                        native.SymbolCanonicalKey,
+                        StringComparison.Ordinal))
                 {
                     throw new InvalidOperationException(
-                        "A matched result did not resolve to one stored native export.");
+                        "A boundary finding is not owned by its matched import/export.");
                 }
 
-                var metadata = new Dictionary<string, string>(
-                    StringComparer.Ordinal)
-                {
-                    ["runtimeIdentifier"] = target.RuntimeIdentifier,
-                    ["status"] = "matched",
-                    ["confidence"] = ConfidenceToken(match.Confidence),
-                };
-                edges.Add(new ProducerEdgeEvidenceFact(
-                    managed.SymbolCanonicalKey,
+                var findingOwnerPath = FindFindingOwnerPath(
+                    finding,
+                    stored,
+                    callbackRows ?? [],
+                    releaseRows ?? []);
+                EnsureFile(findingOwnerPath);
+                var findingProjection = new InteropFindingProjection(
+                    finding.RuleId,
+                    finding.Severity,
+                    finding.Message,
+                    finding.ManagedSymbolCanonicalKey,
                     native.SymbolCanonicalKey,
-                    EdgeKinds.PInvokeMapsTo,
-                    metadata,
-                    new FileEvidenceFact(
-                        managed.Evidence.Location,
-                        match.Confidence,
-                        Producer,
-                        metadata)));
-
-                var findings = _rules.Evaluate(
-                        new InteropBoundary(managed, native))
-                    .Where(finding => finding.RuleId
-                        is InteropRuleIds.CallingConvention
-                            or InteropRuleIds.ParameterTypeRisk
-                            or InteropRuleIds.CallbackGcRisk
-                            or InteropRuleIds.NativeException
-                            or InteropRuleIds.AllocatorMismatch)
-                    .OrderBy(finding => finding.RuleId, StringComparer.Ordinal)
-                    .ThenBy(finding => finding.Message, StringComparer.Ordinal)
-                    .ToArray();
-                foreach (var finding in findings)
+                    target,
+                    finding.Confidence,
+                    ProjectEvidence(finding.Evidence))
                 {
-                    if (!string.Equals(
-                            finding.ManagedSymbolCanonicalKey,
-                            managed.SymbolCanonicalKey,
-                            StringComparison.Ordinal)
-                        || !string.Equals(
-                            finding.NativeSymbolCanonicalKey,
-                            native.SymbolCanonicalKey,
-                            StringComparison.Ordinal))
-                    {
-                        throw new InvalidOperationException(
-                            "A boundary finding is not owned by its matched import/export.");
-                    }
-
-                    var findingProjection = new InteropFindingProjection(
-                        finding.RuleId,
-                        finding.Severity,
-                        finding.Message,
+                    BoundaryManagedSymbolCanonicalKey =
                         managed.SymbolCanonicalKey,
-                        native.SymbolCanonicalKey,
-                        target,
-                        finding.Confidence,
-                        ProjectEvidence(finding.Evidence));
-                    annotations.Add(new FileAnnotationFact(
-                        managed.SymbolCanonicalKey,
+                };
+                annotationsByPath[findingOwnerPath].Add(
+                    new FileAnnotationFact(
+                        finding.ManagedSymbolCanonicalKey,
                         finding.RuleId,
                         $"MedInterop.{finding.RuleId}",
                         InteropAnnotationFlavors.Finding,
-                        InteropFactPayloadCodec.EncodeFinding(findingProjection),
+                        InteropFactPayloadCodec.EncodeFinding(
+                            findingProjection),
                         AttributeCanonicalKey: null));
-                    findingCount++;
-                }
+                findingCounts[findingOwnerPath]++;
             }
+        }
 
-            projections.Add(new ManagedFileProjection(
+        return allFilePaths
+            .OrderBy(path => path, PathComparer)
+            .ThenBy(path => path, StringComparer.Ordinal)
+            .Select(filePath => new ManagedFileProjection(
                 filePath,
-                annotations
-                    .OrderBy(item => item.SymbolCanonicalKey, StringComparer.Ordinal)
+                annotationsByPath[filePath]
+                    .OrderBy(
+                        item => item.SymbolCanonicalKey,
+                        StringComparer.Ordinal)
                     .ThenBy(item => item.Flavor, StringComparer.Ordinal)
                     .ThenBy(item => item.Name, StringComparer.Ordinal)
                     .ThenBy(item => item.ArgsJson, StringComparer.Ordinal)
                     .ToArray(),
-                edges
-                    .OrderBy(item => item.SourceCanonicalKey, StringComparer.Ordinal)
-                    .ThenBy(item => item.TargetCanonicalKey, StringComparer.Ordinal)
+                edgesByPath[filePath]
+                    .OrderBy(
+                        item => item.SourceCanonicalKey,
+                        StringComparer.Ordinal)
+                    .ThenBy(
+                        item => item.TargetCanonicalKey,
+                        StringComparer.Ordinal)
                     .ToArray(),
-                matchCount,
-                findingCount));
-        }
-
-        return projections;
+                matchCounts[filePath],
+                findingCounts[filePath]))
+            .ToArray();
     }
 
     private static List<InteropAnalysisPublicationFailure> LoadFailures(
         StoredInteropFactSnapshot<ManagedImport> managed,
+        StoredInteropFactSnapshot<ManagedCallbackUsageProjection>
+            callbackUsages,
+        StoredInteropFactSnapshot<ManagedReturnReleaseProjection>
+            returnReleases,
         StoredInteropFactSnapshot<NativeExport> native,
         StoredInteropFactSnapshot<InteropMatchProjection> matches,
         StoredInteropFactSnapshot<InteropFindingProjection> findings)
     {
         var failures = new List<InteropAnalysisPublicationFailure>();
         AddLoadFailures(failures, "managed-imports", managed.Failures);
+        AddLoadFailures(
+            failures,
+            "managed-callback-usages",
+            callbackUsages.Failures);
+        AddLoadFailures(
+            failures,
+            "managed-return-releases",
+            returnReleases.Failures);
         AddLoadFailures(failures, "native-exports", native.Failures);
         AddLoadFailures(failures, "previous-matches", matches.Failures);
         AddLoadFailures(failures, "previous-findings", findings.Failures);
@@ -522,17 +610,104 @@ internal sealed class InteropAnalysisPublisher
     private static List<InteropAnalysisPublicationFailure> ValidateTargets(
         InteropTarget target,
         IReadOnlyList<StoredInteropFact<ManagedImport>> managed,
+        IReadOnlyList<StoredInteropFact<ManagedCallbackUsageProjection>>
+            callbackUsages,
+        IReadOnlyList<StoredInteropFact<ManagedReturnReleaseProjection>>
+            returnReleases,
         IReadOnlyList<StoredInteropFact<NativeExport>> native)
     {
         var failures = new List<InteropAnalysisPublicationFailure>();
+        var managedByKey = managed.ToDictionary(
+            item => item.Fact.SymbolCanonicalKey,
+            StringComparer.Ordinal);
         foreach (var item in managed)
         {
             if (!item.Fact.Target.IsAbiEquivalentTo(target))
             {
                 failures.Add(new InteropAnalysisPublicationFailure(
                     item.Row.FilePath,
+                "target-validation",
+                "A managed import does not match the configured interop target."));
+            }
+        }
+        foreach (var item in callbackUsages)
+        {
+            var usage = item.Fact.Usage;
+            if (!PathsEquivalent(
+                    item.Row.FilePath,
+                    usage.Evidence.Location.FilePath))
+            {
+                failures.Add(new InteropAnalysisPublicationFailure(
+                    item.Row.FilePath,
+                    "usage-validation",
+                    "A managed callback usage is not owned by its annotation file."));
+            }
+            if (!managedByKey.TryGetValue(
+                    item.Fact.ManagedImportSymbolCanonicalKey,
+                    out var import))
+            {
+                failures.Add(new InteropAnalysisPublicationFailure(
+                    item.Row.FilePath,
+                    "usage-validation",
+                    "A managed callback usage targets no current managed import."));
+                continue;
+            }
+            if (!usage.Target.IsAbiEquivalentTo(target)
+                || !usage.Target.IsAbiEquivalentTo(import.Fact.Target))
+            {
+                failures.Add(new InteropAnalysisPublicationFailure(
+                    item.Row.FilePath,
                     "target-validation",
-                    "A managed import does not match the configured interop target."));
+                    "A managed callback usage does not match its import target."));
+            }
+            if (usage.Rooting == CallbackGcRooting.Unknown
+                || !import.Fact.Parameters.Any(parameter =>
+                    parameter.Position == usage.ParameterPosition
+                    && parameter.Type.Category
+                        == AbiTypeCategory.FunctionPointer))
+            {
+                failures.Add(new InteropAnalysisPublicationFailure(
+                    item.Row.FilePath,
+                    "usage-validation",
+                    "A managed callback usage has no matching callback parameter."));
+            }
+        }
+        foreach (var item in returnReleases)
+        {
+            var release = item.Fact.Release;
+            if (!PathsEquivalent(
+                    item.Row.FilePath,
+                    release.Evidence.Location.FilePath))
+            {
+                failures.Add(new InteropAnalysisPublicationFailure(
+                    item.Row.FilePath,
+                    "usage-validation",
+                    "A managed return release is not owned by its annotation file."));
+            }
+            if (!managedByKey.TryGetValue(
+                    item.Fact.ManagedImportSymbolCanonicalKey,
+                    out var import))
+            {
+                failures.Add(new InteropAnalysisPublicationFailure(
+                    item.Row.FilePath,
+                    "usage-validation",
+                    "A managed return release targets no current managed import."));
+                continue;
+            }
+            if (release.ReleaseFamily == InteropAllocatorFamily.Unknown)
+            {
+                failures.Add(new InteropAnalysisPublicationFailure(
+                    item.Row.FilePath,
+                    "usage-validation",
+                    "A managed return release has no proven allocator family."));
+            }
+            if (!release.Target.IsAbiEquivalentTo(target)
+                || !release.Target.IsAbiEquivalentTo(import.Fact.Target))
+            {
+                failures.Add(new InteropAnalysisPublicationFailure(
+                    item.Row.FilePath,
+                    "target-validation",
+                    "A managed return release does not match its import target."));
             }
         }
         foreach (var item in native)
@@ -546,6 +721,52 @@ internal sealed class InteropAnalysisPublisher
             }
         }
         return failures;
+    }
+
+    private static string FindFindingOwnerPath(
+        InteropFinding finding,
+        StoredInteropFact<ManagedImport> managed,
+        IReadOnlyList<StoredInteropFact<ManagedCallbackUsageProjection>>
+            callbackUsages,
+        IReadOnlyList<StoredInteropFact<ManagedReturnReleaseProjection>>
+            returnReleases)
+    {
+        var managedKey = finding.ManagedSymbolCanonicalKey
+            ?? throw new InvalidOperationException(
+                "An interop finding has no managed symbol.");
+        if (string.Equals(
+                managedKey,
+                managed.Fact.SymbolCanonicalKey,
+                StringComparison.Ordinal))
+        {
+            return managed.Row.FilePath;
+        }
+
+        IEnumerable<string> candidates = finding.RuleId switch
+        {
+            InteropRuleIds.CallbackGcRisk => callbackUsages
+                .Where(item => string.Equals(
+                    item.Fact.Usage.CallerSymbolCanonicalKey,
+                    managedKey,
+                    StringComparison.Ordinal))
+                .Select(item => item.Row.FilePath),
+            InteropRuleIds.AllocatorMismatch => returnReleases
+                .Where(item => string.Equals(
+                    item.Fact.Release.CallerSymbolCanonicalKey,
+                    managedKey,
+                    StringComparison.Ordinal))
+                .Select(item => item.Row.FilePath),
+            _ => [],
+        };
+        var paths = candidates
+            .Distinct(PathComparer)
+            .ToArray();
+        if (paths.Length != 1)
+        {
+            throw new InvalidOperationException(
+                $"Finding {finding.RuleId} has no unique caller-owned usage fact.");
+        }
+        return paths[0];
     }
 
     private static void ValidateManagedOwnership(

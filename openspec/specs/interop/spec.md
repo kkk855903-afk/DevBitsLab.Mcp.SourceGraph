@@ -197,6 +197,19 @@ and evidence. A native source, `.def`, binary, or project-control deletion SHALL
 complete native snapshot and rematch affected managed imports; if rebuild is incomplete, prior
 boundary facts remain and the scope is partial rather than publishing false `Unmatched` results.
 
+Managed callback and release use-flow facts SHALL be owned by the physical caller file and SHALL
+identify the exact import declaration they consume. A successful import-declaration edit SHALL
+re-evaluate every potentially unchanged managed caller before publishing; a conservative
+solution-wide C# fanout is allowed when no complete import-to-caller dependency set is available.
+Calls inside an anonymous or local function that has no persisted declaration SHALL NOT be
+attributed to an outer member, because declaration alone does not prove that the nested callable
+executes.
+Because `Interop004`/`Interop006` findings can therefore be owned by a different file from their
+match and `pinvoke-maps-to` edge, one refresh SHALL validate and replace all affected
+import/caller-file projections in one storage transaction. Declaration reconciliation SHALL
+preserve the previous analysis-owned match/finding flavors on surviving symbols until that
+transaction commits, so an incomplete follow-up cannot erase the last-good projection.
+
 Native include dependencies SHALL be tracked. A scope-approved header create/edit/delete SHALL
 re-extract every known owning translation unit and fan out to all affected managed imports.
 Conservative fanout across all scope-approved native translation units/imports is allowed when
@@ -246,6 +259,12 @@ applicable, and every occurrence needed to audit the claim. Parameter findings S
 parameter locations; `.def` aliases and binary verification SHALL retain their own provenance.
 Finding and edge confidence SHALL be no stronger than the weakest evidence on which the result
 depends.
+
+Caller-attributed `Interop004`/`Interop006` findings SHALL persist both keys independently: the
+managed caller that owns the finding and the import declaration that owns the matched boundary.
+Query selection by an import SHALL use the boundary key while rendering the caller key. The
+versioned finding payload SHALL reject a boundary-key field in legacy versions rather than
+silently downgrading a caller/boundary distinction.
 
 Deleting or replacing either endpoint SHALL remove or recompute stale `pinvoke-maps-to` edges and
 findings in the same successful refresh. Query rendering SHALL use stored evidence and SHALL NOT
