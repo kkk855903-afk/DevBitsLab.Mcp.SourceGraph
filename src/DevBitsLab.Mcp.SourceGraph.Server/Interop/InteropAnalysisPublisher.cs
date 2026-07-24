@@ -78,6 +78,10 @@ internal sealed class InteropAnalysisPublisher
                     _store,
                     cancellationToken: cancellationToken)
                 .ConfigureAwait(false);
+            var abiRecords = await InteropFactStoreReader.ReadAbiRecordsAsync(
+                    _store,
+                    cancellationToken: cancellationToken)
+                .ConfigureAwait(false);
             var previousMatches = await InteropFactStoreReader.ReadMatchesAsync(
                     _store,
                     cancellationToken: cancellationToken)
@@ -92,6 +96,7 @@ internal sealed class InteropAnalysisPublisher
                 callbackUsages,
                 returnReleases,
                 native,
+                abiRecords,
                 previousMatches,
                 previousFindings);
             if (!isExportUniverseComplete)
@@ -113,7 +118,8 @@ internal sealed class InteropAnalysisPublisher
                 managed.Facts,
                 callbackUsages.Facts,
                 returnReleases.Facts,
-                native.Facts);
+                native.Facts,
+                abiRecords.Facts);
             if (targetFailures.Count > 0)
             {
                 return Failed(targetFailures);
@@ -128,6 +134,7 @@ internal sealed class InteropAnalysisPublisher
                     callbackUsages.Facts,
                     returnReleases.Facts,
                     native.Facts,
+                    abiRecords.Facts,
                     previousMatches.Facts,
                     previousFindings.Facts);
             }
@@ -344,6 +351,7 @@ internal sealed class InteropAnalysisPublisher
         IReadOnlyList<StoredInteropFact<ManagedReturnReleaseProjection>>
             returnReleaseFacts,
         IReadOnlyList<StoredInteropFact<NativeExport>> nativeFacts,
+        IReadOnlyList<StoredInteropFact<AbiRecordLayout>> abiRecordFacts,
         IReadOnlyList<StoredInteropFact<InteropMatchProjection>> previousMatches,
         IReadOnlyList<StoredInteropFact<InteropFindingProjection>> previousFindings)
     {
@@ -354,6 +362,7 @@ internal sealed class InteropAnalysisPublisher
         var nativeByKey = nativeExports.ToDictionary(
             item => item.SymbolCanonicalKey,
             StringComparer.Ordinal);
+        var recordIndex = AbiRecordIndex.Create(abiRecordFacts);
         var callbacksByImport = callbackUsageFacts
             .GroupBy(
                 item => item.Fact.ManagedImportSymbolCanonicalKey,
@@ -469,6 +478,25 @@ internal sealed class InteropAnalysisPublisher
                     Producer,
                     metadata)));
 
+            foreach (var mapping in FindRecordMappings(
+                         managed,
+                         native,
+                         recordIndex,
+                         match.Confidence))
+            {
+                edgesByPath[importFilePath].Add(
+                    new ProducerEdgeEvidenceFact(
+                        mapping.Managed.SymbolCanonicalKey,
+                        mapping.Native.SymbolCanonicalKey,
+                        EdgeKinds.StructMapsTo,
+                        mapping.Metadata,
+                        new FileEvidenceFact(
+                            mapping.Location,
+                            mapping.Confidence,
+                            Producer,
+                            mapping.Metadata)));
+            }
+
             callbacksByImport.TryGetValue(
                 managed.SymbolCanonicalKey,
                 out var callbackRows);
@@ -572,6 +600,7 @@ internal sealed class InteropAnalysisPublisher
         StoredInteropFactSnapshot<ManagedReturnReleaseProjection>
             returnReleases,
         StoredInteropFactSnapshot<NativeExport> native,
+        StoredInteropFactSnapshot<AbiRecordLayout> abiRecords,
         StoredInteropFactSnapshot<InteropMatchProjection> matches,
         StoredInteropFactSnapshot<InteropFindingProjection> findings)
     {
@@ -586,6 +615,7 @@ internal sealed class InteropAnalysisPublisher
             "managed-return-releases",
             returnReleases.Failures);
         AddLoadFailures(failures, "native-exports", native.Failures);
+        AddLoadFailures(failures, "abi-records", abiRecords.Failures);
         AddLoadFailures(failures, "previous-matches", matches.Failures);
         AddLoadFailures(failures, "previous-findings", findings.Failures);
         return failures;
@@ -614,7 +644,8 @@ internal sealed class InteropAnalysisPublisher
             callbackUsages,
         IReadOnlyList<StoredInteropFact<ManagedReturnReleaseProjection>>
             returnReleases,
-        IReadOnlyList<StoredInteropFact<NativeExport>> native)
+        IReadOnlyList<StoredInteropFact<NativeExport>> native,
+        IReadOnlyList<StoredInteropFact<AbiRecordLayout>> abiRecords)
     {
         var failures = new List<InteropAnalysisPublicationFailure>();
         var managedByKey = managed.ToDictionary(
@@ -717,10 +748,140 @@ internal sealed class InteropAnalysisPublisher
                 failures.Add(new InteropAnalysisPublicationFailure(
                     item.Row.FilePath,
                     "target-validation",
-                    "A native export does not match the configured interop target."));
+                "A native export does not match the configured interop target."));
+            }
+        }
+        foreach (var item in abiRecords)
+        {
+            if (!item.Fact.Target.IsAbiEquivalentTo(target))
+            {
+                failures.Add(new InteropAnalysisPublicationFailure(
+                    item.Row.FilePath,
+                    "target-validation",
+                    "An ABI record does not match the configured interop target."));
             }
         }
         return failures;
+    }
+
+    private static IReadOnlyList<ProvenRecordMapping> FindRecordMappings(
+        ManagedImport managed,
+        NativeExport native,
+        AbiRecordIndex records,
+        EvidenceConfidence boundaryConfidence)
+    {
+        var mappings = new List<ProvenRecordMapping>();
+        var seen = new HashSet<(string Managed, string Native)>();
+
+        Add(
+            managed.ReturnType,
+            native.ReturnType,
+            managed.Evidence.Location,
+            "return");
+
+        var nativeParameters = native.Parameters.ToDictionary(
+            parameter => parameter.Position);
+        foreach (var managedParameter in managed.Parameters
+                     .OrderBy(parameter => parameter.Position))
+        {
+            if (!nativeParameters.TryGetValue(
+                    managedParameter.Position,
+                    out var nativeParameter))
+            {
+                continue;
+            }
+
+            Add(
+                managedParameter.Type,
+                nativeParameter.Type,
+                managedParameter.Location,
+                $"parameter:{managedParameter.Position}");
+        }
+
+        return mappings;
+
+        void Add(
+            AbiTypeRef managedType,
+            AbiTypeRef nativeType,
+            SourceLocation location,
+            string position)
+        {
+            var managedRecordType = FindRecordType(managedType);
+            var nativeRecordType = FindRecordType(nativeType);
+            if (managedRecordType is null
+                || nativeRecordType is null
+                || !records.TryResolveManaged(
+                    managedRecordType.CanonicalName,
+                    out var managedRecord)
+                || !records.TryResolveNative(
+                    nativeRecordType.CanonicalName,
+                    out var nativeRecord)
+                || !seen.Add((
+                    managedRecord.SymbolCanonicalKey,
+                    nativeRecord.SymbolCanonicalKey)))
+            {
+                return;
+            }
+
+            if (!PathsEquivalent(
+                    location.FilePath,
+                    managed.Evidence.Location.FilePath))
+            {
+                throw new InvalidOperationException(
+                    "A managed record-boundary location is not owned by its import file.");
+            }
+
+            var confidence = (EvidenceConfidence)Math.Min(
+                (int)boundaryConfidence,
+                Math.Min(
+                    (int)managedRecord.Evidence.Confidence,
+                    (int)nativeRecord.Evidence.Confidence));
+            var compatibility =
+                new AbiStructCompatibilityEngine().Compare(
+                    managedRecord,
+                    nativeRecord);
+            var metadata = new Dictionary<string, string>(
+                StringComparer.Ordinal)
+            {
+                ["boundaryManagedSymbol"] = managed.SymbolCanonicalKey,
+                ["boundaryNativeSymbol"] = native.SymbolCanonicalKey,
+                ["compatibility"] =
+                    CompatibilityToken(compatibility.Compatibility),
+                ["confidence"] = ConfidenceToken(confidence),
+                ["managedType"] = managedRecordType.CanonicalName,
+                ["nativeType"] = nativeRecordType.CanonicalName,
+                ["position"] = position,
+                ["runtimeIdentifier"] =
+                    managed.Target.RuntimeIdentifier,
+                ["status"] = "matched",
+            };
+            mappings.Add(new ProvenRecordMapping(
+                managedRecord,
+                nativeRecord,
+                location,
+                confidence,
+                metadata));
+        }
+    }
+
+    private static AbiTypeRef? FindRecordType(
+        AbiTypeRef type,
+        int depth = 0)
+    {
+        if (depth > 8)
+        {
+            return null;
+        }
+        if (type.Category == AbiTypeCategory.Record)
+        {
+            return type;
+        }
+        if (type.Category == AbiTypeCategory.Pointer
+            && type.PointeeType is not null)
+        {
+            return FindRecordType(type.PointeeType, depth + 1);
+        }
+        return null;
     }
 
     private static string FindFindingOwnerPath(
@@ -821,6 +982,18 @@ internal sealed class InteropAnalysisPublisher
                 $"Unsupported evidence confidence `{confidence}`."),
         };
 
+    private static string CompatibilityToken(
+        InteropCompatibility compatibility) =>
+        compatibility switch
+        {
+            InteropCompatibility.Unknown => "unknown",
+            InteropCompatibility.Compatible => "compatible",
+            InteropCompatibility.Warning => "warning",
+            InteropCompatibility.Error => "error",
+            _ => throw new InvalidOperationException(
+                $"Unsupported interop compatibility `{compatibility}`."),
+        };
+
     private static bool PathsEquivalent(string left, string right)
     {
         try
@@ -859,6 +1032,183 @@ internal sealed class InteropAnalysisPublisher
         IReadOnlyList<ProducerEdgeEvidenceFact> Edges,
         int MatchCount,
         int FindingCount);
+
+    private sealed record ProvenRecordMapping(
+        AbiRecordLayout Managed,
+        AbiRecordLayout Native,
+        SourceLocation Location,
+        EvidenceConfidence Confidence,
+        IReadOnlyDictionary<string, string> Metadata);
+
+    private sealed class AbiRecordIndex
+    {
+        private readonly IReadOnlyDictionary<
+            string,
+            IReadOnlyList<AbiRecordLayout>> _managed;
+        private readonly IReadOnlyDictionary<
+            string,
+            IReadOnlyList<AbiRecordLayout>> _native;
+
+        private AbiRecordIndex(
+            IReadOnlyDictionary<string, IReadOnlyList<AbiRecordLayout>>
+                managed,
+            IReadOnlyDictionary<string, IReadOnlyList<AbiRecordLayout>>
+                native)
+        {
+            _managed = managed;
+            _native = native;
+        }
+
+        public static AbiRecordIndex Create(
+            IReadOnlyList<StoredInteropFact<AbiRecordLayout>> facts)
+        {
+            var managed = new Dictionary<
+                string,
+                List<AbiRecordLayout>>(StringComparer.Ordinal);
+            var native = new Dictionary<
+                string,
+                List<AbiRecordLayout>>(StringComparer.Ordinal);
+
+            foreach (var stored in facts)
+            {
+                var record = stored.Fact;
+                if (TryManagedIdentity(
+                        record.SymbolCanonicalKey,
+                        out var managedIdentity))
+                {
+                    if (record.Kind is not (
+                            AbiRecordKind.Sequential
+                                or AbiRecordKind.Explicit))
+                    {
+                        throw new InvalidOperationException(
+                            "A managed ABI record has an invalid record kind.");
+                    }
+                    Add(managed, managedIdentity, record);
+                    continue;
+                }
+
+                if (TryNativeIdentity(
+                        record.SymbolCanonicalKey,
+                        out var nativeIdentity))
+                {
+                    if (record.Kind != AbiRecordKind.Native)
+                    {
+                        throw new InvalidOperationException(
+                            "A native ABI record has an invalid record kind.");
+                    }
+                    Add(native, nativeIdentity, record);
+                    continue;
+                }
+
+                throw new InvalidOperationException(
+                    "An ABI record has no supported canonical type identity.");
+            }
+
+            return new AbiRecordIndex(
+                Freeze(managed),
+                Freeze(native));
+        }
+
+        public bool TryResolveManaged(
+            string canonicalTypeName,
+            out AbiRecordLayout record) =>
+            TryResolve(_managed, canonicalTypeName, out record);
+
+        public bool TryResolveNative(
+            string canonicalTypeName,
+            out AbiRecordLayout record) =>
+            TryResolve(_native, canonicalTypeName, out record);
+
+        private static bool TryResolve(
+            IReadOnlyDictionary<string, IReadOnlyList<AbiRecordLayout>>
+                index,
+            string canonicalTypeName,
+            out AbiRecordLayout record)
+        {
+            if (index.TryGetValue(canonicalTypeName, out var candidates)
+                && candidates.Count == 1)
+            {
+                record = candidates[0];
+                return true;
+            }
+
+            record = null!;
+            return false;
+        }
+
+        private static bool TryManagedIdentity(
+            string canonicalKey,
+            out string identity)
+        {
+            const string prefix = "csharp:T:";
+            if (canonicalKey.StartsWith(prefix, StringComparison.Ordinal)
+                && canonicalKey.Length > prefix.Length)
+            {
+                identity = canonicalKey[prefix.Length..];
+                return true;
+            }
+
+            identity = string.Empty;
+            return false;
+        }
+
+        private static bool TryNativeIdentity(
+            string canonicalKey,
+            out string identity)
+        {
+            var prefixLength = canonicalKey.StartsWith(
+                    "c:T:",
+                    StringComparison.Ordinal)
+                ? "c:T:".Length
+                : canonicalKey.StartsWith(
+                    "cpp:T:",
+                    StringComparison.Ordinal)
+                    ? "cpp:T:".Length
+                    : -1;
+            if (prefixLength >= 0)
+            {
+                var separator = canonicalKey.IndexOf(
+                    "::",
+                    prefixLength,
+                    StringComparison.Ordinal);
+                if (separator > prefixLength
+                    && separator + 2 < canonicalKey.Length)
+                {
+                    identity = canonicalKey[(separator + 2)..];
+                    return true;
+                }
+            }
+
+            identity = string.Empty;
+            return false;
+        }
+
+        private static void Add(
+            IDictionary<string, List<AbiRecordLayout>> index,
+            string identity,
+            AbiRecordLayout record)
+        {
+            if (!index.TryGetValue(identity, out var candidates))
+            {
+                candidates = [];
+                index.Add(identity, candidates);
+            }
+            candidates.Add(record);
+        }
+
+        private static IReadOnlyDictionary<
+            string,
+            IReadOnlyList<AbiRecordLayout>> Freeze(
+                IReadOnlyDictionary<string, List<AbiRecordLayout>> source) =>
+            source.ToDictionary(
+                pair => pair.Key,
+                pair => (IReadOnlyList<AbiRecordLayout>)pair.Value
+                    .OrderBy(
+                        record => record.SymbolCanonicalKey,
+                        StringComparer.Ordinal)
+                    .ToArray(),
+                StringComparer.Ordinal);
+    }
 
     private sealed record ProjectionOwnerScan(
         IReadOnlyList<string> FilePaths,

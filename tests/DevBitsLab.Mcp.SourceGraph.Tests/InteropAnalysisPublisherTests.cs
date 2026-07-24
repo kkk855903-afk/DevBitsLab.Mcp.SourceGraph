@@ -94,6 +94,156 @@ public sealed class InteropAnalysisPublisherTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task Verified_record_boundary_publishes_unique_struct_mapping()
+    {
+        const string managedImportKey =
+            "csharp:M:Fixture.NativeMethods.Run";
+        const string nativeExportKey =
+            "c:E:native/export.h::run";
+        var managedImportOwner = await SeedOwnerAsync(
+            "managed/NativeMethods.cs",
+            managedImportKey,
+            "Run",
+            "method");
+        var nativeExportOwner = await SeedOwnerAsync(
+            "native/export.h",
+            nativeExportKey,
+            "run",
+            "native-export");
+        var managedRecord = await SeedRecordAsync(
+            "managed/Packet.cs",
+            "csharp:T:Fixture.Packet",
+            "Packet",
+            AbiRecordKind.Sequential);
+        var nativeRecord = await SeedRecordAsync(
+            "native/packet.h",
+            "c:T:native/packet.h::Packet",
+            "Packet",
+            AbiRecordKind.Native);
+
+        var managedParameter = new AbiParameter(
+            0,
+            "packet",
+            new AbiTypeRef(
+                "Fixture.Packet",
+                AbiTypeCategory.Record,
+                pointerDepth: 1,
+                sizeBytes: Target.PointerSizeBytes,
+                alignmentBytes: Target.PointerSizeBytes),
+            AbiParameterDirection.In,
+            new SourceLocation(
+                managedImportOwner.Path,
+                2,
+                5,
+                2,
+                20));
+        var nativeParameter = new AbiParameter(
+            0,
+            "packet",
+            new AbiTypeRef(
+                "const Packet *",
+                AbiTypeCategory.Pointer,
+                pointerDepth: 1,
+                sizeBytes: Target.PointerSizeBytes,
+                alignmentBytes: Target.PointerSizeBytes,
+                pointeeType: new AbiTypeRef(
+                    "Packet",
+                    AbiTypeCategory.Record),
+                isPointeeConst: true),
+            AbiParameterDirection.In,
+            new SourceLocation(
+                nativeExportOwner.Path,
+                2,
+                5,
+                2,
+                20));
+        var managedImport = ManagedFact(
+            managedImportOwner.FileId,
+            managedImportKey,
+            managedImportOwner.Path) with
+        {
+            Parameters = [managedParameter],
+        };
+        var nativeExport = NativeFact(
+            nativeExportOwner.FileId,
+            nativeExportKey,
+            nativeExportOwner.Path,
+            "native.dll",
+            InteropCallingConvention.Cdecl,
+            binaryVerified: true) with
+        {
+            Parameters = [nativeParameter],
+        };
+        await _store!.BulkInsertAnnotationsAsync(
+        [
+            Annotation(
+                managedImportOwner.SymbolId,
+                InteropAnnotationFlavors.ManagedImport,
+                InteropFactPayloadCodec.EncodeManagedImport(managedImport)),
+            Annotation(
+                nativeExportOwner.SymbolId,
+                InteropAnnotationFlavors.NativeExport,
+                InteropFactPayloadCodec.EncodeNativeExport(nativeExport)),
+        ]);
+
+        var result = await Publisher().PublishAsync(Target, true);
+
+        result.IsComplete.Should().BeTrue();
+        result.EdgesPublished.Should().Be(2);
+        (await _store.ListCalleesAsync(
+                managedRecord.SymbolId,
+                edgeKind: EdgeKinds.StructMapsTo))
+            .Should().ContainSingle()
+            .Which.CanonicalKey.Should().Be(nativeRecord.Key);
+        var evidence = await _store.ListEdgeEvidenceAsync(
+            managedRecord.SymbolId,
+            nativeRecord.SymbolId,
+            EdgeKinds.StructMapsTo);
+        evidence.Should().ContainSingle();
+        evidence[0].Producer.Should().Be(
+            InteropAnalysisPublisher.Producer);
+        evidence[0].Confidence.Should().Be(
+            EvidenceConfidence.Semantic);
+        evidence[0].Location.FilePath.Should().Be(
+            managedImportOwner.Path);
+        evidence[0].Metadata.Should().Contain(
+            "managedType",
+            "Fixture.Packet");
+        evidence[0].Metadata.Should().Contain(
+            "nativeType",
+            "Packet");
+        evidence[0].Metadata.Should().Contain(
+            "position",
+            "parameter:0");
+    }
+
+    [Fact]
+    public async Task Ambiguous_native_record_identity_never_publishes_struct_mapping()
+    {
+        var managed = await SeedManagedRecordBoundaryAsync();
+        await SeedRecordAsync(
+            "native/first.h",
+            "c:T:native/first.h::Packet",
+            "Packet",
+            AbiRecordKind.Native);
+        await SeedRecordAsync(
+            "native/second.h",
+            "c:T:native/second.h::Packet",
+            "Packet",
+            AbiRecordKind.Native);
+
+        var result = await Publisher().PublishAsync(Target, true);
+
+        result.IsComplete.Should().BeTrue();
+        result.EdgesPublished.Should().Be(1,
+            "the verified P/Invoke edge remains, but an ambiguous record name is not mapped");
+        (await _store!.ListCalleesAsync(
+                managed.SymbolId,
+                edgeKind: EdgeKinds.StructMapsTo))
+            .Should().BeEmpty();
+    }
+
+    [Fact]
     public async Task Source_only_match_remains_queryable_without_edge_or_findings()
     {
         var managed = await SeedManagedAsync();
@@ -689,6 +839,145 @@ public sealed class InteropAnalysisPublisherTests : IAsyncLifetime
             .Facts.Should().BeEmpty();
     }
 
+    private async Task<Owner> SeedManagedRecordBoundaryAsync()
+    {
+        const string managedImportKey =
+            "csharp:M:Fixture.NativeMethods.Run";
+        const string nativeExportKey =
+            "c:E:native/export.h::run";
+        var managedImportOwner = await SeedOwnerAsync(
+            "managed/NativeMethods.cs",
+            managedImportKey,
+            "Run",
+            "method");
+        var nativeExportOwner = await SeedOwnerAsync(
+            "native/export.h",
+            nativeExportKey,
+            "run",
+            "native-export");
+        var managedRecord = await SeedRecordAsync(
+            "managed/Packet.cs",
+            "csharp:T:Fixture.Packet",
+            "Packet",
+            AbiRecordKind.Sequential);
+        var managedParameter = new AbiParameter(
+            0,
+            "packet",
+            new AbiTypeRef(
+                "Fixture.Packet",
+                AbiTypeCategory.Record,
+                pointerDepth: 1,
+                sizeBytes: Target.PointerSizeBytes,
+                alignmentBytes: Target.PointerSizeBytes),
+            AbiParameterDirection.In,
+            new SourceLocation(
+                managedImportOwner.Path,
+                2,
+                5,
+                2,
+                20));
+        var nativeParameter = new AbiParameter(
+            0,
+            "packet",
+            new AbiTypeRef(
+                "const Packet *",
+                AbiTypeCategory.Pointer,
+                pointerDepth: 1,
+                sizeBytes: Target.PointerSizeBytes,
+                alignmentBytes: Target.PointerSizeBytes,
+                pointeeType: new AbiTypeRef(
+                    "Packet",
+                    AbiTypeCategory.Record),
+                isPointeeConst: true),
+            AbiParameterDirection.In,
+            new SourceLocation(
+                nativeExportOwner.Path,
+                2,
+                5,
+                2,
+                20));
+        var managedImport = ManagedFact(
+            managedImportOwner.FileId,
+            managedImportKey,
+            managedImportOwner.Path) with
+        {
+            Parameters = [managedParameter],
+        };
+        var nativeExport = NativeFact(
+            nativeExportOwner.FileId,
+            nativeExportKey,
+            nativeExportOwner.Path,
+            "native.dll",
+            InteropCallingConvention.Cdecl,
+            binaryVerified: true) with
+        {
+            Parameters = [nativeParameter],
+        };
+        await _store!.BulkInsertAnnotationsAsync(
+        [
+            Annotation(
+                managedImportOwner.SymbolId,
+                InteropAnnotationFlavors.ManagedImport,
+                InteropFactPayloadCodec.EncodeManagedImport(managedImport)),
+            Annotation(
+                nativeExportOwner.SymbolId,
+                InteropAnnotationFlavors.NativeExport,
+                InteropFactPayloadCodec.EncodeNativeExport(nativeExport)),
+        ]);
+        return managedRecord;
+    }
+
+    private async Task<Owner> SeedRecordAsync(
+        string relativePath,
+        string canonicalKey,
+        string name,
+        AbiRecordKind kind)
+    {
+        var owner = await SeedOwnerAsync(
+            relativePath,
+            canonicalKey,
+            name,
+            "struct");
+        var layout = new AbiRecordLayout(
+            canonicalKey,
+            kind,
+            SizeBytes: 4,
+            AlignmentBytes: 4,
+            Pack: kind == AbiRecordKind.Native ? null : Target.DefaultPack,
+            [
+                new AbiFieldLayout(
+                    0,
+                    "value",
+                    Int32Type,
+                    OffsetBytes: 0,
+                    SizeBytes: 4,
+                    RecordEvidence()),
+            ],
+            Target,
+            RecordEvidence());
+        await _store!.BulkInsertAnnotationsAsync(
+        [
+            Annotation(
+                owner.SymbolId,
+                InteropAnnotationFlavors.AbiRecord,
+                InteropFactPayloadCodec.EncodeAbiRecord(layout)),
+        ]);
+        return owner;
+
+        Evidence RecordEvidence() =>
+            EvidenceAt(
+                owner.FileId,
+                owner.Path,
+                kind == AbiRecordKind.Native
+                    ? "clang-native"
+                    : "roslyn-managed-layout") with
+            {
+                Confidence = kind == AbiRecordKind.Native
+                    ? EvidenceConfidence.Exact
+                    : EvidenceConfidence.Semantic,
+            };
+    }
+
     private InteropAnalysisPublisher Publisher() => new(_store!);
 
     private async Task<Owner> SeedManagedAsync(
@@ -847,6 +1136,14 @@ public sealed class InteropAnalysisPublisherTests : IAsyncLifetime
 
     private static AbiTypeRef VoidType { get; } =
         new("void", AbiTypeCategory.Void);
+
+    private static AbiTypeRef Int32Type { get; } =
+        new(
+            "int32",
+            AbiTypeCategory.SignedInteger,
+            sizeBytes: 4,
+            alignmentBytes: 4,
+            isSigned: true);
 
     private static NativeInteropRuntimeState CompleteState() =>
         new(
