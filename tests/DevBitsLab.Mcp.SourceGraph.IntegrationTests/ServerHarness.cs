@@ -33,6 +33,14 @@ namespace DevBitsLab.Mcp.SourceGraph.IntegrationTests;
 internal sealed class ServerHarness : IAsyncDisposable
 {
     /// <summary>
+    /// Optional absolute path to a packaged <c>sourcegraph-mcp</c> executable. The pack smoke
+    /// test sets this so the same official MCP client path exercises the installed dotnet tool
+    /// instead of <c>dotnet run</c>. An absolute, existing file is required to prevent a global
+    /// tool on <c>PATH</c> from accidentally satisfying the package smoke.
+    /// </summary>
+    public const string CommandOverrideEnvironmentVariable = "SOURCEGRAPH_MCP_INTEGRATION_COMMAND";
+
+    /// <summary>
     /// Hard cap on how long we wait for the spawned dotnet host to exit on dispose, and the
     /// matching cap on the MCP <c>initialize</c> handshake. A stuck child shouldn't hang the test
     /// run; if the graceful close-stdin path doesn't release the process within this window the
@@ -104,8 +112,6 @@ internal sealed class ServerHarness : IAsyncDisposable
         IDictionary<string, string?>? environmentVariables = null,
         CancellationToken cancellationToken = default)
     {
-        var serverProject = LocateServerProject();
-        var configuration = DetectBuildConfiguration();
         var stderrLines = new ConcurrentQueue<string>();
 
         // Wipe any pre-existing `.sourcegraph/` directory next to the solution before every
@@ -116,24 +122,48 @@ internal sealed class ServerHarness : IAsyncDisposable
         // tests check. Cleaning here keeps every spawn hermetic.
         TryClearSourcegraphDir(serveArgs);
 
-        // Build the full argument list. `dotnet run` arguments come before the `--`, then the
-        // server's CLI args after. `--no-launch-profile` skips the launchSettings.json lookup
-        // that would otherwise log a warning to stderr on every spawn. `--no-build` keeps the
-        // spawn fast — the IntegrationTests csproj already lists Server as a build-time dep so
-        // the binaries exist by the time tests run. `--configuration <X>` is required because
-        // `dotnet run --no-build` defaults to Debug regardless of how the test was built; CI
-        // builds Release and the harness would otherwise look for Debug binaries that don't
-        // exist. We mirror whichever configuration the test assembly itself was built in.
-        var args = new List<string>
+        var commandOverride = Environment.GetEnvironmentVariable(CommandOverrideEnvironmentVariable);
+        string command;
+        List<string> args;
+        if (commandOverride is null)
         {
-            "run",
-            "--project", serverProject,
-            "--configuration", configuration,
-            "--no-build",
-            "--no-launch-profile",
-            "--",
-            "serve",
-        };
+            var serverProject = LocateServerProject();
+            var configuration = DetectBuildConfiguration();
+
+            // Build the full argument list. `dotnet run` arguments come before the `--`, then the
+            // server's CLI args after. `--no-launch-profile` skips the launchSettings.json lookup
+            // that would otherwise log a warning to stderr on every spawn. `--no-build` keeps the
+            // spawn fast — the IntegrationTests csproj already lists Server as a build-time dep so
+            // the binaries exist by the time tests run. `--configuration <X>` is required because
+            // `dotnet run --no-build` defaults to Debug regardless of how the test was built; CI
+            // builds Release and the harness would otherwise look for Debug binaries that don't
+            // exist. We mirror whichever configuration the test assembly itself was built in.
+            command = "dotnet";
+            args =
+            [
+                "run",
+                "--project", serverProject,
+                "--configuration", configuration,
+                "--no-build",
+                "--no-launch-profile",
+                "--",
+                "serve",
+            ];
+        }
+        else
+        {
+            if (string.IsNullOrWhiteSpace(commandOverride)
+                || !Path.IsPathFullyQualified(commandOverride)
+                || !File.Exists(commandOverride))
+            {
+                throw new InvalidOperationException(
+                    $"{CommandOverrideEnvironmentVariable} must name an existing absolute executable; " +
+                    $"got `{commandOverride}`.");
+            }
+
+            command = commandOverride;
+            args = ["serve"];
+        }
         args.AddRange(serveArgs);
 
         // The transport owns the child process: it spawns it, wires its stdin/stdout to the
@@ -142,7 +172,7 @@ internal sealed class ServerHarness : IAsyncDisposable
         // graceful close-stdin shutdown before forcing a kill on dispose.
         var transportOptions = new StdioClientTransportOptions
         {
-            Command = "dotnet",
+            Command = command,
             Arguments = args,
             Name = "sourcegraph-mcp-integration-test",
             ShutdownTimeout = ProcessExitTimeout,
@@ -196,6 +226,18 @@ internal sealed class ServerHarness : IAsyncDisposable
         }
 
         return new ServerHarness(client, stderrLines);
+    }
+
+    /// <summary>
+    /// Gracefully closes the MCP session and returns the official SDK's process completion
+    /// details. The SDK documents a null <see cref="ClientCompletionDetails.Exception"/> as a
+    /// graceful closure, which lets the package smoke distinguish a clean session from a child
+    /// crash without relying on platform-specific wrapper exit codes.
+    /// </summary>
+    public async Task<ClientCompletionDetails> StopAsync()
+    {
+        await DisposeAsync().ConfigureAwait(false);
+        return await _client.Completion.WaitAsync(ProcessExitTimeout).ConfigureAwait(false);
     }
 
     /// <summary>

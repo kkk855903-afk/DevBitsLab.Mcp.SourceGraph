@@ -94,6 +94,37 @@ jobs:
       - name: Pack SDK
         run: dotnet pack src/DevBitsLab.Mcp.SourceGraph.Sdk -c Release --no-build -o ./out
 
+      - name: Smoke installed tool package
+        shell: bash
+        run: |
+          smoke_config="$RUNNER_TEMP/sourcegraph-mcp-smoke-nuget.config"
+          smoke_dir="$RUNNER_TEMP/sourcegraph-mcp-tool"
+          printf '%s\n' \
+            '<?xml version="1.0" encoding="utf-8"?>' \
+            '<configuration>' \
+            '  <packageSources>' \
+            '    <clear />' \
+            "    <add key=\"local-pack-output\" value=\"$PWD/out\" />" \
+            '  </packageSources>' \
+            '</configuration>' \
+            > "$smoke_config"
+
+          dotnet tool install DevBitsLab.Mcp.SourceGraph.Tool \
+            --tool-path "$smoke_dir" \
+            --version 0.9.0 \
+            --configfile "$smoke_config"
+
+          tool_command="$smoke_dir/sourcegraph-mcp"
+          test -x "$tool_command"
+          "$tool_command" --help
+
+          SOURCEGRAPH_MCP_INTEGRATION_COMMAND="$tool_command" \
+            dotnet test tests/DevBitsLab.Mcp.SourceGraph.IntegrationTests \
+              -c Release \
+              --no-build \
+              --no-restore \
+              --filter "FullyQualifiedName=DevBitsLab.Mcp.SourceGraph.IntegrationTests.InitializeTests.Initialize_and_tools_list_against_Sample_complete_and_exit_cleanly"
+
       - name: Upload packages
         uses: actions/upload-artifact@v7
         with:

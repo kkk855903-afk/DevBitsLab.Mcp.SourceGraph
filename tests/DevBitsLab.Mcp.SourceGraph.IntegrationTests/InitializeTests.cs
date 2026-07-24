@@ -43,7 +43,7 @@ public sealed class InitializeTests
     // chatter (Microsoft.Hosting.Lifetime, StdioServerTransport) stays off stderr during the
     // initialize handshake. Plugin-host startup uses StartupLogging which inherits the same cap.
     [Fact]
-    public async Task Initialize_against_Sample_returns_capabilities_within_timeout()
+    public async Task Initialize_and_tools_list_against_Sample_complete_and_exit_cleanly()
     {
         var sln = ServerHarness.LocateFixture("Sample.sln");
         await using var harness = await ServerHarness.StartAsync(WithSolution(sln));
@@ -53,6 +53,19 @@ public sealed class InitializeTests
         // that never replied would have surfaced a TimeoutException long before we get here.
         harness.Client.ServerCapabilities.Should().NotBeNull();
         harness.Client.ServerInfo.Should().NotBeNull();
+
+        // ListToolsAsync performs a real MCP `tools/list` request over the same stdio channel.
+        // The pack job reruns this test with ServerHarness's command override pointed at the
+        // just-installed 0.9.0 executable, so this assertion cannot be satisfied by the
+        // in-repository build or by merely starting an idle child process.
+        var tools = await harness.Client.ListToolsAsync();
+        tools.Should().NotBeEmpty();
+        tools.Should().Contain(tool => tool.Name == "ping");
+
+        var completion = await harness.StopAsync();
+        completion.Should().BeOfType<ModelContextProtocol.Client.StdioClientCompletionDetails>();
+        completion.Exception.Should().BeNull(
+            "the official MCP SDK defines a null completion exception as graceful stdio closure");
 
         // The server's Logging.AddConsole(o => o.LogToStandardErrorThreshold = LogLevel.Trace)
         // means stderr is silent at default verbosity. If something is going wrong (workspace
