@@ -6,6 +6,7 @@ using System.Security.Cryptography;
 using DevBitsLab.Mcp.SourceGraph.Core;
 using DevBitsLab.Mcp.SourceGraph.Embeddings;
 using DevBitsLab.Mcp.SourceGraph.Indexing.Interop;
+using DevBitsLab.Mcp.SourceGraph.Indexing.Wpf;
 using DevBitsLab.Mcp.SourceGraph.Sdk;
 using DevBitsLab.Mcp.SourceGraph.Storage;
 using Microsoft.CodeAnalysis;
@@ -3179,6 +3180,122 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         {
             if (walkedFileIds.Contains(fid)) diagnosticsByFile[fid] = new List<DiagnosticRecord>();
         }
+        var priorWpfDiagnosticFileIds =
+            (await _store.ListDiagnosticFileIdsByCodesAsync(
+                    [
+                        WpfEventUnsubscriptionFinding.RuleId,
+                        WpfUiThreadRiskAnalyzer.DiagnosticId,
+                    ],
+                    ct)
+                .ConfigureAwait(false))
+            .ToHashSet();
+
+        bool TryResolveDiagnosticFileId(
+            SyntaxTree tree,
+            out long fileId)
+        {
+            if (fileIdBySyntaxTree.TryGetValue(tree, out fileId))
+            {
+                return true;
+            }
+
+            var path = tree.FilePath;
+            if (string.IsNullOrEmpty(path))
+            {
+                fileId = default;
+                return false;
+            }
+            if (_fileIdByPath.TryGetValue(path, out fileId))
+            {
+                return true;
+            }
+
+            try
+            {
+                return _fileIdByPath.TryGetValue(
+                    Path.GetFullPath(path),
+                    out fileId);
+            }
+            catch (Exception ex) when (
+                ex is ArgumentException
+                    or NotSupportedException
+                    or PathTooLongException
+                    or System.Security.SecurityException)
+            {
+                fileId = default;
+                return false;
+            }
+        }
+
+        long? ResolveEnclosingSymbolId(
+            Compilation compilation,
+            SyntaxTree tree,
+            int position)
+        {
+            try
+            {
+                var model = compilation.GetSemanticModel(tree);
+                var enclosing = model.GetEnclosingSymbol(position, ct);
+                while (enclosing is not null
+                       && !SymbolMapping.IsIndexable(enclosing))
+                {
+                    enclosing = enclosing.ContainingSymbol;
+                }
+                if (enclosing is not null)
+                {
+                    var key = SymbolMapping.CanonicalKey(enclosing);
+                    if (key is not null
+                        && _symbolIdByKey.TryGetValue(key, out var symbolId))
+                    {
+                        return symbolId;
+                    }
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch
+            {
+                // Best-effort symbol attribution. File-scoped diagnostics remain useful when
+                // Roslyn cannot identify the smallest indexed declaration.
+            }
+
+            return null;
+        }
+
+        bool TryCreateDiagnosticRecord(
+            Compilation compilation,
+            Diagnostic diagnostic,
+            out DiagnosticRecord record)
+        {
+            record = default!;
+            var location = diagnostic.Location;
+            if (location.SourceSpan.IsEmpty
+                || location.SourceTree is not { } tree
+                || string.IsNullOrEmpty(tree.FilePath)
+                || !TryResolveDiagnosticFileId(tree, out var fileId)
+                || !diagnosticsByFile.ContainsKey(fileId)
+                || (changedFileIds.Contains(fileId)
+                    && !walkedFileIds.Contains(fileId)))
+            {
+                return false;
+            }
+
+            var lineSpan = location.GetLineSpan();
+            record = new DiagnosticRecord(
+                SymbolId: ResolveEnclosingSymbolId(
+                    compilation,
+                    tree,
+                    location.SourceSpan.Start),
+                FileId: fileId,
+                Severity: (int)diagnostic.Severity,
+                Code: diagnostic.Id,
+                Message: diagnostic.GetMessage(),
+                Line: lineSpan.StartLinePosition.Line + 1,
+                Col: lineSpan.StartLinePosition.Character + 1);
+            return true;
+        }
 
         foreach (var pid in projectsTouched)
         {
@@ -3201,69 +3318,168 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
             catch (OperationCanceledException) { throw; }
             catch (Exception ex)
             {
-                var project = _sanitizedSolution!.GetProject(pid);
-                _logger.LogWarning(ex, "Failed to read diagnostics for {Project}", project?.Name ?? pid.ToString());
+                var diagnosticProject = _sanitizedSolution!.GetProject(pid);
+                _logger.LogWarning(
+                    ex,
+                    "Failed to read diagnostics for {Project}",
+                    diagnosticProject?.Name ?? pid.ToString());
                 AddFileFailure(
                     failedFiles,
-                    project?.FilePath ?? project?.Name ?? pid.ToString(),
+                    diagnosticProject?.FilePath
+                    ?? diagnosticProject?.Name
+                    ?? pid.ToString(),
                     "diagnostic discovery failed: " +
                     FailureMessage.Truncate(ex.Message));
                 continue;
             }
 
-            foreach (var diag in diags)
+            // A project-wide WPF risk can change when a different file is edited (for example,
+            // adding an exact -= in another partial declaration or changing a receiver's base
+            // type). Map the complete touched project, but rewrite only changed files plus files
+            // that owned a prior or current WPF diagnostic. That clears stale rows on unchanged
+            // files without turning each edit into thousands of empty diagnostic transactions.
+            var projectFileIds = new HashSet<long>();
+            foreach (var tree in compilation.SyntaxTrees)
             {
-                ct.ThrowIfCancellationRequested();
-                var loc = diag.Location;
-                if (loc.SourceSpan.IsEmpty) continue;
-                var tree = loc.SourceTree;
-                if (tree is null) continue;
-                var path = tree.FilePath;
-                if (string.IsNullOrEmpty(path)) continue;
-                if (!fileIdBySyntaxTree.TryGetValue(tree, out var fileId)) continue;
-                if (!changedFileIds.Contains(fileId)) continue; // only touch files we re-indexed
-                if (!walkedFileIds.Contains(fileId)) continue;  // skip files whose Pass 1B threw
+                if (!TryResolveDiagnosticFileId(tree, out var projectFileId)
+                    || (changedFileIds.Contains(projectFileId)
+                        && !walkedFileIds.Contains(projectFileId)))
+                {
+                    continue;
+                }
 
-                long? symbolId = null;
+                projectFileIds.Add(projectFileId);
+                if (priorWpfDiagnosticFileIds.Contains(projectFileId))
+                {
+                    diagnosticsByFile.TryAdd(
+                        projectFileId,
+                        new List<DiagnosticRecord>());
+                }
+            }
+
+            var project = _sanitizedSolution!.GetProject(pid);
+            var compilationContainsErrors = diags.Any(diagnostic =>
+                diagnostic.Severity == DiagnosticSeverity.Error);
+            var semanticInputComplete =
+                project?.FilePath is { Length: > 0 } projectFilePath
+                && IsProjectSemanticInputComplete(
+                    _workspace!.CurrentSolution,
+                    _sanitizedSolution,
+                    projectFilePath,
+                    _analyzerReferenceLoadCompleteByProject);
+
+            ImmutableArray<Diagnostic> wpfUiDiagnostics = [];
+            if (semanticInputComplete && !compilationContainsErrors)
+            {
                 try
                 {
-                    var model = compilation.GetSemanticModel(tree);
-                    var enclosing = model.GetEnclosingSymbol(loc.SourceSpan.Start, ct);
-                    while (enclosing is not null && !SymbolMapping.IsIndexable(enclosing))
-                    {
-                        enclosing = enclosing.ContainingSymbol;
-                    }
-                    if (enclosing is not null)
-                    {
-                        var key = SymbolMapping.CanonicalKey(enclosing);
-                        if (key is not null && _symbolIdByKey.TryGetValue(key, out var sid))
-                        {
-                            symbolId = sid;
-                        }
-                    }
+                    wpfUiDiagnostics =
+                        WpfUiThreadRiskAnalyzer.Analyze(compilation, ct);
                 }
-                catch (OperationCanceledException) { throw; }
-                catch
+                catch (OperationCanceledException)
                 {
-                    // Best-effort symbol attribution. If lookup fails, leave the diagnostic
-                    // file-scoped (symbolId = NULL) and persist anyway.
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(
+                        ex,
+                        "Failed WPF UI-thread analysis for {Project}",
+                        project?.Name ?? pid.ToString());
+                    AddFileFailure(
+                        failedFiles,
+                        project?.FilePath ?? project?.Name ?? pid.ToString(),
+                        "WPF UI-thread analysis failed: "
+                        + FailureMessage.Truncate(ex.Message));
+                    _requiresStructuralReload = true;
+                }
+            }
+
+            IReadOnlyList<WpfEventUnsubscriptionFinding> eventFindings = [];
+            if (semanticInputComplete && !compilationContainsErrors)
+            {
+                var eventAnalysis = WpfEventSubscriptionAnalyzer.Analyze(
+                    compilation,
+                    semanticInputComplete: true,
+                    compilationContainsErrors: false,
+                    cancellationToken: ct);
+                if (eventAnalysis.IsComplete)
+                {
+                    eventFindings = eventAnalysis.Findings;
+                }
+                else
+                {
+                    var reasons = string.Join(
+                        ", ",
+                        eventAnalysis.Unknowns
+                            .Select(unknown => unknown.Reason)
+                            .Distinct(StringComparer.Ordinal));
+                    AddFileFailure(
+                        failedFiles,
+                        project?.FilePath ?? project?.Name ?? pid.ToString(),
+                        "WPF event-lifetime analysis incomplete"
+                        + (reasons.Length > 0 ? $": {reasons}" : string.Empty));
+                    _requiresStructuralReload = true;
+                }
+            }
+
+            foreach (var diagnostic in wpfUiDiagnostics)
+            {
+                if (diagnostic.Location.SourceTree is { } tree
+                    && TryResolveDiagnosticFileId(tree, out var fileId)
+                    && projectFileIds.Contains(fileId))
+                {
+                    diagnosticsByFile.TryAdd(
+                        fileId,
+                        new List<DiagnosticRecord>());
+                }
+            }
+            foreach (var finding in eventFindings)
+            {
+                if (TryResolveDiagnosticFileId(
+                        finding.SyntaxTree,
+                        out var fileId)
+                    && projectFileIds.Contains(fileId))
+                {
+                    diagnosticsByFile.TryAdd(
+                        fileId,
+                        new List<DiagnosticRecord>());
+                }
+            }
+
+            foreach (var diag in diags.Concat(wpfUiDiagnostics))
+            {
+                ct.ThrowIfCancellationRequested();
+                if (!TryCreateDiagnosticRecord(
+                        compilation,
+                        diag,
+                        out var record))
+                {
+                    continue;
                 }
 
-                var lineSpan = loc.GetLineSpan();
-                var rec = new DiagnosticRecord(
-                    SymbolId: symbolId,
-                    FileId: fileId,
-                    Severity: (int)diag.Severity,
-                    Code: diag.Id,
-                    Message: diag.GetMessage(),
-                    Line: lineSpan.StartLinePosition.Line + 1,
-                    Col: lineSpan.StartLinePosition.Character + 1);
-                if (!diagnosticsByFile.TryGetValue(fileId, out var bucket))
+                diagnosticsByFile[record.FileId].Add(record);
+            }
+
+            foreach (var finding in eventFindings)
+            {
+                ct.ThrowIfCancellationRequested();
+                if (!TryResolveDiagnosticFileId(
+                        finding.SyntaxTree,
+                        out var fileId)
+                    || !diagnosticsByFile.TryGetValue(fileId, out var bucket)
+                    || (changedFileIds.Contains(fileId)
+                        && !walkedFileIds.Contains(fileId)))
                 {
-                    bucket = new List<DiagnosticRecord>();
-                    diagnosticsByFile[fileId] = bucket;
+                    continue;
                 }
-                bucket.Add(rec);
+
+                bucket.Add(finding.ToDiagnosticRecord(
+                    fileId,
+                    ResolveEnclosingSymbolId(
+                        compilation,
+                        finding.SyntaxTree,
+                        finding.SourceSpan.Start)));
             }
         }
 
@@ -3271,7 +3487,11 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         // freshly-fixed warnings disappear from the table on the next index.
         foreach (var (fid, bucket) in diagnosticsByFile)
         {
-            await _store.UpsertDiagnosticsForFileAsync(fid, bucket, ct).ConfigureAwait(false);
+            await _store.UpsertDiagnosticsForFileAsync(
+                    fid,
+                    bucket.Distinct(),
+                    ct)
+                .ConfigureAwait(false);
         }
 
         if (unchangedManagedInteropRefreshes.Count > 0)

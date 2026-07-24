@@ -3510,6 +3510,34 @@ public sealed partial class SqliteGraphStore : IGraphStore
         }
     }
 
+    public async Task<IReadOnlyList<long>> ListDiagnosticFileIdsByCodesAsync(
+        IReadOnlyCollection<string> codes,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(codes);
+        var distinctCodes = codes
+            .Where(code => !string.IsNullOrWhiteSpace(code))
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+        if (distinctCodes.Length == 0)
+        {
+            return [];
+        }
+
+        const string sql = """
+            SELECT DISTINCT file_id
+            FROM diagnostics
+            WHERE code IN @codes
+            ORDER BY file_id;
+            """;
+        var rows = await _connection.QueryAsync<long>(new CommandDefinition(
+                sql,
+                new { codes = distinctCodes },
+                cancellationToken: ct))
+            .ConfigureAwait(false);
+        return rows.AsList();
+    }
+
     public async Task<IReadOnlyList<DiagnosticHit>> FindDiagnosticsAsync(int? severity, string? code, long? symbolId, int limit = 100, CancellationToken ct = default)
     {
         // severity is treated as a >= filter so callers can ask "show me warnings and above" with

@@ -109,13 +109,13 @@ internal static class WpfEventSubscriptionAnalyzer
             return Incomplete(SemanticInputIncomplete);
         }
 
+        bool compilationContainsErrors;
         try
         {
-            if (compilation.GetDiagnostics(cancellationToken).Any(diagnostic =>
-                    diagnostic.Severity == DiagnosticSeverity.Error))
-            {
-                return Incomplete(CompilationContainsErrors);
-            }
+            compilationContainsErrors = compilation
+                .GetDiagnostics(cancellationToken)
+                .Any(diagnostic =>
+                    diagnostic.Severity == DiagnosticSeverity.Error);
         }
         catch (OperationCanceledException)
         {
@@ -124,6 +124,35 @@ internal static class WpfEventSubscriptionAnalyzer
         catch
         {
             return Incomplete(DiagnosticDiscoveryFailed);
+        }
+
+        return Analyze(
+            compilation,
+            semanticInputComplete: true,
+            compilationContainsErrors,
+            cancellationToken);
+    }
+
+    /// <summary>
+    /// Runs the analysis with a caller-owned compiler-error observation. The Roslyn indexing
+    /// pipeline already obtains the complete diagnostic set, so this overload avoids forcing a
+    /// second full compilation diagnostic walk.
+    /// </summary>
+    internal static WpfEventSubscriptionAnalysis Analyze(
+        Compilation compilation,
+        bool semanticInputComplete,
+        bool compilationContainsErrors,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(compilation);
+
+        if (!semanticInputComplete)
+        {
+            return Incomplete(SemanticInputIncomplete);
+        }
+        if (compilationContainsErrors)
+        {
+            return Incomplete(CompilationContainsErrors);
         }
 
         var facts = new List<WpfEventLifetimeFact>();

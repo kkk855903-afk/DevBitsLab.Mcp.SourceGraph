@@ -136,6 +136,52 @@ public sealed class DiagnosticsAndGeneratorTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task ListDiagnosticFileIdsByCodes_returnsDistinctExactOwners()
+    {
+        var files = (await _store!.GetAllFilesAsync()).Take(2).ToArray();
+        files.Should().HaveCount(2);
+        await _store.UpsertDiagnosticsForFileAsync(
+            files[0].Id,
+            [
+                new Core.DiagnosticRecord(
+                    null,
+                    files[0].Id,
+                    2,
+                    "WPFTEST001",
+                    "first",
+                    1,
+                    1),
+                new Core.DiagnosticRecord(
+                    null,
+                    files[0].Id,
+                    2,
+                    "WPFTEST002",
+                    "second",
+                    2,
+                    1),
+            ]);
+        await _store.UpsertDiagnosticsForFileAsync(
+            files[1].Id,
+            [
+                new Core.DiagnosticRecord(
+                    null,
+                    files[1].Id,
+                    2,
+                    "OTHER001",
+                    "other",
+                    1,
+                    1),
+            ]);
+
+        var owners = await _store.ListDiagnosticFileIdsByCodesAsync(
+            ["WPFTEST001", "WPFTEST002", "WPFTEST001"]);
+
+        owners.Should().Equal(files[0].Id);
+        (await _store.ListDiagnosticFileIdsByCodesAsync([]))
+            .Should().BeEmpty();
+    }
+
+    [Fact]
     public async Task IsGeneratedFile_returnsTrueForGeneratedFile_falseOtherwise()
     {
         var files = await _store!.GetAllFilesAsync();

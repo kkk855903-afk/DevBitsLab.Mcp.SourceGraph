@@ -519,6 +519,15 @@ public interface IGraphStore : IAsyncDisposable
     Task UpsertDiagnosticsForFileAsync(long fileId, IEnumerable<DiagnosticRecord> diagnostics, CancellationToken ct = default);
 
     /// <summary>
+    /// Return the distinct file ids that currently own at least one diagnostic whose code is in
+    /// <paramref name="codes"/>. This unbounded-by-row-count maintenance query lets derived
+    /// diagnostic producers reconcile stale rows without scanning or rewriting every file.
+    /// </summary>
+    Task<IReadOnlyList<long>> ListDiagnosticFileIdsByCodesAsync(
+        IReadOnlyCollection<string> codes,
+        CancellationToken ct = default);
+
+    /// <summary>
     /// Filtered diagnostics query. <paramref name="severity"/> filters via <c>severity &gt;= ?</c>
     /// (Roslyn's enum integer values: Hidden=0, Info=1, Warning=2, Error=3); <c>null</c> means
     /// "every severity". <paramref name="code"/> matches the diagnostic id (e.g. <c>CS0618</c>);
