@@ -757,6 +757,38 @@ For every `ObjectCreationExpressionSyntax`, the indexer SHALL emit an `Instantia
 - **WHEN** a method body contains `new MyClass()` and `MyClass` is indexed
 - **THEN** an edge `(method.id, MyClass.id, Instantiates)` is written alongside the existing constructor `Call` edge
 
+### Requirement: ICommand properties identify their execution methods
+The Roslyn indexer SHALL emit a `CommandExecutes` (`"command-executes"`) edge from an indexed
+`ICommand`-like property to an indexed source method only when an initializer or simple assignment
+constructs an `ICommand` implementation and Roslyn's operation tree exposes exactly one delegate
+creation whose target is a method reference. The evidence range SHALL identify that method-group
+expression and carry `semantic` confidence from producer `roslyn`.
+
+The indexer SHALL require semantic `System.Windows.Input.ICommand` implementation evidence for
+both the property type and constructed type. It SHALL NOT infer this relation from names, and SHALL
+fail closed for invalid or dynamic operations, overload ambiguity, multiple delegate arguments,
+non-command properties, metadata-only handlers, and lambdas without a stable indexed method
+endpoint. The ordinary `calls` edge to the command constructor SHALL remain independently
+queryable.
+
+#### Scenario: Command assigned in a constructor
+- **WHEN** an `ICommand RunCommand` property is assigned
+  `new AsyncRelayCommand(RunAsync)` and `RunAsync` resolves uniquely to an indexed source method
+- **THEN** `(RunCommand.id, RunAsync.id, "command-executes")` is written with semantic evidence at
+  `RunAsync`, alongside the enclosing constructor's ordinary `calls` edge to the
+  `AsyncRelayCommand` constructor
+
+#### Scenario: Ambiguous or non-command assignment
+- **WHEN** a method group is overload-ambiguous, more than one delegate argument is present, the
+  property is not `ICommand`-like, or the value is a lambda with no indexed method endpoint
+- **THEN** no `command-executes` edge is emitted
+
+#### Scenario: Command assignment changes or disappears
+- **WHEN** a command property assignment is edited to select another proven handler, removed, or
+  its declaring file is deleted
+- **THEN** normal Roslyn per-file reconciliation replaces or removes the prior
+  `command-executes` edge and its occurrence evidence
+
 ### Requirement: Throws edges from `throw` syntax
 For every `ThrowStatementSyntax` and `ThrowExpressionSyntax`, the indexer SHALL emit a `Throws` edge from the enclosing member to the thrown type, when the thrown type is indexed.
 
@@ -912,7 +944,7 @@ Every relationship emitted by the Roslyn indexing path SHALL include host-owned 
 whose producing file is the current document and whose source range is the relevant syntax.
 Call, construction, throw, and base-type syntax resolved to an indexed symbol SHALL be
 `exact`; relationships inferred through symbol semantics at a declaration (signature type,
-override, and interface-member implementation) SHALL be `semantic`. The producer SHALL be
+override, interface-member implementation, and command delegate wiring) SHALL be `semantic`. The producer SHALL be
 `roslyn`.
 
 Logical edge deduplication SHALL include the evidence range. Two invocations from the same

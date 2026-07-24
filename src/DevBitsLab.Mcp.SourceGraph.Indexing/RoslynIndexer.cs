@@ -13,6 +13,7 @@ using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Microsoft.CodeAnalysis.Diagnostics;
 using Microsoft.CodeAnalysis.MSBuild;
+using Microsoft.CodeAnalysis.Operations;
 using Microsoft.CodeAnalysis.Text;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -2338,6 +2339,12 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                     }
                 }
 
+                // Connect an ICommand property to the source method captured by the command
+                // object's single delegate argument. This is deliberately operation-based:
+                // syntax or name matching would turn overload gaps, dynamic values, and
+                // non-command properties into false cross-layer call paths.
+                EmitCommandExecutes(root, model, AddEdge, ct);
+
                 // Throws edges from `throw` syntax (statement and expression).
                 foreach (var node in root.DescendantNodes())
                 {
@@ -2821,6 +2828,151 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         {
             yield return ReferenceKind.Write;
         }
+    }
+
+    /// <summary>
+    /// Emits <see cref="EdgeKinds.CommandExecutes"/> from an indexed ICommand-like property to
+    /// the one indexed source method that Roslyn proves is captured by a newly constructed
+    /// ICommand implementation. Both property initializers and simple property assignments are
+    /// supported. Multiple delegate arguments, lambdas, dynamic/invalid operations, metadata
+    /// methods, and unresolved endpoints fail closed.
+    /// </summary>
+    private void EmitCommandExecutes(
+        SyntaxNode root,
+        SemanticModel model,
+        Action<long, long, string, SyntaxNode, CoreEvidenceConfidence> addEdge,
+        CancellationToken ct)
+    {
+        var commandType = model.Compilation.GetTypeByMetadataName(
+            "System.Windows.Input.ICommand");
+        if (commandType is null)
+        {
+            return;
+        }
+
+        foreach (var propertyDeclaration in root
+                     .DescendantNodes()
+                     .OfType<PropertyDeclarationSyntax>())
+        {
+            ct.ThrowIfCancellationRequested();
+            if (propertyDeclaration.Initializer?.Value is not { } initializer)
+            {
+                continue;
+            }
+
+            if (model.GetDeclaredSymbol(propertyDeclaration, ct) is not
+                    IPropertySymbol property
+                || model.GetOperation(initializer, ct) is not { } value)
+            {
+                continue;
+            }
+
+            TryEmit(property, value, addEdge);
+        }
+
+        foreach (var assignmentSyntax in root
+                     .DescendantNodes()
+                     .OfType<AssignmentExpressionSyntax>()
+                     .Where(assignment =>
+                         assignment.IsKind(
+                             SyntaxKind.SimpleAssignmentExpression)))
+        {
+            ct.ThrowIfCancellationRequested();
+            if (model.GetOperation(assignmentSyntax, ct) is not
+                    ISimpleAssignmentOperation assignment
+                || UnwrapOperation(assignment.Target) is not
+                    IPropertyReferenceOperation propertyReference)
+            {
+                continue;
+            }
+
+            TryEmit(propertyReference.Property, assignment.Value, addEdge);
+        }
+
+        void TryEmit(
+            IPropertySymbol property,
+            IOperation value,
+            Action<long, long, string, SyntaxNode, CoreEvidenceConfidence>
+                emit)
+        {
+            if (!IsICommandLike(property.Type, commandType)
+                || UnwrapOperation(value) is not
+                    IObjectCreationOperation creation
+                || creation.Constructor is null
+                || creation.Type is null
+                || !IsICommandLike(creation.Type, commandType))
+            {
+                return;
+            }
+
+            var delegateArguments = creation.Arguments
+                .Where(argument =>
+                    argument.ArgumentKind != ArgumentKind.DefaultValue
+                    && argument.Parameter?.Type.TypeKind == TypeKind.Delegate)
+                .ToArray();
+            if (delegateArguments.Length != 1
+                || UnwrapOperation(delegateArguments[0].Value) is not
+                    IDelegateCreationOperation delegateCreation
+                || UnwrapOperation(delegateCreation.Target) is not
+                    IMethodReferenceOperation uniqueMethodReference)
+            {
+                return;
+            }
+
+            if (uniqueMethodReference.Method is not { } handler
+                || handler.DeclaringSyntaxReferences.Length == 0
+                || !SymbolMapping.IsIndexable(handler))
+            {
+                return;
+            }
+
+            var propertyKey = SymbolMapping.CanonicalKey(property);
+            var handlerKey = SymbolMapping.CanonicalKey(handler);
+            if (propertyKey is null
+                || handlerKey is null
+                || !_symbolIdByKey.TryGetValue(propertyKey, out var propertyId)
+                || !_symbolIdByKey.TryGetValue(handlerKey, out var handlerId))
+            {
+                return;
+            }
+
+            emit(
+                propertyId,
+                handlerId,
+                EdgeKinds.CommandExecutes,
+                uniqueMethodReference.Syntax,
+                CoreEvidenceConfidence.Semantic);
+        }
+    }
+
+    private static IOperation UnwrapOperation(IOperation operation)
+    {
+        while (true)
+        {
+            switch (operation)
+            {
+                case IConversionOperation conversion:
+                    operation = conversion.Operand;
+                    continue;
+                case IParenthesizedOperation parenthesized:
+                    operation = parenthesized.Operand;
+                    continue;
+                default:
+                    return operation;
+            }
+        }
+    }
+
+    private static bool IsICommandLike(
+        ITypeSymbol type,
+        INamedTypeSymbol commandType)
+    {
+        return type is INamedTypeSymbol named
+            && (SymbolEqualityComparer.Default.Equals(named, commandType)
+                || named.AllInterfaces.Any(interfaceType =>
+                    SymbolEqualityComparer.Default.Equals(
+                        interfaceType,
+                        commandType)));
     }
 
     /// <summary>

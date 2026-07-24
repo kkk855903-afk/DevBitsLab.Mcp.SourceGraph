@@ -33,6 +33,9 @@ public static class EdgeKinds
     /// <summary>A declarative UI event is handled by the target symbol.</summary>
     public const string HandlesEvent = "handles-event";
 
+    /// <summary>An ICommand property dispatches execution to a source method.</summary>
+    public const string CommandExecutes = "command-executes";
+
     /// <summary>A managed gRPC client invocation targets a protobuf RPC declaration.</summary>
     public const string GrpcCalls = "grpc-calls";
 
