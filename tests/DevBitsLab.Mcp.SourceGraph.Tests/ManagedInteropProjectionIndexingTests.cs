@@ -61,14 +61,17 @@ public sealed class ManagedInteropProjectionIndexingTests
         }
     }
 
-    [Fact]
-    public async Task Unchanged_cold_start_regenerates_missing_projection()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Unchanged_cold_start_regenerates_missing_projection(
+        bool multiTarget)
     {
         var root = CreateTempRoot();
         try
         {
             var (solutionPath, sourcePath) =
-                await WriteSingleProjectSolutionAsync(root);
+                await WriteSingleProjectSolutionAsync(root, multiTarget);
             await File.WriteAllTextAsync(sourcePath, ImportSource("run"));
             var dbPath = Path.Join(root, "graph.db");
             await using var store = new SqliteGraphStore(dbPath);
@@ -100,6 +103,45 @@ public sealed class ManagedInteropProjectionIndexingTests
                     regenerated.ArgsJson!,
                     regenerated.FileId)
                 .EntryPoint.Should().Be("run");
+        }
+        finally
+        {
+            TryDeleteDirectory(root);
+        }
+    }
+
+    [Fact]
+    public async Task Unchanged_cold_start_regenerates_missing_record_projection()
+    {
+        var root = CreateTempRoot();
+        try
+        {
+            var (solutionPath, sourcePath) =
+                await WriteSingleProjectSolutionAsync(root);
+            await File.WriteAllTextAsync(sourcePath, RecordSource());
+            await using var store =
+                new SqliteGraphStore(Path.Join(root, "graph.db"));
+
+            await using (var first = CreateIndexer(store, root))
+            {
+                await first.OpenAsync(solutionPath);
+                (await first.IndexAllAsync()).FailedFiles.Should().BeEmpty();
+            }
+            var original = (await ReadRecordsAsync(store))
+                .Should().ContainSingle().Subject;
+            await store.ReplaceAnnotationsForFileByFlavorAsync(
+                original.FilePath,
+                InteropAnnotationFlavors.AbiRecord,
+                []);
+            (await ReadRecordsAsync(store)).Should().BeEmpty();
+
+            await using (var restarted = CreateIndexer(store, root))
+            {
+                await restarted.OpenAsync(solutionPath);
+                (await restarted.IndexAllAsync()).FailedFiles.Should().BeEmpty();
+            }
+
+            (await ReadRecordsAsync(store)).Should().ContainSingle();
         }
         finally
         {

@@ -1057,6 +1057,18 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
 
     private async Task<bool> HasStoredManagedImportInPathsAsync(
         IReadOnlySet<string> paths,
+        CancellationToken ct) =>
+        await HasStoredManagedInteropProjectionInPathsAsync(
+                InteropAnnotationFlavors.ManagedImport,
+                paths,
+                assumePresentWhenTruncated: true,
+                ct)
+            .ConfigureAwait(false);
+
+    private async Task<bool> HasStoredManagedInteropProjectionInPathsAsync(
+        string flavor,
+        IReadOnlySet<string> paths,
+        bool assumePresentWhenTruncated,
         CancellationToken ct)
     {
         long afterId = 0;
@@ -1069,7 +1081,7 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                 pageSize,
                 MaximumManagedImportFanoutProbeRows - rowsRead);
             var page = await _store.ListAnnotationsByFlavorAsync(
-                    InteropAnnotationFlavors.ManagedImport,
+                    flavor,
                     afterId,
                     limit,
                     ct)
@@ -1093,15 +1105,16 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
             }
         }
 
-        // An over-bound fact universe cannot prove that none of the remaining rows belongs to a
-        // touched file. Fan out conservatively instead of publishing stale caller facts.
+        // An over-bound fact universe cannot prove whether a remaining row belongs to this
+        // file. Fanout callers conservatively assume it does; integrity callers conservatively
+        // force a rebuild.
         var probe = await _store.ListAnnotationsByFlavorAsync(
-                InteropAnnotationFlavors.ManagedImport,
+                flavor,
                 afterId,
                 limit: 1,
                 ct)
             .ConfigureAwait(false);
-        return probe.Count > 0;
+        return probe.Count > 0 && assumePresentWhenTruncated;
     }
 
     private async Task<bool> HasStoredGeneratedManagedImportAsync(
@@ -1178,6 +1191,47 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                     .ConfigureAwait(false))
             {
                 return true;
+            }
+        }
+        return false;
+    }
+
+    private async Task<bool> DocumentsContainManagedAbiRecordAsync(
+        IReadOnlyList<Document> documents,
+        CancellationToken ct)
+    {
+        if (_interopTarget is null)
+        {
+            return false;
+        }
+
+        foreach (var document in documents)
+        {
+            ct.ThrowIfCancellationRequested();
+            var root = await document.GetSyntaxRootAsync(ct)
+                .ConfigureAwait(false);
+            var model = await document.GetSemanticModelAsync(ct)
+                .ConfigureAwait(false);
+            if (root is null || model is null)
+            {
+                continue;
+            }
+            foreach (var declaration in root.DescendantNodes()
+                         .OfType<StructDeclarationSyntax>())
+            {
+                ct.ThrowIfCancellationRequested();
+                if (model.GetDeclaredSymbol(
+                        declaration,
+                        ct)
+                    is INamedTypeSymbol record
+                    && ManagedRecordLayoutExtractor.TryExtract(
+                            record,
+                            _interopTarget,
+                            producingFileId: 1)
+                        is not null)
+                {
+                    return true;
+                }
             }
         }
         return false;
@@ -2436,8 +2490,37 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                 }
             }
 
+            // The source hash proves only that the document is unchanged; it does not prove
+            // that its independently stored interop projection survived. Re-walk an owner
+            // when its import or ABI-record projection is missing instead of sending it to
+            // the usage-only refresh below.
+            var missingManagedInteropProjection =
+                unchanged
+                && !fullReset
+                && forceInteropProjectionRefresh
+                && (await DocumentsContainManagedImportAsync(
+                            groupedDocuments,
+                            ct)
+                        .ConfigureAwait(false)
+                    && !await HasStoredManagedInteropProjectionInPathsAsync(
+                            InteropAnnotationFlavors.ManagedImport,
+                            new HashSet<string>(_pathComparer) { path },
+                            assumePresentWhenTruncated: false,
+                            ct)
+                        .ConfigureAwait(false)
+                    || await DocumentsContainManagedAbiRecordAsync(
+                            groupedDocuments,
+                            ct)
+                        .ConfigureAwait(false)
+                    && !await HasStoredManagedInteropProjectionInPathsAsync(
+                            InteropAnnotationFlavors.AbiRecord,
+                            new HashSet<string>(_pathComparer) { path },
+                            assumePresentWhenTruncated: false,
+                            ct)
+                        .ConfigureAwait(false));
             if (unchanged
                 && !fullReset
+                && !missingManagedInteropProjection
                 && _keysByFileId.TryGetValue(fileId, out var keysForFile))
             {
                 // SHA matches and the in-memory symbol map is hydrated. Verify the store's
