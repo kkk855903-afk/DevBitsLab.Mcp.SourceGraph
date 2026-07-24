@@ -18,6 +18,50 @@ public static class Phase1CompatibilityTools
         "Optional scope id, the literal '*' for all non-isolated scopes, or a comma-separated list of ids. " +
         "Omit to use `default_scope` from .sourcegraph.json.";
 
+    [McpServerTool(
+        UseStructuredContent = true,
+        OutputSchemaType = typeof(SearchSymbolsResult))]
+    [ToolTrigger("\"search indexed code for a name or signature fragment\"")]
+    [Description(
+        "Search indexed code symbols by partial name, qualified name, or signature using the local FTS index. " +
+        "Compatibility name for search_symbols; returns the same evidence-backed symbol locations.")]
+    public static Task<CallToolResult> SearchCodeAsync(
+        ScopeRouter router,
+        [Description("Name, qualified-name, or signature fragment")] string query,
+        [Description("Optional kebab-case symbol kind filter")] string? kind = null,
+        [Description("Maximum results (default 25)")] int topK = 25,
+        [Description(ScopeDescription)] string? scope = null,
+        CancellationToken ct = default) =>
+        GraphTools.SearchSymbolsAsync(
+            router,
+            query,
+            kind,
+            topK,
+            scope,
+            ct);
+
+    [McpServerTool(
+        UseStructuredContent = true,
+        OutputSchemaType = typeof(SearchSymbolsResult))]
+    [ToolTrigger("\"find an indexed symbol\"")]
+    [Description(
+        "Find indexed symbols by name, qualified name, or signature fragment. " +
+        "Compatibility name for search_symbols; ambiguous matches are returned rather than guessed.")]
+    public static Task<CallToolResult> FindSymbolAsync(
+        ScopeRouter router,
+        [Description("Symbol name, qualified name, or signature fragment")] string query,
+        [Description("Optional kebab-case symbol kind filter")] string? kind = null,
+        [Description("Maximum results (default 25)")] int topK = 25,
+        [Description(ScopeDescription)] string? scope = null,
+        CancellationToken ct = default) =>
+        GraphTools.SearchSymbolsAsync(
+            router,
+            query,
+            kind,
+            topK,
+            scope,
+            ct);
+
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(FindReferencesResult))]
     [ToolTrigger("\"find references to X\"")]
     [Description("Find each indexed reference occurrence for a symbol. Compatibility name for find_references; returns the same file, line, column, and reference-kind evidence.")]
@@ -53,6 +97,34 @@ public static class Phase1CompatibilityTools
         [Description(ScopeDescription)] string? scope = null,
         CancellationToken ct = default) =>
         GraphTools.ListCalleesAsync(router, symbol, limit, kind, scope, ct);
+
+    [McpServerTool(
+        UseStructuredContent = true,
+        OutputSchemaType = typeof(TraceCallPathResult))]
+    [ToolTrigger("\"trace a call or execution path from A to B\"")]
+    [Description(
+        "Trace bounded evidence-backed paths between two indexed symbols. Compatibility name for " +
+        "trace_call_path; defaults to calls and accepts the same relation, path, and node bounds.")]
+    public static Task<CallToolResult> TraceCallAsync(
+        ScopeRouter router,
+        [Description("Starting symbol name or qualified name")] string from,
+        [Description("Destination symbol name or qualified name")] string to,
+        [Description("Kebab-case edge relation to traverse (default calls)")] string? kind = null,
+        [Description("Maximum hops per path, 1-12 (default 8)")] int maxDepth = 8,
+        [Description("Maximum returned paths, 1-25 (default 10)")] int maxPaths = 10,
+        [Description("Maximum expanded graph nodes per scope, 1-5000 (default 1000)")] int maxNodes = 1000,
+        [Description(ScopeDescription)] string? scope = null,
+        CancellationToken ct = default) =>
+        TraceCallPathTools.TraceCallPathAsync(
+            router,
+            from,
+            to,
+            kind,
+            maxDepth,
+            maxPaths,
+            maxNodes,
+            scope,
+            ct);
 
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(ImpactOfChangeResult))]
     [ToolTrigger("\"analyze the impact of changing X\"")]
