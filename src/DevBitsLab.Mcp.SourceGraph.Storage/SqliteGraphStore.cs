@@ -2745,6 +2745,49 @@ public sealed class SqliteGraphStore : IGraphStore
         return rows.AsList();
     }
 
+    public async Task<IReadOnlyList<StoredAnnotationRow>> ListAnnotationsByFlavorAsync(
+        string flavor,
+        long afterId,
+        int limit,
+        CancellationToken ct = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(flavor);
+        ArgumentOutOfRangeException.ThrowIfNegative(afterId);
+        if (limit is < 1 or > 1000)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(limit),
+                limit,
+                "Annotation page size must be between 1 and 1000.");
+        }
+
+        const string sql = """
+            SELECT a.id                  AS AnnotationId,
+                   s.id                  AS SymbolId,
+                   s.canonical_key       AS SymbolCanonicalKey,
+                   f.id                  AS FileId,
+                   f.path                AS FilePath,
+                   a.name                AS Name,
+                   a.full_name           AS FullName,
+                   a.flavor              AS Flavor,
+                   a.args_json           AS ArgsJson,
+                   a.attribute_symbol_id AS AttributeSymbolId
+            FROM annotations a
+            JOIN symbols s ON s.id = a.symbol_id
+            JOIN files f ON f.id = s.file_id
+            WHERE a.flavor = @flavor
+              AND a.id > @afterId
+            ORDER BY a.id
+            LIMIT @limit;
+            """;
+        var rows = await _connection.QueryAsync<StoredAnnotationRow>(
+            new CommandDefinition(
+                sql,
+                new { flavor, afterId, limit },
+                cancellationToken: ct)).ConfigureAwait(false);
+        return rows.AsList();
+    }
+
     public async Task<IReadOnlyList<string>> GetDistinctEdgeKindsAsync(CancellationToken ct = default)
     {
         // SELECT DISTINCT delivers dedup; ORDER BY uses the same column so the result is sorted.

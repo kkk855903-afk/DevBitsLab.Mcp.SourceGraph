@@ -78,3 +78,21 @@ public sealed record EdgeTraversalHit(
     SymbolHit Symbol,
     string Relation,
     string? PayloadJson);
+
+/// <summary>
+/// One persisted annotation together with its declaration owner. <see cref="AnnotationId"/> is
+/// the stable, store-local cursor used by <see cref="IGraphStore.ListAnnotationsByFlavorAsync"/>.
+/// Payload consumers must still validate <see cref="ArgsJson"/> with the codec for the selected
+/// <see cref="Flavor"/> before treating it as a domain fact.
+/// </summary>
+public sealed record StoredAnnotationRow(
+    long AnnotationId,
+    long SymbolId,
+    string SymbolCanonicalKey,
+    long FileId,
+    string FilePath,
+    string Name,
+    string FullName,
+    string Flavor,
+    string? ArgsJson,
+    long? AttributeSymbolId);

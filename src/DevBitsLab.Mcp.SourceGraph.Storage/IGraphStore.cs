@@ -129,6 +129,19 @@ public interface IGraphStore : IAsyncDisposable
     Task BulkInsertAnnotationsAsync(IEnumerable<AnnotationRecord> annotations, CancellationToken ct = default);
 
     /// <summary>
+    /// Lists one exact annotation flavor in stable annotation-id order. <paramref name="afterId"/>
+    /// is an exclusive store-local cursor; callers page until fewer than <paramref name="limit"/>
+    /// rows are returned. The concrete store rejects unbounded or invalid page sizes.
+    /// </summary>
+    Task<IReadOnlyList<StoredAnnotationRow>> ListAnnotationsByFlavorAsync(
+        string flavor,
+        long afterId,
+        int limit,
+        CancellationToken ct = default) =>
+        throw new NotSupportedException(
+            "This graph-store implementation predates paged annotation-flavor reads.");
+
+    /// <summary>
     /// Set <c>symbols.test_framework</c> for the given symbol ids. Pairs whose <c>symbol_id</c>
     /// is missing are silently skipped. Runs in a single transaction.
     /// </summary>
