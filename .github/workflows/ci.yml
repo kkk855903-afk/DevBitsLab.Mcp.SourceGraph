@@ -44,6 +44,10 @@ jobs:
         run: dotnet restore DevBitsLab.Mcp.SourceGraph.slnx --locked-mode
 
       - name: Audit top-level and transitive packages
+        # The lock files include every supported RID, so one matrix member scans
+        # the complete dependency graph. Repeating the solution-wide command on
+        # macOS ARM can be killed by the hosted runner with exit 137.
+        if: matrix.os == 'ubuntu-latest'
         shell: pwsh
         run: ./.github/scripts/assert-no-vulnerable-packages.ps1
 
