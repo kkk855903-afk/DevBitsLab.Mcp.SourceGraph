@@ -23,20 +23,27 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: '10.0.x'
+
       - name: Bump version (workflow_dispatch only)
         if: github.event_name == 'workflow_dispatch'
         id: bump
         shell: bash
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
           CSPROJ=src/DevBitsLab.Mcp.SourceGraph.Server/DevBitsLab.Mcp.SourceGraph.Server.csproj
-          current=$(sed -n 's|.*<Version>\([^<][^<]*\)</Version>.*|\1|p' "$CSPROJ" | head -1)
-          if [ -z "$current" ]; then
+          current=$(dotnet msbuild "$CSPROJ" -nologo -getProperty:Version)
+          if ! [[ "$current" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
             echo "::error::could not read current <Version> from $CSPROJ"
             exit 1
           fi
 
-          input='${{ github.event.inputs.version }}'
+          input="$REQUESTED_VERSION"
           case "$input" in
             patch|minor|major)
               IFS='.' read -r MAJ MIN PAT <<< "$current"
@@ -48,7 +55,7 @@ jobs:
               new="$MAJ.$MIN.$PAT"
               ;;
             *)
-              if ! [[ "$input" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              if ! [[ "$input" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
                 echo "::error::version must match x.y.z or be one of patch|minor|major (got: '$input')"
                 exit 1
               fi
@@ -65,28 +72,82 @@ jobs:
             echo "::error::version is already $new"
             exit 1
           fi
+          highest=$(printf '%s\n%s\n' "$current" "$new" | sort -V | tail -n 1)
+          if [ "$highest" != "$new" ]; then
+            echo "::error::new version $new must be greater than current version $current"
+            exit 1
+          fi
 
           echo "Bumping $current → $new (tag $tag)"
           sed -i "s|<Version>$current</Version>|<Version>$new</Version>|" "$CSPROJ"
-          grep '<Version>' "$CSPROJ" | head -1
-
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add "$CSPROJ"
-          git commit -m "Release $new"
-          git tag -a "$tag" -m "$new"
-          git push origin HEAD --follow-tags
+          updated=$(dotnet msbuild "$CSPROJ" -nologo -getProperty:Version)
+          if [ "$updated" != "$new" ]; then
+            echo "::error::failed to update $CSPROJ to $new"
+            exit 1
+          fi
 
           echo "version=$new" >> "$GITHUB_OUTPUT"
           echo "tag=$tag"     >> "$GITHUB_OUTPUT"
 
-      - name: Set up .NET
-        uses: actions/setup-dotnet@v5
-        with:
-          dotnet-version: '10.0.x'
+      - name: Validate release versions
+        id: versions
+        shell: bash
+        env:
+          BUMP_VERSION: ${{ steps.bump.outputs.version }}
+          BUMP_TAG: ${{ steps.bump.outputs.tag }}
+        run: |
+          set -euo pipefail
+          TOOL_PROJECT=src/DevBitsLab.Mcp.SourceGraph.Server/DevBitsLab.Mcp.SourceGraph.Server.csproj
+          SDK_PROJECT=src/DevBitsLab.Mcp.SourceGraph.Sdk/DevBitsLab.Mcp.SourceGraph.Sdk.csproj
+
+          tool_version=$(dotnet msbuild "$TOOL_PROJECT" -nologo -getProperty:Version)
+          sdk_version=$(dotnet msbuild "$SDK_PROJECT" -nologo -getProperty:Version)
+          runtime_identifiers=$(dotnet msbuild "$TOOL_PROJECT" -nologo -getProperty:ToolPackageRuntimeIdentifiers)
+          release_pattern='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+
+          if ! [[ "$tool_version" =~ $release_pattern ]]; then
+            echo "::error::tool Version '$tool_version' is not x.y.z"
+            exit 1
+          fi
+          if ! [[ "$sdk_version" =~ $release_pattern ]]; then
+            echo "::error::SDK Version '$sdk_version' is not x.y.z"
+            exit 1
+          fi
+          if [ -z "$runtime_identifiers" ]; then
+            echo "::error::tool has no ToolPackageRuntimeIdentifiers"
+            exit 1
+          fi
+
+          case "$GITHUB_EVENT_NAME" in
+            push)
+              expected_tag="v$tool_version"
+              if [ "$GITHUB_REF_TYPE" != tag ] || [ "$GITHUB_REF_NAME" != "$expected_tag" ]; then
+                echo "::error::tag '$GITHUB_REF_NAME' does not match tool Version '$tool_version'"
+                exit 1
+              fi
+              ;;
+            workflow_dispatch)
+              if [ "$BUMP_VERSION" != "$tool_version" ] || [ "$BUMP_TAG" != "v$tool_version" ]; then
+                echo "::error::version bump outputs do not match tool Version '$tool_version'"
+                exit 1
+              fi
+              ;;
+            *)
+              echo "::error::unsupported release event '$GITHUB_EVENT_NAME'"
+              exit 1
+              ;;
+          esac
+
+          echo "tool-version=$tool_version" >> "$GITHUB_OUTPUT"
+          echo "sdk-version=$sdk_version" >> "$GITHUB_OUTPUT"
+          echo "runtime-identifiers=$runtime_identifiers" >> "$GITHUB_OUTPUT"
 
       - name: Restore
-        run: dotnet restore
+        run: dotnet restore DevBitsLab.Mcp.SourceGraph.slnx --locked-mode
+
+      - name: Audit top-level and transitive packages
+        shell: pwsh
+        run: ./.github/scripts/assert-no-vulnerable-packages.ps1
 
       - name: Build
         run: dotnet build -c Release --no-restore /p:ContinuousIntegrationBuild=true
@@ -111,6 +172,39 @@ jobs:
 
       - name: Pack SDK
         run: dotnet pack src/DevBitsLab.Mcp.SourceGraph.Sdk -c Release --no-build -o ./out
+
+      - name: Verify package identities and versions
+        shell: pwsh
+        env:
+          TOOL_VERSION: ${{ steps.versions.outputs.tool-version }}
+          SDK_VERSION: ${{ steps.versions.outputs.sdk-version }}
+          TOOL_RUNTIME_IDENTIFIERS: ${{ steps.versions.outputs.runtime-identifiers }}
+        run: |
+          ./.github/scripts/assert-release-packages.ps1 `
+            -PackageDirectory ./out `
+            -ToolVersion $env:TOOL_VERSION `
+            -SdkVersion $env:SDK_VERSION `
+            -ToolRuntimeIdentifiers $env:TOOL_RUNTIME_IDENTIFIERS
+
+      - name: Commit version and push tag (workflow_dispatch only)
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ steps.bump.outputs.version }}
+          RELEASE_TAG: ${{ steps.bump.outputs.tag }}
+        run: |
+          set -euo pipefail
+          CSPROJ=src/DevBitsLab.Mcp.SourceGraph.Server/DevBitsLab.Mcp.SourceGraph.Server.csproj
+          if git ls-remote --exit-code --tags origin "refs/tags/$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "::error::tag $RELEASE_TAG now exists on origin"
+            exit 1
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add "$CSPROJ"
+          git commit -m "Release $RELEASE_VERSION"
+          git tag -a "$RELEASE_TAG" -m "$RELEASE_VERSION"
+          git push origin HEAD --follow-tags
 
       - name: Push to NuGet
         env:

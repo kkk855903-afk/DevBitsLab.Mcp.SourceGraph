@@ -36,12 +36,16 @@ jobs:
         uses: actions/cache@v5
         with:
           path: ~/.nuget/packages
-          key: ${{ runner.os }}-nuget-${{ hashFiles('**/Directory.Packages.props', '**/*.csproj') }}
+          key: ${{ runner.os }}-nuget-${{ hashFiles('**/Directory.Packages.props', '**/*.csproj', '**/packages.lock.json') }}
           restore-keys: |
             ${{ runner.os }}-nuget-
 
       - name: Restore
-        run: dotnet restore
+        run: dotnet restore DevBitsLab.Mcp.SourceGraph.slnx --locked-mode
+
+      - name: Audit top-level and transitive packages
+        shell: pwsh
+        run: ./.github/scripts/assert-no-vulnerable-packages.ps1
 
       - name: Build
         run: dotnet build -c Release --no-restore /p:ContinuousIntegrationBuild=true
@@ -83,7 +87,7 @@ jobs:
           dotnet-version: '10.0.x'
 
       - name: Restore
-        run: dotnet restore
+        run: dotnet restore DevBitsLab.Mcp.SourceGraph.slnx --locked-mode
 
       - name: Build
         run: dotnet build -c Release --no-restore /p:ContinuousIntegrationBuild=true
@@ -93,6 +97,20 @@ jobs:
 
       - name: Pack SDK
         run: dotnet pack src/DevBitsLab.Mcp.SourceGraph.Sdk -c Release --no-build -o ./out
+
+      - name: Verify package identities and versions
+        shell: pwsh
+        run: |
+          $toolProject = 'src/DevBitsLab.Mcp.SourceGraph.Server/DevBitsLab.Mcp.SourceGraph.Server.csproj'
+          $sdkProject = 'src/DevBitsLab.Mcp.SourceGraph.Sdk/DevBitsLab.Mcp.SourceGraph.Sdk.csproj'
+          $toolVersion = (& dotnet msbuild $toolProject -nologo -getProperty:Version | Out-String).Trim()
+          $sdkVersion = (& dotnet msbuild $sdkProject -nologo -getProperty:Version | Out-String).Trim()
+          $runtimeIdentifiers = (& dotnet msbuild $toolProject -nologo -getProperty:ToolPackageRuntimeIdentifiers | Out-String).Trim()
+          ./.github/scripts/assert-release-packages.ps1 `
+            -PackageDirectory ./out `
+            -ToolVersion $toolVersion `
+            -SdkVersion $sdkVersion `
+            -ToolRuntimeIdentifiers $runtimeIdentifiers
 
       - name: Smoke installed tool package
         shell: pwsh
