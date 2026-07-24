@@ -10,10 +10,18 @@ namespace DevBitsLab.Mcp.SourceGraph.Core;
 public static class InteropAnnotationFlavors
 {
     public const string ManagedImport = "interop-managed-import";
+    public const string ManagedCallbackUsage = "interop-managed-callback-usage";
+    public const string ManagedReturnRelease = "interop-managed-return-release";
     public const string NativeExport = "interop-native-export";
     public const string AbiRecord = "interop-abi-record";
     public const string Match = "interop-match";
     public const string Finding = "interop-finding";
+}
+
+/// <summary>Stable producer identities shared by indexers and derived interop publishers.</summary>
+public static class InteropFactProducers
+{
+    public const string Analysis = "interop-analysis";
 }
 
 /// <summary>

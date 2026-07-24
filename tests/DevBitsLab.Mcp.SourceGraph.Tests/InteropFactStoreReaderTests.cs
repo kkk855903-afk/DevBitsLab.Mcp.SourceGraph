@@ -223,6 +223,86 @@ public sealed class InteropFactStoreReaderTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task Conflicting_managed_usage_claims_at_one_call_site_fail_closed()
+    {
+        var owner = await SeedOwnerAsync(
+            "caller.cs",
+            "csharp:M:Caller.Run",
+            "Run");
+        var callback = new ManagedCallbackUsageProjection(
+            "csharp:M:Native.Register",
+            new ManagedCallbackUsage(
+                0,
+                owner.Key,
+                CallbackGcRooting.Unrooted,
+                InteropTarget.WindowsX64Msvc,
+                EvidenceFor(owner.FileId, owner.Path)));
+        var release = new ManagedReturnReleaseProjection(
+            "csharp:M:Native.Allocate",
+            new ManagedReturnRelease(
+                owner.Key,
+                InteropAllocatorFamily.CoTaskMem,
+                InteropTarget.WindowsX64Msvc,
+                EvidenceFor(owner.FileId, owner.Path)));
+        await _store!.BulkInsertAnnotationsAsync(
+        [
+            Annotation(
+                owner.SymbolId,
+                InteropAnnotationFlavors.ManagedCallbackUsage,
+                InteropFactPayloadCodec.EncodeManagedCallbackUsage(
+                    callback)),
+            Annotation(
+                owner.SymbolId,
+                InteropAnnotationFlavors.ManagedCallbackUsage,
+                InteropFactPayloadCodec.EncodeManagedCallbackUsage(
+                    callback with
+                    {
+                        Usage = callback.Usage with
+                        {
+                            Rooting = CallbackGcRooting.Rooted,
+                        },
+                    })),
+            Annotation(
+                owner.SymbolId,
+                InteropAnnotationFlavors.ManagedReturnRelease,
+                InteropFactPayloadCodec.EncodeManagedReturnRelease(
+                    release)),
+            Annotation(
+                owner.SymbolId,
+                InteropAnnotationFlavors.ManagedReturnRelease,
+                InteropFactPayloadCodec.EncodeManagedReturnRelease(
+                    release with
+                    {
+                        Release = release.Release with
+                        {
+                            ReleaseFamily =
+                                InteropAllocatorFamily.HGlobal,
+                        },
+                    })),
+        ]);
+
+        var callbacks =
+            await InteropFactStoreReader.ReadManagedCallbackUsagesAsync(
+                _store);
+        var releases =
+            await InteropFactStoreReader.ReadManagedReturnReleasesAsync(
+                _store);
+
+        callbacks.IsComplete.Should().BeFalse();
+        callbacks.Facts.Should().BeEmpty();
+        callbacks.Failures.Should().ContainSingle(failure =>
+            failure.Reason.Contains(
+                "Conflicting",
+                StringComparison.Ordinal));
+        releases.IsComplete.Should().BeFalse();
+        releases.Facts.Should().BeEmpty();
+        releases.Failures.Should().ContainSingle(failure =>
+            failure.Reason.Contains(
+                "Conflicting",
+                StringComparison.Ordinal));
+    }
+
+    [Fact]
     public async Task Row_bound_is_reported_as_truncation_instead_of_completeness()
     {
         for (var index = 0; index < 3; index++)

@@ -57,6 +57,42 @@ public static class InteropFactStoreReader
             InteropFactPayloadCodec.EncodeManagedImport,
             cancellationToken);
 
+    public static Task<StoredInteropFactSnapshot<ManagedCallbackUsageProjection>>
+        ReadManagedCallbackUsagesAsync(
+            IGraphStore store,
+            int maximumRows = DefaultMaximumRows,
+            CancellationToken cancellationToken = default) =>
+        ReadAsync(
+            store,
+            InteropAnnotationFlavors.ManagedCallbackUsage,
+            maximumRows,
+            (json, ownerFileId) =>
+                InteropFactPayloadCodec.DecodeManagedCallbackUsage(
+                    json,
+                    ownerFileId),
+            fact => fact.Usage.CallerSymbolCanonicalKey,
+            InteropFactPayloadCodec.EncodeManagedCallbackUsage,
+            cancellationToken,
+            ManagedCallbackUsageIdentity);
+
+    public static Task<StoredInteropFactSnapshot<ManagedReturnReleaseProjection>>
+        ReadManagedReturnReleasesAsync(
+            IGraphStore store,
+            int maximumRows = DefaultMaximumRows,
+            CancellationToken cancellationToken = default) =>
+        ReadAsync(
+            store,
+            InteropAnnotationFlavors.ManagedReturnRelease,
+            maximumRows,
+            (json, ownerFileId) =>
+                InteropFactPayloadCodec.DecodeManagedReturnRelease(
+                    json,
+                    ownerFileId),
+            fact => fact.Release.CallerSymbolCanonicalKey,
+            InteropFactPayloadCodec.EncodeManagedReturnRelease,
+            cancellationToken,
+            ManagedReturnReleaseIdentity);
+
     public static Task<StoredInteropFactSnapshot<NativeExport>>
         ReadNativeExportsAsync(
             IGraphStore store,
@@ -278,4 +314,65 @@ public static class InteropFactStoreReader
         message.Length <= MaximumFailureReasonCharacters
             ? message
             : message[..MaximumFailureReasonCharacters];
+
+    private static string ManagedCallbackUsageIdentity(
+        ManagedCallbackUsageProjection projection) =>
+        BuildManagedUsageIdentity(
+            projection.ManagedImportSymbolCanonicalKey,
+            projection.Usage.CallerSymbolCanonicalKey,
+            projection.Usage.ParameterPosition.ToString(
+                System.Globalization.CultureInfo.InvariantCulture),
+            projection.Usage.Target,
+            projection.Usage.Evidence.Location);
+
+    private static string ManagedReturnReleaseIdentity(
+        ManagedReturnReleaseProjection projection) =>
+        BuildManagedUsageIdentity(
+            projection.ManagedImportSymbolCanonicalKey,
+            projection.Release.CallerSymbolCanonicalKey,
+            parameterPosition: string.Empty,
+            projection.Release.Target,
+            projection.Release.Evidence.Location);
+
+    private static string BuildManagedUsageIdentity(
+        string importCanonicalKey,
+        string callerCanonicalKey,
+        string parameterPosition,
+        InteropTarget target,
+        SourceLocation location)
+    {
+        var components = new[]
+        {
+            importCanonicalKey,
+            callerCanonicalKey,
+            parameterPosition,
+            target.RuntimeIdentifier,
+            ((int)target.Architecture).ToString(
+                System.Globalization.CultureInfo.InvariantCulture),
+            ((int)target.CompilerAbi).ToString(
+                System.Globalization.CultureInfo.InvariantCulture),
+            target.PointerSizeBytes.ToString(
+                System.Globalization.CultureInfo.InvariantCulture),
+            target.DefaultPack.ToString(
+                System.Globalization.CultureInfo.InvariantCulture),
+            location.FilePath,
+            location.StartLine.ToString(
+                System.Globalization.CultureInfo.InvariantCulture),
+            location.StartColumn.ToString(
+                System.Globalization.CultureInfo.InvariantCulture),
+            location.EndLine.ToString(
+                System.Globalization.CultureInfo.InvariantCulture),
+            location.EndColumn.ToString(
+                System.Globalization.CultureInfo.InvariantCulture),
+        };
+        var identity = new System.Text.StringBuilder();
+        foreach (var component in components)
+        {
+            identity.Append(component.Length.ToString(
+                System.Globalization.CultureInfo.InvariantCulture));
+            identity.Append(':');
+            identity.Append(component);
+        }
+        return identity.ToString();
+    }
 }

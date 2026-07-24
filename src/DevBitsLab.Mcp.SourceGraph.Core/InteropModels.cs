@@ -332,6 +332,15 @@ public sealed record ManagedCallbackUsage(
     Evidence Evidence);
 
 /// <summary>
+/// Persistable association between one managed callback invocation and the exact import
+/// declaration it targets. The nested usage remains caller-owned so its evidence can be
+/// incrementally replaced with the caller's physical source file.
+/// </summary>
+public sealed record ManagedCallbackUsageProjection(
+    string ManagedImportSymbolCanonicalKey,
+    ManagedCallbackUsage Usage);
+
+/// <summary>
 /// Proof that a native exception can leave the export without being translated before the C ABI.
 /// An absent fact means the escape status is unknown.
 /// </summary>
@@ -354,6 +363,14 @@ public sealed record ManagedReturnRelease(
     InteropAllocatorFamily ReleaseFamily,
     InteropTarget Target,
     Evidence Evidence);
+
+/// <summary>
+/// Persistable association between one managed release operation and the exact import whose
+/// returned value is consumed by that operation.
+/// </summary>
+public sealed record ManagedReturnReleaseProjection(
+    string ManagedImportSymbolCanonicalKey,
+    ManagedReturnRelease Release);
 
 /// <summary>Normalized exported C ABI function, independent of the parser that discovered it.</summary>
 public sealed record NativeExport(

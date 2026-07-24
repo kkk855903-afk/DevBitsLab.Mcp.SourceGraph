@@ -58,17 +58,98 @@ public sealed class InteropAnalysisPayloadCodecTests
         decoded.Should().BeEquivalentTo(finding);
         using var document = JsonDocument.Parse(json);
         var root = document.RootElement;
-        root.GetProperty("version").GetInt32().Should().Be(1);
+        root.GetProperty("version").GetInt32().Should().Be(2);
         root.GetProperty("kind").GetString().Should().Be("finding");
         root.GetProperty("rule_id").GetString().Should().Be("Interop001");
         root.GetProperty("severity").GetString().Should().Be("error");
         root.GetProperty("confidence").GetString().Should().Be("exact");
+        root.GetProperty("boundary_managed_symbol_canonical_key")
+            .GetString()
+            .Should()
+            .Be(finding.ManagedSymbolCanonicalKey);
         root.GetProperty("target")
             .GetProperty("runtime_identifier")
             .GetString()
             .Should()
             .Be("win-x64");
         json.Should().NotContain("producing_file_id");
+    }
+
+    [Fact]
+    public void Finding_v2_roundTripsDistinctCallerAndBoundaryKeys()
+    {
+        var finding = CreateFinding() with
+        {
+            ManagedSymbolCanonicalKey =
+                "csharp:M:Example.Service.ReleaseNativeBuffer",
+            BoundaryManagedSymbolCanonicalKey =
+                "csharp:M:Example.NativeMethods.Run",
+        };
+
+        var json = InteropFactPayloadCodec.EncodeFinding(finding);
+        var decoded = InteropFactPayloadCodec.DecodeFinding(json);
+
+        decoded.ManagedSymbolCanonicalKey.Should().Be(
+            "csharp:M:Example.Service.ReleaseNativeBuffer");
+        decoded.BoundaryManagedSymbolCanonicalKey.Should().Be(
+            "csharp:M:Example.NativeMethods.Run");
+    }
+
+    [Fact]
+    public void Finding_v1_decodesBoundaryAsLegacyManagedOwner()
+    {
+        var v2 = InteropFactPayloadCodec.EncodeFinding(CreateFinding());
+        var v1 = Mutate(
+            v2,
+            root =>
+            {
+                root["version"] = 1;
+                root.Remove("boundary_managed_symbol_canonical_key");
+            });
+
+        var decoded = InteropFactPayloadCodec.DecodeFinding(v1);
+
+        decoded.BoundaryManagedSymbolCanonicalKey.Should().Be(
+            decoded.ManagedSymbolCanonicalKey);
+    }
+
+    [Fact]
+    public void Finding_rejects_v2_boundary_field_disguised_as_v1()
+    {
+        var hybrid = InteropFactPayloadCodec.EncodeFinding(
+                CreateFinding() with
+                {
+                    ManagedSymbolCanonicalKey =
+                        "csharp:M:Example.Service.Release",
+                    BoundaryManagedSymbolCanonicalKey =
+                        "csharp:M:Example.NativeMethods.Run",
+                })
+            .Replace(
+                "\"version\":2",
+                "\"version\":1",
+                StringComparison.Ordinal);
+
+        var act = () => InteropFactPayloadCodec.DecodeFinding(hybrid);
+
+        act.Should().Throw<InteropFactPayloadException>()
+            .WithMessage("*not valid*version 1*");
+    }
+
+    [Fact]
+    public void Finding_rejects_null_v2_boundary_field_disguised_as_v1()
+    {
+        var hybrid = Mutate(
+            InteropFactPayloadCodec.EncodeFinding(CreateFinding()),
+            root =>
+            {
+                root["version"] = 1;
+                root["boundary_managed_symbol_canonical_key"] = null;
+            });
+
+        var act = () => InteropFactPayloadCodec.DecodeFinding(hybrid);
+
+        act.Should().Throw<InteropFactPayloadException>()
+            .WithMessage("*not valid*version 1*");
     }
 
     [Theory]
@@ -116,7 +197,7 @@ public sealed class InteropAnalysisPayloadCodecTests
         json = mutation switch
         {
             "version" => json.Replace(
-                "\"version\":1",
+                "\"version\":2",
                 "\"version\":0",
                 StringComparison.Ordinal),
             "kind" => json.Replace(
@@ -164,8 +245,8 @@ public sealed class InteropAnalysisPayloadCodecTests
     {
         var json = InteropFactPayloadCodec.EncodeFinding(CreateFinding());
         var rootDuplicate = json.Replace(
-            "\"version\":1",
-            "\"version\":1,\"version\":1",
+            "\"version\":2",
+            "\"version\":2,\"version\":2",
             StringComparison.Ordinal);
         var metadataDuplicate = json.Replace(
             "\"alpha\":\"first\"",

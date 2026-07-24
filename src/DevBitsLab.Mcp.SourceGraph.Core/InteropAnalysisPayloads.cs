@@ -36,10 +36,20 @@ public sealed record InteropFindingProjection(
     string NativeSymbolCanonicalKey,
     InteropTarget Target,
     EvidenceConfidence Confidence,
-    IReadOnlyList<InteropEvidenceProjection> Evidence);
+    IReadOnlyList<InteropEvidenceProjection> Evidence)
+{
+    /// <summary>
+    /// Import declaration whose matched boundary produced this finding. This differs from
+    /// <see cref="ManagedSymbolCanonicalKey"/> for caller-attributed rules such as Interop004
+    /// and Interop006.
+    /// </summary>
+    public string BoundaryManagedSymbolCanonicalKey { get; init; } =
+        ManagedSymbolCanonicalKey;
+}
 
 public static partial class InteropFactPayloadCodec
 {
+    private const int FindingCurrentVersion = 2;
     private const string MatchKindToken = "match";
     private const string FindingKindToken = "finding";
 
@@ -86,12 +96,14 @@ public static partial class InteropFactPayloadCodec
     private static FindingPayload ToPayload(InteropFindingProjection finding) =>
         new()
         {
-            Version = CurrentVersion,
+            Version = FindingCurrentVersion,
             Kind = FindingKindToken,
             RuleId = finding.RuleId,
             Severity = ToToken(finding.Severity),
             Message = finding.Message,
             ManagedSymbolCanonicalKey = finding.ManagedSymbolCanonicalKey,
+            BoundaryManagedSymbolCanonicalKey =
+                finding.BoundaryManagedSymbolCanonicalKey,
             NativeSymbolCanonicalKey = finding.NativeSymbolCanonicalKey,
             Target = ToPayload(finding.Target),
             Confidence = ToToken(finding.Confidence),
@@ -177,17 +189,39 @@ public static partial class InteropFactPayloadCodec
 
     private static InteropFindingProjection Validate(FindingPayload payload)
     {
-        ValidateHeader(payload.Version, payload.Kind, FindingKindToken);
+        if (payload.Version is not (1 or FindingCurrentVersion)
+            || !string.Equals(
+                payload.Kind,
+                FindingKindToken,
+                StringComparison.Ordinal))
+        {
+            throw Invalid(
+                $"Expected {FindingKindToken} payload version 1 or "
+                + $"{FindingCurrentVersion}.");
+        }
         var ruleId = RequireString(payload.RuleId, "finding.rule_id");
         ValidateRuleId(ruleId);
+        var managedKey = RequireString(
+            payload.ManagedSymbolCanonicalKey,
+            "finding.managed_symbol_canonical_key");
+        if (payload.Version == 1
+            && payload.BoundaryManagedSymbolCanonicalKeyWasSpecified)
+        {
+            throw Invalid(
+                "finding.boundary_managed_symbol_canonical_key is not valid "
+                + "in a version 1 payload.");
+        }
+        var boundaryManagedKey = payload.Version == 1
+            ? managedKey
+            : RequireString(
+                payload.BoundaryManagedSymbolCanonicalKey,
+                "finding.boundary_managed_symbol_canonical_key");
 
         return new InteropFindingProjection(
             ruleId,
             ParseFindingSeverity(payload.Severity),
             RequireString(payload.Message, "finding.message"),
-            RequireString(
-                payload.ManagedSymbolCanonicalKey,
-                "finding.managed_symbol_canonical_key"),
+            managedKey,
             RequireString(
                 payload.NativeSymbolCanonicalKey,
                 "finding.native_symbol_canonical_key"),
@@ -196,7 +230,10 @@ public static partial class InteropFactPayloadCodec
             FromProjectionPayloads(
                 payload.Evidence,
                 "finding.evidence",
-                requireNonEmpty: true));
+                requireNonEmpty: true))
+        {
+            BoundaryManagedSymbolCanonicalKey = boundaryManagedKey,
+        };
     }
 
     private static IReadOnlyList<string> RequireNonEmptyStrings(
@@ -309,15 +346,33 @@ public static partial class InteropFactPayloadCodec
 
     private sealed class FindingPayload
     {
+        private string? _boundaryManagedSymbolCanonicalKey;
+
         [JsonPropertyOrder(0)] public required int Version { get; init; }
         [JsonPropertyOrder(1)] public required string? Kind { get; init; }
         [JsonPropertyOrder(2)] public required string? RuleId { get; init; }
         [JsonPropertyOrder(3)] public required string? Severity { get; init; }
         [JsonPropertyOrder(4)] public required string? Message { get; init; }
         [JsonPropertyOrder(5)] public required string? ManagedSymbolCanonicalKey { get; init; }
-        [JsonPropertyOrder(6)] public required string? NativeSymbolCanonicalKey { get; init; }
-        [JsonPropertyOrder(7)] public required TargetPayload? Target { get; init; }
-        [JsonPropertyOrder(8)] public required string? Confidence { get; init; }
-        [JsonPropertyOrder(9)] public required List<EvidencePayload>? Evidence { get; init; }
+        [JsonPropertyOrder(6)]
+        public string? BoundaryManagedSymbolCanonicalKey
+        {
+            get => _boundaryManagedSymbolCanonicalKey;
+            init
+            {
+                _boundaryManagedSymbolCanonicalKey = value;
+                BoundaryManagedSymbolCanonicalKeyWasSpecified = true;
+            }
+        }
+        [JsonIgnore]
+        public bool BoundaryManagedSymbolCanonicalKeyWasSpecified
+        {
+            get;
+            private set;
+        }
+        [JsonPropertyOrder(7)] public required string? NativeSymbolCanonicalKey { get; init; }
+        [JsonPropertyOrder(8)] public required TargetPayload? Target { get; init; }
+        [JsonPropertyOrder(9)] public required string? Confidence { get; init; }
+        [JsonPropertyOrder(10)] public required List<EvidencePayload>? Evidence { get; init; }
     }
 }
