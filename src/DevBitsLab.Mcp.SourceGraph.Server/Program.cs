@@ -1,6 +1,7 @@
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using DevBitsLab.Mcp.SourceGraph.Core;
+using DevBitsLab.Mcp.SourceGraph.Core.Security;
 using DevBitsLab.Mcp.SourceGraph.Embeddings;
 using DevBitsLab.Mcp.SourceGraph.Indexing;
 using DevBitsLab.Mcp.SourceGraph.Sdk;
@@ -207,6 +208,8 @@ static async Task<int> RunServeAsync(CommandLine cli)
     // Repo root surfaced for tools (query_graph / describe_schema) that need it to locate
     // per-scope DB files via ScopeLayout.
     builder.Services.AddSingleton(new RepoRootInfo(repoRoot));
+    builder.Services.AddSingleton<IExecutionTrustPolicy>(
+        new UserExecutionTrustPolicy());
 
     // The scope-config watcher is started by LiveIndexService when WatchConfig is true. We skip
     // it when --solution is set: --solution is a runtime override that bypasses .sourcegraph.json
@@ -483,6 +486,7 @@ static async Task<int> RunIndexAsync(CommandLine cli)
     IReadOnlyList<FileFailure> nonCSharpFailedFiles = Array.Empty<FileFailure>();
     IReadOnlyList<ProjectFailure> nonCSharpFailedProjects =
         Array.Empty<ProjectFailure>();
+    var nativeInteropFailed = false;
     var solutionFull = Path.GetFullPath(cli.SolutionPath);
     var repoRootForIndex = cli.ResolvedRepoRoot();
     ScopeConfig indexScopeConfig;
@@ -726,6 +730,43 @@ static async Task<int> RunIndexAsync(CommandLine cli)
         }
     }
 
+    if (selectedScope.Interop is not null)
+    {
+        await using var nativeCoordinator = new NativeInteropCoordinator(
+            selectedScope.Root,
+            selectedScope.Interop,
+            indexScopeSelection.PathPolicy,
+            store,
+            new UserExecutionTrustPolicy());
+        var native = await nativeCoordinator.RunAsync(
+                result.FailedProjects.Count == 0
+                && result.FailedFiles.Count == 0)
+            .ConfigureAwait(false);
+        nativeInteropFailed =
+            native.State.Status == NativeInteropRuntimeStatus.Partial;
+        if (nativeInteropFailed)
+        {
+            var codes = native.State.Failures
+                .Select(failure => failure.Code)
+                .Distinct(StringComparer.Ordinal)
+                .OrderBy(code => code, StringComparer.Ordinal)
+                .Take(8);
+            await Console.Error.WriteLineAsync(
+                    "[sourcegraph-mcp] native interop indexing is partial; "
+                    + "last-good evidence was retained"
+                    + $" ({string.Join(", ", codes)})")
+                .ConfigureAwait(false);
+        }
+        else
+        {
+            Console.WriteLine(
+                "native interop: "
+                + $"{native.State.NativeSymbols} symbols, "
+                + $"{native.State.ManagedMatches} matches, "
+                + $"{native.State.Findings} findings");
+        }
+    }
+
     if (embedService is not null)
     {
         channelSink!.Complete();
@@ -740,6 +781,7 @@ static async Task<int> RunIndexAsync(CommandLine cli)
     if (historyDisabled) Console.WriteLine("history: disabled (--no-history or git unavailable)");
     return nonCSharpFailedFiles.Count == 0
         && nonCSharpFailedProjects.Count == 0
+        && !nativeInteropFailed
             ? 0
             : 1;
 }

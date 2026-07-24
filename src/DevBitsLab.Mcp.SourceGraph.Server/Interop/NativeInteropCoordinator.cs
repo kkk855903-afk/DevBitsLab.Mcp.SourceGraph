@@ -99,6 +99,8 @@ internal sealed class NativeInteropCoordinator : IAsyncDisposable
     private readonly InteropAnalysisPublisher _analysisPublisher;
     private readonly SemaphoreSlim _runLock = new(1, 1);
     private readonly object _stateGate = new();
+    private readonly HashSet<string> _configuredInputPaths;
+    private readonly string[] _watchExtensions;
     private readonly HashSet<string> _pendingStaleKeys =
         new(StringComparer.Ordinal);
 
@@ -181,6 +183,10 @@ internal sealed class NativeInteropCoordinator : IAsyncDisposable
         _store = store;
         _nativePublisher = new NativeInteropSnapshotPublisher(store);
         _analysisPublisher = new InteropAnalysisPublisher(store);
+        _configuredInputPaths = ResolveConfiguredInputPaths(
+            scopeRoot,
+            configuration);
+        _watchExtensions = ResolveWatchExtensions(configuration);
         _state = NativeInteropRuntimeState.NotStarted(configuration.Target);
     }
 
@@ -207,7 +213,54 @@ internal sealed class NativeInteropCoordinator : IAsyncDisposable
         }
     }
 
+    public IReadOnlyList<string> WatchExtensions => _watchExtensions;
+
+    /// <summary>
+    /// Native/header inputs are conservatively scope-wide because a newly introduced include
+    /// is not present in the last dependency graph yet. Exact configured and last-good paths
+    /// are also recognized for uncommon extensions.
+    /// </summary>
+    public bool IsRelevantPath(string path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return false;
+        }
+
+        string fullPath;
+        try
+        {
+            fullPath = Path.GetFullPath(path);
+        }
+        catch (Exception ex) when (
+            ex is ArgumentException
+                or NotSupportedException
+                or PathTooLongException)
+        {
+            return false;
+        }
+        if (_configuredInputPaths.Contains(fullPath))
+        {
+            return true;
+        }
+
+        lock (_stateGate)
+        {
+            if (_lastGoodDependencyFanout.ContainsKey(fullPath))
+            {
+                return true;
+            }
+        }
+        var extension = Path.GetExtension(fullPath);
+        return extension.Length > 0
+            && Array.BinarySearch(
+                _watchExtensions,
+                extension,
+                StringComparer.OrdinalIgnoreCase) >= 0;
+    }
+
     public async Task<NativeInteropRunResult> RunAsync(
+        bool isManagedUniverseComplete = true,
         CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
@@ -330,6 +383,20 @@ internal sealed class NativeInteropCoordinator : IAsyncDisposable
                 {
                     _pendingStaleKeys.Add(key);
                 }
+            }
+
+            if (!isManagedUniverseComplete)
+            {
+                return Failed(
+                    attemptedAt,
+                    [
+                        RuntimeFailure(
+                            "managed-snapshot",
+                            "managed-snapshot-incomplete",
+                            "The managed import universe is incomplete; the last successful analysis projection was retained."),
+                    ],
+                    snapshot,
+                    nativePublication);
             }
 
             InteropAnalysisPublicationResult analysisPublication;
@@ -649,6 +716,91 @@ internal sealed class NativeInteropCoordinator : IAsyncDisposable
                     .ToArray());
         }
         return clone;
+    }
+
+    private static HashSet<string> ResolveConfiguredInputPaths(
+        string scopeRoot,
+        ScopeInteropConfig configuration)
+    {
+        var paths = new HashSet<string>(PathComparer);
+        foreach (var unit in configuration.TranslationUnits)
+        {
+            AddConfiguredPath(paths, scopeRoot, unit.Path);
+            if (unit.BinaryPath is not null)
+            {
+                AddConfiguredPath(paths, scopeRoot, unit.BinaryPath);
+            }
+        }
+        return paths;
+    }
+
+    private static void AddConfiguredPath(
+        ISet<string> destination,
+        string scopeRoot,
+        string configuredPath)
+    {
+        try
+        {
+            destination.Add(Path.GetFullPath(
+                Path.IsPathFullyQualified(configuredPath)
+                    ? configuredPath
+                    : Path.Join(scopeRoot, configuredPath)));
+        }
+        catch (Exception ex) when (
+            ex is ArgumentException
+                or NotSupportedException
+                or PathTooLongException)
+        {
+            // The strict snapshot builder reports malformed configuration.
+        }
+    }
+
+    private static string[] ResolveWatchExtensions(
+        ScopeInteropConfig configuration)
+    {
+        var extensions = new HashSet<string>(
+            StringComparer.OrdinalIgnoreCase)
+        {
+            ".c",
+            ".cc",
+            ".cpp",
+            ".cxx",
+            ".h",
+            ".hh",
+            ".hpp",
+            ".hxx",
+            ".inc",
+            ".inl",
+            ".def",
+            ".dll",
+            ".so",
+            ".dylib",
+            ".a",
+            ".lib",
+        };
+        foreach (var unit in configuration.TranslationUnits)
+        {
+            AddExtension(extensions, unit.Path);
+            if (unit.BinaryPath is not null)
+            {
+                AddExtension(extensions, unit.BinaryPath);
+            }
+        }
+        return extensions
+            .OrderBy(extension => extension, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(extension => extension, StringComparer.Ordinal)
+            .ToArray();
+    }
+
+    private static void AddExtension(
+        ISet<string> destination,
+        string path)
+    {
+        var extension = Path.GetExtension(path);
+        if (!string.IsNullOrWhiteSpace(extension))
+        {
+            destination.Add(extension);
+        }
     }
 
     private static StringComparer PathComparer =>

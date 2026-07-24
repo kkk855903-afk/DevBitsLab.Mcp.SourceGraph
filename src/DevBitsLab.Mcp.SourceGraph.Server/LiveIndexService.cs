@@ -1,8 +1,10 @@
 using System.Diagnostics.CodeAnalysis;
 using DevBitsLab.Mcp.SourceGraph.Core;
+using DevBitsLab.Mcp.SourceGraph.Core.Security;
 using DevBitsLab.Mcp.SourceGraph.Embeddings;
 using DevBitsLab.Mcp.SourceGraph.Indexing;
 using DevBitsLab.Mcp.SourceGraph.Sdk;
+using DevBitsLab.Mcp.SourceGraph.Server.Interop;
 using DevBitsLab.Mcp.SourceGraph.Server.Observability;
 using DevBitsLab.Mcp.SourceGraph.Server.Plugins;
 using DevBitsLab.Mcp.SourceGraph.Server.Scoping;
@@ -37,6 +39,7 @@ public sealed class LiveIndexService : BackgroundService
     private readonly LanguageIndexerDispatcher _languageDispatcher;
     private readonly LanguageProjectFactoryRegistry _projectFactories;
     private readonly RepoRootInfo _repoRoot;
+    private readonly IExecutionTrustPolicy _executionTrustPolicy;
     private readonly ILogger<LiveIndexService> _logger;
     private readonly ILoggerFactory _loggerFactory;
     private readonly DateTimeOffset _processStart = DateTimeOffset.UtcNow;
@@ -80,6 +83,7 @@ public sealed class LiveIndexService : BackgroundService
         LanguageIndexerDispatcher languageDispatcher,
         LanguageProjectFactoryRegistry projectFactories,
         RepoRootInfo repoRoot,
+        IExecutionTrustPolicy executionTrustPolicy,
         ILogger<LiveIndexService> logger,
         ILoggerFactory loggerFactory)
     {
@@ -95,6 +99,7 @@ public sealed class LiveIndexService : BackgroundService
         _languageDispatcher = languageDispatcher;
         _projectFactories = projectFactories;
         _repoRoot = repoRoot;
+        _executionTrustPolicy = executionTrustPolicy;
         _logger = logger;
         _loggerFactory = loggerFactory;
     }
@@ -494,6 +499,17 @@ public sealed class LiveIndexService : BackgroundService
                 EmbeddingsSink = scopeSink,
                 EmbeddingsService = scopeEmbeddings,
             };
+            if (scope.Interop is not null)
+            {
+                host.NativeInteropCoordinator = new NativeInteropCoordinator(
+                    scope.Root,
+                    scope.Interop,
+                    new ScopePathPolicy(
+                        scope.Root,
+                        scope.ProjectSet.Exclude),
+                    store,
+                    _executionTrustPolicy);
+            }
             host.Status = "indexing";
             // Persist the registry row BEFORE registering with the router. If the registry
             // upsert throws, the catch path disposes the host and never registers it, so we
@@ -562,6 +578,8 @@ public sealed class LiveIndexService : BackgroundService
         var nonCSharpFilesIndexed = 0;
         var roslynProducedUsableOutput = false;
         var nonCSharpProducedUsableOutput = false;
+        var nativeProducedUsableOutput = false;
+        var nativeInteropPartial = false;
         var projectDiscoveryFailed = false;
 
         try
@@ -616,6 +634,9 @@ public sealed class LiveIndexService : BackgroundService
                 // the end of this method.
                 host.FailedProjects = initial.FailedProjects;
                 host.FailedFiles = initial.FailedFiles;
+                host.ManagedInteropInputComplete =
+                    initial.FailedProjects.Count == 0
+                    && initial.FailedFiles.Count == 0;
             }
             else
             {
@@ -631,6 +652,7 @@ public sealed class LiveIndexService : BackgroundService
                 });
                 host.FailedProjects = Array.Empty<ProjectFailure>();
                 host.FailedFiles = Array.Empty<FileFailure>();
+                host.ManagedInteropInputComplete = true;
             }
 
             // Build the per-scope file → project lookup and dispatch every registered non-C#
@@ -680,6 +702,42 @@ public sealed class LiveIndexService : BackgroundService
                 await DispatchAnalyzersForScopeAsync(host, ct).ConfigureAwait(false);
             }
 
+            if (host.NativeInteropCoordinator is not null)
+            {
+                host.ProgressSource.Emit(
+                    new ModelContextProtocol.ProgressNotificationValue
+                    {
+                        Progress = 0.85f,
+                        Total = 1.0f,
+                        Message = "indexing native interop",
+                    });
+                var native = await host.NativeInteropCoordinator.RunAsync(
+                        host.ManagedInteropInputComplete,
+                        ct)
+                    .ConfigureAwait(false);
+                nativeProducedUsableOutput =
+                    native.State.Status == NativeInteropRuntimeStatus.Complete
+                    && native.State.NativeSymbols > 0;
+                nativeInteropPartial =
+                    native.State.Status == NativeInteropRuntimeStatus.Partial;
+                if (nativeInteropPartial)
+                {
+                    _logger.LogWarning(
+                        "Scope `{Id}` native interop indexing retained last-good evidence: {Reason}",
+                        scope.Id,
+                        NativeInteropFailureSummary(native.State));
+                }
+                else
+                {
+                    _logger.LogInformation(
+                        "Scope `{Id}` native interop indexing complete ({Symbols} native symbols, {Matches} managed matches, {Findings} findings)",
+                        scope.Id,
+                        native.State.NativeSymbols,
+                        native.State.ManagedMatches,
+                        native.State.Findings);
+                }
+            }
+
             // Settle against both this pass and the graph that remains transactionally stored.
             // A failed project-map rebuild intentionally preserves the last good graph; treating
             // that scope as degraded would hide queryable evidence and prevent the watcher from
@@ -687,7 +745,9 @@ public sealed class LiveIndexService : BackgroundService
             var failedProjectCount = host.FailedProjects.Count;
             var failedFileCount = host.FailedFiles.Count;
             var currentPassProducedUsableOutput =
-                roslynProducedUsableOutput || nonCSharpProducedUsableOutput;
+                roslynProducedUsableOutput
+                || nonCSharpProducedUsableOutput
+                || nativeProducedUsableOutput;
             var retainedCounts =
                 await host.Store.RowCountsAsync(ct).ConfigureAwait(false);
             var status = ResolveColdIndexStatus(
@@ -696,6 +756,15 @@ public sealed class LiveIndexService : BackgroundService
                 failedProjectCount,
                 failedFileCount,
                 projectDiscoveryFailed);
+            if (nativeInteropPartial && status.Status != "degraded")
+            {
+                status = new ColdIndexStatusResolution(
+                    "partial",
+                    "Native interop indexing is incomplete; last-good interop evidence was retained. "
+                    + NativeInteropFailureSummary(host.NativeInteropState!),
+                    status.UsesRetainedGraph
+                    || host.NativeInteropState!.RetainedLastGood);
+            }
             host.Status = status.Status;
             host.StatusMessage = status.StatusMessage;
             if (status.Status is "partial" or "degraded")
@@ -1017,6 +1086,9 @@ public sealed class LiveIndexService : BackgroundService
         var watchRoot = Path.GetFullPath(host.Scope.Root);
         var watchedExtensions = _languageDispatcher.RegisteredSourceExtensions
             .Append(".csproj")
+            .Concat(
+                host.NativeInteropCoordinator?.WatchExtensions
+                ?? Array.Empty<string>())
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToArray();
         if (watchedExtensions.Length == 0)
@@ -1089,11 +1161,23 @@ public sealed class LiveIndexService : BackgroundService
                                     host.Scope.Id,
                                     reconciliation.RoslynFailure.Reason);
                             }
+                            host.ManagedInteropInputComplete =
+                                string.IsNullOrEmpty(solutionPath)
+                                || (reconciliation.RoslynFailure is null
+                                    && reconciliation.RoslynResult is not null
+                                    && reconciliation.RoslynResult
+                                        .FailedProjects.Count == 0
+                                    && reconciliation.RoslynResult
+                                        .FailedFiles.Count == 0);
                             var languageResult = reconciliation.LanguageResult;
                             await RecordLiveLanguageFailuresAsync(
                                 host,
                                 languageResult,
                                 stoppingToken).ConfigureAwait(false);
+                            await RunLiveNativeInteropAsync(
+                                    host,
+                                    stoppingToken)
+                                .ConfigureAwait(false);
                             host.LastIndexedAt = DateTimeOffset.UtcNow;
                             _logger.LogInformation(
                                 "Scope `{Id}`: full reindex complete ({CSharpFiles} C# files, {OtherFiles} registered-language files)",
@@ -1144,6 +1228,14 @@ public sealed class LiveIndexService : BackgroundService
                                         host.Scope.Id,
                                         reconciliation.RoslynFailure.Reason);
                                 }
+                                host.ManagedInteropInputComplete =
+                                    string.IsNullOrEmpty(solutionPath)
+                                    || (reconciliation.RoslynFailure is null
+                                        && reconciliation.RoslynResult is not null
+                                        && reconciliation.RoslynResult
+                                            .FailedProjects.Count == 0
+                                        && reconciliation.RoslynResult
+                                            .FailedFiles.Count == 0);
                             }
                             else
                             {
@@ -1158,6 +1250,12 @@ public sealed class LiveIndexService : BackgroundService
                                     roslynResult is not null
                                     && roslynResult.FailedProjects.Count == 0
                                     && roslynResult.FailedFiles.Count == 0;
+                                if (csharpPaths.Length > 0)
+                                {
+                                    host.ManagedInteropInputComplete =
+                                        host.ManagedInteropInputComplete
+                                        && csharpSemanticUpdateSucceeded;
+                                }
                                 if (csharpPaths.Length > 0
                                     && !csharpSemanticUpdateSucceeded)
                                 {
@@ -1190,6 +1288,20 @@ public sealed class LiveIndexService : BackgroundService
                                 host,
                                 languageResult,
                                 stoppingToken).ConfigureAwait(false);
+                            var refreshNativeInterop =
+                                projectControlChanged
+                                || csharpPaths.Length > 0
+                                || (host.NativeInteropCoordinator is not null
+                                    && batch.Paths.Any(
+                                        host.NativeInteropCoordinator
+                                            .IsRelevantPath));
+                            if (refreshNativeInterop)
+                            {
+                                await RunLiveNativeInteropAsync(
+                                        host,
+                                        stoppingToken)
+                                    .ConfigureAwait(false);
+                            }
                             host.LastIndexedAt = DateTimeOffset.UtcNow;
                             _logger.LogInformation(
                                 "Scope `{Id}`: applied live batch ({CSharpFiles} C# indexed, {OtherFiles} registered-language indexed, {DeletedFiles} deleted)",
@@ -1356,6 +1468,57 @@ public sealed class LiveIndexService : BackgroundService
             result.FailedFiles.Count);
     }
 
+    private async Task RunLiveNativeInteropAsync(
+        ScopeHost host,
+        CancellationToken ct)
+    {
+        if (host.NativeInteropCoordinator is null)
+        {
+            return;
+        }
+
+        var result = await host.NativeInteropCoordinator.RunAsync(
+                host.ManagedInteropInputComplete,
+                ct)
+            .ConfigureAwait(false);
+        if (result.State.Status == NativeInteropRuntimeStatus.Partial)
+        {
+            host.Status = "partial";
+            host.StatusMessage =
+                "Native interop indexing is incomplete; last-good interop evidence was retained. "
+                + NativeInteropFailureSummary(result.State);
+            _logger.LogWarning(
+                "Scope `{Id}` live native interop refresh is partial: {Reason}",
+                host.Scope.Id,
+                NativeInteropFailureSummary(result.State));
+        }
+        else
+        {
+            if (host.FailedProjects.Count == 0
+                && host.FailedFiles.Count == 0)
+            {
+                host.Status = "ok";
+                host.StatusMessage = null;
+            }
+            _logger.LogInformation(
+                "Scope `{Id}` live native interop refresh complete ({Symbols} symbols, {Matches} matches, {Findings} findings)",
+                host.Scope.Id,
+                result.State.NativeSymbols,
+                result.State.ManagedMatches,
+                result.State.Findings);
+        }
+
+        await _registry.UpsertAsync(
+                ToRow(
+                    host.Scope,
+                    host.Status,
+                    host.StatusMessage,
+                    host.FailedProjects,
+                    host.FailedFiles),
+                ct)
+            .ConfigureAwait(false);
+    }
+
     internal static bool ApplyLiveLanguageFailures(
         ScopeHost host,
         LanguageDispatchResult result)
@@ -1404,6 +1567,26 @@ public sealed class LiveIndexService : BackgroundService
         if (projectCount > 0) parts.Add($"{projectCount} project(s)");
         if (fileCount > 0) parts.Add($"{fileCount} file(s)");
         return $"{prefix}: {string.Join(", ", parts)} failed.";
+    }
+
+    private static string NativeInteropFailureSummary(
+        NativeInteropRuntimeState state)
+    {
+        if (state.Failures.Count == 0)
+        {
+            return "Reason unavailable.";
+        }
+        var codes = state.Failures
+            .Select(failure => failure.Code)
+            .Where(code => !string.IsNullOrWhiteSpace(code))
+            .Distinct(StringComparer.Ordinal)
+            .OrderBy(code => code, StringComparer.Ordinal)
+            .Take(4)
+            .ToArray();
+        var omitted = Math.Max(0, state.Failures.Count - codes.Length);
+        return omitted == 0
+            ? $"Reason code(s): {string.Join(", ", codes)}."
+            : $"Reason code(s): {string.Join(", ", codes)}; {omitted} additional failure(s) omitted.";
     }
 
     private static ScopeRow ToRow(

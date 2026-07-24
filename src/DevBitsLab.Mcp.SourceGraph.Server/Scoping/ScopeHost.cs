@@ -1,6 +1,7 @@
 using DevBitsLab.Mcp.SourceGraph.Core;
 using DevBitsLab.Mcp.SourceGraph.Embeddings;
 using DevBitsLab.Mcp.SourceGraph.Indexing;
+using DevBitsLab.Mcp.SourceGraph.Server.Interop;
 using DevBitsLab.Mcp.SourceGraph.Sdk;
 using DevBitsLab.Mcp.SourceGraph.Storage;
 using DevBitsLab.Mcp.SourceGraph.Watcher;
@@ -62,6 +63,18 @@ public sealed class ScopeHost : IAsyncDisposable
     public IEmbeddingsStore EmbeddingsStore { get; }
     public RoslynIndexer Indexer { get; }
     public string SolutionPath { get; }
+    /// <summary>
+    /// Query-safe status for this scope's optional native interop pipeline. Null means the
+    /// scope has no interop configuration.
+    /// </summary>
+    public NativeInteropRuntimeState? NativeInteropState =>
+        NativeInteropCoordinator?.State;
+    internal NativeInteropCoordinator? NativeInteropCoordinator { get; set; }
+    /// <summary>
+    /// Whether the stored managed-import universe came from a complete Roslyn pass. Native
+    /// rematching fails closed while this is false.
+    /// </summary>
+    internal bool ManagedInteropInputComplete { get; set; } = true;
     /// <summary>
     /// Current scope status: one of <c>ok</c>, <c>partial</c>, <c>degraded</c>, <c>indexing</c>.
     /// <c>partial</c> means at least one project produced symbols and at least one project or
@@ -150,6 +163,11 @@ public sealed class ScopeHost : IAsyncDisposable
             EmbeddingsSink = null;
         }
         if (Watcher is not null) await Watcher.DisposeAsync().ConfigureAwait(false);
+        if (NativeInteropCoordinator is not null)
+        {
+            await NativeInteropCoordinator.DisposeAsync().ConfigureAwait(false);
+            NativeInteropCoordinator = null;
+        }
         await Indexer.DisposeAsync().ConfigureAwait(false);
         await Store.DisposeAsync().ConfigureAwait(false);
     }

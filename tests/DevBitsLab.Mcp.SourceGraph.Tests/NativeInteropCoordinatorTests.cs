@@ -113,6 +113,30 @@ public sealed class NativeInteropCoordinatorTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task Incomplete_managed_universe_publishes_native_facts_but_not_analysis()
+    {
+        Write("native/api.cpp");
+        await using var coordinator = Coordinator(
+            new FixedTrustPolicy(allowed: true),
+            (request, _) => Task.FromResult(Extraction(
+                request,
+                Export(request, "c:E:native/api.cpp::run"))));
+
+        var result = await coordinator.RunAsync(
+            isManagedUniverseComplete: false);
+
+        result.State.Status.Should().Be(
+            NativeInteropRuntimeStatus.Partial);
+        result.State.IsExportUniverseComplete.Should().BeFalse();
+        result.State.Failures.Should().ContainSingle()
+            .Which.Code.Should().Be("managed-snapshot-incomplete");
+        result.NativePublication.Should().NotBeNull();
+        result.AnalysisPublication.Should().BeNull();
+        (await InteropFactStoreReader.ReadNativeExportsAsync(_store!))
+            .Facts.Should().ContainSingle();
+    }
+
+    [Fact]
     public async Task Partial_rebuild_retains_last_complete_native_projection()
     {
         Write("native/api.cpp");
@@ -214,6 +238,23 @@ public sealed class NativeInteropCoordinatorTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task Native_watch_set_recognizes_new_headers_without_prior_fanout()
+    {
+        await using var coordinator = Coordinator(
+            new FixedTrustPolicy(allowed: true),
+            (_, _) => throw new InvalidOperationException());
+
+        coordinator.WatchExtensions.Should().Contain(
+            [".cpp", ".h", ".hpp", ".dll"]);
+        coordinator.IsRelevantPath(
+            Path.Join(_root, "native", "new-header.hpp"))
+            .Should().BeTrue();
+        coordinator.IsRelevantPath(
+            Path.Join(_root, "managed", "Service.cs"))
+            .Should().BeFalse();
+    }
+
+    [Fact]
     public async Task Cancellation_is_propagated_without_claiming_a_partial_result()
     {
         Write("native/api.cpp");
@@ -229,7 +270,8 @@ public sealed class NativeInteropCoordinatorTests : IAsyncLifetime
                 throw new InvalidOperationException();
             });
 
-        Func<Task> act = () => coordinator.RunAsync(cancellation.Token);
+        Func<Task> act = () => coordinator.RunAsync(
+            cancellationToken: cancellation.Token);
 
         await act.Should().ThrowAsync<OperationCanceledException>();
         coordinator.State.Status.Should().Be(
