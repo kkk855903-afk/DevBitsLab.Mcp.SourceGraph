@@ -748,15 +748,30 @@ public sealed partial class SqliteGraphStore : IGraphStore
         }
     }
 
+    public Task ReconcileFileDeclarationsAndAnnotationsAsync(
+        string filePath,
+        IReadOnlyCollection<string> keysToKeep,
+        IReadOnlyList<FileAnnotationFact> annotations,
+        CancellationToken ct = default)
+        => ReconcileFileDeclarationsAndAnnotationsAsync(
+            filePath,
+            keysToKeep,
+            annotations,
+            Array.Empty<string>(),
+            ct);
+
     public async Task ReconcileFileDeclarationsAndAnnotationsAsync(
         string filePath,
         IReadOnlyCollection<string> keysToKeep,
         IReadOnlyList<FileAnnotationFact> annotations,
+        IReadOnlyCollection<string> annotationFlavorsToPreserve,
         CancellationToken ct = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(filePath);
         ArgumentNullException.ThrowIfNull(keysToKeep);
         ArgumentNullException.ThrowIfNull(annotations);
+        ArgumentNullException.ThrowIfNull(annotationFlavorsToPreserve);
+        ct.ThrowIfCancellationRequested();
 
         // Snapshot and validate caller-owned collections before acquiring the write lock. This
         // prevents concurrent collection mutation from changing the keep/annotation set between
@@ -771,9 +786,30 @@ public sealed partial class SqliteGraphStore : IGraphStore
             .OrderBy(key => key, StringComparer.Ordinal)
             .ToArray();
 
+        var preservedFlavorSet = new HashSet<string>(StringComparer.Ordinal);
+        var candidatePreservedFlavors = annotationFlavorsToPreserve.ToArray();
+        for (var index = 0; index < candidatePreservedFlavors.Length; index++)
+        {
+            ct.ThrowIfCancellationRequested();
+            var flavor = candidatePreservedFlavors[index];
+            KebabCaseValidator.Validate(
+                flavor,
+                nameof(annotationFlavorsToPreserve));
+            if (!preservedFlavorSet.Add(flavor))
+            {
+                throw new ArgumentException(
+                    $"Preserved annotation flavor `{flavor}` is duplicated (index {index}).",
+                    nameof(annotationFlavorsToPreserve));
+            }
+        }
+        var orderedPreservedFlavors = preservedFlavorSet
+            .OrderBy(flavor => flavor, StringComparer.Ordinal)
+            .ToArray();
+
         var candidateAnnotations = new FileAnnotationFact[annotations.Count];
         for (var index = 0; index < annotations.Count; index++)
         {
+            ct.ThrowIfCancellationRequested();
             var annotation = annotations[index]
                 ?? throw new ArgumentException(
                     $"Annotation reconciliation contains a null fact at index {index}.",
@@ -838,8 +874,11 @@ public sealed partial class SqliteGraphStore : IGraphStore
                     key TEXT PRIMARY KEY);
                 CREATE TEMP TABLE IF NOT EXISTS reconcile_stale_symbol_ids(
                     id INTEGER PRIMARY KEY);
+                CREATE TEMP TABLE IF NOT EXISTS reconcile_preserved_annotation_flavors(
+                    flavor TEXT PRIMARY KEY);
                 DELETE FROM reconcile_keep_keys;
                 DELETE FROM reconcile_stale_symbol_ids;
+                DELETE FROM reconcile_preserved_annotation_flavors;
                 """,
                 transaction: tx,
                 cancellationToken: ct)).ConfigureAwait(false);
@@ -848,6 +887,17 @@ public sealed partial class SqliteGraphStore : IGraphStore
                 await _connection.ExecuteAsync(new CommandDefinition(
                     "INSERT INTO reconcile_keep_keys(key) VALUES (@key);",
                     orderedKeepKeys.Select(key => new { key }),
+                    transaction: tx,
+                    cancellationToken: ct)).ConfigureAwait(false);
+            }
+            if (orderedPreservedFlavors.Length > 0)
+            {
+                await _connection.ExecuteAsync(new CommandDefinition(
+                    """
+                    INSERT INTO reconcile_preserved_annotation_flavors(flavor)
+                    VALUES (@flavor);
+                    """,
+                    orderedPreservedFlavors.Select(flavor => new { flavor }),
                     transaction: tx,
                     cancellationToken: ct)).ConfigureAwait(false);
             }
@@ -1006,8 +1056,17 @@ public sealed partial class SqliteGraphStore : IGraphStore
 
                 DELETE FROM annotations
                 WHERE symbol_id IN (
-                    SELECT id FROM symbols WHERE file_id = @FileId
-                );
+                    SELECT id FROM reconcile_stale_symbol_ids
+                )
+                   OR (
+                       symbol_id IN (
+                           SELECT id FROM symbols WHERE file_id = @FileId
+                       )
+                       AND flavor NOT IN (
+                           SELECT flavor
+                           FROM reconcile_preserved_annotation_flavors
+                       )
+                   );
 
                 DELETE FROM diagnostics
                 WHERE file_id = @FileId
@@ -1078,6 +1137,7 @@ public sealed partial class SqliteGraphStore : IGraphStore
                 """
                 DELETE FROM reconcile_keep_keys;
                 DELETE FROM reconcile_stale_symbol_ids;
+                DELETE FROM reconcile_preserved_annotation_flavors;
                 """,
                 transaction: tx,
                 cancellationToken: ct)).ConfigureAwait(false);

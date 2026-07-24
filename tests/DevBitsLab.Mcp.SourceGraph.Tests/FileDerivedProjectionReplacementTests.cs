@@ -515,6 +515,138 @@ public sealed class FileDerivedProjectionReplacementTests : IAsyncLifetime
         await AssertOldProjectionAsync(sourceId, targetId);
     }
 
+    [Fact]
+    public async Task Batch_unresolved_endpoint_in_second_projection_preserves_both_last_good()
+    {
+        var firstPath = Path.Join(_tempDir, "First.cs");
+        var secondPath = Path.Join(_tempDir, "Second.cs");
+        var nativePath = Path.Join(_tempDir, "native.h");
+        var firstFileId = await SeedFileAsync(firstPath);
+        var secondFileId = await SeedFileAsync(secondPath);
+        var nativeFileId = await SeedFileAsync(nativePath);
+        var firstKey = "csharp:M:NativeMethods.First";
+        var secondKey = "csharp:M:NativeMethods.Second";
+        var targetKey = "c:E:native.h::compute";
+        var firstId = await SeedSymbolAsync(firstFileId, firstKey, "First");
+        var secondId = await SeedSymbolAsync(secondFileId, secondKey, "Second");
+        var targetId = await SeedSymbolAsync(nativeFileId, targetKey, "compute");
+        await SeedOldProjectionAsync(firstPath, firstFileId, firstId, targetId);
+        await SeedOldProjectionAsync(secondPath, secondFileId, secondId, targetId);
+
+        var replace = () => _store!.ReplaceFileDerivedProjectionsAsync(
+        [
+            new FileDerivedProjectionReplacement(
+                firstPath,
+                Producer,
+                [FindingFlavor],
+                [Fact(firstKey, "FirstCandidate", FindingFlavor)],
+                [EdgeFact(firstKey, targetKey, firstPath, line: 10)]),
+            new FileDerivedProjectionReplacement(
+                secondPath,
+                Producer,
+                [FindingFlavor],
+                [Fact(secondKey, "SecondCandidate", FindingFlavor)],
+                [
+                    EdgeFact(
+                        secondKey,
+                        "c:E:native.h::missing",
+                        secondPath,
+                        line: 20),
+                ]),
+        ]);
+
+        await replace.Should().ThrowAsync<InvalidOperationException>()
+            .WithMessage("*native.h::missing*");
+        await AssertOldProjectionAsync(firstId, targetId);
+        await AssertOldProjectionAsync(secondId, targetId);
+    }
+
+    [Fact]
+    public async Task Batch_sql_failure_in_second_projection_rolls_back_both_last_good()
+    {
+        var firstPath = Path.Join(_tempDir, "First.cs");
+        var secondPath = Path.Join(_tempDir, "Second.cs");
+        var nativePath = Path.Join(_tempDir, "native.h");
+        var firstFileId = await SeedFileAsync(firstPath);
+        var secondFileId = await SeedFileAsync(secondPath);
+        var nativeFileId = await SeedFileAsync(nativePath);
+        var firstKey = "csharp:M:NativeMethods.First";
+        var secondKey = "csharp:M:NativeMethods.Second";
+        var targetKey = "c:E:native.h::compute";
+        var firstId = await SeedSymbolAsync(firstFileId, firstKey, "First");
+        var secondId = await SeedSymbolAsync(secondFileId, secondKey, "Second");
+        var targetId = await SeedSymbolAsync(nativeFileId, targetKey, "compute");
+        await SeedOldProjectionAsync(firstPath, firstFileId, firstId, targetId);
+        await SeedOldProjectionAsync(secondPath, secondFileId, secondId, targetId);
+        await ExecuteAsync(
+            $"""
+            CREATE TRIGGER fail_second_derived_projection
+            BEFORE INSERT ON edge_evidence
+            WHEN NEW.producer = '{Producer}' AND NEW.start_line = 20
+            BEGIN
+                SELECT RAISE(ABORT, 'forced second projection failure');
+            END;
+            """);
+
+        var replace = () => _store!.ReplaceFileDerivedProjectionsAsync(
+        [
+            new FileDerivedProjectionReplacement(
+                firstPath,
+                Producer,
+                [FindingFlavor],
+                [Fact(firstKey, "FirstCandidate", FindingFlavor)],
+                [EdgeFact(firstKey, targetKey, firstPath, line: 10)]),
+            new FileDerivedProjectionReplacement(
+                secondPath,
+                Producer,
+                [FindingFlavor],
+                [Fact(secondKey, "SecondCandidate", FindingFlavor)],
+                [EdgeFact(secondKey, targetKey, secondPath, line: 20)]),
+        ]);
+
+        await replace.Should().ThrowAsync<SqliteException>();
+        await AssertOldProjectionAsync(firstId, targetId);
+        await AssertOldProjectionAsync(secondId, targetId);
+    }
+
+    [Fact]
+    public async Task Batch_duplicate_producing_path_is_rejected_before_cleanup()
+    {
+        var managedPath = Path.Join(_tempDir, "Managed.cs");
+        var nativePath = Path.Join(_tempDir, "native.h");
+        var managedFileId = await SeedFileAsync(managedPath);
+        var nativeFileId = await SeedFileAsync(nativePath);
+        var sourceKey = "csharp:M:NativeMethods.Compute";
+        var targetKey = "c:E:native.h::compute";
+        var sourceId = await SeedSymbolAsync(managedFileId, sourceKey, "Compute");
+        var targetId = await SeedSymbolAsync(nativeFileId, targetKey, "compute");
+        await SeedOldProjectionAsync(
+            managedPath,
+            managedFileId,
+            sourceId,
+            targetId);
+
+        var replace = () => _store!.ReplaceFileDerivedProjectionsAsync(
+        [
+            new FileDerivedProjectionReplacement(
+                managedPath,
+                Producer,
+                [FindingFlavor],
+                [Fact(sourceKey, "FirstCandidate", FindingFlavor)],
+                [EdgeFact(sourceKey, targetKey, managedPath, line: 10)]),
+            new FileDerivedProjectionReplacement(
+                Path.Join(_tempDir, ".", "Managed.cs"),
+                Producer,
+                [FindingFlavor],
+                [],
+                []),
+        ]);
+
+        await replace.Should().ThrowAsync<ArgumentException>()
+            .WithMessage("*duplicate producing file path*");
+        await AssertOldProjectionAsync(sourceId, targetId);
+    }
+
     private async Task SeedOldProjectionAsync(
         string producingPath,
         long producingFileId,

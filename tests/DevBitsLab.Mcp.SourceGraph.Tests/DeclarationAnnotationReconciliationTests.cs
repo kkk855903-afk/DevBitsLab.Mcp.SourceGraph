@@ -178,6 +178,81 @@ public sealed class DeclarationAnnotationReconciliationTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task Preserved_flavors_survive_only_on_retained_symbols()
+    {
+        const string findingFlavor = "interop-finding";
+        const string matchFlavor = "interop-match";
+        var path = Path.Join(_tempDir, "Managed.cs");
+        var fileId = await SeedFileAsync(path);
+        var keepKey = "csharp:M:NativeMethods.Keep";
+        var staleKey = "csharp:M:NativeMethods.Stale";
+        var keepId = await SeedSymbolAsync(fileId, keepKey, "Keep");
+        var staleId = await SeedSymbolAsync(fileId, staleKey, "Stale");
+        await _store!.BulkInsertAnnotationsAsync(
+        [
+            Stored(keepId, "OldAttribute", "csharp-attribute"),
+            Stored(keepId, "KeepFinding", findingFlavor),
+            Stored(keepId, "KeepMatch", matchFlavor),
+            Stored(staleId, "StaleFinding", findingFlavor),
+        ]);
+
+        await _store.ReconcileFileDeclarationsAndAnnotationsAsync(
+            path,
+            [keepKey],
+            [Fact(keepKey, "NewAttribute", "csharp-attribute")],
+            [findingFlavor, matchFlavor]);
+
+        (await _store.ListSymbolsInFileAsync(path))
+            .Should().ContainSingle()
+            .Which.CanonicalKey.Should().Be(keepKey);
+        (await FindSymbolIdAsync(staleKey)).Should().BeNull();
+        var retainedAnnotations = await _store.GetAnnotationsForSymbolAsync(keepId);
+        retainedAnnotations.Select(annotation => annotation.Name).Should().BeEquivalentTo(
+        [
+            "KeepFinding",
+            "KeepMatch",
+            "NewAttribute",
+        ]);
+        retainedAnnotations.Should().NotContain(annotation =>
+            annotation.Name == "OldAttribute");
+        (await _store.GetAnnotationsForSymbolAsync(staleId)).Should().BeEmpty(
+            "preserved flavors never retain annotations hosted by stale declarations");
+    }
+
+    [Fact]
+    public async Task Invalid_preserved_flavor_set_is_rejected_without_changing_old_state()
+    {
+        const string findingFlavor = "interop-finding";
+        var path = Path.Join(_tempDir, "Managed.cs");
+        var fileId = await SeedFileAsync(path);
+        var key = "csharp:M:NativeMethods.Keep";
+        var symbolId = await SeedSymbolAsync(fileId, key, "Keep");
+        await _store!.BulkInsertAnnotationsAsync(
+            [Stored(symbolId, "Old", findingFlavor)]);
+
+        var invalidFlavor = () =>
+            _store.ReconcileFileDeclarationsAndAnnotationsAsync(
+                path,
+                [key],
+                [],
+                ["Interop-Finding"]);
+        var duplicateFlavor = () =>
+            _store.ReconcileFileDeclarationsAndAnnotationsAsync(
+                path,
+                [key],
+                [],
+                [findingFlavor, findingFlavor]);
+
+        await invalidFlavor.Should().ThrowAsync<ArgumentException>();
+        await duplicateFlavor.Should().ThrowAsync<ArgumentException>()
+            .WithMessage("*duplicated*");
+        (await _store.ListSymbolsInFileAsync(path)).Should().ContainSingle();
+        (await _store.GetAnnotationsForSymbolAsync(symbolId))
+            .Should().ContainSingle()
+            .Which.Name.Should().Be("Old");
+    }
+
+    [Fact]
     public async Task HostOutsideKeepSet_isRejectedWithoutChangingOldState()
     {
         var path = Path.Join(_tempDir, "Managed.cs");

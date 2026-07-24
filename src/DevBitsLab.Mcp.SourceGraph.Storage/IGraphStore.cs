@@ -98,6 +98,19 @@ public interface IGraphStore : IAsyncDisposable
         throw new NotSupportedException(
             "This graph-store implementation predates atomic file-derived projection replacement.");
 
+    /// <summary>
+    /// Atomically replaces derived projections for multiple distinct producing files. Every
+    /// caller-owned collection is snapshotted and every file, annotation, edge, and canonical
+    /// endpoint is validated and resolved before any prior row is changed. Empty per-file fact
+    /// collections perform precise cleanup while preserving unselected annotation flavors and
+    /// evidence from other producers.
+    /// </summary>
+    Task ReplaceFileDerivedProjectionsAsync(
+        IReadOnlyList<FileDerivedProjectionReplacement> projections,
+        CancellationToken ct = default) =>
+        throw new NotSupportedException(
+            "This graph-store implementation predates atomic multi-file derived projection replacement.");
+
     /// <summary>Delete every symbol declared in <paramref name="fileId"/> whose canonical key is not in
     /// <paramref name="keysToKeep"/>, plus all refs/edges that touch those removed symbols.</summary>
     Task DeleteSymbolsForFileNotInAsync(long fileId, IReadOnlyCollection<string> keysToKeep, CancellationToken ct = default);
@@ -187,6 +200,20 @@ public interface IGraphStore : IAsyncDisposable
         CancellationToken ct = default) =>
         throw new NotSupportedException(
             "This graph-store implementation predates atomic declaration/annotation reconciliation.");
+
+    /// <summary>
+    /// Reconciles one file like the backward-compatible overload while retaining annotations
+    /// whose flavor is in <paramref name="annotationFlavorsToPreserve"/> on surviving symbols.
+    /// Annotations hosted by stale symbols are always removed, including preserved flavors.
+    /// </summary>
+    Task ReconcileFileDeclarationsAndAnnotationsAsync(
+        string filePath,
+        IReadOnlyCollection<string> keysToKeep,
+        IReadOnlyList<FileAnnotationFact> annotations,
+        IReadOnlyCollection<string> annotationFlavorsToPreserve,
+        CancellationToken ct = default) =>
+        throw new NotSupportedException(
+            "This graph-store implementation predates flavor-preserving declaration/annotation reconciliation.");
 
     /// <summary>Upsert a symbol by canonical key. Returns the symbol's stable id (existing or newly created).</summary>
     Task<long> UpsertSymbolAsync(string canonicalKey, Symbol symbol, CancellationToken ct = default);
