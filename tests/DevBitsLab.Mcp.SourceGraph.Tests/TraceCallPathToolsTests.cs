@@ -425,6 +425,64 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
             "does not accept `kind` together");
     }
 
+    [Fact]
+    public void ExecutionState_becomesNonAuthoritative_whenGraphOrRuntimeChanges()
+    {
+        var complete = new TraceCallPathExecutionState(
+            "complete",
+            Partial: false,
+            AbsenceAuthoritative: true,
+            RetainedLastGood: false,
+            Projections:
+            [
+                new TraceCallPathProjectionState(
+                    "scope",
+                    "ok",
+                    Applicable: true,
+                    Authoritative: true,
+                    RetainedLastGood: false,
+                    FailureCount: 0),
+            ],
+            Failures: []);
+        var version = new GraphReadVersion(10, 3);
+
+        TraceCallPathTools.ReconcileExecutionState(
+                complete,
+                version,
+                version,
+                runtimeStateChanged: false)
+            .Should().BeSameAs(complete);
+
+        var graphChanged = TraceCallPathTools.ReconcileExecutionState(
+            complete,
+            version,
+            version with { ConnectionChanges = 11 },
+            runtimeStateChanged: false);
+        var runtimeChanged = TraceCallPathTools.ReconcileExecutionState(
+            complete,
+            version,
+            version,
+            runtimeStateChanged: true);
+
+        foreach (var reconciled in new[]
+                 {
+                     graphChanged,
+                     runtimeChanged,
+                 })
+        {
+            reconciled.Status.Should().Be("partial");
+            reconciled.Partial.Should().BeTrue();
+            reconciled.AbsenceAuthoritative.Should().BeFalse();
+            reconciled.Projections.Should().ContainSingle(projection =>
+                projection.Name == "query-snapshot"
+                && !projection.Authoritative);
+            reconciled.Failures.Should().ContainSingle(failure =>
+                failure.StartsWith(
+                    "query-snapshot:",
+                    StringComparison.Ordinal));
+        }
+    }
+
     private async Task<SeededSymbol> SeedSymbolAsync(
         SqliteGraphStore store,
         string name)

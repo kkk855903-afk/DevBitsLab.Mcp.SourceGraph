@@ -234,13 +234,18 @@ public static class TraceCallPathTools
             }
             catch (Exception ex)
             {
+                var failedExecutionState = executionProfile
+                    ? MarkExecutionUnstable(
+                        BuildExecutionState(host),
+                        "The graph query did not complete against a stable read.")
+                    : null;
                 return new TraceCallPathScopeResult(
                     host.Scope.Id,
                     Array.Empty<TraceCallPath>(),
                     Truncated: false,
                     ExpandedNodes: 0,
                     Note: $"scope query failed: {ex.Message}",
-                    ExecutionState: executionState);
+                    ExecutionState: failedExecutionState);
             }
         })).ConfigureAwait(false);
         sw.Stop();
@@ -318,6 +323,14 @@ public static class TraceCallPathTools
         int maxNodes,
         CancellationToken ct)
     {
+        GraphReadVersion? initialReadVersion = null;
+        ExecutionProjectionStamp? initialProjectionStamp = null;
+        if (executionProfile)
+        {
+            initialReadVersion = await host.Store.GetReadVersionAsync(ct)
+                .ConfigureAwait(false);
+            initialProjectionStamp = CaptureProjectionStamp(host);
+        }
         var executionState = executionProfile
             ? BuildExecutionState(host)
             : null;
@@ -327,6 +340,8 @@ public static class TraceCallPathTools
             ct).ConfigureAwait(false);
         if (sources.Count == 0)
         {
+            executionState = await FinalizeExecutionStateAsync()
+                .ConfigureAwait(false);
             var missingSourceNote =
                 $"No source symbol matches '{fromQuery}'.";
             return new TraceCallPathScopeResult(
@@ -346,6 +361,8 @@ public static class TraceCallPathTools
             ct).ConfigureAwait(false);
         if (targets.Count == 0)
         {
+            executionState = await FinalizeExecutionStateAsync()
+                .ConfigureAwait(false);
             var missingTargetNote =
                 $"No destination symbol matches '{toQuery}'.";
             return new TraceCallPathScopeResult(
@@ -483,6 +500,8 @@ public static class TraceCallPathTools
             }
         }
 
+        executionState = await FinalizeExecutionStateAsync()
+            .ConfigureAwait(false);
         var note = paths.Count == 0
             ? executionProfile
                 ? $"No execution-profile path found within depth {maxDepth}."
@@ -546,6 +565,33 @@ public static class TraceCallPathTools
                 MapSymbol(target),
                 confidence,
                 state.Hops));
+        }
+
+        async Task<TraceCallPathExecutionState?>
+            FinalizeExecutionStateAsync()
+        {
+            if (!executionProfile) return null;
+
+            var finalProjectionStampBefore =
+                CaptureProjectionStamp(host);
+            var finalState = BuildExecutionState(host);
+            var finalProjectionStampAfter =
+                CaptureProjectionStamp(host);
+            var finalReadVersion = await host.Store
+                .GetReadVersionAsync(ct)
+                .ConfigureAwait(false);
+            var runtimeChanged =
+                !ProjectionStampEquals(
+                    initialProjectionStamp!,
+                    finalProjectionStampBefore)
+                || !ProjectionStampEquals(
+                    finalProjectionStampBefore,
+                    finalProjectionStampAfter);
+            return ReconcileExecutionState(
+                finalState,
+                initialReadVersion!.Value,
+                finalReadVersion,
+                runtimeChanged);
         }
     }
 
@@ -732,6 +778,87 @@ public static class TraceCallPathTools
             projections,
             boundedFailures);
     }
+
+    internal static TraceCallPathExecutionState ReconcileExecutionState(
+        TraceCallPathExecutionState current,
+        GraphReadVersion initialReadVersion,
+        GraphReadVersion finalReadVersion,
+        bool runtimeStateChanged)
+    {
+        ArgumentNullException.ThrowIfNull(current);
+        return initialReadVersion == finalReadVersion
+            && !runtimeStateChanged
+                ? current
+                : MarkExecutionUnstable(
+                    current,
+                    "The graph or projection runtime changed while this path was being read.");
+    }
+
+    private static TraceCallPathExecutionState MarkExecutionUnstable(
+        TraceCallPathExecutionState current,
+        string failure)
+    {
+        var projections = current.Projections
+            .Where(projection =>
+                !string.Equals(
+                    projection.Name,
+                    "query-snapshot",
+                    StringComparison.Ordinal))
+            .Append(new TraceCallPathProjectionState(
+                "query-snapshot",
+                "changed",
+                Applicable: true,
+                Authoritative: false,
+                RetainedLastGood: false,
+                FailureCount: 1))
+            .ToArray();
+        var failures = current.Failures
+            .Append($"query-snapshot: {failure}")
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+        IReadOnlyList<string> boundedFailures = failures.Length
+            <= MaximumReportedProjectionFailures
+            ? failures
+            : failures
+                .Take(MaximumReportedProjectionFailures - 1)
+                .Append(
+                    $"{failures.Length - MaximumReportedProjectionFailures + 1} additional projection failure(s) omitted.")
+                .ToArray();
+        return current with
+        {
+            Status = "partial",
+            Partial = true,
+            AbsenceAuthoritative = false,
+            Projections = projections,
+            Failures = boundedFailures,
+        };
+    }
+
+    private static ExecutionProjectionStamp CaptureProjectionStamp(
+        ScopeHost host) =>
+        new(
+            host.Status,
+            host.StatusMessage,
+            host.FailedProjects,
+            host.FailedFiles,
+            host.ManagedInteropInputComplete,
+            host.GrpcLinkState,
+            host.NativeInteropState);
+
+    private static bool ProjectionStampEquals(
+        ExecutionProjectionStamp left,
+        ExecutionProjectionStamp right) =>
+        string.Equals(left.ScopeStatus, right.ScopeStatus, StringComparison.Ordinal)
+        && string.Equals(
+            left.ScopeStatusMessage,
+            right.ScopeStatusMessage,
+            StringComparison.Ordinal)
+        && ReferenceEquals(left.FailedProjects, right.FailedProjects)
+        && ReferenceEquals(left.FailedFiles, right.FailedFiles)
+        && left.ManagedInteropInputComplete
+            == right.ManagedInteropInputComplete
+        && ReferenceEquals(left.Grpc, right.Grpc)
+        && ReferenceEquals(left.Native, right.Native);
 
     private static string AppendNote(string? current, string addition) =>
         string.IsNullOrWhiteSpace(current)
@@ -937,4 +1064,13 @@ public static class TraceCallPathTools
         SymbolHit Current,
         List<TraceCallPathHop> Hops,
         HashSet<long> Visited);
+
+    private sealed record ExecutionProjectionStamp(
+        string ScopeStatus,
+        string? ScopeStatusMessage,
+        object FailedProjects,
+        object FailedFiles,
+        bool ManagedInteropInputComplete,
+        GrpcLinkRuntimeState? Grpc,
+        NativeInteropRuntimeState? Native);
 }
