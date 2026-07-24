@@ -137,13 +137,15 @@ public static class Phase1CompatibilityTools
     [ToolAnnotation(ReadOnlyHint = true, IdempotentHint = true)]
     [ToolTrigger("\"trace a call or execution path from A to B\"")]
     [Description(
-        "Trace bounded evidence-backed paths between two indexed symbols. Compatibility name for " +
-        "trace_call_path; defaults to calls. Set profile=execution for the evidence-backed " +
-        "UI-to-native execution relation whitelist and projection-completeness disclosure.")]
+        "Trace bounded evidence-backed paths between indexed symbols. Compatibility name for " +
+        "trace_call_path; defaults to calls and requires `to`. Set profile=execution for the " +
+        "ordered UI-to-native execution state machine and projection-completeness disclosure; " +
+        "with an exact canonical `from`, execution mode may omit `to` to discover proven terminal algorithms.")]
     public static Task<CallToolResult> TraceCallWithProfileAsync(
         ScopeRouter router,
         [Description("Starting symbol name or qualified name")] string from,
-        [Description("Destination symbol name or qualified name")] string to,
+        [Description("Destination symbol name or qualified name; optional only for execution terminal discovery")]
+        string? to = null,
         [Description("Kebab-case edge relation to traverse (default calls)")] string? kind = null,
         [Description("Optional traversal profile; use execution for cross-domain execution flow")]
         string? profile = null,

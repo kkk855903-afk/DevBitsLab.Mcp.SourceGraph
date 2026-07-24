@@ -30,6 +30,11 @@ public static class TraceCallPathTools
     private const int MaximumQueryCharacters = 4096;
     private const int MaximumScopeFanout = 32;
     private const string ExecutionProfile = "execution";
+    private const string ExecutionTerminalDefinition =
+        "A terminal algorithm is reached only by binds-path, command-executes, one or more "
+        + "managed calls, grpc-calls, rpc-dispatches-to, one or more server calls, "
+        + "pinvoke-maps-to, and one or more native calls, in that order; its final node has "
+        + "no auditable outbound calls edge.";
     private static readonly string[] ExecutionRelations =
     [
         "binds-path",
@@ -75,11 +80,12 @@ public static class TraceCallPathTools
         OutputSchemaType = typeof(TraceCallPathResult))]
     [ToolAnnotation(ReadOnlyHint = true, IdempotentHint = true)]
     [ToolTrigger("\"show how execution can flow from A to B\"")]
-    [Description("Trace bounded directed paths between two indexed symbols. Defaults to calls edges. Set profile=execution to follow only the evidence-backed UI → command → managed call → gRPC dispatch → P/Invoke execution relations. Exact canonical-key inputs never use fuzzy matching. Every hop includes occurrence evidence, and execution results disclose whether current absence claims are authoritative.")]
+    [Description("Trace bounded directed paths between indexed symbols. Defaults to calls edges and requires `to`. Set profile=execution to follow the ordered evidence-backed UI → command → managed call → gRPC dispatch → P/Invoke state machine. Execution mode may omit `to` when `from` is an exact canonical key; it then returns only proven terminal native algorithms. Exact canonical-key inputs never use fuzzy matching. Every hop includes occurrence evidence, and execution results disclose whether current absence claims are authoritative.")]
     public static Task<CallToolResult> TraceCallPathWithProfileAsync(
         ScopeRouter router,
         [Description("Starting symbol name, FQN, or exact canonical key")] string from,
-        [Description("Destination symbol name, FQN, or exact canonical key")] string to,
+        [Description("Destination symbol name, FQN, or exact canonical key. May be omitted only with profile=execution and an exact canonical `from`.")]
+        string? to = null,
         [Description("Kebab-case edge relation to traverse (default calls)")] string? kind = null,
         [Description("Optional traversal profile. Use execution for the cross-domain execution relation whitelist; omit for one relation.")]
         string? profile = null,
@@ -106,7 +112,7 @@ public static class TraceCallPathTools
     private static async Task<CallToolResult> TraceCallPathImplAsync(
         ScopeRouter router,
         string from,
-        string to,
+        string? to,
         string? kind,
         string? profile,
         int maxDepth,
@@ -115,22 +121,15 @@ public static class TraceCallPathTools
         object? scope,
         CancellationToken ct)
     {
-        if (string.IsNullOrWhiteSpace(from) || string.IsNullOrWhiteSpace(to))
+        if (string.IsNullOrWhiteSpace(from))
         {
-            return DiagnosticResult.Error("trace_call_path requires non-empty `from` and `to` symbols.");
+            return DiagnosticResult.Error("trace_call_path requires a non-empty `from` symbol.");
         }
         if (from.Trim().Length > MaximumQueryCharacters
-            || to.Trim().Length > MaximumQueryCharacters)
+            || to?.Trim().Length > MaximumQueryCharacters)
         {
             return DiagnosticResult.Error(
                 $"trace_call_path symbol queries must not exceed {MaximumQueryCharacters} characters.");
-        }
-        var canonicalIntentError =
-            ValidateCanonicalIntent(from, "from")
-            ?? ValidateCanonicalIntent(to, "to");
-        if (canonicalIntentError is not null)
-        {
-            return DiagnosticResult.Error(canonicalIntentError);
         }
         if (maxDepth is < 1 or > 12)
         {
@@ -154,6 +153,26 @@ public static class TraceCallPathTools
                 "trace_call_path `profile` must be `execution` when supplied.");
         }
         var executionProfile = normalizedProfile == ExecutionProfile;
+        var discoverTerminal = executionProfile
+            && string.IsNullOrWhiteSpace(to);
+        if (!discoverTerminal && string.IsNullOrWhiteSpace(to))
+        {
+            return DiagnosticResult.Error(
+                "trace_call_path requires a non-empty `to` symbol unless `profile=execution` discovers terminal algorithms.");
+        }
+        if (discoverTerminal
+            && !CanonicalKeyValidator.IsValid(from.Trim()))
+        {
+            return DiagnosticResult.Error(
+                "trace_call_path requires an exact canonical `from` key when `profile=execution` omits `to`.");
+        }
+        var canonicalIntentError =
+            ValidateCanonicalIntent(from, "from")
+            ?? (discoverTerminal ? null : ValidateCanonicalIntent(to!, "to"));
+        if (canonicalIntentError is not null)
+        {
+            return DiagnosticResult.Error(canonicalIntentError);
+        }
         if (executionProfile && !string.IsNullOrWhiteSpace(kind))
         {
             return DiagnosticResult.Error(
@@ -223,6 +242,7 @@ public static class TraceCallPathTools
                     edgeKind,
                     relations,
                     executionProfile,
+                    discoverTerminal,
                     maxDepth,
                     maxPaths,
                     maxNodes,
@@ -252,8 +272,10 @@ public static class TraceCallPathTools
 
         var dto = new TraceCallPathResult(
             from,
-            to,
+            discoverTerminal ? null : to,
             normalizedProfile,
+            discoverTerminal ? "execution-terminal" : "explicit-target",
+            discoverTerminal ? ExecutionTerminalDefinition : null,
             edgeKind,
             relations,
             maxDepth,
@@ -314,10 +336,11 @@ public static class TraceCallPathTools
     private static async Task<TraceCallPathScopeResult> TraceScopeAsync(
         ScopeHost host,
         string fromQuery,
-        string toQuery,
+        string? toQuery,
         string? edgeKind,
         IReadOnlyList<string> relations,
         bool executionProfile,
+        bool discoverTerminal,
         int maxDepth,
         int maxPaths,
         int maxNodes,
@@ -355,11 +378,13 @@ public static class TraceCallPathTools
                 ExecutionState: executionState);
         }
 
-        var targets = await ResolveSymbolsAsync(
-            host.Store,
-            toQuery,
-            ct).ConfigureAwait(false);
-        if (targets.Count == 0)
+        IReadOnlyList<SymbolHit> targets = discoverTerminal
+            ? []
+            : await ResolveSymbolsAsync(
+                host.Store,
+                toQuery!,
+                ct).ConfigureAwait(false);
+        if (!discoverTerminal && targets.Count == 0)
         {
             executionState = await FinalizeExecutionStateAsync()
                 .ConfigureAwait(false);
@@ -387,7 +412,10 @@ public static class TraceCallPathTools
             queue.Enqueue(new PathState(
                 source,
                 new List<TraceCallPathHop>(),
-                new HashSet<long> { source.Id }));
+                new HashSet<long> { source.Id },
+                executionProfile
+                    ? ExecutionStage.AwaitBinding
+                    : ExecutionStage.Relation));
         }
 
         var paths = new List<TraceCallPath>(maxPaths);
@@ -403,6 +431,22 @@ public static class TraceCallPathTools
         {
             ct.ThrowIfCancellationRequested();
             var state = queue.Dequeue();
+            if (discoverTerminal
+                && state.Stage == ExecutionStage.NativeAlgorithm
+                && !await HasAnyAuditableOutboundAsync(
+                    host.Store,
+                    state.Current.Id,
+                    EdgeKinds.Calls,
+                    ct).ConfigureAwait(false))
+            {
+                AddCompletedPath(state, state.Current);
+                if (paths.Count >= maxPaths)
+                {
+                    truncated |= queue.Count > 0;
+                    break;
+                }
+                continue;
+            }
             if (targetsById.TryGetValue(state.Current.Id, out var reachedTarget))
             {
                 AddCompletedPath(state, reachedTarget);
@@ -418,7 +462,6 @@ public static class TraceCallPathTools
                 truncated |= await HasUnexploredOutboundAsync(
                     host.Store,
                     state,
-                    relations,
                     ct).ConfigureAwait(false);
                 continue;
             }
@@ -427,7 +470,6 @@ public static class TraceCallPathTools
                 truncated |= await HasUnexploredOutboundAsync(
                     host.Store,
                     state,
-                    relations,
                     ct).ConfigureAwait(false);
                 truncated |= queue.Count > 0;
                 break;
@@ -440,7 +482,9 @@ public static class TraceCallPathTools
             var storedEdges = await ListOutboundEdgesAsync(
                 host.Store,
                 state.Current.Id,
-                relations,
+                executionProfile
+                    ? AllowedExecutionRelations(state.Stage)
+                    : relations,
                 checked(branchLimit + state.Visited.Count + 1),
                 ct).ConfigureAwait(false);
             var unvisitedEdges = storedEdges
@@ -455,6 +499,15 @@ public static class TraceCallPathTools
             {
                 var edge = visibleEdges[edgeIndex];
                 var callee = edge.Symbol;
+                var nextStage = state.Stage;
+                if (executionProfile
+                    && !TryAdvanceExecutionStage(
+                        state.Stage,
+                        edge.Relation,
+                        out nextStage))
+                {
+                    continue;
+                }
 
                 var hop = await BuildAuditableHopAsync(
                     host.Store,
@@ -473,7 +526,11 @@ public static class TraceCallPathTools
                 nextHops.AddRange(state.Hops);
                 nextHops.Add(hop);
                 var nextVisited = new HashSet<long>(state.Visited) { callee.Id };
-                var next = new PathState(callee, nextHops, nextVisited);
+                var next = new PathState(
+                    callee,
+                    nextHops,
+                    nextVisited,
+                    nextStage);
 
                 if (targetsById.TryGetValue(callee.Id, out reachedTarget))
                 {
@@ -502,9 +559,15 @@ public static class TraceCallPathTools
 
         executionState = await FinalizeExecutionStateAsync()
             .ConfigureAwait(false);
+        if (executionState is not null && truncated)
+        {
+            executionState = MarkExecutionTruncated(executionState);
+        }
         var note = paths.Count == 0
             ? executionProfile
-                ? $"No execution-profile path found within depth {maxDepth}."
+                ? discoverTerminal
+                    ? $"No terminal execution-profile path found within depth {maxDepth}."
+                    : $"No execution-profile path found within depth {maxDepth}."
                 : $"No `{edgeKind}` path found within depth {maxDepth}."
             : null;
         if (executionState is { AbsenceAuthoritative: false })
@@ -527,13 +590,14 @@ public static class TraceCallPathTools
         async Task<bool> HasUnexploredOutboundAsync(
             IGraphStore store,
             PathState state,
-            IReadOnlyList<string> allowedRelations,
             CancellationToken cancellationToken)
         {
             var probe = await ListOutboundEdgesAsync(
                 store,
                 state.Current.Id,
-                allowedRelations,
+                executionProfile
+                    ? AllowedExecutionRelations(state.Stage)
+                    : relations,
                 checked(state.Visited.Count + 1),
                 cancellationToken).ConfigureAwait(false);
             return probe.Any(edge => !state.Visited.Contains(edge.Symbol.Id));
@@ -632,6 +696,71 @@ public static class TraceCallPathTools
                 relations,
                 limit,
                 ct);
+
+    private static async Task<bool> HasAnyAuditableOutboundAsync(
+        IGraphStore store,
+        long symbolId,
+        string relation,
+        CancellationToken ct) =>
+        (await store.ListAuditableOutboundEdgesAsync(
+            symbolId,
+            limit: 1,
+            edgeKind: relation,
+            ct: ct).ConfigureAwait(false)).Count > 0;
+
+    private static IReadOnlyList<string> AllowedExecutionRelations(
+        ExecutionStage stage) =>
+        stage switch
+        {
+            ExecutionStage.AwaitBinding => ["binds-path"],
+            ExecutionStage.AwaitCommand => [EdgeKinds.CommandExecutes],
+            ExecutionStage.AwaitManagedCall => [EdgeKinds.Calls],
+            ExecutionStage.ManagedClient =>
+                [EdgeKinds.Calls, EdgeKinds.GrpcCalls],
+            ExecutionStage.AwaitRpcDispatch =>
+                [EdgeKinds.RpcDispatchesTo],
+            ExecutionStage.AwaitServerCall => [EdgeKinds.Calls],
+            ExecutionStage.ManagedServer =>
+                [EdgeKinds.Calls, EdgeKinds.PInvokeMapsTo],
+            ExecutionStage.AwaitNativeCall => [EdgeKinds.Calls],
+            ExecutionStage.NativeAlgorithm => [EdgeKinds.Calls],
+            _ => throw new InvalidOperationException(
+                $"Execution relation requested for invalid stage `{stage}`."),
+        };
+
+    private static bool TryAdvanceExecutionStage(
+        ExecutionStage current,
+        string relation,
+        out ExecutionStage next)
+    {
+        next = (current, relation) switch
+        {
+            (ExecutionStage.AwaitBinding, "binds-path") =>
+                ExecutionStage.AwaitCommand,
+            (ExecutionStage.AwaitCommand, EdgeKinds.CommandExecutes) =>
+                ExecutionStage.AwaitManagedCall,
+            (ExecutionStage.AwaitManagedCall, EdgeKinds.Calls) =>
+                ExecutionStage.ManagedClient,
+            (ExecutionStage.ManagedClient, EdgeKinds.Calls) =>
+                ExecutionStage.ManagedClient,
+            (ExecutionStage.ManagedClient, EdgeKinds.GrpcCalls) =>
+                ExecutionStage.AwaitRpcDispatch,
+            (ExecutionStage.AwaitRpcDispatch, EdgeKinds.RpcDispatchesTo) =>
+                ExecutionStage.AwaitServerCall,
+            (ExecutionStage.AwaitServerCall, EdgeKinds.Calls) =>
+                ExecutionStage.ManagedServer,
+            (ExecutionStage.ManagedServer, EdgeKinds.Calls) =>
+                ExecutionStage.ManagedServer,
+            (ExecutionStage.ManagedServer, EdgeKinds.PInvokeMapsTo) =>
+                ExecutionStage.AwaitNativeCall,
+            (ExecutionStage.AwaitNativeCall, EdgeKinds.Calls) =>
+                ExecutionStage.NativeAlgorithm,
+            (ExecutionStage.NativeAlgorithm, EdgeKinds.Calls) =>
+                ExecutionStage.NativeAlgorithm,
+            _ => ExecutionStage.Invalid,
+        };
+        return next != ExecutionStage.Invalid;
+    }
 
     private static TraceCallPathExecutionState BuildExecutionState(
         ScopeHost host)
@@ -834,6 +963,46 @@ public static class TraceCallPathTools
         };
     }
 
+    private static TraceCallPathExecutionState MarkExecutionTruncated(
+        TraceCallPathExecutionState current)
+    {
+        var projections = current.Projections
+            .Where(projection =>
+                !string.Equals(
+                    projection.Name,
+                    "query-bounds",
+                    StringComparison.Ordinal))
+            .Append(new TraceCallPathProjectionState(
+                "query-bounds",
+                "truncated",
+                Applicable: true,
+                Authoritative: false,
+                RetainedLastGood: false,
+                FailureCount: 1))
+            .ToArray();
+        var failures = current.Failures
+            .Append(
+                "query-bounds: traversal stopped at a configured depth, path, node, branch, or evidence bound.")
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+        IReadOnlyList<string> boundedFailures = failures.Length
+            <= MaximumReportedProjectionFailures
+            ? failures
+            : failures
+                .Take(MaximumReportedProjectionFailures - 1)
+                .Append(
+                    $"{failures.Length - MaximumReportedProjectionFailures + 1} additional projection failure(s) omitted.")
+                .ToArray();
+        return current with
+        {
+            Status = "partial",
+            Partial = true,
+            AbsenceAuthoritative = false,
+            Projections = projections,
+            Failures = boundedFailures,
+        };
+    }
+
     private static ExecutionProjectionStamp CaptureProjectionStamp(
         ScopeHost host) =>
         new(
@@ -970,10 +1139,18 @@ public static class TraceCallPathTools
         var sb = new StringBuilder();
         var pathCount = result.Scopes.Sum(scope => scope.Paths.Count);
         sb.Append("trace_call_path `")
-          .Append(result.FromQuery)
-          .Append("` → `")
-          .Append(result.ToQuery)
-          .Append("`: ")
+          .Append(result.FromQuery);
+        if (result.ToQuery is null)
+        {
+            sb.Append("` → terminal native algorithm: ");
+        }
+        else
+        {
+            sb.Append("` → `")
+              .Append(result.ToQuery)
+              .Append("`: ");
+        }
+        sb
           .Append(pathCount)
           .Append(" path")
           .Append(pathCount == 1 ? "" : "s")
@@ -981,6 +1158,11 @@ public static class TraceCallPathTools
               ? " via execution profile"
               : $" via `{result.EdgeKind}`")
           .AppendLine();
+        if (result.TerminalDefinition is not null)
+        {
+            sb.Append("terminal definition: ")
+              .AppendLine(result.TerminalDefinition);
+        }
 
         foreach (var scope in result.Scopes)
         {
@@ -1063,7 +1245,23 @@ public static class TraceCallPathTools
     private sealed record PathState(
         SymbolHit Current,
         List<TraceCallPathHop> Hops,
-        HashSet<long> Visited);
+        HashSet<long> Visited,
+        ExecutionStage Stage);
+
+    private enum ExecutionStage
+    {
+        Invalid,
+        Relation,
+        AwaitBinding,
+        AwaitCommand,
+        AwaitManagedCall,
+        ManagedClient,
+        AwaitRpcDispatch,
+        AwaitServerCall,
+        ManagedServer,
+        AwaitNativeCall,
+        NativeAlgorithm,
+    }
 
     private sealed record ExecutionProjectionStamp(
         string ScopeStatus,

@@ -8,8 +8,10 @@ namespace DevBitsLab.Mcp.SourceGraph.Server.Tools.Output;
 /// </summary>
 public sealed record TraceCallPathResult(
     [property: JsonPropertyName("from_query")] string FromQuery,
-    [property: JsonPropertyName("to_query")] string ToQuery,
+    [property: JsonPropertyName("to_query")] string? ToQuery,
     string Profile,
+    [property: JsonPropertyName("destination_mode")] string DestinationMode,
+    [property: JsonPropertyName("terminal_definition")] string? TerminalDefinition,
     [property: JsonPropertyName("edge_kind")] string? EdgeKind,
     IReadOnlyList<string> Relations,
     [property: JsonPropertyName("max_depth")] int MaxDepth,

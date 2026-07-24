@@ -234,6 +234,31 @@ public sealed class MedInteropFixtureContractTests
                     && !string.IsNullOrWhiteSpace(evidence.Producer));
             });
             tracedScope.Truncated.Should().BeFalse();
+
+            var discovered =
+                await TraceCallPathTools.TraceCallPathWithProfileAsync(
+                    router,
+                    from: expectedEdges[0].From,
+                    profile: "execution",
+                    maxDepth: 8,
+                    maxPaths: 10,
+                    maxNodes: 1000,
+                    scope: scope.Id);
+            var discoveredDto = discovered.StructuredContent!.Value.Deserialize(
+                ToolOutputJsonContext.Default.TraceCallPathResult)!;
+            discoveredDto.ToQuery.Should().BeNull();
+            discoveredDto.DestinationMode.Should().Be(
+                "execution-terminal");
+            var discoveredPath = discoveredDto.Scopes.Should()
+                .ContainSingle()
+                .Which.Paths.Should()
+                .ContainSingle(
+                    "the exact UI source has one proven leaf algorithm")
+                .Which;
+            discoveredPath.To.CanonicalKey.Should().Be(
+                expectedEdges[^1].To);
+            discoveredPath.Hops.Select(hop => hop.Relation)
+                .Should().Equal(expectedEdges.Select(edge => edge.Relation));
         }
         finally
         {
