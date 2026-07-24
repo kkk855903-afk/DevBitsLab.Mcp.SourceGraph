@@ -1901,23 +1901,96 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
             }
         }
 
-        // Reconcile per changed fileId: delete any symbol attributed to this file in DB whose
-        // canonical key is no longer declared anywhere in the file's tree (across all iterations).
-        // The reconcile call also wipes the file's attribute rows; we re-insert the freshly
-        // walked attribute set immediately after, in the same logical step.
+        // Reconcile declarations and publish the complete annotation projection per changed
+        // physical file in one store transaction. This keeps ordinary C# attributes and the
+        // managed-interop projection on the same successful declaration snapshot, including a
+        // successful zero-annotation replacement.
+        var reconciledKeys = new HashSet<string>(StringComparer.Ordinal);
         foreach (var (fileId, fileKeys) in newKeysForFile)
         {
-            // Remove orphaned keys from in-memory map (best-effort; full correctness comes from
-            // the next process restart's hydrate).
-            if (_keysByFileId.TryGetValue(fileId, out var prevKeys))
+            var path = changedFileMeta.TryGetValue(fileId, out var meta)
+                ? meta.Path
+                : throw new InvalidOperationException(
+                    $"Missing changed-file metadata for declaration owner {fileId}.");
+            try
             {
-                foreach (var k in prevKeys)
+                // Namespace and partial declarations can share one canonical key across physical
+                // files. The graph intentionally has one stable symbol row per key, so the final
+                // Pass-B upsert owns that row. Reconcile only the keys currently attributed to
+                // this file; requiring every syntactically observed key to be owned here would
+                // reject valid multi-file declarations.
+                var storedOwners = await _store.ListSymbolsInFileAsync(path, ct)
+                    .ConfigureAwait(false);
+                var currentlyOwnedKeys = storedOwners
+                    .Select(symbol => symbol.CanonicalKey)
+                    .OfType<string>()
+                    .Where(fileKeys.Contains)
+                    .ToHashSet(StringComparer.Ordinal);
+                var annotations = new List<FileAnnotationFact>();
+                if (pendingAttrsByFile.TryGetValue(fileId, out var pendingAttrs))
                 {
-                    if (!fileKeys.Contains(k)) _symbolIdByKey.Remove(k);
+                    annotations.AddRange(pendingAttrs
+                        .Where(pending =>
+                            currentlyOwnedKeys.Contains(
+                                pending.SymbolCanonicalKey))
+                        .Select(pending =>
+                            AttributeExtractor.ToFact(
+                                pending,
+                                _symbolIdByKey)));
                 }
+                if (pendingInteropByFile.TryGetValue(
+                        fileId,
+                        out var interopAnnotations))
+                {
+                    annotations.AddRange(interopAnnotations.Where(annotation =>
+                        currentlyOwnedKeys.Contains(
+                            annotation.SymbolCanonicalKey)));
+                }
+
+                await _store.ReconcileFileDeclarationsAndAnnotationsAsync(
+                        path,
+                        currentlyOwnedKeys,
+                        annotations,
+                        ct)
+                    .ConfigureAwait(false);
+
+                // Update the in-memory declaration map only after the store transaction commits.
+                foreach (var storedOwner in storedOwners)
+                {
+                    if (storedOwner.CanonicalKey is { } storedKey
+                        && !currentlyOwnedKeys.Contains(storedKey))
+                    {
+                        _symbolIdByKey.Remove(storedKey);
+                    }
+                }
+                _keysByFileId[fileId] = currentlyOwnedKeys.ToList();
+                reconciledKeys.UnionWith(currentlyOwnedKeys);
             }
-            await _store.DeleteSymbolsForFileNotInAsync(fileId, fileKeys, ct).ConfigureAwait(false);
-            _keysByFileId[fileId] = fileKeys.ToList();
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _requiresStructuralReload = true;
+                walkedFileIds.Remove(fileId);
+                foreach (var key in fileKeys)
+                {
+                    if (_symbolIdByKey.TryGetValue(key, out var symbolId))
+                    {
+                        testFrameworkBySymbolId.Remove(symbolId);
+                    }
+                }
+                _logger.LogWarning(
+                    ex,
+                    "Declaration/annotation reconciliation failed for {Path}; "
+                    + "the prior annotation projection was retained",
+                    path);
+                AddFileFailure(
+                    failedFiles,
+                    path,
+                    FailureMessage.Truncate(ex.Message));
+            }
         }
 
         // PASS 1 — phase C: resolve every recorded (childKey -> parentKey) into row ids and
@@ -1929,7 +2002,8 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
             var pairs = new List<(long ChildId, long ParentId)>(parentKeyByChildKey.Count);
             foreach (var (childKey, parentKey) in parentKeyByChildKey)
             {
-                if (_symbolIdByKey.TryGetValue(childKey, out var childId)
+                if (reconciledKeys.Contains(childKey)
+                    && _symbolIdByKey.TryGetValue(childKey, out var childId)
                     && _symbolIdByKey.TryGetValue(parentKey, out var parentId)
                     && childId != parentId)
                 {
@@ -1942,35 +2016,7 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
             }
         }
 
-        // PASS 1 — phase D: resolve and bulk-insert annotations per file, now that every changed
-        // file has had its symbols upserted into _symbolIdByKey. Doing this in a separate sweep
-        // lets a use-site reference an attribute class that lives in a file we hadn't walked yet
-        // when we extracted the use site.
-        foreach (var (fileId, pendingAttrs) in pendingAttrsByFile)
-        {
-            if (pendingAttrs.Count == 0) continue;
-            var resolved = pendingAttrs.Select(p => AttributeExtractor.Resolve(p, _symbolIdByKey)).ToList();
-            await _store.BulkInsertAnnotationsAsync(resolved, ct).ConfigureAwait(false);
-        }
-
-        // Publish a successful zero-fact projection as well as populated imports. This removes a
-        // stale DllImport/LibraryImport annotation when the declaration disappears while leaving
-        // ordinary C# attributes untouched.
-        foreach (var (fileId, interopAnnotations) in pendingInteropByFile)
-        {
-            var path = changedFileMeta.TryGetValue(fileId, out var meta)
-                ? meta.Path
-                : throw new InvalidOperationException(
-                    $"Missing changed-file metadata for interop owner {fileId}.");
-            await _store.ReplaceAnnotationsForFileByFlavorAsync(
-                    path,
-                    InteropAnnotationFlavors.ManagedImport,
-                    interopAnnotations,
-                    ct)
-                .ConfigureAwait(false);
-        }
-
-        // PASS 1 — phase E: flush detected test_framework values for the methods we walked.
+        // PASS 1 — phase D: flush detected test_framework values for the methods we walked.
         // Done as a UPDATE since the value was set during initial UpsertSymbolAsync but the
         // ON-CONFLICT path doesn't update test_framework, so an edit that changes a method's
         // attached attributes still propagates here.
@@ -2480,6 +2526,13 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         {
             foreach (var (fileId, meta) in changedFileMeta)
             {
+                // A declaration/annotation reconciliation failure removes the owner from the
+                // successful walked set. Do not let downstream consumers observe Phase-B
+                // upserts paired with a hash whose projection never committed.
+                if (!walkedFileIds.Contains(fileId))
+                {
+                    continue;
+                }
                 // Generated owner paths are deliberately virtual and have no disk/git object to
                 // blame. Do not enqueue them into the history pipeline, whose contract is a
                 // physical repository path.

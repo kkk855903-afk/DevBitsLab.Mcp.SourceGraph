@@ -105,16 +105,22 @@ internal static class AttributeExtractor
 
     /// <summary>
     /// Converts a pending attribute to its canonical-key form for atomic declaration reconcile.
-    /// The store resolves the optional attribute definition in the same transaction as the host.
+    /// The store resolves an indexed attribute definition in the same transaction as the host;
+    /// framework and package attributes outside the graph retain a null definition link.
     /// </summary>
-    public static FileAnnotationFact ToFact(PendingAnnotation pending) =>
+    public static FileAnnotationFact ToFact(
+        PendingAnnotation pending,
+        IReadOnlyDictionary<string, long> symbolIdByKey) =>
         new(
             pending.SymbolCanonicalKey,
             pending.Name,
             pending.FullName,
             CSharpAttributeFlavor,
             pending.ArgsJson,
-            pending.AnnotationClassKey);
+            pending.AnnotationClassKey is not null
+                && symbolIdByKey.ContainsKey(pending.AnnotationClassKey)
+                    ? pending.AnnotationClassKey
+                    : null);
 
     private static object? UnwrapTypedConstant(TypedConstant tc)
     {

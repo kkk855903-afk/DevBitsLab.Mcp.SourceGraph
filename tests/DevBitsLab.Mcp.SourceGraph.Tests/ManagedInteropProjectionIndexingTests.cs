@@ -200,6 +200,81 @@ public sealed class ManagedInteropProjectionIndexingTests
         }
     }
 
+    [Fact]
+    public async Task Storage_failure_retains_prior_attribute_and_interop_projection()
+    {
+        var root = CreateTempRoot();
+        try
+        {
+            var (solutionPath, sourcePath) =
+                await WriteSingleProjectSolutionAsync(root);
+            await File.WriteAllTextAsync(sourcePath, ImportSource("stable"));
+            var databasePath = Path.Join(root, "graph.db");
+            await using var store = new SqliteGraphStore(databasePath);
+            await using var indexer = CreateIndexer(store, root);
+            await indexer.OpenAsync(solutionPath);
+            (await indexer.IndexAllAsync()).FailedFiles.Should().BeEmpty();
+            var oldImport = (await ReadImportsAsync(store))
+                .Should().ContainSingle().Subject.ArgsJson;
+            var oldAttribute = (await ReadFlavorAsync(
+                    store,
+                    AttributeExtractor.CSharpAttributeFlavor))
+                .Single(row => row.SymbolCanonicalKey.Contains(
+                    "NativeMethods.Run",
+                    StringComparison.Ordinal))
+                .ArgsJson;
+
+            await using (var triggerConnection =
+                         new SqliteConnection($"Data Source={databasePath}"))
+            {
+                await triggerConnection.OpenAsync();
+                await using var trigger = triggerConnection.CreateCommand();
+                trigger.CommandText =
+                    """
+                    CREATE TRIGGER fail_managed_interop_projection
+                    BEFORE INSERT ON annotations
+                    WHEN NEW.flavor = 'interop-managed-import'
+                    BEGIN
+                        SELECT RAISE(ABORT, 'forced managed interop failure');
+                    END;
+                    """;
+                await trigger.ExecuteNonQueryAsync();
+            }
+
+            var downstreamCallbacks = 0;
+            indexer.OnFileIndexed = (_, _, _) =>
+            {
+                downstreamCallbacks++;
+                return Task.CompletedTask;
+            };
+            await File.WriteAllTextAsync(sourcePath, ImportSource("changed"));
+
+            var changed = await indexer.IndexChangedFilesAsync([sourcePath]);
+
+            changed.FailedFiles.Should().ContainSingle(failure =>
+                failure.Path == sourcePath
+                && failure.Reason.Contains(
+                    "forced managed interop failure",
+                    StringComparison.Ordinal));
+            (await ReadImportsAsync(store)).Should().ContainSingle()
+                .Which.ArgsJson.Should().Be(oldImport);
+            (await ReadFlavorAsync(
+                    store,
+                    AttributeExtractor.CSharpAttributeFlavor))
+                .Single(row => row.SymbolCanonicalKey.Contains(
+                    "NativeMethods.Run",
+                    StringComparison.Ordinal))
+                .ArgsJson.Should().Be(oldAttribute);
+            downstreamCallbacks.Should().Be(
+                0,
+                "a failed projection must not publish its new hash downstream");
+        }
+        finally
+        {
+            TryDeleteDirectory(root);
+        }
+    }
+
     private static RoslynIndexer CreateIndexer(
         IGraphStore store,
         string root) =>
@@ -213,8 +288,16 @@ public sealed class ManagedInteropProjectionIndexingTests
 
     private static async Task<IReadOnlyList<StoredAnnotationRow>>
         ReadImportsAsync(IGraphStore store) =>
+        await ReadFlavorAsync(
+            store,
+            InteropAnnotationFlavors.ManagedImport);
+
+    private static async Task<IReadOnlyList<StoredAnnotationRow>>
+        ReadFlavorAsync(
+            IGraphStore store,
+            string flavor) =>
         await store.ListAnnotationsByFlavorAsync(
-            InteropAnnotationFlavors.ManagedImport,
+            flavor,
             afterId: 0,
             limit: 1000);
 
