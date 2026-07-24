@@ -5,6 +5,8 @@ using System.Text.Json;
 using DevBitsLab.Mcp.SourceGraph.Core;
 using DevBitsLab.Mcp.SourceGraph.Sdk;
 using DevBitsLab.Mcp.SourceGraph.Sdk.Validation;
+using DevBitsLab.Mcp.SourceGraph.Server.Grpc;
+using DevBitsLab.Mcp.SourceGraph.Server.Interop;
 using DevBitsLab.Mcp.SourceGraph.Server.Observability;
 using DevBitsLab.Mcp.SourceGraph.Server.Resources;
 using DevBitsLab.Mcp.SourceGraph.Server.Scoping;
@@ -23,15 +25,28 @@ namespace DevBitsLab.Mcp.SourceGraph.Server.Tools;
 public static class TraceCallPathTools
 {
     private const int EvidenceLimitPerHop = 100;
+    private const int MaximumReportedProjectionFailures = 50;
+    private const string ExecutionProfile = "execution";
+    private static readonly string[] ExecutionRelations =
+    [
+        "binds-path",
+        EdgeKinds.CommandExecutes,
+        EdgeKinds.Calls,
+        EdgeKinds.GrpcCalls,
+        EdgeKinds.RpcDispatchesTo,
+        EdgeKinds.PInvokeMapsTo,
+    ];
 
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(TraceCallPathResult))]
     [ToolTrigger("\"show how execution can flow from A to B\"")]
-    [Description("Trace bounded directed paths between two indexed symbols. Defaults to calls edges and returns every hop with source/target symbols, relation, confidence, and occurrence-level file/line evidence. Uses cycle detection plus explicit depth/path/node caps.")]
+    [Description("Trace bounded directed paths between two indexed symbols. Defaults to calls edges. Set profile=execution to follow only the evidence-backed UI → command → managed call → gRPC dispatch → P/Invoke execution relations. Exact canonical-key inputs never use fuzzy matching. Every hop includes occurrence evidence, and execution results disclose whether current absence claims are authoritative.")]
     public static Task<CallToolResult> TraceCallPathAsync(
         ScopeRouter router,
-        [Description("Starting symbol name or FQN")] string from,
-        [Description("Destination symbol name or FQN")] string to,
+        [Description("Starting symbol name, FQN, or exact canonical key")] string from,
+        [Description("Destination symbol name, FQN, or exact canonical key")] string to,
         [Description("Kebab-case edge relation to traverse (default calls)")] string? kind = null,
+        [Description("Optional traversal profile. Use execution for the cross-domain execution relation whitelist; omit for one relation.")]
+        string? profile = null,
         [Description("Maximum hops per path, 1-12 (default 8)")] int maxDepth = 8,
         [Description("Maximum returned paths, 1-25 (default 10)")] int maxPaths = 10,
         [Description("Maximum expanded graph nodes per scope, 1-5000 (default 1000)")] int maxNodes = 1000,
@@ -39,12 +54,13 @@ public static class TraceCallPathTools
         CancellationToken ct = default) =>
         ToolMetrics.TrackAsync(
             "trace_call_path",
-            new { from, to, kind, maxDepth, maxPaths, maxNodes, scope },
+            new { from, to, kind, profile, maxDepth, maxPaths, maxNodes, scope },
             () => TraceCallPathImplAsync(
                 router,
                 from,
                 to,
                 kind,
+                profile,
                 maxDepth,
                 maxPaths,
                 maxNodes,
@@ -56,6 +72,7 @@ public static class TraceCallPathTools
         string from,
         string to,
         string? kind,
+        string? profile,
         int maxDepth,
         int maxPaths,
         int maxNodes,
@@ -79,12 +96,34 @@ public static class TraceCallPathTools
             return DiagnosticResult.Error("trace_call_path `maxNodes` must be between 1 and 5000.");
         }
 
-        var edgeKind = string.IsNullOrWhiteSpace(kind) ? EdgeKinds.Calls : kind.Trim();
-        if (!KebabCaseValidator.IsValid(edgeKind))
+        var normalizedProfile = string.IsNullOrWhiteSpace(profile)
+            ? "relation"
+            : profile.Trim().ToLowerInvariant();
+        if (normalizedProfile is not ("relation" or ExecutionProfile))
+        {
+            return DiagnosticResult.Error(
+                "trace_call_path `profile` must be `execution` when supplied.");
+        }
+        var executionProfile = normalizedProfile == ExecutionProfile;
+        if (executionProfile && !string.IsNullOrWhiteSpace(kind))
+        {
+            return DiagnosticResult.Error(
+                "trace_call_path does not accept `kind` together with `profile=execution`; the profile uses a fixed relation whitelist.");
+        }
+
+        var edgeKind = executionProfile
+            ? null
+            : string.IsNullOrWhiteSpace(kind)
+                ? EdgeKinds.Calls
+                : kind.Trim();
+        if (edgeKind is not null && !KebabCaseValidator.IsValid(edgeKind))
         {
             return DiagnosticResult.Error(
                 "trace_call_path `kind` must be a kebab-case edge relation such as `calls`.");
         }
+        IReadOnlyList<string> relations = executionProfile
+            ? ExecutionRelations
+            : [edgeKind!];
 
         ScopeResolution resolution;
         try
@@ -100,9 +139,15 @@ public static class TraceCallPathTools
         var sw = Stopwatch.StartNew();
         var perScope = await Task.WhenAll(resolution.Hosts.Select(async host =>
         {
+            var executionState = executionProfile
+                ? BuildExecutionState(host)
+                : null;
             if (host.Status == "indexing" && !host.Ready.IsCompleted)
             {
                 await host.Ready.WaitAsync(ct).ConfigureAwait(false);
+                executionState = executionProfile
+                    ? BuildExecutionState(host)
+                    : null;
             }
             if (host.Status == "degraded")
             {
@@ -111,7 +156,8 @@ public static class TraceCallPathTools
                     Array.Empty<TraceCallPath>(),
                     Truncated: false,
                     ExpandedNodes: 0,
-                    Note: $"scope is degraded: {host.StatusMessage ?? "(no message)"}");
+                    Note: $"scope is degraded: {host.StatusMessage ?? "(no message)"}",
+                    ExecutionState: executionState);
             }
 
             try
@@ -121,6 +167,8 @@ public static class TraceCallPathTools
                     from,
                     to,
                     edgeKind,
+                    relations,
+                    executionProfile,
                     maxDepth,
                     maxPaths,
                     maxNodes,
@@ -137,7 +185,8 @@ public static class TraceCallPathTools
                     Array.Empty<TraceCallPath>(),
                     Truncated: false,
                     ExpandedNodes: 0,
-                    Note: $"scope query failed: {ex.Message}");
+                    Note: $"scope query failed: {ex.Message}",
+                    ExecutionState: executionState);
             }
         })).ConfigureAwait(false);
         sw.Stop();
@@ -145,7 +194,9 @@ public static class TraceCallPathTools
         var dto = new TraceCallPathResult(
             from,
             to,
+            normalizedProfile,
             edgeKind,
+            relations,
             maxDepth,
             maxPaths,
             maxNodes,
@@ -205,38 +256,53 @@ public static class TraceCallPathTools
         ScopeHost host,
         string fromQuery,
         string toQuery,
-        string edgeKind,
+        string? edgeKind,
+        IReadOnlyList<string> relations,
+        bool executionProfile,
         int maxDepth,
         int maxPaths,
         int maxNodes,
         CancellationToken ct)
     {
-        var sources = await host.Store.FindSymbolsAsync(
+        var executionState = executionProfile
+            ? BuildExecutionState(host)
+            : null;
+        var sources = await ResolveSymbolsAsync(
+            host.Store,
             fromQuery,
-            limit: 10,
-            ct: ct).ConfigureAwait(false);
+            ct).ConfigureAwait(false);
         if (sources.Count == 0)
         {
+            var missingSourceNote =
+                $"No source symbol matches '{fromQuery}'.";
             return new TraceCallPathScopeResult(
                 host.Scope.Id,
                 Array.Empty<TraceCallPath>(),
                 Truncated: false,
                 ExpandedNodes: 0,
-                Note: $"No source symbol matches '{fromQuery}'.");
+                Note: AddAbsenceDisclosure(
+                    missingSourceNote,
+                    executionState),
+                ExecutionState: executionState);
         }
 
-        var targets = await host.Store.FindSymbolsAsync(
+        var targets = await ResolveSymbolsAsync(
+            host.Store,
             toQuery,
-            limit: 10,
-            ct: ct).ConfigureAwait(false);
+            ct).ConfigureAwait(false);
         if (targets.Count == 0)
         {
+            var missingTargetNote =
+                $"No destination symbol matches '{toQuery}'.";
             return new TraceCallPathScopeResult(
                 host.Scope.Id,
                 Array.Empty<TraceCallPath>(),
                 Truncated: false,
                 ExpandedNodes: 0,
-                Note: $"No destination symbol matches '{toQuery}'.");
+                Note: AddAbsenceDisclosure(
+                    missingTargetNote,
+                    executionState),
+                ExecutionState: executionState);
         }
 
         var targetsById = targets.ToDictionary(target => target.Id);
@@ -280,7 +346,7 @@ public static class TraceCallPathTools
                 truncated |= await HasUnexploredOutboundAsync(
                     host.Store,
                     state,
-                    edgeKind,
+                    relations,
                     ct).ConfigureAwait(false);
                 continue;
             }
@@ -289,7 +355,7 @@ public static class TraceCallPathTools
                 truncated |= await HasUnexploredOutboundAsync(
                     host.Store,
                     state,
-                    edgeKind,
+                    relations,
                     ct).ConfigureAwait(false);
                 truncated |= queue.Count > 0;
                 break;
@@ -299,10 +365,11 @@ public static class TraceCallPathTools
             // A fixed relation has at most one edge per target. Fetch enough extra rows to cover
             // every path-local visited target plus one unvisited sentinel, so cycle edges cannot
             // consume the branch cap or cause a false truncation report.
-            var storedEdges = await host.Store.ListAuditableOutboundEdgesAsync(
+            var storedEdges = await ListOutboundEdgesAsync(
+                host.Store,
                 state.Current.Id,
+                relations,
                 checked(branchLimit + state.Visited.Count + 1),
-                edgeKind,
                 ct).ConfigureAwait(false);
             var unvisitedEdges = storedEdges
                 .Where(edge => !state.Visited.Contains(edge.Symbol.Id))
@@ -361,25 +428,39 @@ public static class TraceCallPathTools
             }
         }
 
+        var note = paths.Count == 0
+            ? executionProfile
+                ? $"No execution-profile path found within depth {maxDepth}."
+                : $"No `{edgeKind}` path found within depth {maxDepth}."
+            : null;
+        if (executionState is { AbsenceAuthoritative: false })
+        {
+            note = AppendNote(
+                note,
+                paths.Count == 0
+                    ? "The relevant projections are partial, so this empty result is not an authoritative current absence."
+                    : "The returned paths use persisted evidence, but partial projections can omit additional current paths.");
+        }
+
         return new TraceCallPathScopeResult(
             host.Scope.Id,
             paths,
             truncated,
             expandedNodes,
-            paths.Count == 0
-                ? $"No `{edgeKind}` path found within depth {maxDepth}."
-                : null);
+            note,
+            executionState);
 
         async Task<bool> HasUnexploredOutboundAsync(
             IGraphStore store,
             PathState state,
-            string relation,
+            IReadOnlyList<string> allowedRelations,
             CancellationToken cancellationToken)
         {
-            var probe = await store.ListAuditableOutboundEdgesAsync(
+            var probe = await ListOutboundEdgesAsync(
+                store,
                 state.Current.Id,
+                allowedRelations,
                 checked(state.Visited.Count + 1),
-                relation,
                 cancellationToken).ConfigureAwait(false);
             return probe.Any(edge => !state.Visited.Contains(edge.Symbol.Id));
         }
@@ -404,6 +485,175 @@ public static class TraceCallPathTools
                 state.Hops));
         }
     }
+
+    private static async Task<IReadOnlyList<SymbolHit>> ResolveSymbolsAsync(
+        IGraphStore store,
+        string query,
+        CancellationToken ct)
+    {
+        var selection = query.Trim();
+        if (CanonicalKeyValidator.IsValid(selection))
+        {
+            var exact = await store.GetSymbolByCanonicalKeyAsync(
+                selection,
+                ct).ConfigureAwait(false);
+            return exact is null ? [] : [exact];
+        }
+
+        return await store.FindSymbolsAsync(
+            selection,
+            limit: 10,
+            ct: ct).ConfigureAwait(false);
+    }
+
+    private static Task<IReadOnlyList<EdgeTraversalHit>> ListOutboundEdgesAsync(
+        IGraphStore store,
+        long symbolId,
+        IReadOnlyList<string> relations,
+        int limit,
+        CancellationToken ct) =>
+        relations.Count == 1
+            ? store.ListAuditableOutboundEdgesAsync(
+                symbolId,
+                limit,
+                relations[0],
+                ct)
+            : store.ListAuditableOutboundEdgesByKindsAsync(
+                symbolId,
+                relations,
+                limit,
+                ct);
+
+    private static TraceCallPathExecutionState BuildExecutionState(
+        ScopeHost host)
+    {
+        var projections = new List<TraceCallPathProjectionState>(3);
+        var failures = new List<string>();
+
+        var scopeFailureCount =
+            host.FailedProjects.Count + host.FailedFiles.Count;
+        var scopeAuthoritative = string.Equals(
+                host.Status,
+                "ok",
+                StringComparison.Ordinal)
+            && scopeFailureCount == 0;
+        projections.Add(new TraceCallPathProjectionState(
+            "scope",
+            host.Status,
+            Applicable: true,
+            Authoritative: scopeAuthoritative,
+            RetainedLastGood: false,
+            FailureCount: scopeFailureCount));
+        if (!scopeAuthoritative)
+        {
+            failures.Add(
+                $"scope: current source universe is {host.Status}"
+                + (string.IsNullOrWhiteSpace(host.StatusMessage)
+                    ? "."
+                    : $": {host.StatusMessage}"));
+            if (scopeFailureCount > 0)
+            {
+                failures.Add(
+                    $"scope: {host.FailedProjects.Count} project failure(s) and "
+                    + $"{host.FailedFiles.Count} file failure(s).");
+            }
+        }
+
+        var grpc = host.GrpcLinkState;
+        var grpcAuthoritative = grpc is
+        {
+            Status: GrpcLinkRuntimeStatus.Complete,
+            RetainedLastGood: false,
+        };
+        projections.Add(new TraceCallPathProjectionState(
+            "grpc",
+            grpc?.Status.ToString().ToLowerInvariant() ?? "not-run",
+            Applicable: true,
+            Authoritative: grpcAuthoritative,
+            RetainedLastGood: grpc?.RetainedLastGood ?? false,
+            FailureCount: grpc?.FailureCount ?? 1));
+        if (grpc is null)
+        {
+            failures.Add(
+                "grpc: the current gRPC projection has not run.");
+        }
+        else
+        {
+            failures.AddRange(grpc.Failures.Select(failure =>
+                $"grpc:{failure.Code}: {failure.Message}"));
+        }
+
+        var nativeApplicable = host.Scope.Interop is not null;
+        var native = host.NativeInteropState;
+        var nativeAuthoritative = !nativeApplicable
+            || native is
+            {
+                Status: NativeInteropRuntimeStatus.Complete,
+                RetainedLastGood: false,
+                IsExportUniverseComplete: true,
+            } && host.ManagedInteropInputComplete;
+        projections.Add(new TraceCallPathProjectionState(
+            "native-interop",
+            !nativeApplicable
+                ? "not-configured"
+                : native?.Status.ToString().ToLowerInvariant()
+                    ?? "not-started",
+            Applicable: nativeApplicable,
+            Authoritative: nativeAuthoritative,
+            RetainedLastGood: native?.RetainedLastGood ?? false,
+            FailureCount: !nativeApplicable
+                ? 0
+                : native?.Failures.Count ?? 1));
+        if (nativeApplicable && native is null)
+        {
+            failures.Add(
+                "native-interop: the configured projection has not started.");
+        }
+        else if (nativeApplicable)
+        {
+            failures.AddRange(native!.Failures.Select(failure =>
+                $"native-interop:{failure.Stage}/{failure.Code}: {failure.Message}"));
+            if (!host.ManagedInteropInputComplete)
+            {
+                failures.Add(
+                    "native-interop: the managed import universe is incomplete.");
+            }
+        }
+
+        var partial = projections.Any(projection =>
+            projection.Applicable && !projection.Authoritative);
+        var retainedLastGood = projections.Any(projection =>
+            projection.RetainedLastGood);
+        IReadOnlyList<string> boundedFailures = failures.Count
+            <= MaximumReportedProjectionFailures
+            ? failures
+            : failures
+                .Take(MaximumReportedProjectionFailures - 1)
+                .Append(
+                    $"{failures.Count - MaximumReportedProjectionFailures + 1} additional projection failure(s) omitted.")
+                .ToArray();
+        return new TraceCallPathExecutionState(
+            partial ? "partial" : "complete",
+            partial,
+            AbsenceAuthoritative: !partial,
+            retainedLastGood,
+            projections,
+            boundedFailures);
+    }
+
+    private static string AppendNote(string? current, string addition) =>
+        string.IsNullOrWhiteSpace(current)
+            ? addition
+            : $"{current} {addition}";
+
+    private static string AddAbsenceDisclosure(
+        string note,
+        TraceCallPathExecutionState? executionState) =>
+        executionState is { AbsenceAuthoritative: false }
+            ? AppendNote(
+                note,
+                "The relevant projections are partial, so this is not an authoritative current absence.")
+            : note;
 
     internal static async Task<TraceCallPathHop?> BuildAuditableHopAsync(
         IGraphStore store,
@@ -483,9 +733,10 @@ public static class TraceCallPathTools
           .Append(pathCount)
           .Append(" path")
           .Append(pathCount == 1 ? "" : "s")
-          .Append(" via `")
-          .Append(result.EdgeKind)
-          .AppendLine("`");
+          .Append(result.Profile == ExecutionProfile
+              ? " via execution profile"
+              : $" via `{result.EdgeKind}`")
+          .AppendLine();
 
         foreach (var scope in result.Scopes)
         {
@@ -493,6 +744,21 @@ public static class TraceCallPathTools
             {
                 sb.AppendLine();
                 sb.Append("### scope: `").Append(scope.ScopeId).AppendLine("`");
+            }
+            if (scope.ExecutionState is not null)
+            {
+                sb.AppendLine();
+                sb.Append("execution projection: ")
+                  .Append(scope.ExecutionState.Status)
+                  .Append("; absence authoritative: ")
+                  .AppendLine(scope.ExecutionState.AbsenceAuthoritative
+                      ? "yes"
+                      : "no");
+                if (scope.ExecutionState.RetainedLastGood)
+                {
+                    sb.AppendLine(
+                        "note: at least one relation projection is retained from the last complete index.");
+                }
             }
             if (!string.IsNullOrEmpty(scope.Note))
             {

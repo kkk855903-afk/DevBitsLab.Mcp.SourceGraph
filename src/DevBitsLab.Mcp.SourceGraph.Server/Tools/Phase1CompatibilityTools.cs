@@ -104,12 +104,15 @@ public static class Phase1CompatibilityTools
     [ToolTrigger("\"trace a call or execution path from A to B\"")]
     [Description(
         "Trace bounded evidence-backed paths between two indexed symbols. Compatibility name for " +
-        "trace_call_path; defaults to calls and accepts the same relation, path, and node bounds.")]
+        "trace_call_path; defaults to calls. Set profile=execution for the evidence-backed " +
+        "UI-to-native execution relation whitelist and projection-completeness disclosure.")]
     public static Task<CallToolResult> TraceCallAsync(
         ScopeRouter router,
         [Description("Starting symbol name or qualified name")] string from,
         [Description("Destination symbol name or qualified name")] string to,
         [Description("Kebab-case edge relation to traverse (default calls)")] string? kind = null,
+        [Description("Optional traversal profile; use execution for cross-domain execution flow")]
+        string? profile = null,
         [Description("Maximum hops per path, 1-12 (default 8)")] int maxDepth = 8,
         [Description("Maximum returned paths, 1-25 (default 10)")] int maxPaths = 10,
         [Description("Maximum expanded graph nodes per scope, 1-5000 (default 1000)")] int maxNodes = 1000,
@@ -120,6 +123,7 @@ public static class Phase1CompatibilityTools
             from,
             to,
             kind,
+            profile,
             maxDepth,
             maxPaths,
             maxNodes,

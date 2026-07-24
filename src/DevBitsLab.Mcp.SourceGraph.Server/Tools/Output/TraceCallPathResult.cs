@@ -9,7 +9,9 @@ namespace DevBitsLab.Mcp.SourceGraph.Server.Tools.Output;
 public sealed record TraceCallPathResult(
     [property: JsonPropertyName("from_query")] string FromQuery,
     [property: JsonPropertyName("to_query")] string ToQuery,
-    [property: JsonPropertyName("edge_kind")] string EdgeKind,
+    string Profile,
+    [property: JsonPropertyName("edge_kind")] string? EdgeKind,
+    IReadOnlyList<string> Relations,
     [property: JsonPropertyName("max_depth")] int MaxDepth,
     [property: JsonPropertyName("max_paths")] int MaxPaths,
     [property: JsonPropertyName("max_nodes")] int MaxNodes,
@@ -20,7 +22,34 @@ public sealed record TraceCallPathScopeResult(
     IReadOnlyList<TraceCallPath> Paths,
     bool Truncated,
     [property: JsonPropertyName("expanded_nodes")] int ExpandedNodes,
-    string? Note);
+    string? Note,
+    [property: JsonPropertyName("execution_state")]
+    TraceCallPathExecutionState? ExecutionState);
+
+/// <summary>
+/// Completeness disclosure for the cross-domain execution profile. Persisted paths remain
+/// evidence-backed when a projection is partial, but an empty result is authoritative only when
+/// every applicable projection is current and complete.
+/// </summary>
+public sealed record TraceCallPathExecutionState(
+    string Status,
+    bool Partial,
+    [property: JsonPropertyName("absence_authoritative")]
+    bool AbsenceAuthoritative,
+    [property: JsonPropertyName("retained_last_good")]
+    bool RetainedLastGood,
+    IReadOnlyList<TraceCallPathProjectionState> Projections,
+    IReadOnlyList<string> Failures);
+
+public sealed record TraceCallPathProjectionState(
+    string Name,
+    string Status,
+    bool Applicable,
+    bool Authoritative,
+    [property: JsonPropertyName("retained_last_good")]
+    bool RetainedLastGood,
+    [property: JsonPropertyName("failure_count")]
+    int FailureCount);
 
 public sealed record TraceCallPath(
     TraceCallPathSymbol From,
