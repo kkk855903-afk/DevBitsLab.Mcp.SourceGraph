@@ -63,6 +63,7 @@
     <PackageProjectUrl>https://github.com/Jak3b0/DevBitsLab.Mcp.SourceGraph</PackageProjectUrl>
     <RepositoryUrl>https://github.com/Jak3b0/DevBitsLab.Mcp.SourceGraph.git</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
     <IncludeSymbols>true</IncludeSymbols>
     <SymbolPackageFormat>snupkg</SymbolPackageFormat>
 
@@ -70,6 +71,10 @@
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
   </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
 
   <ItemGroup>
     <InternalsVisibleTo Include="DevBitsLab.Mcp.SourceGraph.Server" />

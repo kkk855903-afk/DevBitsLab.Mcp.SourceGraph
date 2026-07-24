@@ -17,6 +17,74 @@ public sealed class ToolPackageContractTests
     ];
 
     [Fact]
+    public void Release_package_projects_declare_audited_metadata_and_content()
+    {
+        var root = FindRepositoryRoot();
+        var projectPaths = new[]
+        {
+            Path.Join(
+                root,
+                "src",
+                "DevBitsLab.Mcp.SourceGraph.Server",
+                "DevBitsLab.Mcp.SourceGraph.Server.csproj"),
+            Path.Join(
+                root,
+                "src",
+                "DevBitsLab.Mcp.SourceGraph.Sdk",
+                "DevBitsLab.Mcp.SourceGraph.Sdk.csproj"),
+        };
+
+        foreach (var projectPath in projectPaths)
+        {
+            var project = XDocument.Load(projectPath);
+            project.Descendants("PackageLicenseExpression")
+                .Single()
+                .Value
+                .Should()
+                .Be("MIT");
+            project.Descendants("RepositoryUrl")
+                .Single()
+                .Value
+                .Should()
+                .Be(
+                    "https://github.com/Jak3b0/"
+                    + "DevBitsLab.Mcp.SourceGraph.git");
+            project.Descendants("RepositoryType")
+                .Single()
+                .Value
+                .Should()
+                .Be("git");
+            project.Descendants("PackageReadmeFile")
+                .Single()
+                .Value
+                .Should()
+                .Be("README.md");
+
+            var readme = project
+                .Descendants("None")
+                .Single(item =>
+                    string.Equals(
+                        (string?)item.Attribute("Include"),
+                        @"..\..\README.md",
+                        StringComparison.Ordinal));
+            ((string?)readme.Attribute("Pack")).Should().Be("true");
+            ((string?)readme.Attribute("PackagePath")).Should().Be(@"\");
+        }
+
+        var sharedBuild = XDocument.Load(
+            Path.Join(root, "Directory.Build.props"));
+        var license = sharedBuild
+            .Descendants("None")
+            .Single(item =>
+                string.Equals(
+                    (string?)item.Attribute("Include"),
+                    "$(MSBuildThisFileDirectory)LICENSE",
+                    StringComparison.Ordinal));
+        ((string?)license.Attribute("Pack")).Should().Be("true");
+        ((string?)license.Attribute("PackagePath")).Should().Be(@"\");
+    }
+
+    [Fact]
     public void Every_advertised_tool_rid_has_both_clang_native_runtime_packages()
     {
         var root = FindRepositoryRoot();
