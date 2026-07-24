@@ -69,6 +69,14 @@
                       SkipGetTargetFrameworkProperties="true"
                       Private="false"
                       PrivateAssets="all" />
+    <!-- Code-only genuine WindowsDesktop/WPF fixture. With no markup-generated sources,
+         Roslyn can prove the complete input required by the WPF lifetime rule. -->
+    <ProjectReference Include="..\fixtures\SampleWpfRisksWindows\SampleWpfRisksWindows.csproj"
+                      Condition="'$(OS)' == 'Windows_NT'"
+                      ReferenceOutputAssembly="false"
+                      SkipGetTargetFrameworkProperties="true"
+                      Private="false"
+                      PrivateAssets="all" />
     <ProjectReference Include="..\fixtures\SampleAvalonia\SampleAvalonia.csproj"
                       ReferenceOutputAssembly="false"
                       Private="false"

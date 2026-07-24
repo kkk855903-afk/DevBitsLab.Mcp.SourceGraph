@@ -184,6 +184,75 @@ public sealed class WpfWindowsFixtureContractTests
         }
     }
 
+    [SkippableFact]
+    public async Task RealWindowsDesktopCompilationPublishesWpfRiskDiagnostics()
+    {
+        Skip.IfNot(
+            OperatingSystem.IsWindows(),
+            "The real WindowsDesktop/WPF risk fixture runs on Windows.");
+
+        var fixtureRoot = LocateFixture("SampleWpfRisksWindows");
+        var tempRoot = Path.Combine(
+            Path.GetTempPath(),
+            "sourcegraph-real-wpf-risks-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tempRoot);
+
+        try
+        {
+            await using var store = new SqliteGraphStore(
+                Path.Combine(tempRoot, "graph.db"));
+            await using var roslyn = new RoslynIndexer(store);
+            await roslyn.OpenAsync(
+                Path.Combine(fixtureRoot, "SampleWpfRisksWindows.sln"));
+
+            var result = await roslyn.IndexAllAsync();
+            result.FailedFiles.Should().BeEmpty();
+
+            var projectPath = Path.Combine(
+                fixtureRoot,
+                "SampleWpfRisksWindows.csproj");
+            roslyn.IsProjectSemanticInputComplete(projectPath).Should().BeTrue(
+                "the real code-only WindowsDesktop project has no omitted generated documents");
+
+            var eventRisks = await store.FindDiagnosticsAsync(
+                severity: null,
+                code: "WPFEVENT001",
+                symbolId: null);
+            eventRisks.Should().ContainSingle(diagnostic =>
+                diagnostic.SymbolFqn != null
+                && diagnostic.SymbolFqn.Contains(
+                    "SampleWpfRisksWindows.Subscriber.Attach",
+                    StringComparison.Ordinal)
+                && diagnostic.Message.Contains(
+                    "AppLifetime.Changed",
+                    StringComparison.Ordinal));
+
+            var threadRisks = await store.FindDiagnosticsAsync(
+                severity: null,
+                code: "WPFTHREAD001",
+                symbolId: null);
+            threadRisks.Should().ContainSingle(diagnostic =>
+                diagnostic.SymbolFqn != null
+                && diagnostic.SymbolFqn.Contains(
+                    "SampleWpfRisksWindows.Worker.Run",
+                    StringComparison.Ordinal)
+                && diagnostic.Message.Contains(
+                    "View.Text",
+                    StringComparison.Ordinal));
+        }
+        finally
+        {
+            try
+            {
+                Directory.Delete(tempRoot, recursive: true);
+            }
+            catch
+            {
+                // Best-effort cleanup; a failed assertion remains the useful signal.
+            }
+        }
+    }
+
     private static async Task DispatchXamlAsync(
         SqliteGraphStore store,
         string fixtureRoot,
