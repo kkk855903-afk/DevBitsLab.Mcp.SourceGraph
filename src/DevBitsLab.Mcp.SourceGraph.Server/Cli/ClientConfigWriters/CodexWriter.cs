@@ -33,11 +33,18 @@ internal sealed class CodexWriter : IClientConfigWriter
     public WriterPlan Plan(WriterContext ctx)
     {
         var (command, rawArgs) = WriterCommandLine.Build(ctx);
-        var args = rawArgs.Select(arg => MakePortableArgument(arg, ctx.Root)).ToArray();
-        const string cwd = "..";
+        var cwd = Path.GetFullPath(ctx.Root);
+        var args = MakeAbsoluteArguments(rawArgs, cwd).ToList();
+        if (!args.Contains("--root", StringComparer.Ordinal))
+        {
+            args.Add("--root");
+            args.Add(cwd);
+        }
+        args.Add("--codex-compat");
+        var ownedArgs = args.ToArray();
 
         if (!IsWellFormedUnicode(command)
-            || args.Any(arg => !IsWellFormedUnicode(arg)))
+            || ownedArgs.Any(arg => !IsWellFormedUnicode(arg)))
         {
             return new WriterPlan(
                 ctx.TargetPath,
@@ -48,8 +55,8 @@ internal sealed class CodexWriter : IClientConfigWriter
 
         if (ctx.ExistingContent is null or { Length: 0 })
         {
-            var fresh = BuildTable(command, args, cwd, "\n");
-            if (!CandidateIsValid(fresh, ctx.TargetPath, command, args, cwd))
+            var fresh = BuildTable(command, ownedArgs, cwd, "\n");
+            if (!CandidateIsValid(fresh, ctx.TargetPath, command, ownedArgs, cwd))
             {
                 return UnsafePlan(
                     ctx,
@@ -82,7 +89,7 @@ internal sealed class CodexWriter : IClientConfigWriter
         var hasBom = decoded.StartsWith('\uFEFF');
         var existing = hasBom ? decoded[1..] : decoded;
         var newline = DetectNewline(existing);
-        var standalone = BuildTable(command, args, cwd, newline);
+        var standalone = BuildTable(command, ownedArgs, cwd, newline);
 
         if (!TryParse(existing, ctx.TargetPath, out var document)
             || !TryReadModel(existing, out var model))
@@ -112,7 +119,7 @@ internal sealed class CodexWriter : IClientConfigWriter
             }
 
             var candidate = AppendTable(existing, standalone, newline);
-            if (!CandidateIsValid(candidate, ctx.TargetPath, command, args, cwd))
+            if (!CandidateIsValid(candidate, ctx.TargetPath, command, ownedArgs, cwd))
             {
                 return UnsafePlan(
                     ctx,
@@ -157,8 +164,8 @@ internal sealed class CodexWriter : IClientConfigWriter
                 targetModel,
                 targetSyntax,
                 "args",
-                args,
-                ArrayValue(args),
+                ownedArgs,
+                ArrayValue(ownedArgs),
                 patches,
                 missingLines,
                 ref differs)
@@ -199,7 +206,7 @@ internal sealed class CodexWriter : IClientConfigWriter
         }
 
         var updated = ApplyPatches(existing, patches);
-        if (!CandidateIsValid(updated, ctx.TargetPath, command, args, cwd))
+        if (!CandidateIsValid(updated, ctx.TargetPath, command, ownedArgs, cwd))
         {
             return UnsafePlan(
                 ctx,
@@ -495,26 +502,32 @@ internal sealed class CodexWriter : IClientConfigWriter
     private static byte[] Encode(string text, bool withBom) =>
         StrictUtf8.GetBytes(withBom ? "\uFEFF" + text : text);
 
-    private static string MakePortableArgument(string value, string root)
+    private static string[] MakeAbsoluteArguments(IReadOnlyList<string> values, string root)
+    {
+        var result = new string[values.Count];
+        for (var i = 0; i < values.Count; i++)
+        {
+            var isPathValue = i > 0
+                && values[i - 1] is "--solution" or "--root" or "--project";
+            result[i] = isPathValue
+                ? MakeAbsolutePathArgument(values[i], root)
+                : values[i];
+        }
+        return result;
+    }
+
+    private static string MakeAbsolutePathArgument(string value, string root)
     {
         const string token = "${workspaceFolder}";
-        if (string.Equals(value, token, StringComparison.Ordinal)) return ".";
+        if (string.Equals(value, token, StringComparison.Ordinal)) return root;
         if (value.StartsWith(token + "/", StringComparison.Ordinal)
             || value.StartsWith(token + "\\", StringComparison.Ordinal))
         {
-            return value[(token.Length + 1)..].Replace('\\', '/');
+            return Path.GetFullPath(Path.Join(root, value[(token.Length + 1)..]));
         }
 
-        if (!Path.IsPathFullyQualified(value)) return value;
-        var relative = Path.GetRelativePath(Path.GetFullPath(root), value);
-        if (relative == ".") return ".";
-        if (!relative.StartsWith(".." + Path.DirectorySeparatorChar, StringComparison.Ordinal)
-            && !string.Equals(relative, "..", StringComparison.Ordinal)
-            && !Path.IsPathFullyQualified(relative))
-        {
-            return relative.Replace('\\', '/');
-        }
-        return value;
+        return Path.GetFullPath(
+            Path.IsPathFullyQualified(value) ? value : Path.Join(root, value));
     }
 
     private static string BuildTable(

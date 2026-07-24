@@ -377,15 +377,17 @@ Codex reads MCP servers from TOML. Run
 ```toml
 [mcp_servers.sourcegraph]
 command = "sourcegraph-mcp"
-args = ["serve", "--solution", "MySolution.slnx"]
-cwd = ".."
+args = ["serve", "--solution", "C:\\absolute\\repo\\MySolution.slnx", "--root", "C:\\absolute\\repo", "--codex-compat"]
+cwd = "C:\\absolute\\repo"
 ```
 
-`cwd = ".."` makes the server run from the repository root because relative
-paths in a project Codex config are resolved from its `.codex/` directory.
-The Codex writer deliberately emits repository-relative paths instead of
-`${workspaceFolder}`, whose expansion is not part of the Codex project-config
-contract.
+The Codex writer deliberately emits absolute solution/root paths and an
+absolute `cwd`. This prevents a desktop host or resumed task from starting the
+server in its application directory. It also adds `--codex-compat`, which
+serves rich graph results as one plain-text content block for Codex builds that
+otherwise report `Unexpected response type`; other MCP clients continue to
+receive structured content. `${workspaceFolder}` is not used because its
+expansion is not part of the Codex project-config contract.
 
 Codex loads project configuration only after the repository is trusted. After
 writing or changing the file, start a new Codex task (or restart the
@@ -1210,15 +1212,15 @@ published tool, swap `command` / `args` for:
 }
 ```
 
-For this repository's Codex config, generate the equivalent portable TOML
+For this repository's Codex config, generate the equivalent TOML
 instead of hand-translating the JSON:
 
 ```bash
 sourcegraph-mcp init --yes --client codex --install-mode in-repo
 ```
 
-That writes `command = "dotnet"`, repository-relative `--project` and
-`--solution` arguments, and `cwd = ".."` under
+That writes `command = "dotnet"`, absolute `--project`, `--solution`, and
+`--root` arguments, an absolute `cwd`, and `--codex-compat` under
 `[mcp_servers.sourcegraph]`.
 
 Re-run `dotnet build` after each change so the next launch picks it up.

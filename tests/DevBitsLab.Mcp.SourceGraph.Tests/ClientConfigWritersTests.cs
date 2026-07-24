@@ -191,7 +191,7 @@ public sealed class ClientConfigWritersTests : IDisposable
     // ────────────────────────── CodexWriter ──────────────────────────
 
     [Fact]
-    public void Codex_cleanWrite_emitsPortableToml()
+    public void Codex_cleanWrite_emitsAbsoluteRootedCompatibilityConfig()
     {
         var w = new CodexWriter();
         var plan = w.Plan(MakeContext(w, existingContent: null));
@@ -203,9 +203,10 @@ public sealed class ClientConfigWritersTests : IDisposable
         w.DefaultUserPath().Should().BeNull();
         toml.Should().Contain("[mcp_servers.sourcegraph]");
         toml.Should().Contain("command = \"sourcegraph-mcp\"");
-        toml.Should().Contain(
-            "args = [\"serve\", \"--solution\", \"MyApp.slnx\"]");
-        toml.Should().Contain("cwd = \"..\"");
+        toml.Should().Contain(BasicTomlPath(Path.Join(_tempRoot, "MyApp.slnx")));
+        toml.Should().Contain(BasicTomlPath(_tempRoot));
+        toml.Should().Contain("\"--codex-compat\"");
+        toml.Should().Contain($"cwd = {BasicTomlPath(_tempRoot)}");
         toml.Should().NotContain("${workspaceFolder}");
         CodexWriter.ContainsSourcegraphEntry(toml).Should().BeTrue(
             "the fresh write candidate must pass strict TOML parsing and contain a semantic table");
@@ -255,12 +256,18 @@ public sealed class ClientConfigWritersTests : IDisposable
             args = [
               'serve',
               '--solution',
-              'MyApp.slnx',
+              '__SOLUTION__',
+              '--root',
+              '__ROOT__',
+              '--codex-compat',
             ]
             enabled = true # user-owned option
-            cwd = '..'
+            cwd = '__ROOT__'
             command = 'sourcegraph-mcp'
             """;
+        existingText = existingText
+            .Replace("__SOLUTION__", Path.Join(_tempRoot, "MyApp.slnx"), StringComparison.Ordinal)
+            .Replace("__ROOT__", _tempRoot, StringComparison.Ordinal);
         var existing = Encoding.UTF8.GetBytes(existingText);
         var w = new CodexWriter();
         var plan = w.Plan(MakeContext(w, existing));
@@ -352,8 +359,8 @@ public sealed class ClientConfigWritersTests : IDisposable
         plan.Action.Should().Be(WriterAction.ReplaceOurs);
         updated.Should().Contain("enabled = true");
         updated.Should().Contain("command = \"sourcegraph-mcp\"");
-        updated.Should().Contain("args = [\"serve\", \"--solution\", \"MyApp.slnx\"]");
-        updated.Should().Contain("cwd = \"..\"");
+        updated.Should().Contain("\"--codex-compat\"");
+        updated.Should().Contain($"cwd = {BasicTomlPath(_tempRoot)}");
     }
 
     [Fact]
@@ -425,15 +432,31 @@ public sealed class ClientConfigWritersTests : IDisposable
         var w = new CodexWriter();
         var rootPlan = w.Plan(MakeContext(w, null) with { SolutionPath = null });
         var rootToml = Encoding.UTF8.GetString(rootPlan.ContentBytes);
-        rootToml.Should().Contain("args = [\"serve\", \"--root\", \".\"]");
+        rootToml.Should().Contain("\"--root\"");
+        rootToml.Should().Contain(BasicTomlPath(_tempRoot));
+        rootToml.Should().Contain("\"--codex-compat\"");
 
         var inRepoPlan = w.Plan(MakeContext(w, null) with
         {
             InstallMode = InstallMode.InRepo,
         });
         var inRepoToml = Encoding.UTF8.GetString(inRepoPlan.ContentBytes);
-        inRepoToml.Should().Contain("\"src/DevBitsLab.Mcp.SourceGraph.Server\"");
+        inRepoToml.Should().Contain(
+            BasicTomlPath(Path.Join(_tempRoot, "src", "DevBitsLab.Mcp.SourceGraph.Server")));
         inRepoToml.Should().NotContain("${workspaceFolder}");
+    }
+
+    [Fact]
+    public void Codex_relativeSolution_isResolvedAgainstRepositoryRoot()
+    {
+        var writer = new CodexWriter();
+        var plan = writer.Plan(MakeContext(writer, null) with
+        {
+            SolutionPath = Path.Join(".", "GestureHub.slnx"),
+        });
+        var toml = Encoding.UTF8.GetString(plan.ContentBytes);
+
+        toml.Should().Contain(BasicTomlPath(Path.Join(_tempRoot, "GestureHub.slnx")));
     }
 
     [Fact]
@@ -446,6 +469,9 @@ public sealed class ClientConfigWritersTests : IDisposable
         File.Exists(plan.TargetPath).Should().BeTrue();
         File.ReadAllText(plan.TargetPath).Should().Contain("[mcp_servers.sourcegraph]");
     }
+
+    private static string BasicTomlPath(string path) =>
+        "\"" + path.Replace("\\", "\\\\", StringComparison.Ordinal) + "\"";
 
     // ────────────────────────── ContinueWriter ──────────────────────────
 

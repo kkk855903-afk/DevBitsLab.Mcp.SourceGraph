@@ -11,6 +11,17 @@ below note which package the change applies to.
 ## [Unreleased]
 
 ### Changed
+- **Codex MCP transport compatibility and deterministic project paths.** Codex
+  configs now use absolute `--solution` / `--root` paths plus an absolute
+  `cwd`, and add `--codex-compat`. That mode emits one plain text content block
+  and omits output schemas for rich tools, avoiding affected Codex builds'
+  `Unexpected response type` decoder failure while other clients retain full
+  structured content. Operators can also opt in explicitly with
+  `SOURCEGRAPH_CODEX_COMPAT=1`.
+- **Reliable `init --prewarm` relaunch.** Pre-warm now invokes the running
+  apphost/assembly first, falls back to global and local-tool launch forms, and
+  continues after a subprocess starts but exits non-zero. It no longer treats
+  the invalid `dotnet sourcegraph-mcp` failure as a completed pre-warm.
 - **Fork-aware SourceLink package verification.** Release-package checks now
   validate symbol URLs against the GitHub repository that produced the
   checkout (or an explicit local override), while retaining the canonical
@@ -27,8 +38,8 @@ below note which package the change applies to.
 ### Added
 - **First-class Codex MCP onboarding.** `sourcegraph-mcp init` now includes
   project-scoped `.codex/config.toml` in its defaults and accepts
-  `--client codex` / `--no-codex`. The dedicated TOML writer emits portable
-  repo-relative arguments with `cwd = ".."`, never relies on
+  `--client codex` / `--no-codex`. The dedicated TOML writer emits absolute
+  repository and solution arguments with an absolute `cwd`, never relies on
   `${workspaceFolder}`, strictly validates existing TOML, and patches only
   `command` / `args` / `cwd` while preserving comments, extra options, and
   other servers. `doctor`, English/Chinese help, tests, and installation smoke

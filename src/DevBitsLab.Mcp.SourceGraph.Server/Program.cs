@@ -338,6 +338,7 @@ static async Task<int> RunServeAsync(CommandLine cli)
     ToolDescriptionFormatter.Suppressed = ServerInstructions.ShouldSuppress(
         cli.NoToolTriggers,
         Environment.GetEnvironmentVariable(ToolDescriptionFormatter.EnvVarName));
+    CodexCompatibility.Enabled = CodexCompatibility.ShouldEnable(cli.CodexCompat);
     if (!noInstructions)
     {
         // Use Program as the logger category — ServerVocabulary is static so it can't be a
@@ -392,6 +393,15 @@ static async Task<int> RunServeAsync(CommandLine cli)
         .WithStdioServerTransport()
         .WithToolsFromAssembly()
         .WithResourcesFromAssembly();
+    if (CodexCompatibility.Enabled)
+    {
+        // Run after any built-in or plugin tool and before the SDK serialises CallToolResult.
+        // This single protocol-level chokepoint also covers SDK-generated error results.
+        mcpBuilder.WithRequestFilters(filters =>
+            filters.AddCallToolFilter(next => async (request, cancellationToken) =>
+                CodexCompatibility.NormalizeToolResult(
+                    await next(request, cancellationToken).ConfigureAwait(false))));
+    }
 
     // Tool plugins: register every tool the loaded plugins want to expose, prefixed by their
     // declared `Prefix`. Collisions (same final name from two plugins, or shadowing a built-in)
@@ -465,6 +475,10 @@ static async Task<int> RunServeAsync(CommandLine cli)
     // method carrying [ToolAnnotation]. Spec-aware hosts use these to require explicit user
     // confirmation before invoking destructive tools (e.g. embeddings_remove).
     ToolDescriptionFormatter.ApplyAnnotationsFromAttributes(host.Services.GetServices<McpServerTool>());
+    if (CodexCompatibility.Enabled)
+    {
+        CodexCompatibility.RemoveOutputSchemas(host.Services.GetServices<McpServerTool>());
+    }
 
     // Stamp the brand mark on every built-in tool's catalog identity (Title + Description). Same
     // post-build mutation pattern as ApplyTriggersFromAttributes; reads LeafFormatter.Suppressed

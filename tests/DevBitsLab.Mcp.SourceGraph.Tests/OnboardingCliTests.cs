@@ -71,7 +71,7 @@ public sealed class OnboardingCliTests : IDisposable
     }
 
     [Fact]
-    public async Task Init_yes_printOnly_codexEmitsPortableToml()
+    public async Task Init_yes_printOnly_codexEmitsAbsoluteCompatibleToml()
     {
         var cli = ParseInit("--print-only", "--client", "codex");
         var rc = await InitCli.RunAsync(cli);
@@ -80,7 +80,11 @@ public sealed class OnboardingCliTests : IDisposable
         rc.Should().Be(0);
         output.Should().Contain(Path.Join(".codex", "config.toml"));
         output.Should().Contain("[mcp_servers.sourcegraph]");
-        output.Should().Contain("cwd = \"..\"");
+        output.Should().Contain($"cwd = \"{_tempRoot.Replace("\\", "\\\\", StringComparison.Ordinal)}\"");
+        output.Should().Contain(
+            Path.Join(_tempRoot, "MySolution.slnx").Replace("\\", "\\\\", StringComparison.Ordinal));
+        output.Should().Contain("\"--root\"");
+        output.Should().Contain("\"--codex-compat\"");
         output.Should().NotContain("${workspaceFolder}");
         _stderr.ToString().Should().NotContain("unknown --client");
     }

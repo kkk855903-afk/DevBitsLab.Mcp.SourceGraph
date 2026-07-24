@@ -33,6 +33,9 @@ internal sealed class CommandLine
     /// <summary>True when <c>--no-tool-triggers</c> was passed; suppresses the
     /// <c>Use when: …</c> append on every tool description (built-in and plugin).</summary>
     public bool NoToolTriggers { get; private init; }
+    /// <summary>Downgrade rich MCP tool results to one plain text block for Codex builds that
+    /// otherwise fail to decode them with <c>Unexpected response type</c>.</summary>
+    public bool CodexCompat { get; private init; }
     /// <summary>True when <c>--strict</c> was passed; consumed by <c>vocabulary list</c> to exit
     /// non-zero when drift candidates are reported.</summary>
     public bool Strict { get; private init; }
@@ -140,6 +143,7 @@ internal sealed class CommandLine
         var noInstructions = false;
         var noLeaf = false;
         var noToolTriggers = false;
+        var codexCompat = false;
         var strict = false;
         var all = false;
         string? scopeId = null;
@@ -221,6 +225,9 @@ internal sealed class CommandLine
                     break;
                 case "--no-tool-triggers":
                     noToolTriggers = true;
+                    break;
+                case "--codex-compat":
+                    codexCompat = true;
                     break;
                 case "--strict":
                     strict = true;
@@ -324,6 +331,7 @@ internal sealed class CommandLine
             NoInstructions = noInstructions,
             NoLeaf = noLeaf,
             NoToolTriggers = noToolTriggers,
+            CodexCompat = codexCompat,
             Strict = strict,
             All = all,
             ScopeId = scopeId,
@@ -449,7 +457,7 @@ internal sealed class CommandLine
           sourcegraph-mcp --help [--lang <en|zh>]
               Print this help in English (`en`) or Simplified Chinese (`zh`).
 
-          sourcegraph-mcp serve [--solution <path>] [--db <path>] [--root <repo>] [--model <id>] [--no-embeddings] [--allow-model-download|--no-model-download] [--no-history]
+          sourcegraph-mcp serve [--solution <path>] [--db <path>] [--root <repo>] [--model <id>] [--no-embeddings] [--allow-model-download|--no-model-download] [--no-history] [--codex-compat]
               Run the MCP stdio server. With --solution given, registers an implicit single-scope
               `default` mapped to that solution. Otherwise reads `.sourcegraph.json` from --root
               (or CWD) for multi-scope configuration.
@@ -559,6 +567,9 @@ internal sealed class CommandLine
                             tools/list. Saves upfront tokens at the cost of less guidance
                             for agents picking between tools. Equivalent to setting
                             SOURCEGRAPH_NO_TOOL_TRIGGERS=1.
+          --codex-compat    Emit plain-text-only tool results for Codex clients that cannot
+                            decode rich MCP CallToolResult payloads. Codex init configs add this
+                            automatically. Equivalent to SOURCEGRAPH_CODEX_COMPAT=1.
           --scope <id>      Restrict the operation to a single scope. Used by `index`, `demo`,
                             and `vocabulary list`.
           --strict          Treat warnings as errors. Currently consumed by `vocabulary list`,
@@ -589,7 +600,7 @@ internal sealed class CommandLine
           sourcegraph-mcp --help [--lang <en|zh>]
               使用英文 (`en`) 或简体中文 (`zh`) 显示本帮助。
 
-          sourcegraph-mcp serve [--solution <path>] [--db <path>] [--root <repo>] [--model <id>] [--no-embeddings] [--allow-model-download|--no-model-download] [--no-history]
+          sourcegraph-mcp serve [--solution <path>] [--db <path>] [--root <repo>] [--model <id>] [--no-embeddings] [--allow-model-download|--no-model-download] [--no-history] [--codex-compat]
               运行 MCP stdio 服务器。指定 --solution 时，将创建映射到该解决方案的隐式
               `default` 单作用域；否则从 --root（或当前工作目录）读取 `.sourcegraph.json`
               多作用域配置。
@@ -693,6 +704,9 @@ internal sealed class CommandLine
                             不在 tools/list 的工具说明末尾附加 `Use when: …`。
                             可减少首次载荷，但代理选择工具时获得的指引也会减少。
                             等价于 SOURCEGRAPH_NO_TOOL_TRIGGERS=1。
+          --codex-compat    仅输出纯文本工具结果，以兼容无法解码丰富 CallToolResult 的
+                            Codex 客户端。Codex 初始化配置会自动添加此参数，也可设置
+                            SOURCEGRAPH_CODEX_COMPAT=1。
           --scope <id>      将操作限制到一个作用域，用于 index、demo 和
                             vocabulary list。
           --strict          将警告视为错误。目前用于 vocabulary list；发现漂移候选时

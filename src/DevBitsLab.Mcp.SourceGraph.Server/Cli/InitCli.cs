@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using DevBitsLab.Mcp.SourceGraph.Server.Cli.ClientConfigWriters;
 using DevBitsLab.Mcp.SourceGraph.Storage;
 
@@ -445,78 +444,20 @@ internal static class InitCli
         }
         Console.WriteLine();
         Console.WriteLine($"Pre-warming index against {Path.GetFileName(abs)}…");
-        var sw = Stopwatch.StartNew();
-        // Shell out for the pre-warm so we don't re-create the indexer construction graph that
-        // lives in Program.cs. Three invocation strategies, tried in order — the first one that
-        // starts wins. The order is chosen so the path that actually works in each install
-        // mode is hit first:
-        //   1. `dotnet sourcegraph-mcp index <abs>` — works for global tool install AND for the
-        //      .NET local-tool manifest pattern. Most common in practice.
-        //   2. `<entry-apphost> index <abs>` — works when the current process is launched via a
-        //      native apphost (e.g. running in-tree via `dotnet run` produces an apphost binary
-        //      whose Environment.ProcessPath is the apphost itself, not "dotnet").
-        //   3. `dotnet <entry-dll> index <abs>` — last-resort fallback when neither of the
-        //      above starts: re-invokes the same .dll under `dotnet exec`-style launch.
-        var attempts = new List<(string FileName, string[] Args)>
+        var startedAt = DateTimeOffset.UtcNow;
+        var exitCode = await PrewarmLauncher.RunAttemptsAsync(
+            PrewarmLauncher.BuildAttempts(abs),
+            PrewarmLauncher.RunProcessAsync).ConfigureAwait(false);
+        var elapsed = DateTimeOffset.UtcNow - startedAt;
+        if (exitCode == 0)
         {
-            ("dotnet", new[] { "sourcegraph-mcp", "index", abs }),
-        };
-        var processPath = Environment.ProcessPath;
-        if (!string.IsNullOrEmpty(processPath))
-        {
-            // Heuristic: a `.dll` at ProcessPath means we're being run as `dotnet <dll>`; any
-            // other extension (none on Unix, `.exe` on Windows) means an apphost.
-            if (processPath.EndsWith(".dll", StringComparison.OrdinalIgnoreCase))
-            {
-                attempts.Add(("dotnet", new[] { processPath, "index", abs }));
-            }
-            else
-            {
-                attempts.Add((processPath, new[] { "index", abs }));
-            }
+            Console.WriteLine($"  pre-warm: complete in {elapsed.TotalSeconds:F1}s");
+            return;
         }
 
-        foreach (var (fileName, args) in attempts)
-        {
-            // Inherit stdout/stderr instead of redirecting. The original implementation
-            // redirected both pipes but never drained them, which would deadlock the child
-            // once a buffer filled (a real `index` pass on a sizeable solution easily
-            // produces enough output to hit that). Inheriting lets the user see indexer
-            // progress live AND avoids the deadlock entirely; we only need to know the
-            // child's exit code, which comes from WaitForExitAsync.
-            var psi = new ProcessStartInfo(fileName)
-            {
-                RedirectStandardOutput = false,
-                RedirectStandardError = false,
-                UseShellExecute = false,
-            };
-            foreach (var a in args) psi.ArgumentList.Add(a);
-            try
-            {
-                using var p = Process.Start(psi);
-                if (p is null) continue;
-                await p.WaitForExitAsync().ConfigureAwait(false);
-                sw.Stop();
-                Console.WriteLine($"  pre-warm: exit {p.ExitCode} in {sw.Elapsed.TotalSeconds:F1}s");
-                return;
-            }
-            catch (System.ComponentModel.Win32Exception)
-            {
-                // FileName not found / not executable — try the next strategy.
-                continue;
-            }
-            catch (IOException ex)
-            {
-                Console.Error.WriteLine($"warn: pre-warm failed (i/o): {ex.Message}");
-                return;
-            }
-            catch (InvalidOperationException ex)
-            {
-                Console.Error.WriteLine($"warn: pre-warm failed (process state): {ex.Message}");
-                return;
-            }
-        }
-        Console.Error.WriteLine("warn: pre-warm could not start any subprocess (tried `dotnet sourcegraph-mcp` + the current entry binary). Run `sourcegraph-mcp index <solution>` manually if needed.");
+        var detail = exitCode.HasValue ? $"last exit {exitCode.Value}" : "no process started";
+        Console.Error.WriteLine(
+            $"warn: pre-warm failed ({detail}). Run `sourcegraph-mcp index \"{abs}\"` manually if needed.");
     }
 
     private sealed record WriterRunResult(
