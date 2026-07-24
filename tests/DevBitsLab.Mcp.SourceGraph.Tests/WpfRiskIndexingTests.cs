@@ -52,6 +52,11 @@ public sealed class WpfRiskIndexingTests
             var eventRisks = await DiagnosticsAsync(store, "WPFEVENT001");
             eventRisks.Should().ContainSingle();
             eventRisks[0].FilePath.Should().Be(subscriberPath);
+            eventRisks[0].SymbolId.Should().NotBeNull();
+            eventRisks[0].SymbolFqn.Should()
+                .Contain("WpfRiskFixture.Subscriber.Attach");
+            eventRisks[0].SymbolCanonicalKey.Should()
+                .StartWith("csharp:M:WpfRiskFixture.Subscriber.Attach");
             eventRisks[0].Message.Should()
                 .Contain("AppLifetime.Changed")
                 .And.Contain("Subscriber.OnChanged");
@@ -59,6 +64,11 @@ public sealed class WpfRiskIndexingTests
             var threadRisks = await DiagnosticsAsync(store, "WPFTHREAD001");
             threadRisks.Should().ContainSingle();
             threadRisks[0].FilePath.Should().Be(workerPath);
+            threadRisks[0].SymbolId.Should().NotBeNull();
+            threadRisks[0].SymbolFqn.Should()
+                .Contain("WpfRiskFixture.Worker.Run");
+            threadRisks[0].SymbolCanonicalKey.Should()
+                .StartWith("csharp:M:WpfRiskFixture.Worker.Run");
             threadRisks[0].Message.Should()
                 .Contain("Task.Run")
                 .And.Contain("View.Text");

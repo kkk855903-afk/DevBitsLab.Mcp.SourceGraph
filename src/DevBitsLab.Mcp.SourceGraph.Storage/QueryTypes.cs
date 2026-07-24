@@ -49,6 +49,8 @@ public sealed record ReferenceHit(
 public sealed record DiagnosticHit(
     long Id,
     long? SymbolId,
+    string? SymbolFqn,
+    string? SymbolCanonicalKey,
     long FileId,
     string FilePath,
     int Severity,

@@ -25,6 +25,13 @@ public sealed record FindDiagnosticsRow(
     string Severity,
     string Code,
     string Message,
+    [property: JsonPropertyName("symbol_id")] long? SymbolId,
+    string? Symbol,
+    [property: JsonPropertyName("symbol_canonical_key")]
+        string? SymbolCanonicalKey,
+    string Relation,
+    string Confidence,
+    string Producer,
     [property: JsonPropertyName("file_path")] string FilePath,
     int Line,
     int Column);

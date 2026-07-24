@@ -193,15 +193,35 @@ public sealed class TabularRenderingTests : IAsyncLifetime, IDisposable
         // and there's an Obsolete attribute on Greeter.LegacyGreet too — so multiple sites
         // get the warning. We assert tolerantly: the prose lead-in is always there, and if
         // there are 2+ rows we expect the table header.
-        var output = CallToolResultHelpers.ProseText(await GraphTools.FindDiagnosticsAsync(_router!));
+        var result = await GraphTools.FindDiagnosticsAsync(_router!);
+        var output = CallToolResultHelpers.ProseText(result);
         output.Should().Contain("Diagnostics (severity");
         var firstLine = output.Split('\n')[0];
         firstLine.Should().NotStartWith("|");
         if (output.Contains("|"))
         {
             // If we got the table at all, it must be the right shape.
-            output.Should().Contain("| Severity | Code | Location | Message |");
+            output.Should().Contain(
+                "| Severity | Code | Symbol | Relation | Confidence | Location | Message |");
         }
+
+        var rows = result.StructuredContent!.Value
+            .GetProperty("diagnostics")
+            .EnumerateArray()
+            .ToArray();
+        rows.Should().NotBeEmpty();
+        rows.Should().AllSatisfy(row =>
+        {
+            row.GetProperty("relation").GetString()
+                .Should().BeOneOf("diagnoses-symbol", "diagnoses-file");
+            row.GetProperty("confidence").GetString()
+                .Should().Be("semantic");
+            row.GetProperty("producer").GetString()
+                .Should().NotBeNullOrWhiteSpace();
+            row.GetProperty("file_path").GetString()
+                .Should().NotBeNullOrWhiteSpace();
+            row.GetProperty("line").GetInt32().Should().BeGreaterThan(0);
+        });
     }
 
     [Fact]

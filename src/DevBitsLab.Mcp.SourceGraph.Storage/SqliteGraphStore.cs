@@ -3550,10 +3550,14 @@ public sealed partial class SqliteGraphStore : IGraphStore
         var where = clauses.Count == 0 ? "" : "WHERE " + string.Join(" AND ", clauses);
 
         var sql = $"""
-            SELECT d.id, d.symbol_id AS SymbolId, d.file_id AS FileId, f.path AS FilePath,
+            SELECT d.id, d.symbol_id AS SymbolId,
+                   s.fqn AS SymbolFqn,
+                   s.canonical_key AS SymbolCanonicalKey,
+                   d.file_id AS FileId, f.path AS FilePath,
                    d.severity, d.code, d.message, d.line, d.col
             FROM diagnostics d
             JOIN files f ON f.id = d.file_id
+            LEFT JOIN symbols s ON s.id = d.symbol_id
             {where}
             ORDER BY f.path, d.line, d.col
             LIMIT @limit;
@@ -3616,11 +3620,31 @@ public sealed partial class SqliteGraphStore : IGraphStore
         return v is not null && v.Value != 0;
     }
 
-    private sealed record RawDiagnosticHit(long Id, long? SymbolId, long FileId, string FilePath,
-        long Severity, string Code, string Message, long Line, long Col)
+    private sealed record RawDiagnosticHit(
+        long Id,
+        long? SymbolId,
+        string? SymbolFqn,
+        string? SymbolCanonicalKey,
+        long FileId,
+        string FilePath,
+        long Severity,
+        string Code,
+        string Message,
+        long Line,
+        long Col)
     {
-        public DiagnosticHit ToHit() => new(Id, SymbolId, FileId, FilePath,
-            (int)Severity, Code, Message, (int)Line, (int)Col);
+        public DiagnosticHit ToHit() => new(
+            Id,
+            SymbolId,
+            SymbolFqn,
+            SymbolCanonicalKey,
+            FileId,
+            FilePath,
+            (int)Severity,
+            Code,
+            Message,
+            (int)Line,
+            (int)Col);
     }
 
     public async Task<IReadOnlyDictionary<long, byte[]?>> GetBlamedShasForFileAsync(long fileId, CancellationToken ct = default)

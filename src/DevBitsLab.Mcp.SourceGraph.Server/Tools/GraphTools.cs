@@ -2401,17 +2401,37 @@ public static class GraphTools
                         {
                             SeverityLabel(d.Severity),
                             d.Code,
+                            d.SymbolFqn ?? "(file)",
+                            DiagnosticRelation(d),
+                            "semantic",
                             Format.Location(d.FilePath, d.Line, d.Col),
                             d.Message,
                         });
                     }
-                    Format.AppendTable(sb, new[] { "Severity", "Code", "Location", "Message" }, tableRows);
+                    Format.AppendTable(
+                        sb,
+                        new[]
+                        {
+                            "Severity",
+                            "Code",
+                            "Symbol",
+                            "Relation",
+                            "Confidence",
+                            "Location",
+                            "Message",
+                        },
+                        tableRows);
                 }
                 else if (rows.Count == 1)
                 {
                     foreach (var d in rows)
                     {
-                        sb.AppendLine($"- **{SeverityLabel(d.Severity)} {d.Code}** at {Format.Location(d.FilePath, d.Line, d.Col)} — {d.Message}");
+                        sb.AppendLine(
+                            $"- **{SeverityLabel(d.Severity)} {d.Code}** "
+                            + $"on `{d.SymbolFqn ?? "(file)"}` "
+                            + $"({DiagnosticRelation(d)}, semantic) at "
+                            + $"{Format.Location(d.FilePath, d.Line, d.Col)} "
+                            + $"— {d.Message}");
                     }
                 }
                 return BuildFindDiagnosticsResult(
@@ -2452,6 +2472,12 @@ public static class GraphTools
                 Severity: SeverityLabel(d.Severity),
                 Code: d.Code,
                 Message: d.Message,
+                SymbolId: d.SymbolId,
+                Symbol: d.SymbolFqn,
+                SymbolCanonicalKey: d.SymbolCanonicalKey,
+                Relation: DiagnosticRelation(d),
+                Confidence: "semantic",
+                Producer: DiagnosticProducer(d.Code),
                 FilePath: d.FilePath,
                 Line: d.Line,
                 Column: d.Col))
@@ -2470,6 +2496,21 @@ public static class GraphTools
                 ToolOutputJsonContext.Default.FindDiagnosticsResult),
         };
     }
+
+    private static string DiagnosticRelation(DiagnosticHit diagnostic) =>
+        diagnostic.SymbolId is null
+            ? "diagnoses-file"
+            : "diagnoses-symbol";
+
+    private static string DiagnosticProducer(string code) =>
+        code switch
+        {
+            "WPFEVENT001" => "wpf-event-lifetime",
+            "WPFTHREAD001" => "wpf-ui-thread",
+            _ when code.StartsWith("CS", StringComparison.Ordinal) =>
+                "roslyn-compiler",
+            _ => "roslyn-analyzer",
+        };
 
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(ListGeneratedFilesResult))]
     [ToolTrigger("\"what's source-generated in this codebase?\"")]
