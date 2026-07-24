@@ -145,7 +145,7 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
     public void Tool_registersExactPhase1Name()
     {
         var method = typeof(TraceCallPathTools).GetMethod(
-            nameof(TraceCallPathTools.TraceCallPathAsync),
+            nameof(TraceCallPathTools.TraceCallPathWithProfileAsync),
             BindingFlags.Public | BindingFlags.Static);
         var tool = McpServerTool.Create(
             method!,
@@ -153,12 +153,16 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
             new McpServerToolCreateOptions());
 
         tool.ProtocolTool.Name.Should().Be("trace_call_path");
+        var annotation = method!.GetCustomAttribute<ToolAnnotationAttribute>();
+        annotation.Should().NotBeNull();
+        annotation!.ReadOnlyHint.Should().BeTrue();
+        annotation.IdempotentHint.Should().BeTrue();
     }
 
     [Fact]
     public async Task Trace_returnsEveryHopWithEvidence_andDetectsCycles()
     {
-        var result = await TraceCallPathTools.TraceCallPathAsync(
+        var result = await TraceCallPathTools.TraceCallPathWithProfileAsync(
             _router!,
             from: "Graph.A",
             to: "Graph.C",
@@ -203,7 +207,7 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
     [Fact]
     public async Task Trace_enforcesDepthAndResourceCaps()
     {
-        var shallow = await TraceCallPathTools.TraceCallPathAsync(
+        var shallow = await TraceCallPathTools.TraceCallPathWithProfileAsync(
             _router!,
             from: "Graph.A",
             to: "Graph.C",
@@ -226,7 +230,7 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
     [Fact]
     public async Task Trace_filtersMalformedEdgesBeforeExactBranchAndPathCaps()
     {
-        var result = await TraceCallPathTools.TraceCallPathAsync(
+        var result = await TraceCallPathTools.TraceCallPathWithProfileAsync(
             _router!,
             from: "Graph.StarveSource",
             to: "Graph.ZDirectTarget",
@@ -247,7 +251,7 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
     [Fact]
     public async Task Trace_depthBoundaryIsComplete_whenFrontierHasNoAuditableChildren()
     {
-        var result = await TraceCallPathTools.TraceCallPathAsync(
+        var result = await TraceCallPathTools.TraceCallPathWithProfileAsync(
             _router!,
             from: "Graph.TerminalSource",
             to: "Graph.C",
@@ -264,7 +268,7 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
     [Fact]
     public async Task ExecutionProfile_tracesOnlyWhitelistedRelations_fromExactCanonicalKeys()
     {
-        var result = await TraceCallPathTools.TraceCallPathAsync(
+        var result = await TraceCallPathTools.TraceCallPathWithProfileAsync(
             _router!,
             from: "csharp:M:Graph.Ui",
             to: "csharp:M:Graph.Native",
@@ -287,8 +291,13 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
             EdgeKinds.PInvokeMapsTo);
         var scope = dto.Scopes.Should().ContainSingle().Which;
         scope.ExecutionState.Should().NotBeNull();
-        scope.ExecutionState!.Status.Should().Be("complete");
-        scope.ExecutionState.AbsenceAuthoritative.Should().BeTrue();
+        scope.ExecutionState!.Status.Should().Be("partial");
+        scope.ExecutionState.AbsenceAuthoritative.Should().BeFalse(
+            "the fixture deliberately has no native projection configuration");
+        scope.ExecutionState.Projections.Should().ContainSingle(projection =>
+            projection.Name == "native-interop"
+            && projection.Status == "not-configured"
+            && !projection.Authoritative);
         var path = scope.Paths.Should().ContainSingle().Which;
         path.Hops.Should().HaveCount(8);
         path.Hops.Select(hop => hop.Relation).Should().Equal(
@@ -301,7 +310,7 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
             EdgeKinds.PInvokeMapsTo,
             EdgeKinds.Calls);
 
-        var shallow = await TraceCallPathTools.TraceCallPathAsync(
+        var shallow = await TraceCallPathTools.TraceCallPathWithProfileAsync(
             _router!,
             from: "csharp:M:Graph.Ui",
             to: "csharp:M:Graph.Native",
@@ -318,7 +327,7 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
     [Fact]
     public async Task ExactCanonicalSelection_neverFallsBackToFuzzyMatching()
     {
-        var result = await TraceCallPathTools.TraceCallPathAsync(
+        var result = await TraceCallPathTools.TraceCallPathWithProfileAsync(
             _router!,
             from: "csharp:M:Graph.Ui.Missing",
             to: "csharp:M:Graph.Native",
@@ -330,6 +339,36 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
         scope.Paths.Should().BeEmpty();
         scope.Note.Should().Contain(
             "No source symbol matches 'csharp:M:Graph.Ui.Missing'");
+    }
+
+    [Theory]
+    [InlineData("csharp:")]
+    [InlineData(@"csharp:M:Graph\Ui")]
+    public async Task MalformedCanonicalIntent_isRejectedInsteadOfFuzzyMatched(
+        string from)
+    {
+        var result = await TraceCallPathTools.TraceCallPathWithProfileAsync(
+            _router!,
+            from,
+            to: "csharp:M:Graph.Native",
+            profile: "execution");
+
+        result.IsError.Should().BeTrue();
+        CallToolResultHelpers.ProseText(result).Should().Contain(
+            "`from` canonical key is invalid");
+    }
+
+    [Fact]
+    public async Task Trace_rejectsUnboundedSymbolQueries()
+    {
+        var result = await TraceCallPathTools.TraceCallPathWithProfileAsync(
+            _router!,
+            from: new string('x', 4097),
+            to: "Graph.Native");
+
+        result.IsError.Should().BeTrue();
+        CallToolResultHelpers.ProseText(result).Should().Contain(
+            "must not exceed 4096 characters");
     }
 
     [Fact]
@@ -351,7 +390,7 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
                     null),
             ]);
 
-        var result = await TraceCallPathTools.TraceCallPathAsync(
+        var result = await TraceCallPathTools.TraceCallPathWithProfileAsync(
             _router!,
             from: "csharp:M:Graph.Ui",
             to: "csharp:M:Graph.Native",
@@ -374,7 +413,7 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
     [Fact]
     public async Task ExecutionProfile_rejectsAnExplicitRelation()
     {
-        var result = await TraceCallPathTools.TraceCallPathAsync(
+        var result = await TraceCallPathTools.TraceCallPathWithProfileAsync(
             _router!,
             from: "Graph.Ui",
             to: "Graph.Native",

@@ -16,7 +16,7 @@ public sealed class Phase1CompatibilityToolsTests
     [InlineData(nameof(Phase1CompatibilityTools.FindReferenceAsync), "find_reference", typeof(FindReferencesResult))]
     [InlineData(nameof(Phase1CompatibilityTools.FindCallersAsync), "find_callers", typeof(ListCallersResult))]
     [InlineData(nameof(Phase1CompatibilityTools.FindCalleesAsync), "find_callees", typeof(ListCalleesResult))]
-    [InlineData(nameof(Phase1CompatibilityTools.TraceCallAsync), "trace_call", typeof(TraceCallPathResult))]
+    [InlineData(nameof(Phase1CompatibilityTools.TraceCallWithProfileAsync), "trace_call", typeof(TraceCallPathResult))]
     [InlineData(nameof(Phase1CompatibilityTools.ImpactAnalysisAsync), "impact_analysis", typeof(ImpactOfChangeResult))]
     public void CompatibilityEntryPoint_registersExactContractName_andPreservesOutputSchema(
         string methodName,

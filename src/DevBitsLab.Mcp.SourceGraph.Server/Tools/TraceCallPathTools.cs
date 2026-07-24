@@ -24,8 +24,11 @@ namespace DevBitsLab.Mcp.SourceGraph.Server.Tools;
 [McpServerToolType]
 public static class TraceCallPathTools
 {
-    private const int EvidenceLimitPerHop = 100;
+    private const int EvidenceLimitPerHop = 20;
+    private const int MaximumReturnedEvidenceRows = 1000;
     private const int MaximumReportedProjectionFailures = 50;
+    private const int MaximumQueryCharacters = 4096;
+    private const int MaximumScopeFanout = 32;
     private const string ExecutionProfile = "execution";
     private static readonly string[] ExecutionRelations =
     [
@@ -37,10 +40,43 @@ public static class TraceCallPathTools
         EdgeKinds.PInvokeMapsTo,
     ];
 
-    [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(TraceCallPathResult))]
+    /// <summary>
+    /// Source-compatible entry point retained for callers compiled against the original
+    /// one-relation API. The MCP surface is registered by
+    /// <see cref="TraceCallPathWithProfileAsync"/>.
+    /// </summary>
+    public static Task<CallToolResult> TraceCallPathAsync(
+        ScopeRouter router,
+        string from,
+        string to,
+        string? kind = null,
+        int maxDepth = 8,
+        int maxPaths = 10,
+        int maxNodes = 1000,
+        string? scope = null,
+        CancellationToken ct = default) =>
+        TraceCallPathWithProfileAsync(
+            router,
+            from,
+            to,
+            kind,
+            profile: null,
+            maxDepth,
+            maxPaths,
+            maxNodes,
+            scope,
+            ct);
+
+    [McpServerTool(
+        Name = "trace_call_path",
+        ReadOnly = true,
+        Idempotent = true,
+        UseStructuredContent = true,
+        OutputSchemaType = typeof(TraceCallPathResult))]
+    [ToolAnnotation(ReadOnlyHint = true, IdempotentHint = true)]
     [ToolTrigger("\"show how execution can flow from A to B\"")]
     [Description("Trace bounded directed paths between two indexed symbols. Defaults to calls edges. Set profile=execution to follow only the evidence-backed UI → command → managed call → gRPC dispatch → P/Invoke execution relations. Exact canonical-key inputs never use fuzzy matching. Every hop includes occurrence evidence, and execution results disclose whether current absence claims are authoritative.")]
-    public static Task<CallToolResult> TraceCallPathAsync(
+    public static Task<CallToolResult> TraceCallPathWithProfileAsync(
         ScopeRouter router,
         [Description("Starting symbol name, FQN, or exact canonical key")] string from,
         [Description("Destination symbol name, FQN, or exact canonical key")] string to,
@@ -82,6 +118,19 @@ public static class TraceCallPathTools
         if (string.IsNullOrWhiteSpace(from) || string.IsNullOrWhiteSpace(to))
         {
             return DiagnosticResult.Error("trace_call_path requires non-empty `from` and `to` symbols.");
+        }
+        if (from.Trim().Length > MaximumQueryCharacters
+            || to.Trim().Length > MaximumQueryCharacters)
+        {
+            return DiagnosticResult.Error(
+                $"trace_call_path symbol queries must not exceed {MaximumQueryCharacters} characters.");
+        }
+        var canonicalIntentError =
+            ValidateCanonicalIntent(from, "from")
+            ?? ValidateCanonicalIntent(to, "to");
+        if (canonicalIntentError is not null)
+        {
+            return DiagnosticResult.Error(canonicalIntentError);
         }
         if (maxDepth is < 1 or > 12)
         {
@@ -135,6 +184,11 @@ public static class TraceCallPathTools
             return DiagnosticResult.Error(ex.Message);
         }
         if (resolution.IsError) return DiagnosticResult.Error(resolution.ErrorMessage!);
+        if (resolution.Hosts.Count > MaximumScopeFanout)
+        {
+            return DiagnosticResult.Error(
+                $"trace_call_path resolves at most {MaximumScopeFanout} scopes per request; narrow `scope`.");
+        }
 
         var sw = Stopwatch.StartNew();
         var perScope = await Task.WhenAll(resolution.Hosts.Select(async host =>
@@ -321,6 +375,7 @@ public static class TraceCallPathTools
 
         var paths = new List<TraceCallPath>(maxPaths);
         var emittedPathKeys = new HashSet<string>(StringComparer.Ordinal);
+        var returnedEvidenceRows = 0;
         var expandedNodes = 0;
         var scheduledStates = queue.Count;
         var truncated = orderedSources.Count > maxNodes;
@@ -472,6 +527,14 @@ public static class TraceCallPathTools
                 : string.Join(">", state.Hops.Select(hop =>
                     $"{hop.From.SymbolId}:{hop.Relation}:{hop.To.SymbolId}"));
             if (!emittedPathKeys.Add(key)) return;
+            var evidenceRows = state.Hops.Sum(hop => hop.Evidence.Count);
+            if (returnedEvidenceRows + evidenceRows
+                > MaximumReturnedEvidenceRows)
+            {
+                truncated = true;
+                return;
+            }
+            returnedEvidenceRows += evidenceRows;
             var source = state.Hops.Count == 0
                 ? MapSymbol(state.Current)
                 : state.Hops[0].From;
@@ -564,6 +627,7 @@ public static class TraceCallPathTools
         {
             Status: GrpcLinkRuntimeStatus.Complete,
             RetainedLastGood: false,
+            FailureCount: 0,
         };
         projections.Add(new TraceCallPathProjectionState(
             "grpc",
@@ -581,35 +645,49 @@ public static class TraceCallPathTools
         {
             failures.AddRange(grpc.Failures.Select(failure =>
                 $"grpc:{failure.Code}: {failure.Message}"));
+            if (!grpcAuthoritative && grpc.Failures.Count == 0)
+            {
+                failures.Add(
+                    $"grpc: projection status is {grpc.Status.ToString().ToLowerInvariant()} "
+                    + $"with {grpc.FailureCount} reported failure(s).");
+            }
         }
 
-        var nativeApplicable = host.Scope.Interop is not null;
+        var nativeConfigured = host.Scope.Interop is not null;
         var native = host.NativeInteropState;
-        var nativeAuthoritative = !nativeApplicable
-            || native is
+        var nativeAuthoritative = nativeConfigured
+            && native is
             {
                 Status: NativeInteropRuntimeStatus.Complete,
                 RetainedLastGood: false,
                 IsExportUniverseComplete: true,
+                PendingStaleSymbols: 0,
+                Failures.Count: 0,
             } && host.ManagedInteropInputComplete;
         projections.Add(new TraceCallPathProjectionState(
             "native-interop",
-            !nativeApplicable
+            !nativeConfigured
                 ? "not-configured"
                 : native?.Status.ToString().ToLowerInvariant()
                     ?? "not-started",
-            Applicable: nativeApplicable,
+            Applicable: true,
             Authoritative: nativeAuthoritative,
             RetainedLastGood: native?.RetainedLastGood ?? false,
-            FailureCount: !nativeApplicable
-                ? 0
+            FailureCount: !nativeConfigured
+                ? 1
                 : native?.Failures.Count ?? 1));
-        if (nativeApplicable && native is null)
+        if (!nativeConfigured)
+        {
+            failures.Add(
+                "native-interop: this scope has no native projection configuration, "
+                + "so full execution-chain absence is unavailable.");
+        }
+        else if (native is null)
         {
             failures.Add(
                 "native-interop: the configured projection has not started.");
         }
-        else if (nativeApplicable)
+        else
         {
             failures.AddRange(native!.Failures.Select(failure =>
                 $"native-interop:{failure.Stage}/{failure.Code}: {failure.Message}"));
@@ -617,6 +695,20 @@ public static class TraceCallPathTools
             {
                 failures.Add(
                     "native-interop: the managed import universe is incomplete.");
+            }
+            if (native.PendingStaleSymbols > 0)
+            {
+                failures.Add(
+                    $"native-interop: {native.PendingStaleSymbols} stale symbol(s) remain pending cleanup.");
+            }
+            if (!nativeAuthoritative
+                && native.Failures.Count == 0
+                && host.ManagedInteropInputComplete
+                && native.PendingStaleSymbols == 0)
+            {
+                failures.Add(
+                    $"native-interop: projection status is "
+                    + $"{native.Status.ToString().ToLowerInvariant()} and is not authoritative.");
             }
         }
 
@@ -654,6 +746,31 @@ public static class TraceCallPathTools
                 note,
                 "The relevant projections are partial, so this is not an authoritative current absence.")
             : note;
+
+    private static string? ValidateCanonicalIntent(
+        string query,
+        string parameterName)
+    {
+        var selection = query.Trim();
+        var colon = selection.IndexOf(':');
+        if (colon <= 0) return null;
+        var scheme = selection[..colon];
+        if (!CanonicalKeyValidator.EnforcedSchemes.Contains(scheme))
+        {
+            return null;
+        }
+        if (CanonicalKeyValidator.IsValid(selection)) return null;
+
+        try
+        {
+            CanonicalKeyValidator.Validate(selection, parameterName);
+        }
+        catch (ArgumentException ex)
+        {
+            return $"trace_call_path `{parameterName}` canonical key is invalid: {ex.Message}";
+        }
+        return null;
+    }
 
     internal static async Task<TraceCallPathHop?> BuildAuditableHopAsync(
         IGraphStore store,

@@ -98,15 +98,44 @@ public static class Phase1CompatibilityTools
         CancellationToken ct = default) =>
         GraphTools.ListCalleesAsync(router, symbol, limit, kind, scope, ct);
 
+    /// <summary>
+    /// Source-compatible entry point for the original Phase 1 alias signature.
+    /// </summary>
+    public static Task<CallToolResult> TraceCallAsync(
+        ScopeRouter router,
+        string from,
+        string to,
+        string? kind = null,
+        int maxDepth = 8,
+        int maxPaths = 10,
+        int maxNodes = 1000,
+        string? scope = null,
+        CancellationToken ct = default) =>
+        TraceCallWithProfileAsync(
+            router,
+            from,
+            to,
+            kind,
+            profile: null,
+            maxDepth,
+            maxPaths,
+            maxNodes,
+            scope,
+            ct);
+
     [McpServerTool(
+        Name = "trace_call",
+        ReadOnly = true,
+        Idempotent = true,
         UseStructuredContent = true,
         OutputSchemaType = typeof(TraceCallPathResult))]
+    [ToolAnnotation(ReadOnlyHint = true, IdempotentHint = true)]
     [ToolTrigger("\"trace a call or execution path from A to B\"")]
     [Description(
         "Trace bounded evidence-backed paths between two indexed symbols. Compatibility name for " +
         "trace_call_path; defaults to calls. Set profile=execution for the evidence-backed " +
         "UI-to-native execution relation whitelist and projection-completeness disclosure.")]
-    public static Task<CallToolResult> TraceCallAsync(
+    public static Task<CallToolResult> TraceCallWithProfileAsync(
         ScopeRouter router,
         [Description("Starting symbol name or qualified name")] string from,
         [Description("Destination symbol name or qualified name")] string to,
@@ -118,7 +147,7 @@ public static class Phase1CompatibilityTools
         [Description("Maximum expanded graph nodes per scope, 1-5000 (default 1000)")] int maxNodes = 1000,
         [Description(ScopeDescription)] string? scope = null,
         CancellationToken ct = default) =>
-        TraceCallPathTools.TraceCallPathAsync(
+        TraceCallPathTools.TraceCallPathWithProfileAsync(
             router,
             from,
             to,
