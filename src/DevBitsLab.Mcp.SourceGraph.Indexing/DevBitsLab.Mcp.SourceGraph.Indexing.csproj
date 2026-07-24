@@ -31,7 +31,7 @@
     <BundledProtocPlatform Condition="'$(RuntimeIdentifier)' == 'win-x64' or '$(RuntimeIdentifier)' == 'win-arm64'">windows_x64</BundledProtocPlatform>
     <BundledProtocPlatform Condition="'$(RuntimeIdentifier)' == 'linux-x64'">linux_x64</BundledProtocPlatform>
     <BundledProtocPlatform Condition="'$(RuntimeIdentifier)' == 'linux-arm64'">linux_arm64</BundledProtocPlatform>
-    <BundledProtocPlatform Condition="'$(RuntimeIdentifier)' == 'osx-arm64'">macosx_x64</BundledProtocPlatform>
+    <BundledProtocPlatform Condition="'$(RuntimeIdentifier)' == 'osx-arm64' or '$(RuntimeIdentifier)' == 'osx-x64'">macosx_x64</BundledProtocPlatform>
     <BundledProtocPlatform Condition="'$(RuntimeIdentifier)' == '' and $([MSBuild]::IsOSPlatform('Windows'))">windows_x64</BundledProtocPlatform>
     <BundledProtocPlatform Condition="'$(RuntimeIdentifier)' == '' and $([MSBuild]::IsOSPlatform('Linux')) and ('$(PROCESSOR_ARCHITECTURE)' == 'ARM64' or '$(NETCoreSdkRuntimeIdentifier)' == 'linux-arm64')">linux_arm64</BundledProtocPlatform>
     <BundledProtocPlatform Condition="'$(RuntimeIdentifier)' == '' and $([MSBuild]::IsOSPlatform('Linux')) and '$(BundledProtocPlatform)' == ''">linux_x64</BundledProtocPlatform>
