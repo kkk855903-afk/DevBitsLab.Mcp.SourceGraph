@@ -3,7 +3,14 @@
     <TargetFramework>net10.0</TargetFramework>
     <RootNamespace>MedInteropChain.GrpcService</RootNamespace>
     <Nullable>enable</Nullable>
-    <ImplicitUsings>enable</ImplicitUsings>
+    <!-- This referenced compilation participates in XAML completeness; keep SDK-generated
+         obj/ inputs out of both the raw and privacy-sanitized project snapshots. -->
+    <ImplicitUsings>disable</ImplicitUsings>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <GenerateTargetFrameworkAttribute>false</GenerateTargetFrameworkAttribute>
+    <GenerateMSBuildEditorConfigFile>false</GenerateMSBuildEditorConfigFile>
+    <EnableNETAnalyzers>false</EnableNETAnalyzers>
+    <AnalysisLevel>none</AnalysisLevel>
     <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
   </PropertyGroup>
   <ItemGroup>

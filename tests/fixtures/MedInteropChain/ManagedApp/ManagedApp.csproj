@@ -3,7 +3,14 @@
     <TargetFramework>net10.0</TargetFramework>
     <RootNamespace>MedInteropChain.ManagedApp</RootNamespace>
     <Nullable>enable</Nullable>
-    <ImplicitUsings>enable</ImplicitUsings>
+    <!-- Keep raw and privacy-sanitized Roslyn inputs identical so production XAML semantic
+         completeness can be proven without trusting SDK-authored obj/ files. -->
+    <ImplicitUsings>disable</ImplicitUsings>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <GenerateTargetFrameworkAttribute>false</GenerateTargetFrameworkAttribute>
+    <GenerateMSBuildEditorConfigFile>false</GenerateMSBuildEditorConfigFile>
+    <EnableNETAnalyzers>false</EnableNETAnalyzers>
+    <AnalysisLevel>none</AnalysisLevel>
     <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
   </PropertyGroup>
   <ItemGroup>
