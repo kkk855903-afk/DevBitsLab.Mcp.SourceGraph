@@ -104,7 +104,7 @@ public sealed class XamlIndexFixtureTests : IAsyncLifetime
         evidence.Should().HaveCount(2,
             "the explicit DataContext and x:DataType independently support the association");
         evidence.Should().OnlyContain(item =>
-            item.Confidence == CoreEvidenceConfidence.Exact
+            item.Confidence == CoreEvidenceConfidence.Semantic
             && item.Producer == "xaml-semantic");
         evidence.Select(item => item.Metadata!["association"])
             .Should().OnlyContain(value => value == "data-context");
@@ -154,12 +154,12 @@ public sealed class XamlIndexFixtureTests : IAsyncLifetime
             handler.Id,
             "handles-event");
         evidence.Should().ContainSingle();
-        evidence[0].Confidence.Should().Be(CoreEvidenceConfidence.Exact);
+        evidence[0].Confidence.Should().Be(CoreEvidenceConfidence.Semantic);
         evidence[0].Producer.Should().Be("xaml-semantic");
     }
 
     [Fact]
-    public async Task SampleWpf_dataContextBindingResolvesToRealTerminalPropertyWithExactEvidence()
+    public async Task SampleWpf_dataContextBindingResolvesToRealTerminalPropertyWithSemanticEvidence()
     {
         var box = (await _wpfStore!.FindSymbolsAsync("UserNameBox"))
             .First(h => h.Kind == "xaml-element");
@@ -178,7 +178,7 @@ public sealed class XamlIndexFixtureTests : IAsyncLifetime
             nameProperty.Id,
             "binds-path");
         evidence.Should().ContainSingle();
-        evidence[0].Confidence.Should().Be(CoreEvidenceConfidence.Exact);
+        evidence[0].Confidence.Should().Be(CoreEvidenceConfidence.Semantic);
         evidence[0].Producer.Should().Be("xaml-semantic");
         evidence[0].Location.FilePath.Replace('\\', '/').Should()
             .EndWith("Views/MainWindow.xaml");
@@ -312,25 +312,24 @@ public sealed class XamlIndexFixtureTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task SampleWpf_dynamicResourceIsDistinguishedFromStaticResource()
+    public async Task SampleWpf_dynamicResourceIsUnsupportedWithoutFindingOrEdge()
     {
         var consumer = (await _wpfStore!.FindSymbolsAsync("DynamicResourceConsumer"))
             .First(h => h.Kind == "xaml-element");
-        var brush = (await _wpfStore.ListCalleesAsync(
-                consumer.Id,
-                limit: 50,
-                edgeKind: "uses-resource"))
-            .Should().ContainSingle(c =>
-                c.CanonicalKey == "xaml:resource:App.xaml#AccentBrush").Subject;
-
-        var evidence = await _wpfStore.ListEdgeEvidenceAsync(
+        (await _wpfStore.ListCalleesAsync(
             consumer.Id,
-            brush.Id,
-            "uses-resource");
-        evidence.Should().ContainSingle();
-        evidence[0].Confidence.Should().Be(CoreEvidenceConfidence.Exact);
-        evidence[0].Metadata.Should().ContainKey("resource-lookup")
-            .WhoseValue.Should().Be("dynamic");
+            limit: 50,
+            edgeKind: "uses-resource")).Should().BeEmpty();
+
+        var annotations = await _wpfStore.GetAnnotationsForSymbolAsync(consumer.Id);
+        annotations.Should().NotContain(annotation =>
+            annotation.Flavor == "xaml-resource-finding");
+        var outcome = annotations.Should().ContainSingle(annotation =>
+            annotation.Flavor == "xaml-resource-outcome"
+            && annotation.FullName == "unsupported").Subject;
+        using var json = JsonDocument.Parse(outcome.ArgsJson!);
+        json.RootElement.GetProperty("reason").GetString().Should()
+            .Be("dynamic-resource-runtime-lookup");
     }
 
     [Fact]
@@ -410,7 +409,9 @@ public sealed class XamlIndexFixtureTests : IAsyncLifetime
         var langRegistry = new LanguageIndexerRegistry();
         langRegistry.Register(new XamlLanguageIndexer());
         var factories = new LanguageProjectFactoryRegistry();
-        factories.Register(new XamlLanguageProjectFactory(() => roslyn.SanitizedSolution));
+        factories.Register(new XamlLanguageProjectFactory(
+            () => roslyn.SanitizedSolution,
+            roslyn.IsProjectSemanticInputComplete));
         var dispatcher = new LanguageIndexerDispatcher(langRegistry, factories);
 
         var projectMap = new Dictionary<string, ILanguageProject>(StringComparer.OrdinalIgnoreCase);

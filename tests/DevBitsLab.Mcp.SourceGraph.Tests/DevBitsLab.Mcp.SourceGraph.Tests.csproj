@@ -59,6 +59,15 @@
                       Private="false"
                       PrivateAssets="all"
                       SetConfiguration="Configuration=Debug" />
+    <!-- A genuine WindowsDesktop/WPF build dependency. Its codebehind calls the
+         markup compiler-generated InitializeComponent methods, so this verifies more than
+         project-file metadata while the indexing-only SampleWpf fixture keeps invalid cases. -->
+    <ProjectReference Include="..\fixtures\SampleWpfWindows\SampleWpfWindows.csproj"
+                      Condition="'$(OS)' == 'Windows_NT'"
+                      ReferenceOutputAssembly="false"
+                      SkipGetTargetFrameworkProperties="true"
+                      Private="false"
+                      PrivateAssets="all" />
     <ProjectReference Include="..\fixtures\SampleAvalonia\SampleAvalonia.csproj"
                       ReferenceOutputAssembly="false"
                       Private="false"

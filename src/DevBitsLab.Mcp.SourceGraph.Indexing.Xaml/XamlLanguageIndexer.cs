@@ -22,9 +22,10 @@ namespace DevBitsLab.Mcp.SourceGraph.Indexing.Xaml;
 /// <see cref="XamlProfileDetector"/> and dispatches markup-extension handling through the
 /// matching <see cref="IXamlDialect"/>. The per-project resource cascade lives on the
 /// <see cref="XamlLanguageProject"/> instance the host attaches via
-/// <see cref="IndexContext.Project"/>. Missing and ambiguous resource keys emit a structured
-/// <c>xaml-resource-finding</c> annotation on the consuming element and no edge; the indexer never
-/// manufactures an unresolved target symbol.
+/// <see cref="IndexContext.Project"/>. Only a resource key proven missing from a complete static
+/// cascade emits a structured <c>xaml-resource-finding</c>; ambiguous, unsupported, incomplete,
+/// and unknown results remain non-finding outcomes. The indexer never manufactures an unresolved
+/// target symbol.
 /// </summary>
 public sealed class XamlLanguageIndexer : ILanguageIndexer
 {
@@ -79,7 +80,7 @@ public sealed class XamlLanguageIndexer : ILanguageIndexer
         XamlReader.Walk(doc.Root, (element, ancestors) =>
         {
             emission.RegisterNamedElement(element);
-            emission.RegisterResource(element, ancestors);
+            emission.RegisterResourceScope(element, ancestors);
         });
 
         // Pass 2: emit all symbol declarations, edges, and annotations.
@@ -105,8 +106,12 @@ public sealed class XamlLanguageIndexer : ILanguageIndexer
         private readonly string? _xClass;
         private readonly string _viewKey;
         private readonly Dictionary<string, string> _namedElementKeysByName = new(StringComparer.Ordinal);
-        private readonly Dictionary<string, List<ResourceDefinition>> _localResources =
+        private readonly IReadOnlyDictionary<XamlElement, string>
+            _resourceCanonicalDiscriminators;
+        private readonly Dictionary<string, List<LocalResourceDefinition>> _localResources =
             new(StringComparer.Ordinal);
+        private readonly Dictionary<XamlElement, HashSet<string>>
+            _localResourceUnknownReasons = new();
         private int _anonymousCounter;
 
         public List<IndexEvent> Events { get; } = new();
@@ -126,6 +131,8 @@ public sealed class XamlLanguageIndexer : ILanguageIndexer
             _xClassAttribute = doc.Root.FindAttribute(XamlReader.XamlNamespace, "Class");
             _xClass = _xClassAttribute?.Value?.Trim();
             _viewKey = $"xaml:view:{_relativePath}";
+            _resourceCanonicalDiscriminators =
+                XamlResourceCanonicalKey.FindDeclarationDiscriminators(doc.Root);
         }
 
         public void RegisterNamedElement(XamlElement element)
@@ -136,31 +143,184 @@ public sealed class XamlLanguageIndexer : ILanguageIndexer
             _namedElementKeysByName[name] = key;
         }
 
-        public void RegisterResource(
+        public void RegisterResourceScope(
             XamlElement element,
             IReadOnlyList<XamlElement> ancestors)
         {
-            var keyAttribute = element.FindAttribute(
-                XamlReader.XamlNamespace,
-                "Key");
-            if (keyAttribute is null
-                || (!AnyAncestorIsResources(ancestors)
-                    && !IsStyleOrTemplate(element)))
+            if (ancestors.Count == 0
+                && string.Equals(
+                    element.LocalName,
+                    "ResourceDictionary",
+                    StringComparison.Ordinal))
+            {
+                RegisterDictionary(element, element);
+                return;
+            }
+            if (!element.LocalName.EndsWith(
+                    ".Resources",
+                    StringComparison.Ordinal)
+                || element.Parent is null)
             {
                 return;
             }
 
+            RegisterResourceCollection(element, element.Parent);
+        }
+
+        private void RegisterResourceCollection(
+            XamlElement collection,
+            XamlElement scopeOwner)
+        {
+            foreach (var child in collection.Children)
+            {
+                if (child.LocalName.EndsWith(
+                        ".MergedDictionaries",
+                        StringComparison.Ordinal))
+                {
+                    RegisterMergedDictionaries(child, scopeOwner);
+                    continue;
+                }
+                if (string.Equals(
+                        child.LocalName,
+                        "ResourceDictionary",
+                        StringComparison.Ordinal))
+                {
+                    RegisterDictionaryEntry(child, scopeOwner);
+                    continue;
+                }
+                RegisterLocalDefinition(child, scopeOwner);
+            }
+        }
+
+        private void RegisterDictionaryEntry(
+            XamlElement dictionary,
+            XamlElement outerScopeOwner)
+        {
+            var key = dictionary.FindAttribute(
+                XamlReader.XamlNamespace,
+                "Key");
+            if (key is null)
+            {
+                RegisterDictionary(dictionary, outerScopeOwner);
+                return;
+            }
+
+            // A keyed dictionary is itself a resource in the containing scope, while its
+            // declarations and inline merges belong to the dictionary's private scope.
+            RegisterLocalDefinition(dictionary, outerScopeOwner);
+            RegisterDictionary(dictionary, dictionary);
+        }
+
+        private void RegisterDictionary(
+            XamlElement dictionary,
+            XamlElement scopeOwner)
+        {
+            var source = dictionary.FindAttributeByLocalName("Source");
+            if (source is not null && !string.IsNullOrWhiteSpace(source.Value))
+            {
+                MarkLocalScopeIncomplete(
+                    scopeOwner,
+                    "local-merged-dictionary-source-not-modeled:"
+                    + source.Value.Trim());
+                if (dictionary.Children.Count > 0)
+                {
+                    MarkLocalScopeIncomplete(
+                        scopeOwner,
+                        "local-resource-dictionary-source-with-inline-content");
+                }
+                return;
+            }
+
+            foreach (var child in dictionary.Children)
+            {
+                if (child.LocalName.EndsWith(
+                        ".MergedDictionaries",
+                        StringComparison.Ordinal))
+                {
+                    RegisterMergedDictionaries(child, scopeOwner);
+                    continue;
+                }
+                if (string.Equals(
+                        child.LocalName,
+                        "ResourceDictionary",
+                        StringComparison.Ordinal))
+                {
+                    RegisterDictionaryEntry(child, scopeOwner);
+                    continue;
+                }
+                RegisterLocalDefinition(child, scopeOwner);
+            }
+        }
+
+        private void RegisterMergedDictionaries(
+            XamlElement mergedDictionaries,
+            XamlElement scopeOwner)
+        {
+            foreach (var child in mergedDictionaries.Children)
+            {
+                if (!string.Equals(
+                        child.LocalName,
+                        "ResourceDictionary",
+                        StringComparison.Ordinal))
+                {
+                    MarkLocalScopeIncomplete(
+                        scopeOwner,
+                        "unsupported-inline-merged-dictionary:"
+                        + child.LocalName);
+                    continue;
+                }
+                RegisterDictionary(child, scopeOwner);
+            }
+        }
+
+        private void RegisterLocalDefinition(
+            XamlElement element,
+            XamlElement scopeOwner)
+        {
+            var keyAttribute = element.FindAttribute(
+                XamlReader.XamlNamespace,
+                "Key");
+            if (keyAttribute is null) return;
+
             if (!_localResources.TryGetValue(keyAttribute.Value, out var candidates))
             {
-                candidates = new List<ResourceDefinition>();
+                candidates = new List<LocalResourceDefinition>();
                 _localResources[keyAttribute.Value] = candidates;
             }
-            candidates.Add(new ResourceDefinition(
-                keyAttribute.Value,
+            candidates.Add(new LocalResourceDefinition(
+                CreateResourceDefinition(element, keyAttribute.Value),
+                scopeOwner,
+                element));
+        }
+
+        private ResourceDefinition CreateResourceDefinition(
+            XamlElement element,
+            string key)
+        {
+            _resourceCanonicalDiscriminators.TryGetValue(
+                element,
+                out var discriminator);
+            return new ResourceDefinition(
+                key,
                 _ctx.FilePath,
                 element.Line,
                 element.Column,
-                element.LocalName));
+                element.LocalName,
+                discriminator);
+        }
+
+        private void MarkLocalScopeIncomplete(
+            XamlElement scopeOwner,
+            string reason)
+        {
+            if (!_localResourceUnknownReasons.TryGetValue(
+                    scopeOwner,
+                    out var reasons))
+            {
+                reasons = new HashSet<string>(StringComparer.Ordinal);
+                _localResourceUnknownReasons[scopeOwner] = reasons;
+            }
+            reasons.Add(reason);
         }
 
         public void Emit(XamlElement element, IReadOnlyList<XamlElement> ancestors)
@@ -246,7 +406,10 @@ public sealed class XamlLanguageIndexer : ILanguageIndexer
             if (keyAttr is not null && (inResources || IsStyleOrTemplate(element)))
             {
                 kind = ClassifyKeyedKind(element);
-                canonicalKey = $"xaml:{kind.Substring("xaml-".Length)}:{_relativePath}#{keyAttr.Value}";
+                canonicalKey = CreateResourceDefinition(
+                        element,
+                        keyAttr.Value)
+                    .ToCanonicalKey(_ctx.RepoRoot);
             }
             else if (hasName)
             {
@@ -359,7 +522,15 @@ public sealed class XamlLanguageIndexer : ILanguageIndexer
                 var classification = XamlAttributeClassifier.Classify(attr);
                 if (classification == XamlAttributeKind.NamespaceDeclaration) continue;
                 if (classification == XamlAttributeKind.XamlDirective) continue;
-                if (classification == XamlAttributeKind.AttachedProperty) continue;
+                if (classification == XamlAttributeKind.AttachedProperty)
+                {
+                    // Classification describes the attribute name, not its value. Attached
+                    // properties such as Validation.ErrorTemplate and custom behaviors can still
+                    // contain Binding/StaticResource markup extensions and need the same semantic
+                    // outcome/edge treatment as ordinary dependency properties.
+                    EmitMarkupExtensionEdges(element, attr, hostKey);
+                    continue;
+                }
                 if (classification == XamlAttributeKind.MarkupExtension)
                 {
                     EmitMarkupExtensionEdges(element, attr, hostKey);
@@ -442,7 +613,7 @@ public sealed class XamlLanguageIndexer : ILanguageIndexer
             // Resource extensions may be the top-level value or nested inside another extension
             // (for example Binding.Converter). Walk the parsed tree once so both shapes preserve
             // the same exact attribute evidence.
-            EmitResourceExtensions(attr, hostKey, ext);
+            EmitResourceExtensions(element, attr, hostKey, ext);
         }
 
         private void EmitBindingEdge(
@@ -489,31 +660,72 @@ public sealed class XamlLanguageIndexer : ILanguageIndexer
                 });
             }
 
-            // ElementName / RelativeSource / explicit Source bindings do not evaluate against the
-            // inherited DataContext. Until those source shapes have their own CLR-type resolver,
-            // retaining only the exact binds-element fact is safer than claiming a property edge
-            // against the wrong object.
-            if (ext.NamedArgs.ContainsKey("ElementName")
-                || ext.NamedArgs.ContainsKey("RelativeSource")
-                || ext.NamedArgs.ContainsKey("Source")
-                || !string.Equals(ext.Name, "Binding", StringComparison.Ordinal)
-                || string.IsNullOrWhiteSpace(path))
+            var isCommand = string.Equals(
+                attr.LocalName,
+                "Command",
+                StringComparison.Ordinal);
+            XamlBindingResolution resolution;
+            if (!string.Equals(ext.Name, "Binding", StringComparison.Ordinal))
             {
+                resolution = XamlBindingResolution.Unresolved(
+                    XamlResolutionStatus.Unsupported,
+                    "compiled-binding-not-supported");
+            }
+            else if (ext.NamedArgs.ContainsKey("ElementName"))
+            {
+                resolution = XamlBindingResolution.Unresolved(
+                    XamlResolutionStatus.Unsupported,
+                    "element-name-property-resolution-not-supported");
+            }
+            else if (ext.NamedArgs.ContainsKey("RelativeSource"))
+            {
+                resolution = XamlBindingResolution.Unresolved(
+                    XamlResolutionStatus.Unsupported,
+                    "relative-source-resolution-not-supported");
+            }
+            else if (ext.NamedArgs.ContainsKey("Source"))
+            {
+                resolution = XamlBindingResolution.Unresolved(
+                    XamlResolutionStatus.Unsupported,
+                    "explicit-source-resolution-not-supported");
+            }
+            else if (string.IsNullOrWhiteSpace(path))
+            {
+                resolution = XamlBindingResolution.Unresolved(
+                    XamlResolutionStatus.Unsupported,
+                    "binding-path-is-empty");
+            }
+            else if (_semanticResolver is null)
+            {
+                resolution = XamlBindingResolution.Unresolved(
+                    XamlResolutionStatus.Incomplete,
+                    "roslyn-compilation-unavailable");
+            }
+            else
+            {
+                resolution = _semanticResolver.ResolveBinding(
+                    element,
+                    path!,
+                    requireCommand: isCommand);
+            }
+            if (resolution.Target is null
+                || resolution.Outcome.Status != XamlResolutionStatus.Resolved)
+            {
+                EmitBindingOutcome(
+                    attr,
+                    hostKey,
+                    path,
+                    isCommand,
+                    resolution);
                 return;
             }
 
-            var semanticTarget = _semanticResolver?.ResolveBinding(
-                element,
-                path!,
-                requireCommand: string.Equals(
-                    attr.LocalName,
-                    "Command",
-                    StringComparison.Ordinal));
-            if (semanticTarget is null) return;
-
+            var semanticTarget = resolution.Target;
             metadata[PayloadKeys.DataType] = semanticTarget.DataTypeCanonicalKey;
             metadata["context-source"] = semanticTarget.ContextSource;
-            if (string.Equals(attr.LocalName, "Command", StringComparison.Ordinal))
+            metadata["resolution-status"] = resolution.Outcome.StatusName;
+            metadata["resolution-reason"] = resolution.Outcome.Reason;
+            if (isCommand)
             {
                 metadata["command"] = semanticTarget.Property.Name;
             }
@@ -526,37 +738,94 @@ public sealed class XamlLanguageIndexer : ILanguageIndexer
             {
                 Evidence = CreateAttributeEvidence(
                     attr,
-                    semanticTarget.Confidence,
+                    EvidenceConfidence.Semantic,
                     metadata),
             });
         }
 
+        private void EmitBindingOutcome(
+            XamlAttribute attribute,
+            string hostKey,
+            string? path,
+            bool isCommand,
+            XamlBindingResolution resolution)
+        {
+            var kind = isCommand ? "command" : "binding";
+            var payload = new Dictionary<string, object?>(StringComparer.Ordinal)
+            {
+                ["status"] = resolution.Outcome.StatusName,
+                ["reason"] = resolution.Outcome.Reason,
+                ["kind"] = kind,
+                ["path"] = path,
+                ["candidateCount"] = resolution.Candidates.Count,
+                ["file"] = _ctx.FilePath,
+                ["startLine"] = attribute.Line,
+                ["startColumn"] = attribute.Column,
+                ["endLine"] = attribute.Line,
+                ["endColumn"] = attribute.Column
+                    + Math.Max(1, QualifiedAttributeNameLength(attribute)),
+                ["confidence"] = "semantic",
+                ["producer"] = "xaml-semantic",
+            };
+            if (resolution.Candidates.Count > 0)
+            {
+                payload["candidates"] = resolution.Candidates;
+            }
+
+            var missing = resolution.Outcome.Status == XamlResolutionStatus.Missing;
+            var flavor = missing
+                ? isCommand
+                    ? "xaml-command-finding"
+                    : "xaml-binding-finding"
+                : isCommand
+                    ? "xaml-command-outcome"
+                    : "xaml-binding-outcome";
+            var code = isCommand ? "XAMLCOMMAND001" : "XAMLBINDING001";
+            var name = missing
+                ? isCommand ? "Command成员不存在" : "Binding成员不存在"
+                : isCommand ? "Command解析结果" : "Binding解析结果";
+            if (missing)
+            {
+                payload["code"] = code;
+                payload["severity"] = "warning";
+                payload["message"] = name;
+            }
+            Events.Add(new IndexEvent.AnnotationAttached(
+                symbolCanonicalKey: hostKey,
+                annotationName: name,
+                flavor: flavor,
+                fullName: missing ? code : resolution.Outcome.StatusName,
+                argsJson: System.Text.Json.JsonSerializer.Serialize(payload)));
+        }
+
         private void EmitResourceExtensions(
+            XamlElement element,
             XamlAttribute attr,
             string hostKey,
             MarkupExtensionValue extension)
         {
             if (extension.Name is "StaticResource" or "DynamicResource" or "ThemeResource")
             {
-                EmitUsesResourceEdge(attr, hostKey, extension);
+                EmitUsesResourceEdge(element, attr, hostKey, extension);
             }
             foreach (var positional in extension.PositionalArgs)
             {
                 if (!positional.IsLiteral)
                 {
-                    EmitResourceExtensions(attr, hostKey, positional);
+                    EmitResourceExtensions(element, attr, hostKey, positional);
                 }
             }
             foreach (var named in extension.NamedArgs.Values)
             {
                 if (!named.IsLiteral)
                 {
-                    EmitResourceExtensions(attr, hostKey, named);
+                    EmitResourceExtensions(element, attr, hostKey, named);
                 }
             }
         }
 
         private void EmitUsesResourceEdge(
+            XamlElement element,
             XamlAttribute attr,
             string hostKey,
             MarkupExtensionValue ext)
@@ -564,19 +833,49 @@ public sealed class XamlLanguageIndexer : ILanguageIndexer
             var key = ext.PositionalArgs.Count > 0 && ext.PositionalArgs[0].IsLiteral
                 ? ext.PositionalArgs[0].Literal
                 : ResolveNamedAsLiteral(ext, "ResourceKey");
-            if (string.IsNullOrEmpty(key)) return;
-
             var lookupKind = ext.Name switch
             {
                 "StaticResource" => "static",
                 "DynamicResource" => "dynamic",
                 _ => "theme",
             };
-            var resolution = ResolveResource(key!);
-            if (resolution.Status != ResourceResolutionStatus.Resolved
+            if (string.IsNullOrWhiteSpace(key))
+            {
+                var hasUnmodeledKey =
+                    (ext.PositionalArgs.Count > 0
+                     && !ext.PositionalArgs[0].IsLiteral)
+                    || (ext.NamedArgs.TryGetValue(
+                            "ResourceKey",
+                            out var namedKey)
+                        && !namedKey.IsLiteral);
+                EmitResourceOutcome(
+                    attr,
+                    hostKey,
+                    key ?? string.Empty,
+                    lookupKind,
+                    new ResourceResolution(
+                        new XamlResolutionOutcome(
+                            XamlResolutionStatus.Unsupported,
+                            hasUnmodeledKey
+                                ? "resource-key-not-literal"
+                                : "resource-key-is-empty"),
+                        Array.Empty<ResourceDefinition>()));
+                return;
+            }
+
+            var resolution = lookupKind == "static"
+                ? ResolveResource(element, attr, key!)
+                : new ResourceResolution(
+                    new XamlResolutionOutcome(
+                        XamlResolutionStatus.Unsupported,
+                        lookupKind == "dynamic"
+                            ? "dynamic-resource-runtime-lookup"
+                            : "theme-resource-runtime-lookup"),
+                    Array.Empty<ResourceDefinition>());
+            if (resolution.Outcome.Status != XamlResolutionStatus.Resolved
                 || resolution.Definition is null)
             {
-                EmitResourceFinding(
+                EmitResourceOutcome(
                     attr,
                     hostKey,
                     key!,
@@ -613,37 +912,176 @@ public sealed class XamlLanguageIndexer : ILanguageIndexer
             });
         }
 
-        private ResourceResolution ResolveResource(string key)
+        private ResourceResolution ResolveResource(
+            XamlElement consumer,
+            XamlAttribute reference,
+            string key)
         {
-            if (_localResources.TryGetValue(key, out var localCandidates)
-                && localCandidates.Count > 0)
+            if (_localResources.TryGetValue(key, out var localCandidates))
             {
-                return localCandidates.Count == 1
-                    ? new ResourceResolution(
-                        ResourceResolutionStatus.Resolved,
-                        localCandidates)
-                    : new ResourceResolution(
-                        ResourceResolutionStatus.Ambiguous,
-                        localCandidates);
+                for (var scope = consumer; scope is not null; scope = scope.Parent)
+                {
+                    var scopedCandidates = localCandidates
+                        .Where(candidate =>
+                            ReferenceEquals(candidate.ScopeOwner, scope))
+                        .ToArray();
+                    var scopeIsIncomplete =
+                        _localResourceUnknownReasons.ContainsKey(scope);
+                    if (scopedCandidates.Length == 0)
+                    {
+                        if (scopeIsIncomplete)
+                        {
+                            var projectRootResolution =
+                                ResolveCompleteProjectRootScope(scope, key);
+                            if (projectRootResolution is not null)
+                            {
+                                return projectRootResolution;
+                            }
+                            return new ResourceResolution(
+                                new XamlResolutionOutcome(
+                                    XamlResolutionStatus.Incomplete,
+                                    "local-resource-scope-incomplete"),
+                                Array.Empty<ResourceDefinition>());
+                        }
+                        continue;
+                    }
+
+                    var visible = scopedCandidates
+                        .Where(candidate =>
+                            !ReferenceEquals(
+                                candidate.DeclarationElement,
+                                consumer)
+                            && IsDeclaredBefore(
+                                candidate.Definition,
+                                reference))
+                        .Select(candidate => candidate.Definition)
+                        .ToArray();
+                    if (visible.Length == 1)
+                    {
+                        if (scopeIsIncomplete)
+                        {
+                            var projectRootResolution =
+                                ResolveCompleteProjectRootScope(scope, key);
+                            if (projectRootResolution is not null)
+                            {
+                                return projectRootResolution;
+                            }
+                            return new ResourceResolution(
+                                new XamlResolutionOutcome(
+                                    XamlResolutionStatus.Incomplete,
+                                    "local-resource-scope-incomplete"),
+                                visible);
+                        }
+                        return new ResourceResolution(
+                            new XamlResolutionOutcome(
+                                XamlResolutionStatus.Resolved,
+                                "unique-visible-local-resource-declaration"),
+                            visible);
+                    }
+                    if (visible.Length > 1)
+                    {
+                        return new ResourceResolution(
+                            new XamlResolutionOutcome(
+                                XamlResolutionStatus.Ambiguous,
+                                "multiple-visible-local-resource-declarations"),
+                            visible);
+                    }
+
+                    if (scopeIsIncomplete)
+                    {
+                        return new ResourceResolution(
+                            new XamlResolutionOutcome(
+                                XamlResolutionStatus.Incomplete,
+                                "local-resource-scope-incomplete"),
+                            Array.Empty<ResourceDefinition>());
+                    }
+
+                    // A same-scope declaration exists, but only at/after the reference. WPF
+                    // StaticResource forward lookup is not proven here, and falling through to a
+                    // project/global candidate could incorrectly bypass the nearer local scope.
+                    return new ResourceResolution(
+                        new XamlResolutionOutcome(
+                            XamlResolutionStatus.Unknown,
+                            "local-resource-forward-visibility-not-proven"),
+                        Array.Empty<ResourceDefinition>());
+                }
             }
-            return _project?.ResolveResource(key) ?? ResourceResolution.Missing;
+            else
+            {
+                for (var scope = consumer; scope is not null; scope = scope.Parent)
+                {
+                    if (_localResourceUnknownReasons.ContainsKey(scope))
+                    {
+                        var projectRootResolution =
+                            ResolveCompleteProjectRootScope(scope, key);
+                        if (projectRootResolution is not null)
+                        {
+                            return projectRootResolution;
+                        }
+                        return new ResourceResolution(
+                            new XamlResolutionOutcome(
+                                XamlResolutionStatus.Incomplete,
+                                "local-resource-scope-incomplete"),
+                            Array.Empty<ResourceDefinition>());
+                    }
+                }
+            }
+            return _project?.ResolveResource(key)
+                ?? new ResourceResolution(
+                    new XamlResolutionOutcome(
+                        XamlResolutionStatus.Unknown,
+                        "project-resource-snapshot-unavailable"),
+                    Array.Empty<ResourceDefinition>());
         }
 
-        private void EmitResourceFinding(
+        private ResourceResolution? ResolveCompleteProjectRootScope(
+            XamlElement scope,
+            string key)
+        {
+            if (!ReferenceEquals(scope, _doc.Root)
+                || _project is null)
+            {
+                return null;
+            }
+
+            var snapshot = _project.ResourceSnapshot;
+            var currentPath = Path.GetFullPath(_ctx.FilePath);
+            if (!snapshot.IsComplete
+                || !snapshot.ContributorPaths.Any(path =>
+                    string.Equals(
+                        Path.GetFullPath(path),
+                        currentPath,
+                        StringComparison.OrdinalIgnoreCase)))
+            {
+                return null;
+            }
+
+            // For an active App/Generic/merged contributor, the immutable project snapshot has
+            // already modeled this root dictionary's external merges. Reuse it instead of
+            // treating the same Source as an unknown view-local merge.
+            return _project.ResolveResource(key);
+        }
+
+        private static bool IsDeclaredBefore(
+            ResourceDefinition definition,
+            XamlAttribute reference) =>
+            definition.Line < reference.Line
+            || (definition.Line == reference.Line
+                && definition.Column < reference.Column);
+
+        private void EmitResourceOutcome(
             XamlAttribute attribute,
             string hostKey,
             string key,
             string lookupKind,
             ResourceResolution resolution)
         {
-            var missing = resolution.Status == ResourceResolutionStatus.Missing;
-            var code = missing ? "XAMLRESOURCE001" : "XAMLRESOURCE002";
-            var name = missing ? "Resource不存在" : "Resource不明确";
-            var finding = new Dictionary<string, object?>(StringComparer.Ordinal)
+            var missing = resolution.Outcome.Status == XamlResolutionStatus.Missing;
+            var name = missing ? "Resource不存在" : "Resource解析结果";
+            var payload = new Dictionary<string, object?>(StringComparer.Ordinal)
             {
-                ["code"] = code,
-                ["severity"] = "warning",
-                ["message"] = name,
+                ["status"] = resolution.Outcome.StatusName,
+                ["reason"] = resolution.Outcome.Reason,
                 ["key"] = key,
                 ["resourceLookup"] = lookupKind,
                 ["candidateCount"] = resolution.Candidates.Count,
@@ -656,9 +1094,21 @@ public sealed class XamlLanguageIndexer : ILanguageIndexer
                 ["confidence"] = "exact",
                 ["producer"] = "xaml-resource",
             };
+            if (missing)
+            {
+                payload["code"] = "XAMLRESOURCE001";
+                payload["severity"] = "warning";
+                payload["message"] = name;
+            }
+            if (_project is not null)
+            {
+                payload["snapshotComplete"] = _project.ResourceSnapshot.IsComplete;
+                payload["snapshotUnknownReasonCount"] =
+                    _project.ResourceSnapshot.UnknownReasons.Count;
+            }
             if (resolution.Candidates.Count > 0)
             {
-                finding["candidates"] = resolution.Candidates
+                payload["candidates"] = resolution.Candidates
                     .Select(candidate => new Dictionary<string, object?>
                     {
                         ["canonicalKey"] = candidate.ToCanonicalKey(_ctx.RepoRoot),
@@ -671,9 +1121,13 @@ public sealed class XamlLanguageIndexer : ILanguageIndexer
             Events.Add(new IndexEvent.AnnotationAttached(
                 symbolCanonicalKey: hostKey,
                 annotationName: name,
-                flavor: "xaml-resource-finding",
-                fullName: code,
-                argsJson: System.Text.Json.JsonSerializer.Serialize(finding)));
+                flavor: missing
+                    ? "xaml-resource-finding"
+                    : "xaml-resource-outcome",
+                fullName: missing
+                    ? "XAMLRESOURCE001"
+                    : resolution.Outcome.StatusName,
+                argsJson: System.Text.Json.JsonSerializer.Serialize(payload)));
         }
 
         private void EmitPossibleEventHandlerEdge(XamlAttribute attr, string hostKey)
@@ -706,7 +1160,7 @@ public sealed class XamlLanguageIndexer : ILanguageIndexer
             {
                 Evidence = CreateAttributeEvidence(
                     attr,
-                    EvidenceConfidence.Exact,
+                    EvidenceConfidence.Semantic,
                     meta),
             });
         }
@@ -773,12 +1227,12 @@ public sealed class XamlLanguageIndexer : ILanguageIndexer
         }
 
         private static string ClassifyResourceFromElementName(string elementName) =>
-            elementName switch
-            {
-                "Style" => "style",
-                "DataTemplate" or "ControlTemplate" or "ItemsPanelTemplate" or "ControlTheme" => "template",
-                _ => "resource",
-            };
+            XamlResourceCanonicalKey.ClassifyScheme(elementName);
+
+        private sealed record LocalResourceDefinition(
+            ResourceDefinition Definition,
+            XamlElement ScopeOwner,
+            XamlElement DeclarationElement);
 
         private static bool ElementNeedsSymbol(XamlElement element)
         {

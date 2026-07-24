@@ -95,6 +95,60 @@ public sealed class XamlPrivacyDiscoveryTests : IDisposable
     }
 
     [Fact]
+    public async Task ExcludedApplicationDefinitionMakesResourceSnapshotIncomplete()
+    {
+        var projectDir = Path.Join(_root, "ManagedApp");
+        var excludedDirectory = Path.Join(projectDir, "Private");
+        await PlantAsync(
+            Path.Join(projectDir, "ManagedApp.csproj"),
+            """
+            <Project Sdk="Microsoft.NET.Sdk">
+              <ItemGroup>
+                <ApplicationDefinition Include="Private/Bootstrap.xaml" />
+                <Page Include="Views/MainWindow.xaml" />
+              </ItemGroup>
+            </Project>
+            """);
+        await PlantAsync(
+            Path.Join(excludedDirectory, "Bootstrap.xaml"),
+            """
+            <Application xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+              <Application.Resources>
+                <SolidColorBrush x:Key="PrivateAccent" />
+              </Application.Resources>
+            </Application>
+            """);
+        var viewPath = await PlantAsync(
+            Path.Join(projectDir, "Views", "MainWindow.xaml"),
+            """<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" />""");
+        var factory = (IExclusionAwareLanguageProjectFactory)
+            new XamlLanguageProjectFactory(
+                (_, path) =>
+                {
+                    if (IsSameOrDescendant(path, excludedDirectory))
+                    {
+                        throw new InvalidOperationException(
+                            "Privacy-excluded application root was accessed: " + path);
+                    }
+                });
+
+        var project = (await factory.DiscoverAsync(
+                _root,
+                ["**/private/**"],
+                CancellationToken.None))
+            .Should().ContainSingle().Subject.Should()
+            .BeOfType<XamlLanguageProject>().Subject;
+
+        project.FilePaths.Should().Equal(viewPath);
+        project.ResourceSnapshot.IsComplete.Should().BeFalse();
+        project.ResourceSnapshot.UnknownReasons.Should().Contain(
+            "project-application-definition-excluded");
+        project.ResolveResource("PrivateAccent").Outcome.Status.Should()
+            .Be(XamlResolutionStatus.Incomplete);
+    }
+
+    [Fact]
     public async Task Discover_preCancelledEmptyRepository_propagatesCancellation()
     {
         using var cts = new CancellationTokenSource();
@@ -197,6 +251,76 @@ public sealed class XamlPrivacyDiscoveryTests : IDisposable
         projects[0].Id.Should().Be(projectPath);
         projects[0].FilePaths.Should().BeEquivalentTo(
             new[] { explicitXaml, implicitXaml });
+    }
+
+    [Fact]
+    public async Task Discover_parentFallbackScanStopsAtNestedProjectRoot()
+    {
+        var parentDir = Path.Join(_root, "Parent");
+        var parentProjectPath = await PlantAsync(
+            Path.Join(parentDir, "Parent.csproj"),
+            """<Project Sdk="Microsoft.NET.Sdk" />""");
+        var parentView = await PlantAsync(
+            Path.Join(parentDir, "ParentView.xaml"),
+            """<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" />""");
+        var childDir = Path.Join(parentDir, "Child");
+        var childProjectPath = await PlantAsync(
+            Path.Join(childDir, "Child.csproj"),
+            """<Project Sdk="Microsoft.NET.Sdk" />""");
+        var childView = await PlantAsync(
+            Path.Join(childDir, "ChildView.xaml"),
+            """<UserControl xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" />""");
+
+        var projects = await new XamlLanguageProjectFactory().DiscoverAsync(
+            _root,
+            CancellationToken.None);
+
+        projects.Should().HaveCount(2);
+        var parent = projects.Should().ContainSingle(project =>
+            project.Id == parentProjectPath).Subject;
+        var child = projects.Should().ContainSingle(project =>
+            project.Id == childProjectPath).Subject;
+        parent.FilePaths.Should().Equal(parentView);
+        child.FilePaths.Should().Equal(childView);
+    }
+
+    [Fact]
+    public async Task Discover_explicitLinkedIncludeMayCrossNestedProjectBoundary()
+    {
+        var parentDir = Path.Join(_root, "Parent");
+        var parentProjectPath = await PlantAsync(
+            Path.Join(parentDir, "Parent.csproj"),
+            """
+            <Project Sdk="Microsoft.NET.Sdk">
+              <ItemGroup>
+                <Page Include="Child/Linked.xaml">
+                  <Link>Linked.xaml</Link>
+                </Page>
+              </ItemGroup>
+            </Project>
+            """);
+        var parentView = await PlantAsync(
+            Path.Join(parentDir, "ParentView.xaml"),
+            """<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" />""");
+        var childDir = Path.Join(parentDir, "Child");
+        var childProjectPath = await PlantAsync(
+            Path.Join(childDir, "Child.csproj"),
+            """<Project Sdk="Microsoft.NET.Sdk" />""");
+        var linkedView = await PlantAsync(
+            Path.Join(childDir, "Linked.xaml"),
+            """<UserControl xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" />""");
+
+        var projects = await new XamlLanguageProjectFactory().DiscoverAsync(
+            _root,
+            CancellationToken.None);
+
+        projects.Should().HaveCount(2);
+        var parent = projects.Should().ContainSingle(project =>
+            project.Id == parentProjectPath).Subject;
+        var child = projects.Should().ContainSingle(project =>
+            project.Id == childProjectPath).Subject;
+        parent.FilePaths.Should().BeEquivalentTo(new[] { parentView, linkedView });
+        child.FilePaths.Should().Equal(linkedView);
     }
 
     [Theory]

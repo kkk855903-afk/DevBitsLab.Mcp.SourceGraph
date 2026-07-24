@@ -17,14 +17,24 @@ namespace DevBitsLab.Mcp.SourceGraph.Indexing.Xaml;
 internal sealed class XamlSemanticResolver
 {
     private readonly Compilation _compilation;
-    private readonly Dictionary<XamlElement, XamlBindingContext?> _bindingContexts = new();
+    private readonly bool _compilationIsComplete;
+    private readonly bool _semanticResolutionIsSafe;
+    private readonly Dictionary<XamlElement, XamlBindingContextResolution> _bindingContexts = new();
     private readonly Dictionary<XamlElement, IReadOnlyList<XamlViewModelAssociation>>
         _viewModelAssociations = new();
 
-    private XamlSemanticResolver(Compilation compilation, XamlDocument document)
+    private XamlSemanticResolver(
+        Compilation compilation,
+        bool compilationIsComplete,
+        bool semanticResolutionIsSafe,
+        XamlDocument document)
     {
         _compilation = compilation;
-        BuildBindingContexts(document.Root, inherited: null);
+        _compilationIsComplete = compilationIsComplete;
+        _semanticResolutionIsSafe = semanticResolutionIsSafe;
+        BuildBindingContexts(
+            document.Root,
+            XamlBindingContextResolution.Unknown("no-known-data-context"));
     }
 
     public static async Task<XamlSemanticResolver?> CreateAsync(
@@ -33,44 +43,107 @@ internal sealed class XamlSemanticResolver
         CancellationToken ct)
     {
         if (project is null) return null;
-        var compilation = await project.GetCompilationAsync(ct).ConfigureAwait(false);
-        return compilation is null ? null : new XamlSemanticResolver(compilation, document);
+        var compilationState = await project
+            .GetCompilationStateAsync(ct)
+            .ConfigureAwait(false);
+        return compilationState is null
+            ? null
+            : new XamlSemanticResolver(
+                compilationState.Compilation,
+                compilationState.IsComplete,
+                compilationState.CanResolve,
+                document);
     }
 
-    public XamlBindingTarget? ResolveBinding(
+    public XamlBindingResolution ResolveBinding(
         XamlElement element,
         string path,
         bool requireCommand)
     {
-        if (!_bindingContexts.TryGetValue(element, out var context) || context is null)
+        if (!IsSimplePropertyPath(path))
         {
-            return null;
+            return XamlBindingResolution.Unresolved(
+                XamlResolutionStatus.Unsupported,
+                "binding-path-syntax-not-supported");
         }
 
-        var property = ResolvePropertyPath(context.Type, path);
-        if (property is null) return null;
-        if (requireCommand && !IsCommandType(property.Type)) return null;
+        if (!_semanticResolutionIsSafe)
+        {
+            return XamlBindingResolution.Unresolved(
+                XamlResolutionStatus.Incomplete,
+                "semantic-input-incomplete");
+        }
+
+        if (!_bindingContexts.TryGetValue(element, out var contextResolution)
+            || contextResolution.Context is null
+            || contextResolution.Outcome.Status != XamlResolutionStatus.Resolved)
+        {
+            return new XamlBindingResolution(
+                contextResolution?.Outcome
+                ?? new XamlResolutionOutcome(
+                    XamlResolutionStatus.Unknown,
+                    "no-known-data-context"),
+                Target: null,
+                contextResolution?.Candidates ?? Array.Empty<string>());
+        }
+
+        var context = contextResolution.Context;
+        var propertyResolution = ResolvePropertyPath(context.Type, path);
+        if (propertyResolution.Property is null)
+        {
+            if (propertyResolution.Outcome.Status == XamlResolutionStatus.Missing
+                && !_compilationIsComplete)
+            {
+                return XamlBindingResolution.Unresolved(
+                    XamlResolutionStatus.Incomplete,
+                    "compilation-has-errors");
+            }
+            return new XamlBindingResolution(
+                propertyResolution.Outcome,
+                Target: null,
+                propertyResolution.Candidates);
+        }
+
+        var property = propertyResolution.Property;
+        if (requireCommand && !IsCommandType(property.Type))
+        {
+            return XamlBindingResolution.Unresolved(
+                XamlResolutionStatus.Unsupported,
+                "resolved-member-is-not-icommand");
+        }
 
         var propertyKey = CanonicalKey(property);
         var dataTypeKey = CanonicalKey(context.Type);
-        if (propertyKey is null || dataTypeKey is null) return null;
+        if (propertyKey is null || dataTypeKey is null)
+        {
+            return XamlBindingResolution.Unresolved(
+                XamlResolutionStatus.Unknown,
+                "canonical-symbol-identity-unavailable");
+        }
 
-        return new XamlBindingTarget(
-            property,
-            propertyKey,
-            dataTypeKey,
-            context.Confidence,
-            context.Source);
+        return new XamlBindingResolution(
+            new XamlResolutionOutcome(
+                XamlResolutionStatus.Resolved,
+                "unique-semantic-property"),
+            new XamlBindingTarget(
+                property,
+                propertyKey,
+                dataTypeKey,
+                EvidenceConfidence.Semantic,
+                context.Source),
+            Array.Empty<string>());
     }
 
     public IReadOnlyList<XamlViewModelAssociation> GetViewModelAssociations(
         XamlElement element) =>
-        _viewModelAssociations.TryGetValue(element, out var associations)
+        _semanticResolutionIsSafe
+        && _viewModelAssociations.TryGetValue(element, out var associations)
             ? associations
             : Array.Empty<XamlViewModelAssociation>();
 
     public IMethodSymbol? ResolveEventHandler(string? xClass, string handlerName)
     {
+        if (!_semanticResolutionIsSafe) return null;
         if (string.IsNullOrWhiteSpace(xClass) || string.IsNullOrWhiteSpace(handlerName))
         {
             return null;
@@ -139,7 +212,7 @@ internal sealed class XamlSemanticResolver
 
     private void BuildBindingContexts(
         XamlElement element,
-        XamlBindingContext? inherited)
+        XamlBindingContextResolution inherited)
     {
         var effective = inherited;
         var associations = new List<XamlViewModelAssociation>(capacity: 2);
@@ -166,7 +239,8 @@ internal sealed class XamlSemanticResolver
         {
             effective = dataContextElements.Length == 1
                 ? ResolveDataContextPropertyElement(dataContextElements[0])
-                : null;
+                : XamlBindingContextResolution.Ambiguous(
+                    "multiple-data-context-property-elements");
             if (dataContextElements.Length == 1)
             {
                 var propertyElement = dataContextElements[0];
@@ -184,11 +258,13 @@ internal sealed class XamlSemanticResolver
         if (dataType is not null)
         {
             var declaredType = ResolveTypeToken(element, dataType.Value);
-            effective = declaredType is null
-                ? null
-                : new XamlBindingContext(
-                    declaredType,
-                    EvidenceConfidence.Exact,
+            effective = declaredType.Type is null
+                ? new XamlBindingContextResolution(
+                    declaredType.Outcome,
+                    Context: null,
+                    declaredType.Candidates)
+                : XamlBindingContextResolution.Resolved(
+                    declaredType.Type,
                     "x-data-type");
             AddAssociation(
                 associations,
@@ -209,13 +285,18 @@ internal sealed class XamlSemanticResolver
 
     private static void AddAssociation(
         ICollection<XamlViewModelAssociation> associations,
-        XamlBindingContext? context,
+        XamlBindingContextResolution contextResolution,
         string source,
         int line,
         int column,
         int length)
     {
-        if (context is null) return;
+        var context = contextResolution.Context;
+        if (context is null
+            || contextResolution.Outcome.Status != XamlResolutionStatus.Resolved)
+        {
+            return;
+        }
         var targetCanonicalKey = CanonicalKey(context.Type);
         if (targetCanonicalKey is null) return;
         associations.Add(new XamlViewModelAssociation(
@@ -233,9 +314,9 @@ internal sealed class XamlSemanticResolver
             ? 0
             : attribute.Prefix.Length + 1);
 
-    private XamlBindingContext? ResolveDataContextAttribute(
+    private XamlBindingContextResolution ResolveDataContextAttribute(
         XamlAttribute attribute,
-        XamlBindingContext? inherited)
+        XamlBindingContextResolution inherited)
     {
         if (!MarkupExtensionParser.TryParse(attribute.Value, out var extension)
             || extension.IsLiteral
@@ -244,7 +325,8 @@ internal sealed class XamlSemanticResolver
             || extension.NamedArgs.ContainsKey("RelativeSource")
             || extension.NamedArgs.ContainsKey("Source"))
         {
-            return null;
+            return XamlBindingContextResolution.Unknown(
+                "data-context-expression-not-statically-supported");
         }
 
         var path = ResolveBindingPath(extension);
@@ -252,36 +334,78 @@ internal sealed class XamlSemanticResolver
         {
             return inherited;
         }
-        if (inherited is null) return null;
+        if (inherited.Context is null
+            || inherited.Outcome.Status != XamlResolutionStatus.Resolved)
+        {
+            return inherited;
+        }
 
-        var property = ResolvePropertyPath(inherited.Type, path);
-        var type = property is null ? null : AsNamedType(property.Type);
+        var property = ResolvePropertyPath(inherited.Context.Type, path);
+        if (property.Property is null)
+        {
+            var outcome = property.Outcome.Status == XamlResolutionStatus.Missing
+                ? new XamlResolutionOutcome(
+                    _compilationIsComplete
+                        ? XamlResolutionStatus.Unknown
+                        : XamlResolutionStatus.Incomplete,
+                    _compilationIsComplete
+                        ? "data-context-binding-target-unknown"
+                        : "compilation-has-errors")
+                : property.Outcome;
+            return new XamlBindingContextResolution(
+                outcome,
+                Context: null,
+                property.Candidates);
+        }
+
+        var type = AsNamedType(property.Property.Type);
         return type is null
-            ? null
-            : new XamlBindingContext(
+            ? new XamlBindingContextResolution(
+                new XamlResolutionOutcome(
+                    XamlResolutionStatus.Unsupported,
+                    "data-context-binding-type-not-supported"),
+                Context: null,
+                Array.Empty<string>())
+            : XamlBindingContextResolution.Resolved(
                 type,
-                EvidenceConfidence.Semantic,
                 "data-context-binding");
     }
 
-    private XamlBindingContext? ResolveDataContextPropertyElement(XamlElement propertyElement)
+    private XamlBindingContextResolution ResolveDataContextPropertyElement(
+        XamlElement propertyElement)
     {
-        if (propertyElement.Children.Count != 1) return null;
+        if (propertyElement.Children.Count == 0)
+        {
+            return XamlBindingContextResolution.Unknown(
+                "data-context-property-element-is-empty");
+        }
+        if (propertyElement.Children.Count != 1)
+        {
+            return XamlBindingContextResolution.Ambiguous(
+                "multiple-data-context-values");
+        }
         var type = ResolveElementType(propertyElement.Children[0]);
-        return type is null
-            ? null
-            : new XamlBindingContext(
-                type,
-                EvidenceConfidence.Exact,
+        return type.Type is null
+            ? new XamlBindingContextResolution(
+                type.Outcome,
+                Context: null,
+                type.Candidates)
+            : XamlBindingContextResolution.Resolved(
+                type.Type,
                 "data-context");
     }
 
-    private INamedTypeSymbol? ResolveTypeToken(XamlElement element, string rawValue)
+    private XamlTypeResolution ResolveTypeToken(XamlElement element, string rawValue)
     {
         var token = rawValue.Trim();
         if (MarkupExtensionParser.TryParse(token, out var extension) && !extension.IsLiteral)
         {
-            if (extension.Name is not ("x:Type" or "Type")) return null;
+            if (extension.Name is not ("x:Type" or "Type"))
+            {
+                return XamlTypeResolution.Unresolved(
+                    XamlResolutionStatus.Unsupported,
+                    "data-type-expression-not-supported");
+            }
             token = extension.PositionalArgs.Count > 0
                 && extension.PositionalArgs[0].IsLiteral
                     ? extension.PositionalArgs[0].Literal ?? string.Empty
@@ -292,29 +416,43 @@ internal sealed class XamlSemanticResolver
         }
 
         token = token.Trim();
-        if (token.Length == 0) return null;
+        if (token.Length == 0)
+        {
+            return XamlTypeResolution.Unresolved(
+                XamlResolutionStatus.Unknown,
+                "data-type-token-is-empty");
+        }
 
         var colon = token.IndexOf(':');
         if (colon < 0)
         {
             return token.IndexOf('.') >= 0
-                ? _compilation.GetTypeByMetadataName(token)
-                : null;
+                ? ResolveMetadataType(token, assemblyName: null)
+                : XamlTypeResolution.Unresolved(
+                    XamlResolutionStatus.Unknown,
+                    "data-type-namespace-prefix-unavailable");
         }
 
         var prefix = token.Substring(0, colon);
         var localName = token.Substring(colon + 1);
-        if (localName.Length == 0) return null;
+        if (localName.Length == 0)
+        {
+            return XamlTypeResolution.Unresolved(
+                XamlResolutionStatus.Unknown,
+                "data-type-local-name-is-empty");
+        }
         var namespaceUri = ResolveNamespaceUri(element, prefix);
         return namespaceUri is null
-            ? null
+            ? XamlTypeResolution.Unresolved(
+                XamlResolutionStatus.Unknown,
+                "data-type-namespace-prefix-unresolved")
             : ResolveClrType(namespaceUri, localName);
     }
 
-    private INamedTypeSymbol? ResolveElementType(XamlElement element) =>
+    private XamlTypeResolution ResolveElementType(XamlElement element) =>
         ResolveClrType(element.Namespace, element.LocalName);
 
-    private INamedTypeSymbol? ResolveClrType(string namespaceUri, string localName)
+    private XamlTypeResolution ResolveClrType(string namespaceUri, string localName)
     {
         string namespaceName;
         string? assemblyName = null;
@@ -342,41 +480,89 @@ internal sealed class XamlSemanticResolver
         }
         else
         {
-            return null;
+            return XamlTypeResolution.Unresolved(
+                XamlResolutionStatus.Unsupported,
+                "xaml-namespace-is-not-clr-addressable");
         }
 
         if (string.IsNullOrWhiteSpace(namespaceName)
             || string.IsNullOrWhiteSpace(localName))
         {
-            return null;
+            return XamlTypeResolution.Unresolved(
+                XamlResolutionStatus.Unknown,
+                "clr-type-name-is-incomplete");
         }
 
         var metadataName = namespaceName.Trim() + "." + localName.Trim();
-        if (string.IsNullOrEmpty(assemblyName))
+        return ResolveMetadataType(metadataName, assemblyName);
+    }
+
+    private XamlTypeResolution ResolveMetadataType(
+        string metadataName,
+        string? assemblyName)
+    {
+        var candidates = new List<INamedTypeSymbol>();
+        var localType = _compilation.Assembly.GetTypeByMetadataName(metadataName);
+        if (string.IsNullOrEmpty(assemblyName) && localType is not null)
         {
-            return _compilation.GetTypeByMetadataName(metadataName);
+            return XamlTypeResolution.Resolved(localType);
         }
 
-        if (string.Equals(
-            _compilation.AssemblyName,
-            assemblyName,
-            StringComparison.OrdinalIgnoreCase))
-        {
-            return _compilation.Assembly.GetTypeByMetadataName(metadataName);
-        }
-
+        AddCandidate(_compilation.Assembly);
         foreach (var referencedAssembly in _compilation.SourceModule.ReferencedAssemblySymbols)
         {
-            if (string.Equals(
-                referencedAssembly.Name,
-                assemblyName,
-                StringComparison.OrdinalIgnoreCase))
-            {
-                return referencedAssembly.GetTypeByMetadataName(metadataName);
-            }
+            AddCandidate(referencedAssembly);
         }
 
-        return null;
+        if (candidates.Count == 1)
+        {
+            return XamlTypeResolution.Resolved(candidates[0]);
+        }
+
+        var candidateKeys = candidates
+            .Select(candidate =>
+                CanonicalKey(candidate)
+                ?? candidate.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat))
+            .OrderBy(candidate => candidate, StringComparer.Ordinal)
+            .ToArray();
+        if (candidates.Count > 1)
+        {
+            return new XamlTypeResolution(
+                new XamlResolutionOutcome(
+                    XamlResolutionStatus.Ambiguous,
+                    "multiple-clr-types-match-data-context"),
+                Type: null,
+                candidateKeys);
+        }
+
+        return XamlTypeResolution.Unresolved(
+            _compilationIsComplete
+                ? XamlResolutionStatus.Unknown
+                : XamlResolutionStatus.Incomplete,
+            _compilationIsComplete
+                ? "data-context-type-not-found"
+                : "compilation-has-errors");
+
+        void AddCandidate(IAssemblySymbol assembly)
+        {
+            if (!string.IsNullOrEmpty(assemblyName)
+                && !string.Equals(
+                    assembly.Name,
+                    assemblyName,
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+
+            var candidate = assembly.GetTypeByMetadataName(metadataName);
+            if (candidate is null
+                || candidates.Any(existing =>
+                    SymbolEqualityComparer.Default.Equals(existing, candidate)))
+            {
+                return;
+            }
+            candidates.Add(candidate);
+        }
     }
 
     private static string? ResolveNamespaceUri(XamlElement element, string prefix)
@@ -402,46 +588,113 @@ internal sealed class XamlSemanticResolver
         return null;
     }
 
-    private IPropertySymbol? ResolvePropertyPath(
+    private XamlPropertyResolution ResolvePropertyPath(
         INamedTypeSymbol rootType,
         string path)
     {
         var segments = path.Split('.');
-        if (segments.Length == 0) return null;
 
         ITypeSymbol currentType = rootType;
-        IPropertySymbol? property = null;
+        XamlPropertyResolution? resolution = null;
         foreach (var rawSegment in segments)
         {
             var segment = rawSegment.Trim();
-            if (!IsIdentifier(segment)) return null;
-
-            property = FindProperty(currentType, segment);
-            if (property is null) return null;
-            currentType = property.Type;
+            resolution = FindProperty(currentType, segment);
+            if (resolution.Property is null) return resolution;
+            currentType = resolution.Property.Type;
         }
 
-        return property;
+        return resolution
+            ?? XamlPropertyResolution.Unresolved(
+                XamlResolutionStatus.Unsupported,
+                "binding-path-is-empty");
     }
 
-    private static IPropertySymbol? FindProperty(ITypeSymbol type, string name)
+    private static XamlPropertyResolution FindProperty(ITypeSymbol type, string name)
     {
         var current = AsNamedType(type);
+        if (current is null)
+        {
+            return XamlPropertyResolution.Unresolved(
+                XamlResolutionStatus.Unsupported,
+                "binding-path-enters-non-object-type");
+        }
         while (current is not null)
         {
-            var matches = current.GetMembers(name)
-                .OfType<IPropertySymbol>()
-                .Where(p =>
-                    !p.IsStatic
-                    && p.Parameters.Length == 0
-                    && p.DeclaredAccessibility == Accessibility.Public)
-                .ToArray();
-            if (matches.Length > 1) return null;
-            if (matches.Length == 1) return matches[0];
+            var matches = BindableProperties(current, name);
+            if (matches.Length > 1)
+            {
+                return Ambiguous(matches);
+            }
+            if (matches.Length == 1)
+            {
+                return XamlPropertyResolution.Resolved(matches[0]);
+            }
+
+            if (current.TypeKind == TypeKind.Interface)
+            {
+                var inheritedMatches = new List<IPropertySymbol>();
+                foreach (var inheritedInterface in current.AllInterfaces)
+                {
+                    foreach (var property in BindableProperties(
+                                 inheritedInterface,
+                                 name))
+                    {
+                        if (inheritedMatches.Any(existing =>
+                                SymbolEqualityComparer.Default.Equals(
+                                    existing.OriginalDefinition,
+                                    property.OriginalDefinition)))
+                        {
+                            continue;
+                        }
+                        inheritedMatches.Add(property);
+                    }
+                }
+
+                if (inheritedMatches.Count > 1)
+                {
+                    return Ambiguous(inheritedMatches);
+                }
+                if (inheritedMatches.Count == 1)
+                {
+                    return XamlPropertyResolution.Resolved(inheritedMatches[0]);
+                }
+                break;
+            }
+
             current = current.BaseType;
         }
 
-        return null;
+        return XamlPropertyResolution.Unresolved(
+            XamlResolutionStatus.Missing,
+            "property-not-found");
+
+        static IPropertySymbol[] BindableProperties(
+            INamedTypeSymbol declaringType,
+            string propertyName) =>
+            declaringType.GetMembers(propertyName)
+                .OfType<IPropertySymbol>()
+                .Where(property =>
+                    !property.IsStatic
+                    && property.Parameters.Length == 0
+                    && property.DeclaredAccessibility == Accessibility.Public)
+                .ToArray();
+
+        static XamlPropertyResolution Ambiguous(
+            IEnumerable<IPropertySymbol> properties) =>
+            new(
+                new XamlResolutionOutcome(
+                    XamlResolutionStatus.Ambiguous,
+                    "multiple-properties-match-binding-segment"),
+                Property: null,
+                properties
+                    .Select(property =>
+                        CanonicalKey(property)
+                        ?? property.ToDisplayString(
+                            SymbolDisplayFormat.FullyQualifiedFormat))
+                    .Distinct(StringComparer.Ordinal)
+                    .OrderBy(candidate => candidate, StringComparer.Ordinal)
+                    .ToArray());
     }
 
     private bool IsCommandType(ITypeSymbol type)
@@ -480,6 +733,14 @@ internal sealed class XamlSemanticResolver
     private static bool IsDataContextPropertyElement(XamlElement element) =>
         element.LocalName.EndsWith(".DataContext", StringComparison.Ordinal);
 
+    private static bool IsSimplePropertyPath(string path)
+    {
+        if (string.IsNullOrWhiteSpace(path)) return false;
+        var segments = path.Split('.');
+        return segments.Length > 0
+            && segments.All(segment => IsIdentifier(segment.Trim()));
+    }
+
     private static bool IsIdentifier(string value)
     {
         if (value.Length == 0) return false;
@@ -497,6 +758,81 @@ internal sealed record XamlBindingContext(
     EvidenceConfidence Confidence,
     string Source);
 
+internal sealed record XamlBindingContextResolution(
+    XamlResolutionOutcome Outcome,
+    XamlBindingContext? Context,
+    IReadOnlyList<string> Candidates)
+{
+    public static XamlBindingContextResolution Resolved(
+        INamedTypeSymbol type,
+        string source) =>
+        new(
+            new XamlResolutionOutcome(
+                XamlResolutionStatus.Resolved,
+                "unique-data-context-type"),
+            new XamlBindingContext(
+                type,
+                EvidenceConfidence.Semantic,
+                source),
+            Array.Empty<string>());
+
+    public static XamlBindingContextResolution Unknown(string reason) =>
+        new(
+            new XamlResolutionOutcome(XamlResolutionStatus.Unknown, reason),
+            Context: null,
+            Array.Empty<string>());
+
+    public static XamlBindingContextResolution Ambiguous(string reason) =>
+        new(
+            new XamlResolutionOutcome(XamlResolutionStatus.Ambiguous, reason),
+            Context: null,
+            Array.Empty<string>());
+}
+
+internal sealed record XamlTypeResolution(
+    XamlResolutionOutcome Outcome,
+    INamedTypeSymbol? Type,
+    IReadOnlyList<string> Candidates)
+{
+    public static XamlTypeResolution Resolved(INamedTypeSymbol type) =>
+        new(
+            new XamlResolutionOutcome(
+                XamlResolutionStatus.Resolved,
+                "unique-clr-type"),
+            type,
+            Array.Empty<string>());
+
+    public static XamlTypeResolution Unresolved(
+        XamlResolutionStatus status,
+        string reason) =>
+        new(
+            new XamlResolutionOutcome(status, reason),
+            Type: null,
+            Array.Empty<string>());
+}
+
+internal sealed record XamlPropertyResolution(
+    XamlResolutionOutcome Outcome,
+    IPropertySymbol? Property,
+    IReadOnlyList<string> Candidates)
+{
+    public static XamlPropertyResolution Resolved(IPropertySymbol property) =>
+        new(
+            new XamlResolutionOutcome(
+                XamlResolutionStatus.Resolved,
+                "unique-property"),
+            property,
+            Array.Empty<string>());
+
+    public static XamlPropertyResolution Unresolved(
+        XamlResolutionStatus status,
+        string reason) =>
+        new(
+            new XamlResolutionOutcome(status, reason),
+            Property: null,
+            Array.Empty<string>());
+}
+
 internal sealed record XamlViewModelAssociation(
     string TargetCanonicalKey,
     EvidenceConfidence Confidence,
@@ -511,3 +847,17 @@ internal sealed record XamlBindingTarget(
     string DataTypeCanonicalKey,
     EvidenceConfidence Confidence,
     string ContextSource);
+
+internal sealed record XamlBindingResolution(
+    XamlResolutionOutcome Outcome,
+    XamlBindingTarget? Target,
+    IReadOnlyList<string> Candidates)
+{
+    public static XamlBindingResolution Unresolved(
+        XamlResolutionStatus status,
+        string reason) =>
+        new(
+            new XamlResolutionOutcome(status, reason),
+            Target: null,
+            Array.Empty<string>());
+}

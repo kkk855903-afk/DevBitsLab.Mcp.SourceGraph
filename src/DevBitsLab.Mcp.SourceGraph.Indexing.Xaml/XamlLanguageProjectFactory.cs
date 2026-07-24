@@ -20,13 +20,19 @@ namespace DevBitsLab.Mcp.SourceGraph.Indexing.Xaml;
 /// / <c>&lt;Resource&gt;</c> items unioned with a complete policy-pruned directory scan), and
 /// builds a two-pass per-project resource catalog. Pass one parses every allowed
 /// project XAML document into declarations plus merged-dictionary links; pass two walks the
-/// cascades rooted at <c>App.xaml</c> and <c>Themes/Generic.xaml</c>. Relative
+/// cascades rooted at the project's <c>ApplicationDefinition</c> item and
+/// <c>Themes/Generic.xaml</c>. When an <c>App.xaml</c> directly beside the project file has no
+/// explicit, conflicting item identity, its filename is retained as a conservative SDK-default
+/// fallback.
+/// Project item expressions, conditions, imports, and removals that require MSBuild evaluation
+/// make the resource snapshot incomplete instead of being guessed. Relative
 /// <c>MergedDictionaries Source=</c> links are followed only when their physical target is an
 /// allowed XAML file owned by the same project.
 /// </summary>
 public sealed class XamlLanguageProjectFactory : IExclusionAwareLanguageProjectFactory
 {
     private readonly Func<Solution?>? _solutionProvider;
+    private readonly Func<string, bool>? _semanticInputCompleteProvider;
     private readonly Action<XamlDiscoveryAccess, string>? _beforeAccess;
 
     public XamlLanguageProjectFactory()
@@ -35,12 +41,28 @@ public sealed class XamlLanguageProjectFactory : IExclusionAwareLanguageProjectF
 
     /// <summary>
     /// Creates a factory backed by the host's current privacy-sanitized Roslyn solution.
-    /// The callback is intentionally lazy so live solution snapshots remain current.
+    /// The callback is intentionally lazy so live solution snapshots remain current. Because
+    /// this overload has no raw-versus-sanitized completeness proof, semantic edges fail closed;
+    /// production hosts should use the two-callback overload.
     /// </summary>
     public XamlLanguageProjectFactory(Func<Solution?> solutionProvider)
     {
         _solutionProvider = solutionProvider
             ?? throw new ArgumentNullException(nameof(solutionProvider));
+        _semanticInputCompleteProvider = _ => false;
+    }
+
+    /// <summary>
+    /// Creates a Roslyn-backed factory with an explicit completeness probe for the raw versus
+    /// privacy-sanitized project inputs. The probe is evaluated lazily for every semantic pass.
+    /// </summary>
+    public XamlLanguageProjectFactory(
+        Func<Solution?> solutionProvider,
+        Func<string, bool> semanticInputCompleteProvider)
+        : this(solutionProvider)
+    {
+        _semanticInputCompleteProvider = semanticInputCompleteProvider
+            ?? throw new ArgumentNullException(nameof(semanticInputCompleteProvider));
     }
 
     internal XamlLanguageProjectFactory(
@@ -173,55 +195,74 @@ public sealed class XamlLanguageProjectFactory : IExclusionAwareLanguageProjectF
     {
         ct.ThrowIfCancellationRequested();
         var projectDir = Path.GetDirectoryName(Path.GetFullPath(csprojPath))!;
-        var xamlFiles = EnumerateXamlFiles(
+        var xamlDiscovery = EnumerateXamlFiles(
             csprojPath,
             projectDir,
             pathPolicy,
             ct);
+        var xamlFiles = xamlDiscovery.FilePaths;
         if (xamlFiles.Count == 0) return null;
 
         ct.ThrowIfCancellationRequested();
-        var resourceCache = BuildResourceCache(xamlFiles, pathPolicy, ct);
+        var resourceSnapshot = BuildResourceSnapshot(
+            xamlDiscovery,
+            pathPolicy,
+            ct);
         ct.ThrowIfCancellationRequested();
         var fullProjectPath = Path.GetFullPath(csprojPath);
-        Func<Project?>? roslynProjectProvider = _solutionProvider is null
+        Func<IReadOnlyList<Project>>? roslynProjectsProvider = _solutionProvider is null
             ? null
-            : () => FindRoslynProject(_solutionProvider(), fullProjectPath);
+            : () => FindRoslynProjects(_solutionProvider(), fullProjectPath);
+        Func<bool>? semanticInputCompleteProvider = _solutionProvider is null
+            ? null
+            : () => _semanticInputCompleteProvider?.Invoke(fullProjectPath) ?? false;
         return new XamlLanguageProject(
             fullProjectPath,
             xamlFiles,
-            resourceCache,
-            () => BuildResourceCache(
-                xamlFiles,
+            resourceSnapshot,
+            () => BuildResourceSnapshot(
+                xamlDiscovery,
                 pathPolicy,
                 CancellationToken.None),
-            roslynProjectProvider);
+            roslynProjectsProvider,
+            semanticInputCompleteProvider);
     }
 
-    private static Project? FindRoslynProject(Solution? solution, string projectFilePath)
+    private static IReadOnlyList<Project> FindRoslynProjects(
+        Solution? solution,
+        string projectFilePath)
     {
-        if (solution is null) return null;
+        if (solution is null) return Array.Empty<Project>();
 
+        var matches = new List<Project>();
         foreach (var project in solution.Projects)
         {
-            if (string.IsNullOrEmpty(project.FilePath)) continue;
+            if (project.Language != LanguageNames.CSharp
+                || string.IsNullOrEmpty(project.FilePath))
+            {
+                continue;
+            }
             string candidate;
             try
             {
                 candidate = Path.GetFullPath(project.FilePath);
             }
-            catch (Exception ex) when (ex is ArgumentException or NotSupportedException)
+            catch (Exception ex) when (
+                ex is ArgumentException
+                    or NotSupportedException
+                    or PathTooLongException
+                    or System.Security.SecurityException)
             {
                 continue;
             }
 
             if (string.Equals(candidate, projectFilePath, StringComparison.OrdinalIgnoreCase))
             {
-                return project;
+                matches.Add(project);
             }
         }
 
-        return null;
+        return matches;
     }
 
     /// <summary>
@@ -230,7 +271,7 @@ public sealed class XamlLanguageProjectFactory : IExclusionAwareLanguageProjectF
     /// policy-pruned recursive scan. An <c>Update</c> item only changes metadata for an SDK default
     /// item and therefore can never be treated as the complete project file set.
     /// </summary>
-    private IReadOnlyList<string> EnumerateXamlFiles(
+    private XamlFileDiscovery EnumerateXamlFiles(
         string csprojPath,
         string projectDir,
         ScopePathPolicy pathPolicy,
@@ -238,20 +279,25 @@ public sealed class XamlLanguageProjectFactory : IExclusionAwareLanguageProjectF
     {
         ct.ThrowIfCancellationRequested();
         var results = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var item in ReadXamlItemsFromCsproj(
-                     csprojPath,
-                     projectDir,
-                     pathPolicy,
-                     ct))
+        var projectMetadata = ReadXamlItemsFromCsproj(
+            csprojPath,
+            projectDir,
+            pathPolicy,
+            ct);
+        var projectItems = projectMetadata.Items;
+        foreach (var item in projectItems)
         {
-            results.Add(item);
+            results.Add(item.Path);
         }
 
         // Always walk the project directory for *.xaml. Privacy-excluded directories are pruned
-        // before enumeration, so markup outputs and medical data are never opened.
+        // before enumeration, so markup outputs and medical data are never opened. A nested
+        // project root is also a hard fallback-scan boundary; an explicit item above remains in
+        // the result and is the only way for the parent to link a file across that boundary.
         var stack = new Stack<string>();
         var visitedPhysicalDirectories = new HashSet<string>(
             StringComparer.OrdinalIgnoreCase);
+        var fullProjectPath = Path.GetFullPath(csprojPath);
         stack.Push(projectDir);
         while (stack.Count > 0)
         {
@@ -267,10 +313,28 @@ public sealed class XamlLanguageProjectFactory : IExclusionAwareLanguageProjectF
                 continue;
             }
 
-            foreach (var entry in EnumerateDirectoryEntries(
-                         dir,
-                         XamlDiscoveryAccess.EnumerateXamlEntries,
-                         ct))
+            var entries = EnumerateDirectoryEntries(
+                dir,
+                XamlDiscoveryAccess.EnumerateXamlEntries,
+                ct);
+            if (!string.Equals(
+                    Path.GetFullPath(dir),
+                    projectDir,
+                    StringComparison.OrdinalIgnoreCase)
+                && entries.Any(entry =>
+                    string.Equals(
+                        Path.GetExtension(entry),
+                        ".csproj",
+                        StringComparison.OrdinalIgnoreCase)
+                    && !string.Equals(
+                        Path.GetFullPath(entry),
+                        fullProjectPath,
+                        StringComparison.OrdinalIgnoreCase)))
+            {
+                continue;
+            }
+
+            foreach (var entry in entries)
             {
                 ct.ThrowIfCancellationRequested();
                 if (pathPolicy.IsExcludedForDiscovery(entry)) continue;
@@ -292,19 +356,49 @@ public sealed class XamlLanguageProjectFactory : IExclusionAwareLanguageProjectF
             }
         }
         ct.ThrowIfCancellationRequested();
-        return results
+        var filePaths = results
             .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
             .ThenBy(path => path, StringComparer.Ordinal)
             .ToArray();
+        var applicationDefinitionPaths = new HashSet<string>(
+            projectItems
+                .Where(item => item.IsApplicationDefinition)
+                .Select(item => item.Path),
+            StringComparer.OrdinalIgnoreCase);
+        var nonApplicationDefinitionPaths = new HashSet<string>(
+            projectItems
+                .Where(item => !item.IsApplicationDefinition)
+                .Select(item => item.Path),
+            StringComparer.OrdinalIgnoreCase);
+        var metadataUnknownReasons = new HashSet<string>(
+            projectMetadata.UnknownReasons,
+            StringComparer.Ordinal);
+        foreach (var conflictingPath in applicationDefinitionPaths
+                     .Where(nonApplicationDefinitionPaths.Contains))
+        {
+            metadataUnknownReasons.Add(
+                "project-xaml-item-evaluation-unsupported:conflicting-identity:"
+                + Path.GetFileName(conflictingPath));
+        }
+        return new XamlFileDiscovery(
+            filePaths,
+            projectDir,
+            applicationDefinitionPaths,
+            nonApplicationDefinitionPaths,
+            metadataUnknownReasons
+                .OrderBy(reason => reason, StringComparer.Ordinal)
+                .ToArray());
     }
 
-    private IReadOnlyList<string> ReadXamlItemsFromCsproj(
+    private XamlProjectMetadata ReadXamlItemsFromCsproj(
         string csprojPath,
         string projectDir,
         ScopePathPolicy pathPolicy,
         CancellationToken ct)
     {
-        var results = new List<string>();
+        var results = new List<XamlProjectItem>();
+        var unknownReasons = new HashSet<string>(StringComparer.Ordinal);
+        var conditionalDepths = new Stack<int>();
         BeforeAccess(XamlDiscoveryAccess.ReadProjectFile, csprojPath, ct);
         using var stream = File.OpenRead(csprojPath);
         ct.ThrowIfCancellationRequested();
@@ -322,23 +416,148 @@ public sealed class XamlLanguageProjectFactory : IExclusionAwareLanguageProjectF
             ct.ThrowIfCancellationRequested();
             if (!reader.Read()) break;
             ct.ThrowIfCancellationRequested();
-            if (reader.NodeType != XmlNodeType.Element) continue;
-            if (!IsXamlItemElement(reader.LocalName)) continue;
-            var include = reader.GetAttribute("Include") ?? reader.GetAttribute("Update");
-            if (string.IsNullOrEmpty(include)) continue;
-            if (include.IndexOfAny(new[] { '*', '?' }) >= 0) continue; // globbed; defer to fs walk
-            if (!include.EndsWith(".xaml", StringComparison.OrdinalIgnoreCase)) continue;
-            var relative = include.Replace('\\', '/');
-            var absolute = Path.IsPathRooted(relative) ? relative : Path.GetFullPath(Path.Join(projectDir, relative));
-            ct.ThrowIfCancellationRequested();
-            if (!pathPolicy.IsExcludedForDiscovery(absolute))
+            if (reader.NodeType == XmlNodeType.EndElement)
             {
-                results.Add(absolute);
+                if (conditionalDepths.Count > 0
+                    && conditionalDepths.Peek() == reader.Depth)
+                {
+                    conditionalDepths.Pop();
+                }
+                continue;
+            }
+            if (reader.NodeType != XmlNodeType.Element) continue;
+
+            var condition = reader.GetAttribute("Condition");
+            var hasOwnCondition = !string.IsNullOrWhiteSpace(condition);
+            var hasInheritedCondition = conditionalDepths.Count > 0;
+            if (hasOwnCondition && !reader.IsEmptyElement)
+            {
+                conditionalDepths.Push(reader.Depth);
+            }
+
+            if (string.Equals(
+                    reader.LocalName,
+                    "Import",
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                unknownReasons.Add(
+                    "project-xaml-item-evaluation-unsupported:import");
+                continue;
+            }
+            if (!IsXamlItemElement(reader.LocalName)) continue;
+
+            var isApplicationDefinition = string.Equals(
+                reader.LocalName,
+                "ApplicationDefinition",
+                StringComparison.OrdinalIgnoreCase);
+            var include = reader.GetAttribute("Include");
+            var update = reader.GetAttribute("Update");
+            var remove = reader.GetAttribute("Remove");
+            var itemSpec = include ?? update ?? remove;
+            if (string.IsNullOrWhiteSpace(itemSpec)) continue;
+            if (!IsPotentialXamlItemSpec(
+                    reader.LocalName,
+                    itemSpec))
+            {
+                continue;
+            }
+
+            // Update only changes metadata on an item that already exists. It neither creates
+            // project membership nor changes the item's Page/ApplicationDefinition identity.
+            if (string.IsNullOrWhiteSpace(include)
+                && !string.IsNullOrWhiteSpace(update)
+                && string.IsNullOrWhiteSpace(remove))
+            {
+                continue;
+            }
+            if (!string.IsNullOrWhiteSpace(remove))
+            {
+                unknownReasons.Add(
+                    "project-xaml-item-evaluation-unsupported:remove");
+                continue;
+            }
+            if (hasOwnCondition || hasInheritedCondition)
+            {
+                unknownReasons.Add(
+                    "project-xaml-item-evaluation-unsupported:condition");
+                continue;
+            }
+            if (!string.IsNullOrWhiteSpace(reader.GetAttribute("Exclude")))
+            {
+                unknownReasons.Add(
+                    "project-xaml-item-evaluation-unsupported:exclude");
+                continue;
+            }
+            if (ContainsMsBuildExpression(itemSpec))
+            {
+                unknownReasons.Add(
+                    "project-xaml-item-evaluation-unsupported:expression");
+                continue;
+            }
+            if (itemSpec.IndexOfAny(new[] { '*', '?' }) >= 0)
+            {
+                unknownReasons.Add(
+                    "project-xaml-item-evaluation-unsupported:glob");
+                continue;
+            }
+            if (itemSpec.Contains(';'))
+            {
+                unknownReasons.Add(
+                    "project-xaml-item-evaluation-unsupported:item-list");
+                continue;
+            }
+            if (!itemSpec.EndsWith(".xaml", StringComparison.OrdinalIgnoreCase)) continue;
+
+            var relative = itemSpec.Replace('\\', '/');
+            var absolute = Path.GetFullPath(
+                Path.IsPathRooted(relative)
+                    ? relative
+                    : Path.Join(projectDir, relative));
+            ct.ThrowIfCancellationRequested();
+            if (pathPolicy.IsExcludedForDiscovery(absolute))
+            {
+                if (isApplicationDefinition)
+                {
+                    // The project file proves that an application resource root exists, but the
+                    // privacy policy forbids reading it. Silently dropping that root would turn
+                    // every key it may contain into a false project-wide "missing" finding.
+                    unknownReasons.Add(
+                        "project-application-definition-excluded");
+                }
+            }
+            else
+            {
+                results.Add(new XamlProjectItem(
+                    absolute,
+                    isApplicationDefinition));
             }
         }
         ct.ThrowIfCancellationRequested();
-        return results;
+        return new XamlProjectMetadata(
+            results,
+            unknownReasons
+                .OrderBy(reason => reason, StringComparer.Ordinal)
+                .ToArray());
     }
+
+    private static bool IsPotentialXamlItemSpec(
+        string itemType,
+        string itemSpec) =>
+        string.Equals(
+            itemType,
+            "Page",
+            StringComparison.OrdinalIgnoreCase)
+        || string.Equals(
+            itemType,
+            "ApplicationDefinition",
+            StringComparison.OrdinalIgnoreCase)
+        || itemSpec.Contains(".xaml", StringComparison.OrdinalIgnoreCase)
+        || ContainsMsBuildExpression(itemSpec);
+
+    private static bool ContainsMsBuildExpression(string itemSpec) =>
+        itemSpec.Contains("$(", StringComparison.Ordinal)
+        || itemSpec.Contains("@(", StringComparison.Ordinal)
+        || itemSpec.Contains("%(", StringComparison.Ordinal);
 
     private static bool IsXamlItemElement(string localName) =>
         // <Page> + <ApplicationDefinition> are the WPF/WinUI markup-compiler item types; many
@@ -352,13 +571,13 @@ public sealed class XamlLanguageProjectFactory : IExclusionAwareLanguageProjectF
 
     /// <summary>
     /// Build an immutable project-level resource snapshot. Pass one parses every allowed XAML
-    /// file exactly once. Pass two follows relative merged-dictionary links from App.xaml and
-    /// Themes/Generic.xaml, collecting all reachable keyed declarations. Duplicate keys retain
-    /// every declaration so lookup can report ambiguity rather than depending on enumeration
-    /// order.
+    /// file exactly once. Pass two follows relative merged-dictionary links from the selected
+    /// application-definition roots and Themes/Generic.xaml, collecting all reachable keyed
+    /// declarations. Duplicate keys retain every declaration so lookup can report ambiguity
+    /// rather than depending on enumeration order.
     /// </summary>
-    private IReadOnlyDictionary<string, IReadOnlyList<ResourceDefinition>> BuildResourceCache(
-        IReadOnlyList<string> xamlFiles,
+    private XamlResourceSnapshot BuildResourceSnapshot(
+        XamlFileDiscovery xamlDiscovery,
         ScopePathPolicy pathPolicy,
         CancellationToken ct)
     {
@@ -367,7 +586,7 @@ public sealed class XamlLanguageProjectFactory : IExclusionAwareLanguageProjectF
             StringComparer.OrdinalIgnoreCase);
 
         // Pass 1: parse all project-owned, policy-approved files into an in-memory catalog.
-        foreach (var candidate in xamlFiles
+        foreach (var candidate in xamlDiscovery.FilePaths
                      .Select(Path.GetFullPath)
                      .Distinct(StringComparer.OrdinalIgnoreCase)
                      .OrderBy(path => path, StringComparer.OrdinalIgnoreCase))
@@ -381,45 +600,16 @@ public sealed class XamlLanguageProjectFactory : IExclusionAwareLanguageProjectF
             var document = XamlReader.Parse(bytes);
             ct.ThrowIfCancellationRequested();
 
-            var definitions = new List<ResourceDefinition>();
-            var mergedSources = new List<string>();
-            XamlReader.Walk(document.Root, (element, ancestors) =>
-            {
-                ct.ThrowIfCancellationRequested();
-                var keyAttribute = element.FindAttribute(
-                    XamlReader.XamlNamespace,
-                    "Key");
-                if (keyAttribute is not null && IsInResourceScope(ancestors))
-                {
-                    definitions.Add(new ResourceDefinition(
-                        keyAttribute.Value,
-                        candidate,
-                        element.Line,
-                        element.Column,
-                        element.LocalName));
-                }
-
-                if (!string.Equals(
-                        element.LocalName,
-                        "ResourceDictionary",
-                        StringComparison.Ordinal))
-                {
-                    return;
-                }
-                var sourceAttribute = element.FindAttributeByLocalName("Source");
-                if (sourceAttribute is not null
-                    && !string.IsNullOrWhiteSpace(sourceAttribute.Value))
-                {
-                    mergedSources.Add(sourceAttribute.Value.Trim());
-                }
-            });
-            documents[candidate] = new ResourceDocument(definitions, mergedSources);
+            documents[candidate] = new ResourceDocument(
+                document.Root,
+                XamlResourceCanonicalKey.FindDeclarationDiscriminators(
+                    document.Root));
         }
 
         ct.ThrowIfCancellationRequested();
         // Pass 2: walk only the project-global cascade roots and their same-project merges.
         var roots = documents.Keys
-            .Where(IsProjectResourceRoot)
+            .Where(path => IsProjectResourceRoot(path, xamlDiscovery))
             .OrderBy(
                 path => string.Equals(
                     Path.GetFileName(path),
@@ -432,6 +622,9 @@ public sealed class XamlLanguageProjectFactory : IExclusionAwareLanguageProjectF
         var visible = new Dictionary<string, List<ResourceDefinition>>(
             StringComparer.Ordinal);
         var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var unknownReasons = new HashSet<string>(
+            xamlDiscovery.MetadataUnknownReasons,
+            StringComparer.Ordinal);
 
         foreach (var root in roots)
         {
@@ -439,7 +632,7 @@ public sealed class XamlLanguageProjectFactory : IExclusionAwareLanguageProjectF
             Visit(root);
         }
 
-        return new ReadOnlyDictionary<string, IReadOnlyList<ResourceDefinition>>(
+        var snapshotDefinitions = new ReadOnlyDictionary<string, IReadOnlyList<ResourceDefinition>>(
             visible.ToDictionary(
                 pair => pair.Key,
                 pair => (IReadOnlyList<ResourceDefinition>)pair.Value
@@ -448,74 +641,250 @@ public sealed class XamlLanguageProjectFactory : IExclusionAwareLanguageProjectF
                     .ThenBy(definition => definition.Column)
                     .ToArray(),
                 StringComparer.Ordinal));
+        return new XamlResourceSnapshot(
+            snapshotDefinitions,
+            visited
+                .Where(documents.ContainsKey)
+                .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
+                .ThenBy(path => path, StringComparer.Ordinal)
+                .ToArray(),
+            isComplete: unknownReasons.Count == 0,
+            unknownReasons
+                .OrderBy(reason => reason, StringComparer.Ordinal)
+                .ToArray());
 
-        void Visit(string path)
+        void Visit(
+            string path,
+            bool requireResourceDictionaryRoot = false,
+            string? mergeSource = null)
         {
             ct.ThrowIfCancellationRequested();
-            if (!visited.Add(path)) return;
             if (!documents.TryGetValue(path, out var document)) return;
-
-            foreach (var definition in document.Definitions)
-            {
-                ct.ThrowIfCancellationRequested();
-                if (!visible.TryGetValue(definition.Key, out var candidates))
-                {
-                    candidates = new List<ResourceDefinition>();
-                    visible[definition.Key] = candidates;
-                }
-                if (!candidates.Any(existing =>
-                        string.Equals(
-                            existing.FilePath,
-                            definition.FilePath,
-                            StringComparison.OrdinalIgnoreCase)
-                        && existing.Line == definition.Line
-                        && existing.Column == definition.Column))
-                {
-                    candidates.Add(definition);
-                }
-            }
-
-            foreach (var source in document.MergedSources)
-            {
-                ct.ThrowIfCancellationRequested();
-                var mergedPath = ResolveMergedDictionaryPath(
-                    path,
-                    source,
-                    documents,
-                    pathPolicy,
-                    ct);
-                if (mergedPath is not null) Visit(mergedPath);
-            }
-        }
-    }
-
-    private static bool IsInResourceScope(IReadOnlyList<XamlElement> ancestors)
-    {
-        foreach (var ancestor in ancestors)
-        {
-            if (string.Equals(
-                    ancestor.LocalName,
+            if (requireResourceDictionaryRoot
+                && !string.Equals(
+                    document.Root.LocalName,
                     "ResourceDictionary",
-                    StringComparison.Ordinal)
-                || ancestor.LocalName.EndsWith(
-                    ".Resources",
                     StringComparison.Ordinal))
             {
-                return true;
+                visited.Add(path);
+                unknownReasons.Add(
+                    "merged-dictionary-target-root-not-resource-dictionary:"
+                    + (mergeSource ?? Path.GetFileName(path)));
+                return;
+            }
+            if (!visited.Add(path)) return;
+
+            VisitProjectRoot(document.Root, path);
+        }
+
+        void VisitProjectRoot(XamlElement root, string documentPath)
+        {
+            ct.ThrowIfCancellationRequested();
+            if (string.Equals(
+                    root.LocalName,
+                    "ResourceDictionary",
+                    StringComparison.Ordinal))
+            {
+                VisitDictionary(root, documentPath);
+                return;
+            }
+
+            foreach (var child in root.Children.Where(child =>
+                         child.LocalName.EndsWith(
+                             ".Resources",
+                             StringComparison.Ordinal)))
+            {
+                VisitResourceCollection(child, documentPath);
             }
         }
-        return false;
+
+        void VisitResourceCollection(
+            XamlElement collection,
+            string documentPath)
+        {
+            foreach (var child in collection.Children)
+            {
+                ct.ThrowIfCancellationRequested();
+                if (child.LocalName.EndsWith(
+                        ".MergedDictionaries",
+                        StringComparison.Ordinal))
+                {
+                    VisitMergedDictionaries(child, documentPath);
+                    continue;
+                }
+
+                if (string.Equals(
+                        child.LocalName,
+                        "ResourceDictionary",
+                        StringComparison.Ordinal)
+                    && child.FindAttribute(
+                        XamlReader.XamlNamespace,
+                        "Key") is null)
+                {
+                    VisitDictionary(child, documentPath);
+                    continue;
+                }
+
+                AddDefinition(child, documentPath);
+            }
+        }
+
+        void VisitDictionary(XamlElement dictionary, string documentPath)
+        {
+            ct.ThrowIfCancellationRequested();
+            var sourceAttribute = dictionary.FindAttributeByLocalName("Source");
+            if (sourceAttribute is not null
+                && !string.IsNullOrWhiteSpace(sourceAttribute.Value))
+            {
+                VisitMergedSource(
+                    documentPath,
+                    sourceAttribute.Value.Trim());
+                if (dictionary.Children.Count > 0)
+                {
+                    unknownReasons.Add(
+                        "resource-dictionary-source-with-inline-content:"
+                        + sourceAttribute.Value.Trim());
+                }
+                return;
+            }
+
+            foreach (var child in dictionary.Children)
+            {
+                ct.ThrowIfCancellationRequested();
+                if (child.LocalName.EndsWith(
+                        ".MergedDictionaries",
+                        StringComparison.Ordinal))
+                {
+                    VisitMergedDictionaries(child, documentPath);
+                    continue;
+                }
+                AddDefinition(child, documentPath);
+            }
+        }
+
+        void VisitMergedDictionaries(
+            XamlElement mergedDictionaries,
+            string documentPath)
+        {
+            foreach (var child in mergedDictionaries.Children)
+            {
+                ct.ThrowIfCancellationRequested();
+                if (!string.Equals(
+                        child.LocalName,
+                        "ResourceDictionary",
+                        StringComparison.Ordinal))
+                {
+                    unknownReasons.Add(
+                        "unsupported-inline-merged-dictionary:"
+                        + child.LocalName);
+                    continue;
+                }
+
+                var sourceAttribute = child.FindAttributeByLocalName("Source");
+                if (sourceAttribute is not null
+                    && !string.IsNullOrWhiteSpace(sourceAttribute.Value))
+                {
+                    VisitMergedSource(
+                        documentPath,
+                        sourceAttribute.Value.Trim());
+                    continue;
+                }
+
+                VisitDictionary(child, documentPath);
+            }
+        }
+
+        void VisitMergedSource(string containingPath, string source)
+        {
+            var merged = ResolveMergedDictionaryPath(
+                containingPath,
+                source,
+                documents,
+                pathPolicy,
+                ct);
+            if (merged.Path is not null)
+            {
+                Visit(
+                    merged.Path,
+                    requireResourceDictionaryRoot: true,
+                    mergeSource: source);
+            }
+            else if (merged.UnknownReason is not null)
+            {
+                unknownReasons.Add(merged.UnknownReason);
+            }
+        }
+
+        void AddDefinition(XamlElement element, string documentPath)
+        {
+            var keyAttribute = element.FindAttribute(
+                XamlReader.XamlNamespace,
+                "Key");
+            if (keyAttribute is null) return;
+            documents[documentPath].CanonicalDiscriminators.TryGetValue(
+                element,
+                out var canonicalDiscriminator);
+
+            var definition = new ResourceDefinition(
+                keyAttribute.Value,
+                documentPath,
+                element.Line,
+                element.Column,
+                element.LocalName,
+                canonicalDiscriminator);
+            if (!visible.TryGetValue(definition.Key, out var candidates))
+            {
+                candidates = new List<ResourceDefinition>();
+                visible[definition.Key] = candidates;
+            }
+            if (!candidates.Any(existing =>
+                    string.Equals(
+                        existing.FilePath,
+                        definition.FilePath,
+                        StringComparison.OrdinalIgnoreCase)
+                    && existing.Line == definition.Line
+                    && existing.Column == definition.Column))
+            {
+                candidates.Add(definition);
+            }
+        }
     }
 
-    private static bool IsProjectResourceRoot(string path)
+    private static bool IsProjectResourceRoot(
+        string path,
+        XamlFileDiscovery xamlDiscovery)
     {
-        if (string.Equals(
-                Path.GetFileName(path),
-                "App.xaml",
-                StringComparison.OrdinalIgnoreCase))
+        if (IsThemeGenericDictionary(path))
         {
             return true;
         }
+
+        if (xamlDiscovery.ApplicationDefinitionPaths.Contains(path))
+        {
+            return true;
+        }
+
+        // Explicit identity for this file is authoritative. In particular, a
+        // <Page Include="App.xaml"> is an ordinary page even though its file name resembles the
+        // conventional app root. Metadata for unrelated XAML files does not suppress the SDK
+        // implicit App.xaml fallback, which is limited to the project directory itself.
+        if (xamlDiscovery.NonApplicationDefinitionPaths.Contains(path))
+        {
+            return false;
+        }
+
+        return string.Equals(
+                   Path.GetFileName(path),
+                   "App.xaml",
+                   StringComparison.OrdinalIgnoreCase)
+               && string.Equals(
+                   Path.GetDirectoryName(Path.GetFullPath(path)),
+                   xamlDiscovery.ProjectDirectory,
+                   StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsThemeGenericDictionary(string path)
+    {
         if (!string.Equals(
                 Path.GetFileName(path),
                 "Generic.xaml",
@@ -529,7 +898,7 @@ public sealed class XamlLanguageProjectFactory : IExclusionAwareLanguageProjectF
             StringComparison.OrdinalIgnoreCase);
     }
 
-    private static string? ResolveMergedDictionaryPath(
+    private static MergedDictionaryResolution ResolveMergedDictionaryPath(
         string containingFile,
         string source,
         IReadOnlyDictionary<string, ResourceDocument> documents,
@@ -546,7 +915,9 @@ public sealed class XamlLanguageProjectFactory : IExclusionAwareLanguageProjectF
             || clean.Contains(";component/", StringComparison.OrdinalIgnoreCase)
             || Path.IsPathRooted(clean))
         {
-            return null;
+            return new MergedDictionaryResolution(
+                Path: null,
+                UnknownReason: "unsupported-merged-dictionary-source:" + source);
         }
 
         try
@@ -555,24 +926,59 @@ public sealed class XamlLanguageProjectFactory : IExclusionAwareLanguageProjectF
                 .Replace('/', Path.DirectorySeparatorChar)
                 .Replace('\\', Path.DirectorySeparatorChar);
             var containingDirectory = Path.GetDirectoryName(containingFile);
-            if (string.IsNullOrEmpty(containingDirectory)) return null;
+            if (string.IsNullOrEmpty(containingDirectory))
+            {
+                return new MergedDictionaryResolution(
+                    Path: null,
+                    UnknownReason: "merged-dictionary-containing-directory-unavailable");
+            }
             var candidate = Path.GetFullPath(Path.Combine(containingDirectory, clean));
             ct.ThrowIfCancellationRequested();
-            if (pathPolicy.IsExcludedForDiscovery(candidate)) return null;
-            return documents.ContainsKey(candidate) ? candidate : null;
+            if (pathPolicy.IsExcludedForDiscovery(candidate))
+            {
+                return new MergedDictionaryResolution(
+                    Path: null,
+                    UnknownReason: "merged-dictionary-target-excluded:" + source);
+            }
+            return documents.ContainsKey(candidate)
+                ? new MergedDictionaryResolution(candidate, UnknownReason: null)
+                : new MergedDictionaryResolution(
+                    Path: null,
+                    UnknownReason: "merged-dictionary-target-unavailable:" + source);
         }
         catch (Exception ex) when (ex is ArgumentException
                                    or NotSupportedException
                                    or PathTooLongException
                                    or UriFormatException)
         {
-            return null;
+            return new MergedDictionaryResolution(
+                Path: null,
+                UnknownReason: "unsupported-merged-dictionary-source:" + source);
         }
     }
 
     private sealed record ResourceDocument(
-        IReadOnlyList<ResourceDefinition> Definitions,
-        IReadOnlyList<string> MergedSources);
+        XamlElement Root,
+        IReadOnlyDictionary<XamlElement, string> CanonicalDiscriminators);
+
+    private sealed record XamlProjectItem(
+        string Path,
+        bool IsApplicationDefinition);
+
+    private sealed record XamlProjectMetadata(
+        IReadOnlyList<XamlProjectItem> Items,
+        IReadOnlyList<string> UnknownReasons);
+
+    private sealed record XamlFileDiscovery(
+        IReadOnlyList<string> FilePaths,
+        string ProjectDirectory,
+        IReadOnlySet<string> ApplicationDefinitionPaths,
+        IReadOnlySet<string> NonApplicationDefinitionPaths,
+        IReadOnlyList<string> MetadataUnknownReasons);
+
+    private sealed record MergedDictionaryResolution(
+        string? Path,
+        string? UnknownReason);
 }
 
 internal enum XamlDiscoveryAccess
