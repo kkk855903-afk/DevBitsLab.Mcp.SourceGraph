@@ -54,7 +54,8 @@ jobs:
       - name: Build
         run: dotnet build -c Release --no-restore /p:ContinuousIntegrationBuild=true
 
-      - name: Test (with coverage)
+      - name: Test full suite (with coverage)
+        if: matrix.os == 'windows-latest'
         run: >
           dotnet test -c Release --no-build
           --logger "trx;LogFileName=test-results.trx"
@@ -64,6 +65,23 @@ jobs:
           --
           RunConfiguration.CollectSourceInformation=true
 
+      - name: Test portable integration and offline-bundle contracts
+        if: matrix.os != 'windows-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          dotnet test \
+            tests/DevBitsLab.Mcp.SourceGraph.IntegrationTests \
+            -c Release --no-build \
+            --logger "trx;LogFileName=integration-results.trx" \
+            --results-directory ./TestResults
+          dotnet test \
+            tests/DevBitsLab.Mcp.SourceGraph.Tests \
+            -c Release --no-build \
+            --filter "FullyQualifiedName~FullOfflineBundleTests" \
+            --logger "trx;LogFileName=offline-bundle-results.trx" \
+            --results-directory ./TestResults
+
       - name: Upload test results
         if: always()
         uses: actions/upload-artifact@v7
@@ -72,7 +90,7 @@ jobs:
           path: ./TestResults/**/*.trx
 
       - name: Upload coverage
-        if: always() && matrix.os == 'ubuntu-latest'
+        if: always() && matrix.os == 'windows-latest'
         uses: actions/upload-artifact@v7
         with:
           name: coverage
