@@ -13,7 +13,7 @@
       Emit the SDK's RID-specific implementation packages so an installed tool can run the
       isolated native worker instead of shipping a platform-agnostic package without libclang.
     -->
-    <ToolPackageRuntimeIdentifiers>win-x64;win-arm64;linux-x64;linux-arm64;osx-arm64;osx-x64</ToolPackageRuntimeIdentifiers>
+    <ToolPackageRuntimeIdentifiers>win-x64;win-arm64;linux-x64;linux-arm64;osx-arm64</ToolPackageRuntimeIdentifiers>
     <RuntimeIdentifiers>$(ToolPackageRuntimeIdentifiers)</RuntimeIdentifiers>
     <PackageId>DevBitsLab.Mcp.SourceGraph.Tool</PackageId>
     <Version>0.9.0</Version>
@@ -42,6 +42,10 @@
     <PackageReference Include="ModelContextProtocol" />
     <PackageReference Include="Microsoft.Extensions.Hosting" />
     <PackageReference Include="Microsoft.Extensions.Logging" />
+    <PackageReference Include="Grpc.Tools"
+                      GeneratePathProperty="true"
+                      PrivateAssets="all"
+                      IncludeAssets="runtime;build;native;contentfiles;analyzers" />
     <ProjectReference Include="..\DevBitsLab.Mcp.SourceGraph.Core\DevBitsLab.Mcp.SourceGraph.Core.csproj" />
     <ProjectReference Include="..\DevBitsLab.Mcp.SourceGraph.Storage\DevBitsLab.Mcp.SourceGraph.Storage.csproj" />
     <ProjectReference Include="..\DevBitsLab.Mcp.SourceGraph.Indexing\DevBitsLab.Mcp.SourceGraph.Indexing.csproj" />
@@ -53,6 +57,37 @@
     <ProjectReference Include="..\DevBitsLab.Mcp.SourceGraph.Watcher\DevBitsLab.Mcp.SourceGraph.Watcher.csproj" />
     <ProjectReference Include="..\DevBitsLab.Mcp.SourceGraph.Embeddings\DevBitsLab.Mcp.SourceGraph.Embeddings.csproj" />
     <ProjectReference Include="..\DevBitsLab.Mcp.SourceGraph.Sdk\DevBitsLab.Mcp.SourceGraph.Sdk.csproj" />
+  </ItemGroup>
+
+  <!--
+    Select protoc in the RID-bearing tool project. Keeping this at the packaging boundary is
+    intentional: content copied from Indexing through a ProjectReference is evaluated for the
+    build host, then reused by a no-build pack for every RID-specific tool package.
+    Grpc.Tools has no native Windows ARM64 or macOS ARM64 compiler, so those packages use the
+    OS-supported x64 compatibility layer.
+  -->
+  <PropertyGroup>
+    <BundledProtocPlatform Condition="'$(RuntimeIdentifier)' == 'win-x64' or '$(RuntimeIdentifier)' == 'win-arm64'">windows_x64</BundledProtocPlatform>
+    <BundledProtocPlatform Condition="'$(RuntimeIdentifier)' == 'linux-x64'">linux_x64</BundledProtocPlatform>
+    <BundledProtocPlatform Condition="'$(RuntimeIdentifier)' == 'linux-arm64'">linux_arm64</BundledProtocPlatform>
+    <BundledProtocPlatform Condition="'$(RuntimeIdentifier)' == 'osx-arm64'">macosx_x64</BundledProtocPlatform>
+    <BundledProtocPlatform Condition="'$(RuntimeIdentifier)' == '' and $([MSBuild]::IsOSPlatform('Windows'))">windows_x64</BundledProtocPlatform>
+    <BundledProtocPlatform Condition="'$(RuntimeIdentifier)' == '' and $([MSBuild]::IsOSPlatform('Linux')) and ('$(PROCESSOR_ARCHITECTURE)' == 'ARM64' or '$(NETCoreSdkRuntimeIdentifier)' == 'linux-arm64')">linux_arm64</BundledProtocPlatform>
+    <BundledProtocPlatform Condition="'$(RuntimeIdentifier)' == '' and $([MSBuild]::IsOSPlatform('Linux')) and '$(BundledProtocPlatform)' == ''">linux_x64</BundledProtocPlatform>
+    <BundledProtocPlatform Condition="'$(RuntimeIdentifier)' == '' and $([MSBuild]::IsOSPlatform('OSX'))">macosx_x64</BundledProtocPlatform>
+    <BundledProtocFileName Condition="'$(BundledProtocPlatform)' == 'windows_x64'">protoc.exe</BundledProtocFileName>
+    <BundledProtocFileName Condition="'$(BundledProtocPlatform)' != 'windows_x64'">protoc</BundledProtocFileName>
+  </PropertyGroup>
+
+  <ItemGroup Condition="'$(BundledProtocPlatform)' != ''">
+    <None Include="$(PkgGrpc_Tools)\tools\$(BundledProtocPlatform)\$(BundledProtocFileName)"
+          Link="protoc\$(BundledProtocFileName)"
+          CopyToOutputDirectory="PreserveNewest"
+          CopyToPublishDirectory="PreserveNewest" />
+    <None Include="$(PkgGrpc_Tools)\build\native\include\google\protobuf\**\*.proto"
+          Link="protoc\include\google\protobuf\%(RecursiveDir)%(Filename)%(Extension)"
+          CopyToOutputDirectory="PreserveNewest"
+          CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
 
   <ItemGroup>

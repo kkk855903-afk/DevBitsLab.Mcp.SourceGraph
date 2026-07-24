@@ -12,45 +12,12 @@
     <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
     <PackageReference Include="Google.Protobuf" />
     <PackageReference Include="Grpc.Tools"
-                      GeneratePathProperty="true"
                       PrivateAssets="all"
                       IncludeAssets="runtime;build;native;contentfiles;analyzers" />
     <ProjectReference Include="..\DevBitsLab.Mcp.SourceGraph.Core\DevBitsLab.Mcp.SourceGraph.Core.csproj" />
     <ProjectReference Include="..\DevBitsLab.Mcp.SourceGraph.Storage\DevBitsLab.Mcp.SourceGraph.Storage.csproj" />
     <ProjectReference Include="..\DevBitsLab.Mcp.SourceGraph.Embeddings\DevBitsLab.Mcp.SourceGraph.Embeddings.csproj" />
     <ProjectReference Include="..\DevBitsLab.Mcp.SourceGraph.Sdk\DevBitsLab.Mcp.SourceGraph.Sdk.csproj" />
-  </ItemGroup>
-
-  <!--
-    The per-file protobuf indexer invokes protoc at runtime. Copy exactly one compiler into
-    ordinary development/test outputs and each RID-specific dotnet-tool implementation package.
-    Grpc.Tools currently publishes x64 compilers for Windows/macOS and a native arm64 compiler
-    for Linux; Windows ARM64 and macOS ARM64 use their OS-supported x64 compatibility layer.
-  -->
-  <PropertyGroup>
-    <BundledProtocPlatform Condition="'$(RuntimeIdentifier)' == 'win-x64' or '$(RuntimeIdentifier)' == 'win-arm64'">windows_x64</BundledProtocPlatform>
-    <BundledProtocPlatform Condition="'$(RuntimeIdentifier)' == 'linux-x64'">linux_x64</BundledProtocPlatform>
-    <BundledProtocPlatform Condition="'$(RuntimeIdentifier)' == 'linux-arm64'">linux_arm64</BundledProtocPlatform>
-    <BundledProtocPlatform Condition="'$(RuntimeIdentifier)' == 'osx-arm64' or '$(RuntimeIdentifier)' == 'osx-x64'">macosx_x64</BundledProtocPlatform>
-    <BundledProtocPlatform Condition="'$(RuntimeIdentifier)' == '' and $([MSBuild]::IsOSPlatform('Windows'))">windows_x64</BundledProtocPlatform>
-    <BundledProtocPlatform Condition="'$(RuntimeIdentifier)' == '' and $([MSBuild]::IsOSPlatform('Linux')) and ('$(PROCESSOR_ARCHITECTURE)' == 'ARM64' or '$(NETCoreSdkRuntimeIdentifier)' == 'linux-arm64')">linux_arm64</BundledProtocPlatform>
-    <BundledProtocPlatform Condition="'$(RuntimeIdentifier)' == '' and $([MSBuild]::IsOSPlatform('Linux')) and '$(BundledProtocPlatform)' == ''">linux_x64</BundledProtocPlatform>
-    <BundledProtocPlatform Condition="'$(RuntimeIdentifier)' == '' and $([MSBuild]::IsOSPlatform('OSX'))">macosx_x64</BundledProtocPlatform>
-    <BundledProtocFileName Condition="'$(BundledProtocPlatform)' == 'windows_x64'">protoc.exe</BundledProtocFileName>
-    <BundledProtocFileName Condition="'$(BundledProtocPlatform)' != 'windows_x64'">protoc</BundledProtocFileName>
-  </PropertyGroup>
-
-  <ItemGroup Condition="'$(BundledProtocPlatform)' != ''">
-    <None Include="$(PkgGrpc_Tools)\tools\$(BundledProtocPlatform)\$(BundledProtocFileName)"
-          Link="protoc\$(BundledProtocFileName)"
-          CopyToOutputDirectory="PreserveNewest"
-          Pack="true"
-          PackagePath="protoc/$(BundledProtocFileName)" />
-    <None Include="$(PkgGrpc_Tools)\build\native\include\google\protobuf\**\*.proto"
-          Link="protoc\include\google\protobuf\%(RecursiveDir)%(Filename)%(Extension)"
-          CopyToOutputDirectory="PreserveNewest"
-          Pack="true"
-          PackagePath="protoc/include/google/protobuf/%(RecursiveDir)%(Filename)%(Extension)" />
   </ItemGroup>
 
   <!-- MSBuildLocator requires that Microsoft.Build.* assemblies are not loaded from the project's
