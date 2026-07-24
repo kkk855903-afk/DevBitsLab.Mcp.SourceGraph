@@ -22,6 +22,36 @@ internal static class ServerHelp
         graph genuinely doesn't cover the question (config files, plain text, comments,
         PR descriptions, etc.) or when a tool returns nothing relevant.
 
+        # MedInteropLens 0.9
+
+        Use the exact compatibility names `search_code`, `find_symbol`, `trace_call`, and
+        `impact_analysis` when a workflow expects the MedInteropLens contract. For WPF use
+        `trace_binding`, `trace_command`, and `check_resources`; for protobuf/gRPC use
+        `trace_rpc` and `check_proto_contract`; for native/ABI work use `match_pinvoke`,
+        `compare_struct`, and `analyze_native_boundary`.
+
+        To trace execution across domains, call `trace_call` or `trace_call_path` with
+        `profile="execution"` and omit `kind`. The fixed evidence-backed route is
+        `binds-path` → `command-executes` → `calls` → `grpc-calls` →
+        `rpc-dispatches-to` → `calls` → `pinvoke-maps-to` → `calls`: XAML element,
+        command property, view-model method, managed gRPC client, protobuf RPC, server
+        handler, managed import, native export, then the C/C++ implementation. Every hop
+        includes stored occurrence evidence.
+
+        Before treating an empty execution result as "no path", require
+        `execution_state.absence_authoritative=true`. A missing native configuration, a
+        partial/refreshing projection, retained last-good evidence, failures, truncation,
+        or a graph generation change makes absence non-authoritative; returned paths remain
+        evidence-backed. Exact canonical-key inputs are never fuzzily substituted, and
+        ambiguous matches are returned rather than guessed.
+
+        Native parsing is opt-in: the scope needs an explicit `interop` target and
+        translation units plus an external user trust grant for `NativeParsing`. The
+        short-lived worker has a sanitized environment, bounded protocol, timeout, and
+        process-tree termination, but 0.9 does not claim OS network isolation or reduced
+        privileges. `WPFEVENT001` and `WPFTHREAD001` are deliberately narrow proof-based
+        WPF warnings; query them with `find_diagnostics`.
+
         # Ad-hoc queries (describe_schema + query_graph)
 
         For ad-hoc questions that don't fit a curated tool — aggregations, joins, "how

@@ -32,6 +32,109 @@ below note which package the change applies to.
   the serialised `args` JSON (matching how `response_len` is measured — string
   `.Length`, not UTF-8 byte count). No client-visible behaviour change.
 
+## [0.9.0] - 2026-07-24
+
+MedInteropLens 0.9 extends the local source graph from managed-code navigation
+to an evidence-backed WPF → gRPC → P/Invoke → C/C++ execution and compatibility
+analysis surface. The tool package is `0.9.0`; the independently versioned
+plugin SDK is `2.5.0`.
+
+### Added
+
+- **A validated eight-hop UI-to-native execution trace.** `trace_call` and
+  `trace_call_path` accept `profile="execution"` and traverse only
+  `binds-path` → `command-executes` → `calls` → `grpc-calls` →
+  `rpc-dispatches-to` → `calls` → `pinvoke-maps-to` → `calls`. The production
+  fixture proves one contiguous route from a XAML element through its command,
+  view-model method, managed gRPC client, protobuf RPC, server handler, managed
+  import, and native export to the C++ implementation. Every hop carries
+  occurrence-level file/range/producer/confidence evidence.
+- **Stable MedInteropLens MCP names.** Added compatibility entry points
+  `search_code`, `find_symbol`, `trace_call`, and `impact_analysis`, plus the
+  domain tools `trace_binding`, `trace_command`, `check_resources`,
+  `trace_rpc`, `check_proto_contract`, `match_pinvoke`, `compare_struct`, and
+  `analyze_native_boundary`. Domain queries and execution tracing advertise
+  read-only/idempotent MCP hints.
+- **WPF semantic projections.** The XAML/Roslyn pipeline now resolves data
+  bindings, command properties, command execution, resources, and styles to
+  canonical identities when the input proves a unique target. Query results
+  preserve resolved/missing/ambiguous/incomplete/unsupported/unknown outcomes
+  and exact occurrence evidence.
+- **Two conservative WPF risk rules.** `WPFEVENT001` reports a source-defined
+  static event retaining a direct named instance handler only when a complete,
+  error-free compilation contains no exact matching `-=`. `WPFTHREAD001`
+  reports `DispatcherObject` member access from inline callbacks directly
+  scheduled by `Task.Run`, ThreadPool queue APIs, or an immediately started
+  `Thread`, while recognizing direct Dispatcher marshaling. Lambdas/aliases or
+  indirect shapes that cannot prove the event lifetime, and method-group or
+  unknown thread-entry shapes, do not warn.
+- **Protobuf and gRPC indexing/linking.** Source `.proto` contracts are compiled
+  with bundled `protoc` assets and linked to generated managed clients and
+  server overrides. The graph persists `grpc-calls`, managed→proto
+  `implements-rpc`, and execution-direction proto→handler
+  `rpc-dispatches-to`, with managed and protobuf evidence on derived links.
+  `check_proto_contract` covers missing implementations, uniquely proven
+  generated-signature mismatches, field-number changes, and streaming changes
+  against a first complete successful baseline.
+- **Target-aware native extraction and graph publication.** Explicit
+  per-scope RID/compiler-ABI/pointer-size/pack configuration drives libclang
+  translation-unit extraction for C/C++ declarations, record layouts, direct
+  calls, exports, callbacks, exception escape, allocation provenance, and
+  optional binary-export verification. Stable Clang USRs resolve direct calls
+  across translation units; content-bound snapshots prevent stale evidence
+  from being published after source changes.
+- **Managed/native matching and rule pack.** Roslyn extracts
+  `DllImport`/`LibraryImport`, callback rooting, and return-release usage.
+  Exact managed/native matching publishes `pinvoke-maps-to`; boundary analysis
+  reports proven `Interop001` calling-convention, `Interop003` parameter-type,
+  `Interop004` callback-GC, `Interop005` native-exception, and `Interop006`
+  allocator-mismatch risks. `compare_struct` performs target-specific,
+  field-by-field ABI comparison and emits `Interop002`; nested records require
+  explicit mappings and are never guessed by name.
+- **RID-complete 0.9 packaging.** The outer .NET tool selects implementation
+  packages for `win-x64`, `win-arm64`, `linux-x64`, `linux-arm64`, `osx-x64`,
+  and `osx-arm64`, including native libclang and bundled protoc assets. CI
+  installs the packed tool locally, exercises `--help`, and completes a real
+  stdio MCP `tools/list` handshake against the installed command.
+
+### Changed
+
+- **Absence is now an explicit completeness claim.** Execution responses expose
+  per-projection `status`, `authoritative`, `failure_count`, and
+  `retained_last_good`, plus aggregate
+  `execution_state.absence_authoritative`. Native-not-configured, partial or
+  refreshing gRPC/native projections, retained last-good facts, bounded
+  truncation, and graph/runtime-state changes during a read all make empty
+  execution results non-authoritative. Existing evidence-backed paths remain
+  visible.
+- **Derived projections replace atomically and retain last-good evidence on
+  incomplete input.** A failed native translation unit or incomplete gRPC
+  refresh cannot erase the last complete snapshot or create speculative
+  matches/findings. First incomplete observations correctly report no retained
+  evidence; retention is claimed only when persisted producer evidence exists.
+- **Semantic model download is offline by default.** `serve` and `index` never
+  fetch the embedding model unless the operator runs `embeddings pull`, passes
+  `--allow-model-download`, or sets
+  `SOURCEGRAPH_ALLOW_MODEL_DOWNLOAD=1`. A populated cache remains usable.
+
+### Security
+
+- **Mandatory local privacy boundary.** Build/output, repository metadata,
+  medical-data/image, log/database, dependency, and internal graph paths are
+  excluded before indexing. Scope excludes may narrow but never override the
+  mandatory set; physical-path validation rejects links that escape the
+  repository boundary.
+- **Explicit trust for native parsing.** A scope's `interop` block configures
+  inputs but does not authorize execution. `NativeParsing` requires an exact
+  repository grant in the external user-owned `MedInteropLens/trust-v1.json`;
+  missing, malformed, self-hosted, or unsupported trust stores fail closed.
+- **Bounded native parser worker.** Each authorized translation unit is parsed
+  in a short-lived child process with a sanitized environment, bounded framed
+  protocol, 30-second default timeout, and process-tree termination. 0.9
+  reports honestly that this baseline does not provide OS network isolation or
+  reduced privileges; compiler-controlled file inputs and includes that cannot
+  be proven inside the approved scope are rejected.
+
 ## [0.8.0] - 2026-05-10
 
 ### Fixed

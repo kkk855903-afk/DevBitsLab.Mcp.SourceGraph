@@ -5,17 +5,20 @@
 [![Release](https://github.com/Jak3b0/DevBitsLab.Mcp.SourceGraph/actions/workflows/publish-nuget.yml/badge.svg?event=push)](https://github.com/Jak3b0/DevBitsLab.Mcp.SourceGraph/releases)
 [![NuGet](https://img.shields.io/nuget/v/DevBitsLab.Mcp.SourceGraph.Tool.svg)](https://www.nuget.org/packages/DevBitsLab.Mcp.SourceGraph.Tool/)
 
-A live code source graph [Model Context Protocol](https://modelcontextprotocol.io)
-server for .NET solutions. It indexes your C# code with Roslyn into a SQLite +
-FTS5 database, exposes structured graph queries to MCP-aware clients (Claude
-Code, Cursor, Continue, Claude Desktop, …) over stdio, and keeps the index
-fresh as files change on disk.
+A local-first, evidence-backed code source graph
+[Model Context Protocol](https://modelcontextprotocol.io) server for .NET
+solutions. MedInteropLens 0.9 connects C#, WPF/XAML, protobuf/gRPC, and
+configured C/C++ interop in one SQLite + FTS5 graph, exposes structured queries
+to MCP-aware clients (Claude Code, Cursor, Continue, Claude Desktop, …) over
+stdio, and keeps the index fresh as files change on disk.
 
 The goal is to let coding agents replace dozens of ad-hoc `Grep` + `Read`
 calls with a single structured tool call:
 
 > *"Where is `OrderService.PublishAsync` defined?"*
 > *"Who calls it transitively, and what would change if I rename it?"*
+> *"Trace this WPF button all the way to the C++ implementation."*
+> *"Does this P/Invoke match the native ABI, and is the protobuf contract still compatible?"*
 > *"Find every controller action attributed `[HttpPost]` whose route contains `/v2/`."*
 > *"Which tests cover this method, and who authored it last?"*
 
@@ -30,6 +33,7 @@ calls with a single structured tool call:
 - [Features](#features)
 - [Why not just use Roslyn directly?](#why-not-just-use-roslyn-directly)
 - [Requirements](#requirements)
+- [Privacy, trust, and native configuration](#privacy-trust-and-native-configuration)
 - [Installation](#installation)
 - [Quickstart (60 seconds)](#quickstart-60-seconds)
 - [Wiring it into an MCP client](#wiring-it-into-an-mcp-client)
@@ -59,6 +63,42 @@ calls with a single structured tool call:
   Five XAML symbol kinds, eight cross-language edge kinds, plus
   `xaml-attached-property` annotations for `Grid.Row` / `DockPanel.Dock` /
   etc.
+- **WPF semantic flow and risk checks.** WPF bindings, commands, resources,
+  styles, and command execution are resolved to canonical C# identities when
+  the semantic input proves a unique target. `WPFEVENT001` reports a
+  source-defined static event retaining a named instance handler without an
+  exact matching `-=`, while `WPFTHREAD001` reports proven
+  `DispatcherObject` access from a directly scheduled background callback.
+  Ambiguous, indirect, or incomplete cases remain unknown instead of becoming
+  warnings.
+- **Protobuf/gRPC contract graph.** Source `.proto` contracts are compiled with
+  the bundled `protoc`, linked to generated managed client/server code, and
+  persisted as `grpc-calls`, `implements-rpc`, and execution-direction
+  `rpc-dispatches-to` relations. Contract checks cover missing server
+  implementations, uniquely proven generated-signature mismatches, field
+  number changes, and streaming changes.
+- **Target-specific managed/native interop.** Roslyn extracts
+  `DllImport`/`LibraryImport` declarations and caller-owned callback/release
+  facts; libclang extracts configured C/C++ exports, record layouts, and direct
+  native calls for an explicit RID, compiler ABI, pointer size, and packing.
+  Optional binary-export verification strengthens export identity. Matching,
+  boundary analysis, and ABI comparison always return stored source evidence.
+- **One UI-to-native execution trace.** `trace_call` and `trace_call_path` with
+  `profile="execution"` traverse the validated eight-hop relation sequence:
+  `binds-path` → `command-executes` → `calls` → `grpc-calls` →
+  `rpc-dispatches-to` → `calls` → `pinvoke-maps-to` → `calls`. This connects a
+  XAML element to its command, view-model method, gRPC client and RPC, server
+  handler, managed import, native export, and final C/C++ implementation.
+- **Conservative completeness.** Every cross-domain result carries
+  occurrence-level evidence. Exact canonical keys are never fuzzily
+  substituted, ambiguous candidates are not guessed, incomplete projections
+  retain last-good facts without turning them into current absence claims, and
+  execution traces expose `execution_state.absence_authoritative`.
+- **Local privacy boundary and opt-in native execution.** Repository content is
+  indexed into local SQLite databases. Network model download is off by
+  default; sensitive/build paths are mandatorily excluded; native parsing
+  requires both explicit per-scope configuration and a separate user-owned
+  `NativeParsing` trust grant.
 - **TypeScript / JavaScript / TSX / JSX indexing.** Built-in tree-sitter-backed
   indexer for `.ts` / `.tsx` / `.js` / `.jsx`, covering function / class /
   interface / type-alias / enum / namespace / const / let declarations, call-site
@@ -112,7 +152,7 @@ cheap structural queries against a stable solution.
 | **Initial indexing** | `MSBuildWorkspace` load (10–60 s on a real solution), paid in every consumer process | Scope open + full indexing on host start (and after `clear` or workspace reloads); tool calls await `ScopeHost.Ready` until the pass completes. Borne once by the host, shared across every connected client. |
 | **Steady-state query** | Fast in-memory queries against the loaded workspace | Milliseconds — SQLite query against the warm DB; incremental re-indexing handled by the watcher (see *Freshness* below) |
 | **Search shape** | Exact-identity lookups (`SymbolFinder.FindReferencesAsync`) | Same exact lookups *plus* FTS5 fragment search and ONNX semantic search |
-| **Languages** | C# / VB only | C# + XAML + TypeScript / JavaScript / TSX / JSX today, with cross-language joins; plugin SDK for more |
+| **Languages** | C# / VB only | C# + XAML + protobuf + configured C/C++ interop + TypeScript / JavaScript / TSX / JSX, with cross-language joins; plugin SDK for more |
 | **Multi-solution** | One workspace per solution | Native scope router with isolation flags for vendored / generated code |
 | **Freshness** | Caller's problem | File watcher + `.git/HEAD` watcher with 200 ms debounce |
 | **Semantic accuracy** | 100% live | Snapshot-accurate, refreshed on file changes |
@@ -126,6 +166,124 @@ that ask *"where does this go?"* forty times an hour.
 - [.NET 10 SDK](https://dotnet.microsoft.com/download) (see `global.json`).
 - A `.sln` or `.slnx` solution file for the codebase you want to index.
 - An MCP-aware client (Claude Code, Cursor, Continue, Claude Desktop, …).
+- For native analysis only: a supported 0.9 runtime package, explicit
+  `scopes[].interop` configuration, and a user trust grant. Native analysis is
+  optional; managed, WPF, and gRPC indexing continue when it is not configured.
+
+## Privacy, trust, and native configuration
+
+The server indexes source into `<repo>/.sourcegraph/scopes/*.db` and talks to
+the configured MCP client over stdio. It does not upload repository content or
+contact a hosted analysis service. Tool responses still go to the MCP client
+you configured, and local `.sourcegraph/usage.jsonl` records tool-call metadata
+(including ad-hoc `query_graph` SQL), so apply the same access policy to those
+two surfaces as to the repository itself.
+
+Automatic network access is disabled. `serve` and `index` use an already
+populated embedding cache or run without semantic search; only an explicit
+`embeddings pull`, `--allow-model-download`, or
+`SOURCEGRAPH_ALLOW_MODEL_DOWNLOAD=1` permits a Hugging Face model download.
+Native parsing does not fetch dependencies.
+
+The following privacy exclusions are mandatory and cannot be undone by a
+scope include or plugin: `bin`, `obj`, `.vs`, `Debug`, `Release`, `Images`,
+`PatientData`, `Database`, `Logs`, `.git`, `.sourcegraph`, `node_modules`, and
+files ending in `.dcm`, `.jpg`, `.jpeg`, or `.png`. Configured `exclude` globs
+can only narrow this set. Physical path checks reject symlinks, junctions, and
+reparse points that escape the scope.
+
+### Configure native interop
+
+Native indexing is opt-in per scope. Declare one explicit ABI target and the
+ordered translation units to parse; the server does not infer ABI settings
+from the host and the native pipeline does not execute a native build or import
+`compile_commands.json`. Paths are repository-relative, while `arguments` are
+the exact libclang parse arguments:
+
+```json
+{
+  "$schema": "./schema/sourcegraph.schema.json",
+  "scopes": [
+    {
+      "name": "app",
+      "solutions": ["MedInteropChain.slnx"],
+      "interop": {
+        "target": {
+          "runtime_identifier": "win-x64",
+          "architecture": "x64",
+          "compiler_abi": "msvc",
+          "pointer_size_bytes": 8,
+          "default_pack": 8
+        },
+        "translation_units": [
+          {
+            "path": "NativeLibrary/src/exports.cpp",
+            "library": "medalgo",
+            "arguments": [
+              "-x", "c++", "-std=c++20",
+              "--target=x86_64-pc-windows-msvc",
+              "-I", "NativeLibrary/include"
+            ],
+            "binary_path": "NativeLibrary/bin/medalgo.dll"
+          },
+          {
+            "path": "NativeLibrary/src/algorithm.cpp",
+            "library": "medalgo",
+            "arguments": [
+              "-x", "c++", "-std=c++20",
+              "--target=x86_64-pc-windows-msvc",
+              "-I", "NativeLibrary/include"
+            ]
+          }
+        ]
+      }
+    }
+  ],
+  "default_scope": "app"
+}
+```
+
+`binary_path` is optional. When supplied, the file must stay inside the privacy
+boundary and is used to verify that the configured library really exports the
+matched symbol. Explicit include paths and every observed repository include
+must resolve inside the approved scope. Compiler-controlled file inputs,
+non-literal includes, response files, plugins, PCH/module inputs, output paths,
+and other arguments that cannot be validated safely fail closed; there is no
+textual parser fallback.
+
+### Grant native parsing trust
+
+Configuration alone does not authorize native code parsing. Add an exact,
+absolute repository path and the case-sensitive `NativeParsing` capability to
+the external user trust store. On Windows the default path is
+`%LOCALAPPDATA%\MedInteropLens\trust-v1.json`; on other platforms it is under
+the OS local-application-data directory. The trust file must not live inside
+the repository.
+
+```json
+{
+  "schemaVersion": 1,
+  "repositories": [
+    {
+      "path": "C:\\absolute\\path\\to\\repository",
+      "capabilities": ["NativeParsing"]
+    }
+  ],
+  "pathPlugins": [],
+  "nugetPlugins": []
+}
+```
+
+Missing, malformed, oversized, unsupported-version, or self-hosted trust files
+deny execution. `NativeParsing` is independent of every other executable
+capability.
+
+Each approved parse runs in a short-lived child process with a sanitized
+environment, bounded one-request/one-response framing, a 30-second default
+timeout, and process-tree termination. This is process isolation, not a full
+OS sandbox: the 0.9 worker does **not** claim network isolation or reduced
+privileges. Scope/path validation and the explicit trust gate remain the
+security boundary.
 
 ## Installation
 
@@ -138,6 +296,11 @@ dotnet tool install -g DevBitsLab.Mcp.SourceGraph.Tool
 Make sure `~/.dotnet/tools` is on your `PATH`. The installed command is
 `sourcegraph-mcp`. You can also pin a version per repository — see
 [Pin a version per repo](#pin-a-version-per-repo) below.
+
+The 0.9.0 tool package contains runtime-specific payloads for `win-x64`,
+`win-arm64`, `linux-x64`, `linux-arm64`, `osx-x64`, and `osx-arm64`; the .NET
+tool shim selects the current host RID. These payloads include the native
+libclang assets used by the isolated interop worker.
 
 ## Quickstart (60 seconds)
 
@@ -309,6 +472,49 @@ Every tool accepts an optional `scope` parameter (a scope id, a comma-separated
 list, or `"*"` for fan-out). Detailed parameter docs are emitted by the server
 to the client at handshake time.
 
+### MedInteropLens 0.9 cross-domain tools
+
+These are the exact stable MCP names for the 0.9 workflow. The domain tools and
+execution trace are read-only and idempotent; they query persisted facts and
+never build, mutate, or run the indexed application.
+
+| Tool | Question it answers |
+|---|---|
+| `search_code` | Search indexed names, qualified names, and signatures. Compatibility name for `search_symbols`. |
+| `find_symbol` | Resolve a symbol query without guessing among ambiguous matches. Compatibility name for `search_symbols`. |
+| `trace_call` | Trace an evidence-backed relation path. Set `profile="execution"` (and omit `kind`) for the fixed UI-to-native relation whitelist and completeness disclosure. |
+| `impact_analysis` | Compute bounded upstream change impact with an evidence-backed predecessor path. Compatibility name for `impact_of_change`. |
+| `trace_binding` | Resolve a WPF binding from an element and/or path, including explicit resolved, missing, ambiguous, incomplete, unsupported, or unknown outcomes and occurrence evidence. |
+| `trace_command` | Resolve a WPF `Command` binding to its canonical command property with the same conservative outcome model. |
+| `check_resources` | Audit WPF resource/style references by optional file and exact key; reports resolved and unresolved outcomes without substituting similarly named resources. |
+| `trace_rpc` | From one exact `proto:R:` or `csharp:` canonical key, return persisted `grpc-calls` clients and `implements-rpc` server implementations. No name-only matching. |
+| `check_proto_contract` | Check complete current contracts for missing server implementations, uniquely proven generated signature mismatches, field-number changes, and streaming changes against the first complete baseline. |
+| `match_pinvoke` | Match one uniquely selected managed `DllImport`/`LibraryImport` to persisted native exports; zero or multiple candidates are reported, not guessed. |
+| `compare_struct` | Compare one managed and one native ABI record for the configured target. Nested records require explicit `nested_mappings`; incompatible results carry `Interop002`. |
+| `analyze_native_boundary` | Return target-specific persisted boundary facts and proven `Interop001`/`Interop003`–`Interop006` findings. Struct-layout compatibility belongs to `compare_struct`. |
+
+The execution profile's validated eight-hop route is:
+
+```text
+XAML element
+  --binds-path--> ICommand property
+  --command-executes--> view-model method
+  --calls--> managed gRPC client wrapper
+  --grpc-calls--> protobuf RPC
+  --rpc-dispatches-to--> server handler
+  --calls--> managed P/Invoke declaration
+  --pinvoke-maps-to--> native export
+  --calls--> C/C++ implementation
+```
+
+Every hop includes source/target canonical identities plus persisted
+file/range/producer/confidence evidence. Read
+`scopes[].execution_state.absence_authoritative` before interpreting an empty
+execution result as “no path”: it is false while any applicable projection is
+missing, partial, refreshing, retained from a last-good snapshot, failed, or
+changed generation during the bounded read. A returned path remains
+evidence-backed even when the completeness state is partial.
+
 ### Discovery & navigation
 
 | Tool | Question it answers |
@@ -326,7 +532,7 @@ to the client at handshake time.
 | `module_summary` | Top symbols in a namespace or directory by inbound call count |
 | `impact_of_change` | Transitive upstream callers of X up to `maxDepth` |
 | `impact_analysis` | Phase 1 compatibility name for `impact_of_change`. |
-| `trace_call_path` | Bounded, cycle-safe directed paths from one symbol to another. Every hop includes its source and target symbols, edge relation, confidence, and occurrence-level file/range evidence; configurable depth, path, and node caps report truncation explicitly. |
+| `trace_call_path` | Bounded, cycle-safe directed paths from one symbol to another. Defaults to one `calls` relation; set `profile="execution"` for the fixed cross-domain whitelist and `execution_state` completeness disclosure. Every hop includes source/target canonical identities, relation, confidence, and occurrence-level evidence; configurable depth, path, and node caps report truncation explicitly. |
 | `find_data_bindings` | Walks `binds-path` edges with payload-aware filters (`path`, `mode`, `converter`, plus optional `target` / `source` canonical keys). Answers "where does this property bind?", "find every TwoWay binding", "which views use this converter?". Soft-empty `note:` when the active scope hasn't loaded an indexer that emits `binds-path`. |
 | `find_event_handlers` | Walks `handles-event` edges with `event` / `command` payload filters and optional `handler` / `element` canonical keys. Answers "find all Click handlers", "where is OnSave wired up?". Same soft-empty pattern as `find_data_bindings`. |
 
@@ -342,11 +548,18 @@ to the client at handshake time.
 
 | Tool | Question it answers |
 |---|---|
-| `find_diagnostics` | Roslyn analyzer/compiler diagnostics captured during indexing — filter by severity, code (e.g. `CS0618`), or symbol |
+| `find_diagnostics` | Compiler/indexer diagnostics captured during indexing — filter by severity, code (for example `CS0618`, `WPFEVENT001`, or `WPFTHREAD001`), or symbol. |
 | `list_generated_files` | Every source-generated file the index tracks, with the count of symbols emitted from each |
 | `list_tests_for` | Test methods exercising a production symbol (xUnit/NUnit/MSTest), with framework + class |
 | `who_authored` | Cached git-blame summary for a symbol: last commit sha, author, ISO-8601 time, lines blamed |
 | `recent_changes` | Symbols whose last authored time falls within the last N days, optionally filtered by author substring |
+
+The WPF risk codes intentionally cover only statically proven shapes:
+
+| Code | Proven condition |
+|---|---|
+| `WPFEVENT001` | A source-defined static event receives a direct named handler on a subscriber instance, the complete error-free compilation contains no exact matching `-=` for the same event/handler/subscriber identity, and no ambiguous removal invalidates the proof. Instance/external events, lambdas, aliases, delegate indirection, and incomplete compilations do not warn. |
+| `WPFTHREAD001` | A member whose receiver's static type derives from WPF `DispatcherObject` is accessed inside an inline callback directly scheduled by `Task.Run`, `ThreadPool.QueueUserWorkItem`, `ThreadPool.UnsafeQueueUserWorkItem`, or `new Thread(lambda).Start()`. A direct `Dispatcher.Invoke`, `BeginInvoke`, or `InvokeAsync` callback is treated as marshalled; method groups and other indirect callbacks remain unknown. |
 
 ### Operations
 
@@ -437,6 +650,31 @@ The nine views cover: code structure (`v_symbols`/`v_files`/`v_edges`/`v_referen
 // the `SaveButton.Click → SampleWpf.Views.MainWindow.OnSave` wiring.
 { "tool": "find_event_handlers",
   "args": { "event": "Click" } }
+
+// MedInteropLens execution profile: trace the proven WPF-to-C++ route.
+// Use exact canonical keys when they are available; do not pass `kind` together
+// with `profile: "execution"`.
+{ "tool": "trace_call",
+  "args": {
+    "from": "xaml:element:ManagedApp/Views/MainWindow.xaml#RunAlgorithmButton",
+    "to": "cpp:F:NativeLibrary/src/algorithm.cpp::Algorithm::Calculate(const NativeInput &)",
+    "profile": "execution",
+    "maxDepth": 8
+  } }
+
+// Resolve a WPF command binding and inspect any missing/ambiguous outcome.
+{ "tool": "trace_command",
+  "args": { "element": "RunAlgorithmButton", "command": "RunAlgorithmCommand" } }
+
+// Trace one exact RPC to its managed callers and server implementation.
+{ "tool": "trace_rpc",
+  "args": { "rpc": "proto:R:medinterop.algorithm.v1.AlgorithmApi.Calculate" } }
+
+// Match a managed import, then inspect target-specific boundary risks.
+{ "tool": "match_pinvoke",
+  "args": { "symbol": "csharp:M:MedInteropChain.GrpcService.Interop.NativeMethods.Calculate(MedInteropChain.GrpcService.Interop.NativeInput@,MedInteropChain.GrpcService.Interop.NativeOutput@)" } }
+{ "tool": "analyze_native_boundary",
+  "args": { "symbol": "csharp:M:MedInteropChain.GrpcService.Interop.NativeMethods.Calculate(MedInteropChain.GrpcService.Interop.NativeInput@,MedInteropChain.GrpcService.Interop.NativeOutput@)" } }
 
 // Every element with `Grid.Row` set (XAML attached-property annotation).
 { "tool": "find_by_annotation",
@@ -597,6 +835,11 @@ A `.sourcegraph.json` at the repo root opts a project into multi-scope mode:
   nested `lsp: { command, args }` field. Loaded and surfaced via
   `scopes info`, but no first-party plugin consumes it at this version —
   the first runtime use lands with the TypeScript indexer.
+- `interop` (object, optional) enables the native pipeline for that scope. It
+  requires an explicit `target` and non-empty ordered `translation_units`;
+  see [Privacy, trust, and native configuration](#privacy-trust-and-native-configuration).
+  A configured scope without an external `NativeParsing` trust grant is
+  reported partial instead of falling back to textual matching.
 - Without a `.sourcegraph.json` and without `--solution`, a synthesised
   `default` scope keeps single-solution users working unchanged.
 - The legacy single-database layout (`.sourcegraph/graph.db`) is migrated to
@@ -647,6 +890,14 @@ without the call failing as a whole. Querying a `partial` scope by id
 returns the indexed symbols (best-effort); use `list_scopes` to see
 what's missing.
 
+Derived gRPC/native projections follow the same fail-closed policy at a finer
+level. A refresh first marks the projection partial; incomplete or failed input
+retains proven last-good facts, exposes `retained_last_good` and failures, and
+does not publish speculative findings. Protobuf field/streaming change checks
+compare only with the first complete successful baseline. Native ABI and
+boundary results are target-qualified; a result from one RID is never reused
+as proof for another.
+
 ## Command-line interface
 
 ```text
@@ -664,7 +915,7 @@ sourcegraph-mcp <subcommand> [options]
 | `demo [--scope <id>] [--no-color]` | Run four canned operations (`ping`, `graph_stats`, `search_symbols`, `find_definition`) against the active scope and print leaf-stamped markdown — the same shape an MCP client would see. Provides the "ah, it works" confidence moment without an agent loop. Exits `2` if the scope has zero symbols indexed. |
 | `init-scopes` | Discover `.slnx`/`.sln` files at `--root` (default: CWD) and write a starter `.sourcegraph.json`. Continues to work standalone; `init` invokes the same scaffolding internally when multi-solution is detected. |
 | `scopes list [--root <path>]` | List the scopes declared in `.sourcegraph.json`. |
-| `scopes info <name> [--root <path>] [--json]` | Detailed view of one scope: identity, project set, optional `language` field, optional `enrichment` block. With `--json`, emits a stable JSON shape. |
+| `scopes info <name> [--root <path>] [--json]` | Detailed view of one scope: identity, project set, optional `language`/`enrichment`, and optional explicit native `interop` target/translation units. With `--json`, emits a stable JSON shape. |
 | `scopes add <name> --solution <path> [--root <path>] [--isolated]` | Add a scope. The file is created on first use. |
 | `scopes remove <name> [--root <path>]` | Remove a scope. |
 | `plugins list [--root <path>]` | List plugins declared in `.sourcegraph.json` with their version, status, registered contracts, and source path. |
@@ -855,11 +1106,19 @@ The curated tools have no built-in timeout — they honour the MCP client's `Can
 
 ## Platform support
 
-| Platform | Build / test in CI | Distribution |
+The 0.9 outer .NET tool package selects one of six RID-specific implementation
+packages, each carrying the matching native dependencies:
+
+| Operating system | Published RIDs | CI host |
 |---|---|---|
-| Linux x64 / arm64 | Ubuntu (latest) on every push and PR | `dotnet tool install -g` |
-| macOS arm64 / x64 | macOS (latest) on every push and PR | `dotnet tool install -g` |
-| Windows x64       | Windows (latest) on every push and PR | `dotnet tool install -g` |
+| Windows | `win-x64`, `win-arm64` | Windows latest |
+| Linux | `linux-x64`, `linux-arm64` | Ubuntu latest |
+| macOS | `osx-x64`, `osx-arm64` | macOS latest |
+
+Install all of them through the same command:
+`dotnet tool install -g DevBitsLab.Mcp.SourceGraph.Tool --version 0.9.0`.
+CI validates package creation, local tool installation, `--help`, and a real
+stdio MCP `tools/list` handshake from the installed command.
 
 The published tool targets **`net10.0`**. Earlier .NET runtimes (8, 9) are not
 currently supported — see [GOVERNANCE.md](GOVERNANCE.md#roadmap-items-currently-parked)

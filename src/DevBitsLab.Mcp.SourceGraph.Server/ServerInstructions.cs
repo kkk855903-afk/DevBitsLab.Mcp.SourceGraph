@@ -5,12 +5,12 @@ namespace DevBitsLab.Mcp.SourceGraph.Server;
 /// <summary>
 /// Cross-cutting guidance the MCP server publishes via the <c>initialize</c> response.
 /// Per-tool trigger phrases are intentionally NOT enumerated here — they travel with their
-/// tool's description in the catalog. This string carries only what doesn't fit there:
-/// (1) the rule to prefer source-graph tools over Grep+Read for symbol-level questions, and
-/// (2) the closing directive to call <c>usage_stats</c> at end-of-turn to verify the graph
-/// was actually queried. The leading <c>🌿 </c> teaches the connecting client the leaf-glyph-
-/// to-<c>sourcegraph</c> association from the initialize handshake (suppressed at publish time
-/// when <see cref="LeafFormatter.Suppressed"/> is true).
+/// tool's description in the catalog. This string carries only cross-cutting guidance: prefer
+/// source-graph tools over Grep+Read, use the execution profile for UI-to-native flow, check its
+/// absence-authoritative disclosure, fetch the detailed help resource, and call
+/// <c>usage_stats</c> at end-of-turn. The leading <c>🌿 </c> teaches the connecting client the
+/// leaf-glyph-to-<c>sourcegraph</c> association from the initialize handshake (suppressed at
+/// publish time when <see cref="LeafFormatter.Suppressed"/> is true).
 /// </summary>
 internal static class ServerInstructions
 {
@@ -31,13 +31,18 @@ internal static class ServerInstructions
 
     public const string Template =
         """
-        🌿 This MCP server exposes a live code source graph for the connected .NET solution.
+        🌿 This MCP server exposes a live evidence-backed graph for the connected .NET
+        solution, including C#, WPF/XAML, protobuf/gRPC, and configured C/C++ interop.
         For symbol-level questions ("where is X defined?", "who calls X?", "what would
         change if I edit X?", and similar) prefer these tools over Grep + Read — the
         graph answers in one structured call instead of dozens of file reads.
 
+        For UI-to-native flow, use `trace_call` or `trace_call_path` with
+        `profile="execution"` and trust an empty result only when
+        `execution_state.absence_authoritative` is true.
+
         Fetch `graph://help` for the full tool-selection guide and the `query_graph`
-        ad-hoc-query reference (view layer, SQL escape hatch, examples).
+        ad-hoc-query reference (MedInteropLens tools, completeness, view layer, examples).
 
         Call `usage_stats` at end-of-turn to verify the graph was actually queried.
         """;
