@@ -620,6 +620,242 @@
         }
       }
     },
+    "net10.0/linux-arm64": {
+      "libclang.runtime.linux-arm64": {
+        "type": "Transitive",
+        "resolved": "21.1.8",
+        "contentHash": "uJ4MmJ1L/dZGABAXYlk8ZZx0qOI9S9IMGCjPsTN510D7E2t4SsY6WhiOqDXc5tWw+Z1+tji9J2neujugbNhe+A=="
+      },
+      "libClangSharp": {
+        "type": "Transitive",
+        "resolved": "21.1.8.2",
+        "contentHash": "Hh9ZESdTYDZTYvuIStJhgNW3C445TN4GWKRHSHznuo4eZ1g2zFrQiqcMO4pPkg6zKEI/c9lnsfQY6V26H29gGA==",
+        "dependencies": {
+          "libClangSharp.runtime.linux-arm64": "21.1.8.2"
+        }
+      },
+      "libClangSharp.runtime.linux-arm64": {
+        "type": "Transitive",
+        "resolved": "21.1.8.2",
+        "contentHash": "cbLi+o9weAS1s4d/Zjh0ekTzAVRVm5iodgYMvyENCQmZoBmrh821bzoAQmZX0lSEeSQRekqvgcSG/63PJWe7ig=="
+      },
+      "SourceGear.sqlite3": {
+        "type": "Transitive",
+        "resolved": "3.53.3",
+        "contentHash": "PaDT7JwQ00HmXZT1xSGSC0c24A5lVpJYHMrXBuJATdpB2t0nf4Kq9HyPaZhxVW0elPq4XI1s5BLh7qLuObmzFA=="
+      },
+      "System.Diagnostics.EventLog": {
+        "type": "Transitive",
+        "resolved": "10.0.1",
+        "contentHash": "xfaHEHVDkMOOZR5S6ZGezD0+vekdH1Nx/9Ih8/rOqOGSOk1fxiN3u94bYkBW/wigj0Uw2Wt3vvRj9mtYdgwEjw=="
+      },
+      "System.Security.Cryptography.Pkcs": {
+        "type": "Transitive",
+        "resolved": "10.0.10",
+        "contentHash": "KG8t5RHczdgB3IWvRndpI0nE1DSo7ikDYSDbITxfgRFyIvnYiKzuPjaZOsPnwFQ1aOGUl9sEulJul9wlHLEUoA=="
+      },
+      "libclang": {
+        "type": "CentralTransitive",
+        "requested": "[21.1.8, )",
+        "resolved": "21.1.8",
+        "contentHash": "dxAwUIutPYoFubhIBT/jbXbbvyQIggs8RusBBC6BAO2r08I2K6UcCVDTA/g5+Cpwp/FHJFBH0tpPH2rFV+gOsQ==",
+        "dependencies": {
+          "libclang.runtime.linux-arm64": "21.1.8"
+        }
+      },
+      "Microsoft.ML.OnnxRuntime": {
+        "type": "CentralTransitive",
+        "requested": "[1.25.1, )",
+        "resolved": "1.25.1",
+        "contentHash": "s1olKkbeUrMNb/Oj+lhQswYxyyUiXMo81eqaMe12PbnByvjlgpEtP71FruUpw+rftjtK9KZZ4wVo5HaoUwlXgA==",
+        "dependencies": {
+          "Microsoft.ML.OnnxRuntime.Managed": "1.25.1"
+        }
+      },
+      "sqlite-vec": {
+        "type": "CentralTransitive",
+        "requested": "[0.1.7-alpha.2.1, )",
+        "resolved": "0.1.7-alpha.2.1",
+        "contentHash": "JCN6wMW9cX7e6tO6BZRBEdLT1qq8cRlQ5AdPvl6ZRjTKOJ2JjQXYI+wIAMb4EOXiDbbpt0IIv5rkkbPOMlrkRQ=="
+      }
+    },
+    "net10.0/linux-x64": {
+      "libclang.runtime.linux-x64": {
+        "type": "Transitive",
+        "resolved": "21.1.8",
+        "contentHash": "VHBxe4RY/kzwqAs4MKHZXsDsT6YTBBJ795DkG+m0PGGVpaN8cHLk2DH2Muhdx0rFB1TIc05dnPAyS/gdVQLkVw=="
+      },
+      "libClangSharp": {
+        "type": "Transitive",
+        "resolved": "21.1.8.2",
+        "contentHash": "Hh9ZESdTYDZTYvuIStJhgNW3C445TN4GWKRHSHznuo4eZ1g2zFrQiqcMO4pPkg6zKEI/c9lnsfQY6V26H29gGA==",
+        "dependencies": {
+          "libClangSharp.runtime.linux-x64": "21.1.8.2"
+        }
+      },
+      "libClangSharp.runtime.linux-x64": {
+        "type": "Transitive",
+        "resolved": "21.1.8.2",
+        "contentHash": "JZeYYKvC2LViOXYXM4Q+QcfHJkq9dtnlYCA+Tpwvp77MxvH/ZB3/6/wrsjhnBTbNu8k4wfhyGaHBK/ItTD6Jig=="
+      },
+      "SourceGear.sqlite3": {
+        "type": "Transitive",
+        "resolved": "3.53.3",
+        "contentHash": "PaDT7JwQ00HmXZT1xSGSC0c24A5lVpJYHMrXBuJATdpB2t0nf4Kq9HyPaZhxVW0elPq4XI1s5BLh7qLuObmzFA=="
+      },
+      "System.Diagnostics.EventLog": {
+        "type": "Transitive",
+        "resolved": "10.0.1",
+        "contentHash": "xfaHEHVDkMOOZR5S6ZGezD0+vekdH1Nx/9Ih8/rOqOGSOk1fxiN3u94bYkBW/wigj0Uw2Wt3vvRj9mtYdgwEjw=="
+      },
+      "System.Security.Cryptography.Pkcs": {
+        "type": "Transitive",
+        "resolved": "10.0.10",
+        "contentHash": "KG8t5RHczdgB3IWvRndpI0nE1DSo7ikDYSDbITxfgRFyIvnYiKzuPjaZOsPnwFQ1aOGUl9sEulJul9wlHLEUoA=="
+      },
+      "libclang": {
+        "type": "CentralTransitive",
+        "requested": "[21.1.8, )",
+        "resolved": "21.1.8",
+        "contentHash": "dxAwUIutPYoFubhIBT/jbXbbvyQIggs8RusBBC6BAO2r08I2K6UcCVDTA/g5+Cpwp/FHJFBH0tpPH2rFV+gOsQ==",
+        "dependencies": {
+          "libclang.runtime.linux-x64": "21.1.8"
+        }
+      },
+      "Microsoft.ML.OnnxRuntime": {
+        "type": "CentralTransitive",
+        "requested": "[1.25.1, )",
+        "resolved": "1.25.1",
+        "contentHash": "s1olKkbeUrMNb/Oj+lhQswYxyyUiXMo81eqaMe12PbnByvjlgpEtP71FruUpw+rftjtK9KZZ4wVo5HaoUwlXgA==",
+        "dependencies": {
+          "Microsoft.ML.OnnxRuntime.Managed": "1.25.1"
+        }
+      },
+      "sqlite-vec": {
+        "type": "CentralTransitive",
+        "requested": "[0.1.7-alpha.2.1, )",
+        "resolved": "0.1.7-alpha.2.1",
+        "contentHash": "JCN6wMW9cX7e6tO6BZRBEdLT1qq8cRlQ5AdPvl6ZRjTKOJ2JjQXYI+wIAMb4EOXiDbbpt0IIv5rkkbPOMlrkRQ=="
+      }
+    },
+    "net10.0/osx-arm64": {
+      "libclang.runtime.osx-arm64": {
+        "type": "Transitive",
+        "resolved": "21.1.8",
+        "contentHash": "t+3LGvE6ZY+q9ULXXOGQLSJncC0/1LL6SYgS2evvrQLDWkcAfdYAwdh59nvxTUUpdlP2tbVKt0g0VsSnXpwmgQ=="
+      },
+      "libClangSharp": {
+        "type": "Transitive",
+        "resolved": "21.1.8.2",
+        "contentHash": "Hh9ZESdTYDZTYvuIStJhgNW3C445TN4GWKRHSHznuo4eZ1g2zFrQiqcMO4pPkg6zKEI/c9lnsfQY6V26H29gGA==",
+        "dependencies": {
+          "libClangSharp.runtime.osx-arm64": "21.1.8.2"
+        }
+      },
+      "libClangSharp.runtime.osx-arm64": {
+        "type": "Transitive",
+        "resolved": "21.1.8.2",
+        "contentHash": "2tiZmKmuvh4iDmyi3LQbfdxYHTb2xZA/c6rRDijSs+ZuP3VLgCAsGYdZqYy8LINbRm+DJtxXyTeM/8IIzXLJKg=="
+      },
+      "SourceGear.sqlite3": {
+        "type": "Transitive",
+        "resolved": "3.53.3",
+        "contentHash": "PaDT7JwQ00HmXZT1xSGSC0c24A5lVpJYHMrXBuJATdpB2t0nf4Kq9HyPaZhxVW0elPq4XI1s5BLh7qLuObmzFA=="
+      },
+      "System.Diagnostics.EventLog": {
+        "type": "Transitive",
+        "resolved": "10.0.1",
+        "contentHash": "xfaHEHVDkMOOZR5S6ZGezD0+vekdH1Nx/9Ih8/rOqOGSOk1fxiN3u94bYkBW/wigj0Uw2Wt3vvRj9mtYdgwEjw=="
+      },
+      "System.Security.Cryptography.Pkcs": {
+        "type": "Transitive",
+        "resolved": "10.0.10",
+        "contentHash": "KG8t5RHczdgB3IWvRndpI0nE1DSo7ikDYSDbITxfgRFyIvnYiKzuPjaZOsPnwFQ1aOGUl9sEulJul9wlHLEUoA=="
+      },
+      "libclang": {
+        "type": "CentralTransitive",
+        "requested": "[21.1.8, )",
+        "resolved": "21.1.8",
+        "contentHash": "dxAwUIutPYoFubhIBT/jbXbbvyQIggs8RusBBC6BAO2r08I2K6UcCVDTA/g5+Cpwp/FHJFBH0tpPH2rFV+gOsQ==",
+        "dependencies": {
+          "libclang.runtime.osx-arm64": "21.1.8"
+        }
+      },
+      "Microsoft.ML.OnnxRuntime": {
+        "type": "CentralTransitive",
+        "requested": "[1.25.1, )",
+        "resolved": "1.25.1",
+        "contentHash": "s1olKkbeUrMNb/Oj+lhQswYxyyUiXMo81eqaMe12PbnByvjlgpEtP71FruUpw+rftjtK9KZZ4wVo5HaoUwlXgA==",
+        "dependencies": {
+          "Microsoft.ML.OnnxRuntime.Managed": "1.25.1"
+        }
+      },
+      "sqlite-vec": {
+        "type": "CentralTransitive",
+        "requested": "[0.1.7-alpha.2.1, )",
+        "resolved": "0.1.7-alpha.2.1",
+        "contentHash": "JCN6wMW9cX7e6tO6BZRBEdLT1qq8cRlQ5AdPvl6ZRjTKOJ2JjQXYI+wIAMb4EOXiDbbpt0IIv5rkkbPOMlrkRQ=="
+      }
+    },
+    "net10.0/win-arm64": {
+      "libclang.runtime.win-arm64": {
+        "type": "Transitive",
+        "resolved": "21.1.8",
+        "contentHash": "4frd8qbl0zDXUHrplta5s+6+iX1xon0VfJpcpLjmKDtXW4lrDtfHtxqNUQf7H4SnZ/EQb0zPpEVIxSZS2RWVjQ=="
+      },
+      "libClangSharp": {
+        "type": "Transitive",
+        "resolved": "21.1.8.2",
+        "contentHash": "Hh9ZESdTYDZTYvuIStJhgNW3C445TN4GWKRHSHznuo4eZ1g2zFrQiqcMO4pPkg6zKEI/c9lnsfQY6V26H29gGA==",
+        "dependencies": {
+          "libClangSharp.runtime.win-arm64": "21.1.8.2"
+        }
+      },
+      "libClangSharp.runtime.win-arm64": {
+        "type": "Transitive",
+        "resolved": "21.1.8.2",
+        "contentHash": "5V0eWBnwX5cOVZiJ7kDFjnSagO5ijVBgGzaovVzI2Jhf7jOIqeoMpcPLALpU4GNo1Yi+y98PrGRMFmZWVgzHHg=="
+      },
+      "SourceGear.sqlite3": {
+        "type": "Transitive",
+        "resolved": "3.53.3",
+        "contentHash": "PaDT7JwQ00HmXZT1xSGSC0c24A5lVpJYHMrXBuJATdpB2t0nf4Kq9HyPaZhxVW0elPq4XI1s5BLh7qLuObmzFA=="
+      },
+      "System.Diagnostics.EventLog": {
+        "type": "Transitive",
+        "resolved": "10.0.1",
+        "contentHash": "xfaHEHVDkMOOZR5S6ZGezD0+vekdH1Nx/9Ih8/rOqOGSOk1fxiN3u94bYkBW/wigj0Uw2Wt3vvRj9mtYdgwEjw=="
+      },
+      "System.Security.Cryptography.Pkcs": {
+        "type": "Transitive",
+        "resolved": "10.0.10",
+        "contentHash": "KG8t5RHczdgB3IWvRndpI0nE1DSo7ikDYSDbITxfgRFyIvnYiKzuPjaZOsPnwFQ1aOGUl9sEulJul9wlHLEUoA=="
+      },
+      "libclang": {
+        "type": "CentralTransitive",
+        "requested": "[21.1.8, )",
+        "resolved": "21.1.8",
+        "contentHash": "dxAwUIutPYoFubhIBT/jbXbbvyQIggs8RusBBC6BAO2r08I2K6UcCVDTA/g5+Cpwp/FHJFBH0tpPH2rFV+gOsQ==",
+        "dependencies": {
+          "libclang.runtime.win-arm64": "21.1.8"
+        }
+      },
+      "Microsoft.ML.OnnxRuntime": {
+        "type": "CentralTransitive",
+        "requested": "[1.25.1, )",
+        "resolved": "1.25.1",
+        "contentHash": "s1olKkbeUrMNb/Oj+lhQswYxyyUiXMo81eqaMe12PbnByvjlgpEtP71FruUpw+rftjtK9KZZ4wVo5HaoUwlXgA==",
+        "dependencies": {
+          "Microsoft.ML.OnnxRuntime.Managed": "1.25.1"
+        }
+      },
+      "sqlite-vec": {
+        "type": "CentralTransitive",
+        "requested": "[0.1.7-alpha.2.1, )",
+        "resolved": "0.1.7-alpha.2.1",
+        "contentHash": "JCN6wMW9cX7e6tO6BZRBEdLT1qq8cRlQ5AdPvl6ZRjTKOJ2JjQXYI+wIAMb4EOXiDbbpt0IIv5rkkbPOMlrkRQ=="
+      }
+    },
     "net10.0/win-x64": {
       "libclang.runtime.win-x64": {
         "type": "Transitive",
