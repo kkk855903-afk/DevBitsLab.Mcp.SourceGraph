@@ -1,5 +1,6 @@
 using System.Reflection;
 using System.Text.Json;
+using System.Text.Json.Schema;
 using DevBitsLab.Mcp.SourceGraph.Core;
 using DevBitsLab.Mcp.SourceGraph.Core.Security;
 using DevBitsLab.Mcp.SourceGraph.Indexing;
@@ -104,6 +105,15 @@ public sealed class InteropToolsTests : IAsyncLifetime, IDisposable
             target: null,
             new McpServerToolCreateOptions());
         protocolTool.ProtocolTool.Name.Should().Be(expectedToolName);
+        var schema = JsonSchemaExporter.GetJsonSchemaAsNode(
+            JsonSerializerOptions.Web,
+            expectedSchema);
+        var scopeProperties = schema["properties"]?["scopes"]?["items"]?
+            ["properties"];
+        scopeProperties?["matches"]?["items"]?["properties"]?.AsObject()
+            .ContainsKey("relation").Should().BeTrue();
+        scopeProperties?["findings"]?["items"]?["properties"]?.AsObject()
+            .ContainsKey("relation").Should().BeTrue();
     }
 
     [Fact]
@@ -187,7 +197,11 @@ public sealed class InteropToolsTests : IAsyncLifetime, IDisposable
         match.Scopes[0].Matches.Should().ContainSingle();
         match.Scopes[0].Matches[0].ManagedSymbol.Should().Be(ManagedKey);
         match.Scopes[0].Matches[0].NativeSymbol.Should().Be(NativeKey);
+        match.Scopes[0].Matches[0].Relation.Should().Be(
+            "pinvoke-maps-to");
         match.Scopes[0].Matches[0].Status.Should().Be("matched");
+        CallToolResultHelpers.ProseText(matchCall).Should().Contain(
+            "relation=pinvoke-maps-to");
         match.Scopes[0].Findings.Should().BeEmpty(
             "match_pinvoke is a managed-import match query, not an analysis query");
 
@@ -214,6 +228,10 @@ public sealed class InteropToolsTests : IAsyncLifetime, IDisposable
         analysis.Scopes.Should().ContainSingle();
         analysis.Scopes[0].Matches.Should().ContainSingle();
         analysis.Scopes[0].Findings.Should().NotBeEmpty();
+        analysis.Scopes[0].Findings.Should().OnlyContain(finding =>
+            finding.Relation == "diagnoses-boundary");
+        CallToolResultHelpers.ProseText(analysisCall).Should().Contain(
+            "diagnoses-boundary");
         analysis.Scopes[0].Findings.Select(item => item.RuleId)
             .Should().OnlyContain(ruleId =>
                 ruleId == InteropRuleIds.CallingConvention
@@ -620,6 +638,7 @@ public sealed class InteropToolsTests : IAsyncLifetime, IDisposable
         var match = new InteropQueryMatchRow(
             $"{ManagedKey}:{id}:{new string('m', 800)}",
             $"{NativeKey}:{id}:{new string('n', 800)}",
+            "pinvoke-maps-to",
             "matched",
             "exact",
             Enumerable.Range(0, 12)
@@ -640,6 +659,7 @@ public sealed class InteropToolsTests : IAsyncLifetime, IDisposable
                 $"risk-{index:D2}-{new string('f', 1_200)}",
                 match.ManagedSymbol,
                 match.NativeSymbol!,
+                "diagnoses-boundary",
                 "exact",
                 target,
                 evidence,

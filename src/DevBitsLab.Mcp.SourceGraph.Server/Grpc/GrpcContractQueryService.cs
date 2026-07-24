@@ -699,6 +699,7 @@ public sealed class GrpcContractQueryService
         {
             findings.Add(new GrpcContractFindingRow(
                 "Grpc002",
+                "diagnoses-contract",
                 "field_number_changed",
                 "error",
                 "semantic",
@@ -731,6 +732,7 @@ public sealed class GrpcContractQueryService
         {
             findings.Add(new GrpcContractFindingRow(
                 "Grpc003",
+                "diagnoses-contract",
                 "streaming_changed",
                 "error",
                 "semantic",
@@ -777,6 +779,7 @@ public sealed class GrpcContractQueryService
 
         findings.Add(new GrpcContractFindingRow(
             "Grpc001",
+            "diagnoses-contract",
             "rpc_without_implementation",
             "warning",
             "semantic",
@@ -807,6 +810,7 @@ public sealed class GrpcContractQueryService
                 "A signature mismatch targeted a non-RPC contract.");
         return new GrpcContractFindingRow(
             "Grpc004",
+            "diagnoses-contract",
             "generated_signature_mismatch",
             "error",
             "semantic",

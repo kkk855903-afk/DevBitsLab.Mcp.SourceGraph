@@ -148,6 +148,7 @@ public sealed record GrpcContractCheckScopeResult(
 
 public sealed record GrpcContractFindingRow(
     [property: JsonPropertyName("rule_id")] string RuleId,
+    string Relation,
     string Category,
     string Severity,
     string Confidence,

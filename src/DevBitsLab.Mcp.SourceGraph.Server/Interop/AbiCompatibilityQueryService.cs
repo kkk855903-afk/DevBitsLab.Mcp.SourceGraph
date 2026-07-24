@@ -19,6 +19,7 @@ internal sealed record AbiRecordMappingQuery(
 public sealed record AbiScopeComparisonResult(
     [property: JsonPropertyName("scope_id")] string ScopeId,
     [property: JsonPropertyName("scope_status")] string ScopeStatus,
+    string Relation,
     string Status,
     string Compatibility,
     bool Partial,
@@ -84,6 +85,7 @@ public sealed record AbiQueryTarget(
 public sealed record AbiCompatibilityCheckRow(
     string Path,
     string Aspect,
+    string Relation,
     string Compatibility,
     string Reason,
     string Confidence,
@@ -110,6 +112,7 @@ public sealed record AbiFindingRow(
     string Message,
     [property: JsonPropertyName("managed_symbol")] string? ManagedSymbol,
     [property: JsonPropertyName("native_symbol")] string? NativeSymbol,
+    string Relation,
     string Confidence,
     IReadOnlyList<AbiQueryEvidenceRow> Evidence,
     [property: JsonPropertyName("evidence_omitted_count")]
@@ -373,6 +376,7 @@ internal sealed class AbiCompatibilityQueryService
         return new AbiScopeComparisonResult(
             scopeId,
             scopeStatus,
+            "struct-maps-to",
             "ok",
             CompatibilityToken(engineResult.Compatibility),
             Partial: false,
@@ -610,6 +614,7 @@ internal sealed class AbiCompatibilityQueryService
         return new AbiScopeComparisonResult(
             scopeId,
             scopeStatus,
+            "struct-maps-to",
             "partial",
             "unknown",
             Partial: true,
@@ -656,6 +661,7 @@ internal sealed class AbiCompatibilityQueryService
         new(
             check.Path,
             AspectToken(check.Aspect),
+            "struct-maps-to",
             CompatibilityToken(check.Compatibility),
             check.Reason,
             ConfidenceToken(check.Confidence),
@@ -669,6 +675,7 @@ internal sealed class AbiCompatibilityQueryService
             finding.Message,
             finding.ManagedSymbolCanonicalKey,
             finding.NativeSymbolCanonicalKey,
+            "struct-maps-to",
             ConfidenceToken(finding.Confidence),
             ProjectEvidence(finding.Evidence),
             EvidenceOmittedCount: 0);

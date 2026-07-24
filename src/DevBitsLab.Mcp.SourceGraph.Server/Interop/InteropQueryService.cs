@@ -616,6 +616,7 @@ internal sealed class InteropQueryService
         new(
             match.ManagedSymbolCanonicalKey,
             match.NativeSymbolCanonicalKey,
+            "pinvoke-maps-to",
             MatchStatusToken(match.Status),
             ConfidenceToken(match.Confidence),
             match.Reasons,
@@ -633,6 +634,7 @@ internal sealed class InteropQueryService
             finding.Message,
             finding.ManagedSymbolCanonicalKey,
             finding.NativeSymbolCanonicalKey,
+            "diagnoses-boundary",
             ConfidenceToken(finding.Confidence),
             ProjectTarget(finding.Target),
             ProjectEvidence(finding.Evidence),
@@ -660,6 +662,7 @@ internal sealed class InteropQueryService
         return new InteropQueryMatchRow(
             managed.SymbolCanonicalKey,
             NativeSymbol: null,
+            Relation: "pinvoke-maps-to",
             Status: "unknown",
             Confidence: "inferred",
             Reasons: reasons.Distinct(StringComparer.Ordinal).ToArray(),

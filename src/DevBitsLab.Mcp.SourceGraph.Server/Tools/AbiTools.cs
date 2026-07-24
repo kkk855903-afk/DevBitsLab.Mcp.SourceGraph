@@ -211,6 +211,7 @@ public static class AbiTools
         return new AbiScopeComparisonResult(
             scoped.ScopeId,
             scoped.ScopeStatus,
+            "struct-maps-to",
             "partial",
             "unknown",
             Partial: true,
@@ -308,6 +309,7 @@ public static class AbiTools
             .Append(dto.Status)
             .Append("`, compatibility=`")
             .Append(dto.Compatibility)
+            .Append("`, relation=`struct-maps-to")
             .Append("`, scopes=")
             .Append(dto.Scopes.Count)
             .Append(", partial=")

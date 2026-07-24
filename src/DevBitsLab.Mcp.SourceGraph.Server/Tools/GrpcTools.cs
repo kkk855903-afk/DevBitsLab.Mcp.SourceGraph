@@ -304,6 +304,7 @@ public static class GrpcTools
         var prose =
             $"check_proto_contract: status=`{dto.Status}`, scopes={dto.TotalScopeCount}, "
             + $"contracts={dto.TotalContractCount}, findings={dto.TotalFindingCount}, "
+            + "relation=`diagnoses-contract`, "
             + $"partial={Bool(dto.Partial)}, truncated={Bool(dto.Truncated)}, "
             + $"omitted={dto.OmittedCount}";
         return new CallToolResult

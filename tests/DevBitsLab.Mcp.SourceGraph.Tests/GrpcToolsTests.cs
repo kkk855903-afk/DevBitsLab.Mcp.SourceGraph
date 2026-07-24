@@ -1,5 +1,6 @@
 using System.Reflection;
 using System.Text.Json;
+using System.Text.Json.Schema;
 using DevBitsLab.Mcp.SourceGraph.Core;
 using DevBitsLab.Mcp.SourceGraph.Indexing;
 using DevBitsLab.Mcp.SourceGraph.Indexing.Protobuf;
@@ -94,6 +95,15 @@ public sealed class GrpcToolsTests : IAsyncLifetime
             .ProtocolTool.Name.Should().Be(expectedName);
         ToolOutputJsonContext.Default.GetTypeInfo(expectedOutput)
             .Should().NotBeNull();
+        if (expectedOutput == typeof(CheckProtoContractResult))
+        {
+            var schema = JsonSchemaExporter.GetJsonSchemaAsNode(
+                JsonSerializerOptions.Web,
+                expectedOutput);
+            schema["properties"]?["scopes"]?["items"]?["properties"]?
+                    ["findings"]?["items"]?["properties"]?.AsObject()
+                .ContainsKey("relation").Should().BeTrue();
+        }
     }
 
     [Fact]
@@ -257,10 +267,15 @@ public sealed class GrpcToolsTests : IAsyncLifetime
                 "client"),
         ]);
 
-        var changed = ReadCheck(
-            await GrpcTools.CheckProtoContractAsync(router));
+        var changedCall =
+            await GrpcTools.CheckProtoContractAsync(router);
+        var changed = ReadCheck(changedCall);
         changed.Scopes[0].Findings.Select(finding => finding.RuleId)
             .Should().Contain(["Grpc002", "Grpc003", "Grpc004"]);
+        changed.Scopes[0].Findings.Should().OnlyContain(finding =>
+            finding.Relation == "diagnoses-contract");
+        CallToolResultHelpers.ProseText(changedCall).Should().Contain(
+            "relation=`diagnoses-contract`");
         var field = changed.Scopes[0].Findings.Single(finding =>
             finding.RuleId == "Grpc002");
         field.Confidence.Should().Be("semantic");
@@ -300,6 +315,7 @@ public sealed class GrpcToolsTests : IAsyncLifetime
             .Should().ContainSingle(item =>
                 item.RuleId == "Grpc001")
             .Which;
+        finding.Relation.Should().Be("diagnoses-contract");
         finding.Confidence.Should().Be("semantic");
         finding.CurrentEvidence.Should().ContainSingle();
         finding.BaselineEvidence.Should().BeEmpty();
@@ -413,6 +429,7 @@ public sealed class GrpcToolsTests : IAsyncLifetime
         var findings = Enumerable.Range(0, 1000)
             .Select(index => new GrpcContractFindingRow(
                 "Grpc003",
+                "diagnoses-contract",
                 "streaming_changed",
                 "error",
                 "semantic",
@@ -461,6 +478,9 @@ public sealed class GrpcToolsTests : IAsyncLifetime
         result.Truncated.Should().BeTrue();
         result.OmittedCount.Should().BeGreaterThan(0);
         result.TotalFindingCount.Should().Be(findings.Length);
+        result.Scopes.SelectMany(scope => scope.Findings)
+            .Should().OnlyContain(finding =>
+                finding.Relation == "diagnoses-contract");
     }
 
     private async Task<FixtureHost> CreateHostAsync(

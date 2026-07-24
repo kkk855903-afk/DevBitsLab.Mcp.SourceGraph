@@ -59,6 +59,7 @@ public sealed record InteropQuerySelectionCandidate(
 public sealed record InteropQueryMatchRow(
     [property: JsonPropertyName("managed_symbol")] string ManagedSymbol,
     [property: JsonPropertyName("native_symbol")] string? NativeSymbol,
+    string Relation,
     string Status,
     string Confidence,
     IReadOnlyList<string> Reasons,
@@ -77,6 +78,7 @@ public sealed record InteropQueryFindingRow(
     string Message,
     [property: JsonPropertyName("managed_symbol")] string ManagedSymbol,
     [property: JsonPropertyName("native_symbol")] string NativeSymbol,
+    string Relation,
     string Confidence,
     InteropQueryTarget Target,
     IReadOnlyList<InteropQueryEvidenceRow> Evidence,

@@ -101,8 +101,13 @@ public sealed class AbiToolsTests : IAsyncLifetime
             ?? throw new Xunit.Sdk.XunitException(
                 "CompareStructResult scope schema is missing properties.");
         scopeProperties.ContainsKey("scope_id").Should().BeTrue();
+        scopeProperties.ContainsKey("relation").Should().BeTrue();
         scopeProperties.ContainsKey("managed_selection").Should().BeTrue();
         scopeProperties.ContainsKey("total_check_count").Should().BeTrue();
+        scopeProperties["checks"]?["items"]?["properties"]?.AsObject()
+            .ContainsKey("relation").Should().BeTrue();
+        scopeProperties["finding"]?["properties"]?.AsObject()
+            .ContainsKey("relation").Should().BeTrue();
     }
 
     [Fact]
@@ -143,7 +148,10 @@ public sealed class AbiToolsTests : IAsyncLifetime
         wildcardDto.Scopes.Should().OnlyContain(scope =>
             scope.Status == "partial"
             && scope.Compatibility == "unknown"
+            && scope.Relation == "struct-maps-to"
             && scope.Partial);
+        CallToolResultHelpers.ProseText(wildcard).Should().Contain(
+            "relation=`struct-maps-to`");
         wildcardDto.Scopes.Should().OnlyContain(scope =>
             scope.Failures.Any(failure =>
                 failure.Code == "native-runtime-unavailable"));
@@ -175,6 +183,7 @@ public sealed class AbiToolsTests : IAsyncLifetime
             .Select(index => new AbiCompatibilityCheckRow(
                 $"$.field[{index}]",
                 "field_offset",
+                "struct-maps-to",
                 index == 0 ? "error" : "compatible",
                 $"check-{index:D4}: {new string('x', 500)}",
                 "exact",
@@ -203,12 +212,14 @@ public sealed class AbiToolsTests : IAsyncLifetime
             "Struct layout mismatch.",
             "csharp:T:Fixture.Packet",
             "cpp:T:native/packet.h::Packet",
+            "struct-maps-to",
             "exact",
             [evidence],
             EvidenceOmittedCount: 0);
         var scope = new AbiScopeComparisonResult(
             "alpha",
             "ok",
+            "struct-maps-to",
             "ok",
             "error",
             Partial: false,
@@ -271,6 +282,10 @@ public sealed class AbiToolsTests : IAsyncLifetime
         dto.TotalFindingCount.Should().Be(1);
         dto.Scopes.Should().ContainSingle()
             .Which.Compatibility.Should().Be("error");
+        dto.Scopes[0].Relation.Should().Be("struct-maps-to");
+        dto.Scopes[0].Checks.Should().OnlyContain(check =>
+            check.Relation == "struct-maps-to");
+        dto.Scopes[0].Finding?.Relation.Should().Be("struct-maps-to");
     }
 
     private async Task<ScopeHost> CreateHostAsync(string id)

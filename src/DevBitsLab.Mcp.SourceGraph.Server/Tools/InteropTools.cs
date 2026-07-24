@@ -557,6 +557,8 @@ public static class InteropTools
                     .Append(match.NativeSymbol is null
                         ? "_no current native symbol_"
                         : $"`{Markdown(Bound(match.NativeSymbol, 256))}`")
+                    .Append("; relation=")
+                    .Append(match.Relation)
                     .Append("; status=")
                     .Append(match.Status)
                     .Append("; candidates=")
@@ -605,7 +607,7 @@ public static class InteropTools
                         scope.Findings
                             .Take(4)
                             .Select(finding =>
-                                $"{finding.RuleId} ({finding.Severity})"))
+                                $"{finding.RuleId} ({finding.Severity}, {finding.Relation})"))
                     .AppendLine();
             }
             if (scope.Failures.Count > 0)
