@@ -9,7 +9,8 @@ A local-first, evidence-backed code source graph
 [Model Context Protocol](https://modelcontextprotocol.io) server for .NET
 solutions. MedInteropLens 0.9 connects C#, WPF/XAML, protobuf/gRPC, and
 configured C/C++ interop in one SQLite + FTS5 graph, exposes structured queries
-to MCP-aware clients (Claude Code, Cursor, Continue, Claude Desktop, …) over
+to MCP-aware clients (Claude Code, Codex, GitHub Copilot, Cursor, Continue,
+Claude Desktop, …) over
 stdio, and keeps the index fresh as files change on disk.
 
 The goal is to let coding agents replace dozens of ad-hoc `Grep` + `Read`
@@ -153,7 +154,7 @@ cheap structural queries against a stable solution.
 
 | Dimension | Roslyn directly (`MSBuildWorkspace` / `SymbolFinder`) | This server |
 |---|---|---|
-| **Where it runs** | In-process API — every client hosts its own workspace | Cross-process MCP server — one host, many clients (Claude Code, Cursor, scripts) |
+| **Where it runs** | In-process API — every client hosts its own workspace | Cross-process MCP server — one host, many clients (Claude Code, Codex, Cursor, scripts) |
 | **Initial indexing** | `MSBuildWorkspace` load (10–60 s on a real solution), paid in every consumer process | Scope open + full indexing on host start (and after `clear` or workspace reloads); tool calls await `ScopeHost.Ready` until the pass completes. Borne once by the host, shared across every connected client. |
 | **Steady-state query** | Fast in-memory queries against the loaded workspace | Milliseconds — SQLite query against the warm DB; incremental re-indexing handled by the watcher (see *Freshness* below) |
 | **Search shape** | Exact-identity lookups (`SymbolFinder.FindReferencesAsync`) | Same exact lookups *plus* FTS5 fragment search and ONNX semantic search |
@@ -170,7 +171,8 @@ that ask *"where does this go?"* forty times an hour.
 
 - [.NET 10 SDK](https://dotnet.microsoft.com/download) (see `global.json`).
 - A `.sln` or `.slnx` solution file for the codebase you want to index.
-- An MCP-aware client (Claude Code, Cursor, Continue, Claude Desktop, …).
+- An MCP-aware client (Claude Code, Codex, GitHub Copilot, Cursor, Continue,
+  Claude Desktop, …).
 - For native analysis only: a supported 0.9 runtime package, explicit
   `scopes[].interop` configuration, and a user trust grant. Native analysis is
   optional; managed, WPF, and gRPC indexing continue when it is not configured.
@@ -315,13 +317,16 @@ From a fresh clone of any .NET solution:
 
 ```bash
 dotnet tool install -g DevBitsLab.Mcp.SourceGraph.Tool
-sourcegraph-mcp init        # interactive: detects clients, writes .mcp.json / .vscode/mcp.json / etc.
+sourcegraph-mcp init        # interactive: detects clients, writes .mcp.json / .codex/config.toml / etc.
 sourcegraph-mcp demo        # canned probe: ping → graph_stats → search_symbols → find_definition
 ```
 
 `init` writes only **project-scoped** files by default (`.mcp.json`,
-`.vscode/mcp.json`, `.cursor/mcp.json`, `.continue/mcp/sourcegraph.yaml`).
+`.codex/config.toml`, `.vscode/mcp.json`, `.cursor/mcp.json`,
+`.continue/mcp/sourcegraph.yaml`).
 User-scope writes (or Claude Desktop) require explicit per-client flags.
+Codex onboarding is project-scoped only; the CLI does not edit the shared
+`~/.codex/config.toml`.
 `demo` reads the indexed scope and prints the same leaf-stamped markdown
 your agent will see — instant verification.
 
@@ -329,6 +334,7 @@ Other useful first-run commands:
 
 ```bash
 sourcegraph-mcp init --yes --client copilot,claude-code --print-only   # CI-friendly preview
+sourcegraph-mcp init --yes --client codex                              # write .codex/config.toml
 sourcegraph-mcp doctor                                                  # environment diagnostic
 sourcegraph-mcp init --prewarm                                          # also pre-build the index
 ```
@@ -361,6 +367,38 @@ server falls back to the `WORKSPACE_FOLDER`, `CLAUDE_PROJECT_DIR`, or
 `MCP_WORKSPACE_FOLDER` environment variable. Any other `${VAR}` token is
 expanded against the process environment, so paths like
 `${HOME}/repos/my.slnx` work too.
+
+### Codex (`.codex/config.toml`, project-scoped)
+
+Codex reads MCP servers from TOML. Run
+`sourcegraph-mcp init --yes --client codex`, or place this at
+`.codex/config.toml`:
+
+```toml
+[mcp_servers.sourcegraph]
+command = "sourcegraph-mcp"
+args = ["serve", "--solution", "MySolution.slnx"]
+cwd = ".."
+```
+
+`cwd = ".."` makes the server run from the repository root because relative
+paths in a project Codex config are resolved from its `.codex/` directory.
+The Codex writer deliberately emits repository-relative paths instead of
+`${workspaceFolder}`, whose expansion is not part of the Codex project-config
+contract.
+
+Codex loads project configuration only after the repository is trusted. After
+writing or changing the file, start a new Codex task (or restart the
+CLI/extension), then use `/mcp` or `codex mcp list` to confirm that
+`sourcegraph` is connected. Codex CLI, the IDE extension, and the ChatGPT
+desktop app use the same configuration layers.
+
+When `.codex/config.toml` already exists, `init` strictly validates the TOML
+and changes only the `mcp_servers.sourcegraph` values it owns:
+`command`, `args`, and `cwd`. Comments, other settings, extra SourceGraph
+options such as `enabled` or timeouts, and other MCP servers are preserved.
+Use `--force` only when replacing differing owned values. Invalid or
+structurally ambiguous TOML is never overwritten.
 
 ### GitHub Copilot (`.vscode/mcp.json`)
 
@@ -922,7 +960,7 @@ sourcegraph-mcp <subcommand> [options]
 | `index <solution>` | Build/refresh the database for a single solution, then exit. Useful in CI. |
 | `stats` | Print counts of files / symbols / references / edges in the database. |
 | `clear` | Delete all rows from the database (schema preserved). |
-| `init [--yes] [--client <id>] [--no-<client>] [--user-<client>] [--claude-desktop] [--print-only] [--force] [--prewarm] [--install-mode <mode>]` | Interactive (default) or flag-driven onboarding flow. Detects environment, picks MCP clients, writes per-client config files (project-scoped by default), and optionally pre-warms the index. First-class clients: `claude-code`, `copilot`, `cursor`, `continue`, `claude-desktop`. Use `--print-only` for a CI-friendly preview that writes nothing. |
+| `init [--yes] [--client <id>] [--no-<client>] [--user-<client>] [--claude-desktop] [--print-only] [--force] [--prewarm] [--install-mode <mode>]` | Interactive (default) or flag-driven onboarding flow. Detects environment, picks MCP clients, writes per-client config files (project-scoped by default), and optionally pre-warms the index. First-class clients: `claude-code`, `codex`, `copilot`, `cursor`, `continue`, `claude-desktop`. Codex writes project-only `.codex/config.toml`; `--user-codex` is not supported. Use `--print-only` for a CI-friendly preview that writes nothing. |
 | `doctor [--json]` | Read-only environment diagnostic. Reports SDK / git / solution / config / per-client status. Exit `0` = all-pass; `2` = at least one warning; `1` = hard failure. `--json` emits a machine-readable `{checks, exit_code}` document. |
 | `demo [--scope <id>] [--no-color]` | Run four canned operations (`ping`, `graph_stats`, `search_symbols`, `find_definition`) against the active scope and print leaf-stamped markdown — the same shape an MCP client would see. Provides the "ah, it works" confidence moment without an agent loop. Exits `2` if the scope has zero symbols indexed. |
 | `init-scopes` | Discover `.slnx`/`.sln` files at `--root` (default: CWD) and write a starter `.sourcegraph.json`. Continues to work standalone; `init` invokes the same scaffolding internally when multi-solution is detected. |
@@ -1171,6 +1209,17 @@ published tool, swap `command` / `args` for:
   ]
 }
 ```
+
+For this repository's Codex config, generate the equivalent portable TOML
+instead of hand-translating the JSON:
+
+```bash
+sourcegraph-mcp init --yes --client codex --install-mode in-repo
+```
+
+That writes `command = "dotnet"`, repository-relative `--project` and
+`--solution` arguments, and `cwd = ".."` under
+`[mcp_servers.sourcegraph]`.
 
 Re-run `dotnet build` after each change so the next launch picks it up.
 

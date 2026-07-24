@@ -261,7 +261,7 @@ internal sealed class CommandLine
                 case "--claude-desktop":
                     claudeDesktop = true;
                     break;
-                case "--no-claude-code" or "--no-copilot" or "--no-cursor"
+                case "--no-claude-code" or "--no-codex" or "--no-copilot" or "--no-cursor"
                     or "--no-continue" or "--no-claude-desktop":
                     noClients.Add(a.Substring(5));
                     break;
@@ -470,9 +470,9 @@ internal sealed class CommandLine
                                 [--no-embeddings] [--no-history] [--root <path>]
               Interactive (default) or flag-driven onboarding flow. Detects environment, picks
               MCP clients, writes per-client config files (project-scoped by default), and
-              optionally pre-warms the index. First-class clients: claude-code, copilot, cursor,
-              continue, claude-desktop. Use --print-only for a CI-friendly preview that writes
-              nothing.
+              optionally pre-warms the index. First-class clients: claude-code, codex, copilot,
+              cursor, continue, claude-desktop. Use --print-only for a CI-friendly preview that
+              writes nothing. Codex uses .codex/config.toml and is project-scope only.
 
           sourcegraph-mcp doctor [--root <path>] [--json]
               Read-only environment diagnostic. Reports SDK/git/solution/config/per-client status.
@@ -610,8 +610,9 @@ internal sealed class CommandLine
                                 [--no-embeddings] [--no-history] [--root <path>]
               运行交互式（默认）或参数驱动的初始化流程。检测环境、选择 MCP 客户端、
               写入客户端配置文件（默认写入项目级配置），并可预热索引。首选客户端包括
-              claude-code、copilot、cursor、continue 和 claude-desktop。使用
-              --print-only 可仅预览配置而不写入文件，适用于 CI。
+              claude-code、codex、copilot、cursor、continue 和 claude-desktop。使用
+              --print-only 可仅预览配置而不写入文件，适用于 CI。Codex 使用
+              .codex/config.toml，目前仅支持项目级配置。
 
           sourcegraph-mcp doctor [--root <path>] [--json]
               执行只读环境诊断，检查 SDK、git、解决方案、配置和各客户端状态。

@@ -19,7 +19,7 @@
     <Version>0.9.0</Version>
     <Description>Evidence-backed local code intelligence for C#, WPF/XAML, gRPC/protobuf, and managed/native C/C++ interop. Builds an incremental SQLite source graph, traces cross-language execution paths, checks ABI and contract risks, and serves read-only MCP queries over stdio without uploading repository content.</Description>
     <Authors>DevBitsLab</Authors>
-    <PackageTags>mcp;roslyn;code-graph;source-graph;claude;cursor;agent</PackageTags>
+    <PackageTags>mcp;roslyn;code-graph;source-graph;claude;codex;cursor;agent</PackageTags>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
 
     <!-- NuGet listing metadata -->
@@ -42,6 +42,7 @@
     <PackageReference Include="ModelContextProtocol" />
     <PackageReference Include="Microsoft.Extensions.Hosting" />
     <PackageReference Include="Microsoft.Extensions.Logging" />
+    <PackageReference Include="Tomlyn" />
     <PackageReference Include="Grpc.Tools"
                       GeneratePathProperty="true"
                       PrivateAssets="all"

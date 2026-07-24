@@ -87,6 +87,9 @@ if (-not $help.Contains(
         [StringComparison]::Ordinal)) {
     throw 'Installed tool help did not contain its command name.'
 }
+if (-not $help.Contains('codex', [StringComparison]::Ordinal)) {
+    throw 'Installed tool help did not advertise Codex onboarding.'
+}
 
 $chineseHelp = (& $appHost.FullName --help --lang zh 2>&1 | Out-String)
 if ($LASTEXITCODE -ne 0) {
@@ -94,6 +97,40 @@ if ($LASTEXITCODE -ne 0) {
 }
 if (-not $chineseHelp.Contains('用法:', [StringComparison]::Ordinal)) {
     throw 'Installed tool Chinese help did not contain its localized usage heading.'
+}
+if (-not $chineseHelp.Contains('codex', [StringComparison]::Ordinal)) {
+    throw 'Installed tool Chinese help did not advertise Codex onboarding.'
+}
+
+$codexFixtureRoot = Join-Path $runRoot 'codex-fixture'
+[IO.Directory]::CreateDirectory($codexFixtureRoot) | Out-Null
+$codexSolutionPath = Join-Path $codexFixtureRoot 'Fixture.slnx'
+$codexPreview = (& $appHost.FullName init `
+    --yes `
+    --client codex `
+    --print-only `
+    --root $codexFixtureRoot `
+    --solution $codexSolutionPath 2>&1 | Out-String)
+if ($LASTEXITCODE -ne 0) {
+    throw "Installed tool Codex init preview failed with exit code $LASTEXITCODE.`n$codexPreview"
+}
+foreach ($expectedCodexText in @(
+        '.codex',
+        'config.toml',
+        '[mcp_servers.sourcegraph]',
+        'command = "sourcegraph-mcp"',
+        '"--solution", "Fixture.slnx"',
+        'cwd = ".."')) {
+    if (-not $codexPreview.Contains(
+            $expectedCodexText,
+            [StringComparison]::Ordinal)) {
+        throw (
+            "Installed tool Codex init preview did not contain " +
+            "'$expectedCodexText'.`n$codexPreview")
+    }
+}
+if ($codexPreview.Contains('${workspaceFolder}', [StringComparison]::Ordinal)) {
+    throw "Installed tool Codex init preview leaked the unsupported workspace placeholder.`n$codexPreview"
 }
 
 $protocName = if ($IsWindows) {
@@ -302,6 +339,6 @@ if ($RunMcpIntegration) {
 }
 
 Write-Host (
-    "Installed tool $version passed help, protoc, native worker" +
+    "Installed tool $version passed help, Codex init, protoc, native worker" +
     $(if ($RunMcpIntegration) { ', and MCP' } else { '' }) +
     " smoke checks for $runtimeIdentifier.")

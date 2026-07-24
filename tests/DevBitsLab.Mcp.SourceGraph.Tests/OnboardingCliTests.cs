@@ -71,6 +71,65 @@ public sealed class OnboardingCliTests : IDisposable
     }
 
     [Fact]
+    public async Task Init_yes_printOnly_codexEmitsPortableToml()
+    {
+        var cli = ParseInit("--print-only", "--client", "codex");
+        var rc = await InitCli.RunAsync(cli);
+        var output = _stdout.ToString();
+
+        rc.Should().Be(0);
+        output.Should().Contain(Path.Join(".codex", "config.toml"));
+        output.Should().Contain("[mcp_servers.sourcegraph]");
+        output.Should().Contain("cwd = \"..\"");
+        output.Should().NotContain("${workspaceFolder}");
+        _stderr.ToString().Should().NotContain("unknown --client");
+    }
+
+    [Fact]
+    public async Task Init_defaultSelection_includesCodexProjectConfig()
+    {
+        var cli = ParseInit("--print-only");
+        await InitCli.RunAsync(cli);
+
+        _stdout.ToString().Should().Contain(Path.Join(".codex", "config.toml"));
+    }
+
+    [Fact]
+    public async Task Init_noCodex_skipsCodex()
+    {
+        var cli = ParseInit("--print-only", "--no-codex");
+        await InitCli.RunAsync(cli);
+
+        _stdout.ToString().Should().NotContain(Path.Join(".codex", "config.toml"));
+    }
+
+    [Fact]
+    public void Init_userCodex_isRejectedBecauseCodexOnboardingIsProjectScoped()
+    {
+        var act = () => ParseInit("--client", "codex", "--user-codex");
+
+        act.Should().Throw<ArgumentException>()
+            .WithMessage("Unrecognised argument: --user-codex");
+    }
+
+    [Fact]
+    public async Task Init_codex_writesAndThenReportsNoChange()
+    {
+        var cli = ParseInit("--client", "codex");
+        var firstRc = await InitCli.RunAsync(cli);
+        var path = Path.Join(_tempRoot, ".codex", "config.toml");
+
+        firstRc.Should().Be(0);
+        File.ReadAllText(path).Should().Contain("[mcp_servers.sourcegraph]");
+
+        using var freshOut = new StringWriter();
+        Console.SetOut(freshOut);
+        var secondRc = await InitCli.RunAsync(ParseInit("--client", "codex"));
+        secondRc.Should().Be(0);
+        freshOut.ToString().Should().Contain("no change");
+    }
+
+    [Fact]
     public async Task Init_yes_printOnly_multipleClients_emitsAll()
     {
         var cli = ParseInit("--print-only", "--client", "claude-code,copilot,cursor");
@@ -302,6 +361,35 @@ public sealed class DoctorCliTests : IDisposable
         first["name"].Should().NotBeNull();
         first["status"].Should().NotBeNull();
         first["message"].Should().NotBeNull();
+    }
+
+    [Fact]
+    public async Task Doctor_reportsCodexConfigPresence()
+    {
+        var codexDir = Path.Join(_tempRoot, ".codex");
+        Directory.CreateDirectory(codexDir);
+        File.WriteAllText(Path.Join(codexDir, "config.toml"),
+            "[mcp_servers.sourcegraph]\ncommand = \"sourcegraph-mcp\"\n");
+
+        var cli = CommandLine.Parse(new[] { "doctor", "--root", _tempRoot });
+        await DoctorCli.RunAsync(cli);
+
+        _stdout.ToString().Should().Contain("client-codex");
+        _stdout.ToString().Should().Contain("codex config wired");
+    }
+
+    [Fact]
+    public async Task Doctor_warnsWhenCodexConfigHasNoSourcegraphEntry()
+    {
+        var codexDir = Path.Join(_tempRoot, ".codex");
+        Directory.CreateDirectory(codexDir);
+        File.WriteAllText(Path.Join(codexDir, "config.toml"), "model = \"gpt-test\"\n");
+
+        var cli = CommandLine.Parse(new[] { "doctor", "--root", _tempRoot });
+        await DoctorCli.RunAsync(cli);
+
+        _stdout.ToString().Should().Contain("client-codex");
+        _stdout.ToString().Should().Contain("has no sourcegraph entry");
     }
 }
 

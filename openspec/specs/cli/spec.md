@@ -252,9 +252,9 @@ The CLI SHALL accept `sourcegraph-mcp init` that runs an interactive (default) o
 The subcommand SHALL accept the following flags:
 
 - `--yes` / `-y` — non-interactive; accept all defaults documented in this requirement.
-- `--client <id>` (repeatable) — restrict to the listed clients (`claude-code`, `copilot`, `cursor`, `continue`, `claude-desktop`).
+- `--client <id>` (repeatable) — restrict to the listed clients (`claude-code`, `codex`, `copilot`, `cursor`, `continue`, `claude-desktop`).
 - `--no-<client>` — exclude one client even if it would otherwise be auto-selected.
-- `--user-<client>` — write that client's config to its user-scope path instead of the project-scope path.
+- `--user-<client>` — write a supported client's config to its user-scope path instead of the project-scope path. Codex is project-only and `--user-codex` is rejected.
 - `--claude-desktop` — required to wire Claude Desktop (no project-scope option exists for that client).
 - `--solution <path>` (repeatable) — override solution-discovery; passes through to `init-scopes` core logic when multiple solutions are configured.
 - `--no-embeddings` / `--no-history` — propagate the corresponding `serve` flag into the written `args` array.
@@ -271,6 +271,10 @@ The subcommand SHALL accept the following flags:
 #### Scenario: Non-interactive init for CI
 - **WHEN** a user runs `sourcegraph-mcp init --yes --client copilot --client claude-code --print-only` from a CI script
 - **THEN** the command exits `0` after writing nothing, having printed two config snippets to stdout — one prefixed with `# would write to: <root>/.vscode/mcp.json` (Copilot's `servers`/`type` shape) and one prefixed with `# would write to: <root>/.mcp.json` (Claude Code's `mcpServers` shape)
+
+#### Scenario: Non-interactive Codex init
+- **WHEN** a user runs `sourcegraph-mcp init --yes --client codex`
+- **THEN** `<root>/.codex/config.toml` contains a valid `[mcp_servers.sourcegraph]` table with portable repository-relative args and `cwd = ".."`; no user-level Codex config is read or written
 
 #### Scenario: Init merges into an existing config without clobbering other servers
 - **WHEN** the user has a pre-existing `<root>/.mcp.json` containing an `mcpServers.other-server` entry, and `sourcegraph-mcp init --yes --client claude-code` is invoked
@@ -291,7 +295,11 @@ The subcommand SHALL accept the following flags:
 ### Requirement: doctor subcommand
 The CLI SHALL accept `sourcegraph-mcp doctor` that runs a read-only environment diagnostic and prints a per-check `pass | warn | fail` summary. The subcommand SHALL accept `--root <path>` and `--json` flags. The exit code SHALL follow the convention: `0` if every check passed, `2` if at least one warn was raised, `1` if any check produced a hard fail.
 
-The diagnostic SHALL cover at minimum: `.NET SDK >= 10.0` on PATH; `git` on PATH; `--root` readable; presence and parseability of `.sourcegraph.json` (or graceful absence); embedding model cache presence and size; per-scope DB writability under `<root>/.sourcegraph/scopes/`; per-client config-file presence and whether each contains a `sourcegraph` server entry that matches what `init` would write today.
+The diagnostic SHALL cover at minimum: `.NET SDK >= 10.0` on PATH; `git` on PATH; `--root` readable; presence and parseability of `.sourcegraph.json` (or graceful absence); embedding model cache presence and size; per-scope DB writability under `<root>/.sourcegraph/scopes/`; and whether each existing per-client config contains a `sourcegraph` server entry. Presence checks SHALL NOT be described as full command/args equivalence checks.
+
+#### Scenario: Doctor recognizes Codex TOML
+- **WHEN** `<root>/.codex/config.toml` contains a semantic `mcp_servers.sourcegraph` table
+- **THEN** `doctor` reports `client-codex` as wired; a valid Codex config without that table produces a warning instead of a false pass
 
 #### Scenario: Healthy environment
 - **WHEN** `sourcegraph-mcp doctor` is invoked in a repo with a valid `.sourcegraph.json`, .NET 10 SDK on PATH, git on PATH, and `.mcp.json` already wired

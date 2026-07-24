@@ -10,7 +10,11 @@ param(
     [string] $SdkVersion,
 
     [Parameter(Mandatory)]
-    [string] $ToolRuntimeIdentifiers
+    [string] $ToolRuntimeIdentifiers,
+
+    [ValidateNotNullOrEmpty()]
+    [string] $SourceLinkRepositoryUrl =
+        'https://github.com/Jak3b0/DevBitsLab.Mcp.SourceGraph.git'
 )
 
 Set-StrictMode -Version Latest
@@ -21,9 +25,39 @@ $sdkPackageId = 'DevBitsLab.Mcp.SourceGraph.Sdk'
 $repositoryUrl =
     'https://github.com/Jak3b0/DevBitsLab.Mcp.SourceGraph.git'
 $repositoryCommitPattern = '^[0-9a-f]{40}$'
+
+# SourceLink follows the repository that produced the checkout. GitHub Actions exposes the fork
+# identity through these variables, while release-package metadata continues to identify the
+# canonical upstream project. An explicit parameter remains available for local fork builds.
+if (-not $PSBoundParameters.ContainsKey('SourceLinkRepositoryUrl') -and
+    -not [string]::IsNullOrWhiteSpace($env:GITHUB_SERVER_URL) -and
+    -not [string]::IsNullOrWhiteSpace($env:GITHUB_REPOSITORY)) {
+    $SourceLinkRepositoryUrl =
+        "$($env:GITHUB_SERVER_URL)/$($env:GITHUB_REPOSITORY)"
+}
+$sourceLinkRepositoryBase = $SourceLinkRepositoryUrl.TrimEnd('/')
+if ($sourceLinkRepositoryBase.EndsWith(
+        '.git',
+        [StringComparison]::OrdinalIgnoreCase)) {
+    $sourceLinkRepositoryBase = $sourceLinkRepositoryBase.Substring(
+        0,
+        $sourceLinkRepositoryBase.Length - 4)
+}
+$sourceLinkRepositoryMatch = [Text.RegularExpressions.Regex]::Match(
+    $sourceLinkRepositoryBase,
+    '^https://github\.com/(?<owner>[0-9A-Za-z_.-]+)/(?<repo>[0-9A-Za-z_.-]+)$',
+    [Text.RegularExpressions.RegexOptions]::CultureInvariant)
+if (-not $sourceLinkRepositoryMatch.Success) {
+    throw (
+        "SourceLink repository '$SourceLinkRepositoryUrl' must be an " +
+        'https://github.com/<owner>/<repository>[.git] URL.')
+}
+$sourceLinkRepositorySlug =
+    $sourceLinkRepositoryMatch.Groups['owner'].Value + '/' +
+    $sourceLinkRepositoryMatch.Groups['repo'].Value
 $sourceLinkUrlPattern =
     '^https://raw\.githubusercontent\.com/' +
-    'Jak3b0/DevBitsLab\.Mcp\.SourceGraph/' +
+    [Text.RegularExpressions.Regex]::Escape($sourceLinkRepositorySlug) + '/' +
     '(?<commit>[0-9a-f]{40})/\*$'
 $packageDirectoryPath = (Resolve-Path -LiteralPath $PackageDirectory).Path
 $repositoryRoot = (

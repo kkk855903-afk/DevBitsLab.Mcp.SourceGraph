@@ -153,6 +153,10 @@ The Tool and SDK projects SHALL emit a `.snupkg` (`SymbolPackageFormat=snupkg`) 
 - **WHEN** a consumer attaches a debugger configured with SourceLink + nuget.org symbol-server, sets a breakpoint inside `sourcegraph-mcp` shipped as `DevBitsLab.Mcp.SourceGraph.Tool`, and steps into a frame
 - **THEN** the debugger pulls the source file from `https://github.com/Jak3b0/DevBitsLab.Mcp.SourceGraph` at the commit SHA recorded in the `.snupkg`, with line numbers matching the deployed binary
 
+#### Scenario: Fork CI verifies its own SourceLink mapping
+- **WHEN** the package gate runs in a GitHub Actions checkout whose `GITHUB_REPOSITORY` identifies a fork, or a local caller passes `-SourceLinkRepositoryUrl`
+- **THEN** the gate requires every SourceLink URL to target that repository and the package commit, while continuing to require the canonical repository URL in NuGet package metadata
+
 #### Scenario: Two CI builds of the same revision produce identical PE bytes
 - **WHEN** the release workflow is run twice against the same git revision (e.g., a re-run from the GitHub Actions UI)
 - **THEN** the two emitted `.nupkg` files differ only in their package signature / timestamp metadata; the contained PE files have identical hashes

@@ -138,6 +138,17 @@ public sealed class CommandLineHelpLanguageTests
             .Should().Equal(FlagTokens(CommandLine.HelpText));
     }
 
+    [Fact]
+    public void BothLanguages_documentCodexProjectConfig()
+    {
+        CommandLine.HelpText.Should().Contain("codex");
+        CommandLine.HelpText.Should().Contain(".codex/config.toml");
+        CommandLine.HelpText.Should().Contain("project-scope only");
+        CommandLine.ChineseHelpText.Should().Contain("codex");
+        CommandLine.ChineseHelpText.Should().Contain(".codex/config.toml");
+        CommandLine.ChineseHelpText.Should().Contain("仅支持项目级配置");
+    }
+
     private static string[] CommandSyntax(string helpText) =>
         helpText.Split('\n')
             .Select(static line => line.Trim())

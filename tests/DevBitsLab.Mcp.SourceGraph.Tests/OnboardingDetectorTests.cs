@@ -151,6 +151,81 @@ public sealed class OnboardingDetectorTests : IDisposable
     }
 
     [Fact]
+    public async Task ClientConfig_codexToml_detectedBySemanticTable()
+    {
+        var codexDir = Path.Join(_tempRoot, ".codex");
+        Directory.CreateDirectory(codexDir);
+        File.WriteAllText(Path.Join(codexDir, "config.toml"),
+            "model = \"gpt-test\"\n[mcp_servers.\"sourcegraph\"]\ncommand = \"sourcegraph-mcp\"\n");
+
+        var result = await OnboardingDetector.DetectAsync(_tempRoot);
+        var codex = result.ClientConfigsDetected.First(
+            c => c.Client == ClientId.Codex && !c.IsUserScope);
+
+        codex.Exists.Should().BeTrue();
+        codex.ContainsSourcegraphEntry.Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task ClientConfig_codexCommentedOrStringHeader_isNotFalsePositive()
+    {
+        var codexDir = Path.Join(_tempRoot, ".codex");
+        Directory.CreateDirectory(codexDir);
+        File.WriteAllText(Path.Join(codexDir, "config.toml"),
+            "# [mcp_servers.sourcegraph]\nnote = '''\n[mcp_servers.sourcegraph]\n'''\n");
+
+        var result = await OnboardingDetector.DetectAsync(_tempRoot);
+        var codex = result.ClientConfigsDetected.First(
+            c => c.Client == ClientId.Codex && !c.IsUserScope);
+
+        codex.Exists.Should().BeTrue();
+        codex.ContainsSourcegraphEntry.Should().BeFalse();
+    }
+
+    [Theory]
+    [InlineData("mcp_servers.sourcegraph = 1\n")]
+    [InlineData("[[mcp_servers.sourcegraph]]\ncommand = \"sourcegraph-mcp\"\n")]
+    public async Task ClientConfig_codexNonTableValue_isNotReportedAsWired(string config)
+    {
+        var codexDir = Path.Join(_tempRoot, ".codex");
+        Directory.CreateDirectory(codexDir);
+        File.WriteAllText(Path.Join(codexDir, "config.toml"), config);
+
+        var result = await OnboardingDetector.DetectAsync(_tempRoot);
+        var codex = result.ClientConfigsDetected.First(
+            c => c.Client == ClientId.Codex && !c.IsUserScope);
+
+        codex.Exists.Should().BeTrue();
+        codex.ContainsSourcegraphEntry.Should().BeFalse();
+    }
+
+    [Theory]
+    [InlineData("utf16")]
+    [InlineData("invalid-utf8")]
+    public async Task ClientConfig_codexNonUtf8_isNotReportedAsWired(string encodingCase)
+    {
+        var codexDir = Path.Join(_tempRoot, ".codex");
+        Directory.CreateDirectory(codexDir);
+        var path = Path.Join(codexDir, "config.toml");
+        var text = "[mcp_servers.sourcegraph]\ncommand = \"sourcegraph-mcp\"\n";
+        var bytes = encodingCase switch
+        {
+            "utf16" => Encoding.Unicode.GetPreamble()
+                .Concat(Encoding.Unicode.GetBytes(text))
+                .ToArray(),
+            _ => new byte[] { 0xff, 0xfe, 0xfd },
+        };
+        File.WriteAllBytes(path, bytes);
+
+        var result = await OnboardingDetector.DetectAsync(_tempRoot);
+        var codex = result.ClientConfigsDetected.First(
+            c => c.Client == ClientId.Codex && !c.IsUserScope);
+
+        codex.Exists.Should().BeTrue();
+        codex.ContainsSourcegraphEntry.Should().BeFalse();
+    }
+
+    [Fact]
     public void ClientId_slugs_roundTrip()
     {
         foreach (var id in Enum.GetValues<ClientId>())

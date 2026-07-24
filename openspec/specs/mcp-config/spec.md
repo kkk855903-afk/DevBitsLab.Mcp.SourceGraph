@@ -2,10 +2,10 @@
 
 ## Purpose
 
-Make the server registerable in MCP clients (Claude Code, Cursor, Continue,
-Claude Desktop) via a project-scoped `.mcp.json` file at the repo root, and
-support relative-style paths so the same config works across machines without
-per-user edits.
+Make the server registerable in MCP clients including Claude Code, Codex,
+GitHub Copilot, Cursor, Continue, and Claude Desktop via each client's native
+configuration shape, and support portable project-scoped paths where the
+client provides that scope.
 ## Requirements
 ### Requirement: Project-scoped registration via .mcp.json
 The repository SHALL ship a `.mcp.json` at its root that registers the
@@ -115,11 +115,12 @@ The `sourcegraph-mcp init-scopes` CLI subcommand SHALL not emit `language` or `e
 - **THEN** the scaffolder writes a config containing only `name` + `solutions` for the default scope; no `language` or `enrichment` keys appear
 
 ### Requirement: First-class per-client config writers
-The CLI SHALL ship a dedicated configuration writer for each first-class MCP client (`Claude Code`, `GitHub Copilot`, `Cursor`, `Continue`, `Claude Desktop`). Each writer SHALL emit the schema documented by its target client verbatim — schemas are not normalised across writers. The writers SHALL be invokable from the `init` subcommand and SHALL share an `IClientConfigWriter` contract so future clients can be added by adding a new writer file.
+The CLI SHALL ship a dedicated configuration writer for each first-class MCP client (`Claude Code`, `Codex`, `GitHub Copilot`, `Cursor`, `Continue`, `Claude Desktop`). Each writer SHALL emit the schema documented by its target client verbatim — schemas are not normalised across writers. The writers SHALL be invokable from the `init` subcommand and SHALL share an `IClientConfigWriter` contract so future clients can be added by adding a new writer file.
 
-The five v1 writers SHALL emit:
+The writers SHALL emit:
 
 - **Claude Code** — JSON at `<root>/.mcp.json` (project) or `~/.claude/.mcp.json` (user) with top-level `mcpServers.<server-name>` shape and `command` + `args` fields.
+- **Codex** — TOML at `<root>/.codex/config.toml` (project only) with a `[mcp_servers.sourcegraph]` table containing `command`, `args`, and `cwd`. It SHALL use `cwd = ".."` and repository-relative arguments instead of `${workspaceFolder}`. Codex loads this layer only for a trusted project; `init` SHALL NOT edit `~/.codex/config.toml`.
 - **GitHub Copilot** — JSON at `<root>/.vscode/mcp.json` (project-scope only in v1) with top-level `servers.<server-name>` shape, an explicit `type: "stdio"` field on each server entry, and `command` + `args` fields. The schema differs from Claude Code's by the top-level key (`servers` vs `mcpServers`) and by the required `type` field. User-scope wiring for Copilot would require editing VS Code's `settings.json` under `chat.mcp.servers`; that path is intentionally not implemented in v1 and `--user-copilot` results in a documented skip with paste-it-yourself guidance.
 - **Cursor** — JSON at `<root>/.cursor/mcp.json` (project) or `~/.cursor/mcp.json` (user) with top-level `mcpServers.<server-name>` shape (matches Claude Code's shape).
 - **Continue** — YAML at `<root>/.continue/mcp/sourcegraph.yaml` (project) or `~/.continue/mcp/sourcegraph.yaml` (user) with top-level `name` / `command` / `args` keys.
@@ -133,6 +134,10 @@ The five v1 writers SHALL emit:
 - **WHEN** `sourcegraph-mcp init --yes --client continue --print-only` is invoked
 - **THEN** the printed content parses as YAML (not JSON), starts with `name: sourcegraph`, and the file path comment reads `# would write to: <root>/.continue/mcp/sourcegraph.yaml`
 
+#### Scenario: Codex writer emits portable TOML
+- **WHEN** `sourcegraph-mcp init --yes --client codex --print-only` is invoked
+- **THEN** the printed content is valid TOML at `<root>/.codex/config.toml`, contains `[mcp_servers.sourcegraph]`, `command`, `args`, and `cwd = ".."`, contains no `${workspaceFolder}`, and writes no user-level config
+
 #### Scenario: Cursor writer matches Claude Code shape
 - **WHEN** the Cursor writer and the Claude Code writer are both invoked against the same solution and install-mode
 - **THEN** the per-server JSON object inside `mcpServers.sourcegraph` is identical in both files (same `command`, same `args`); the only difference is the file path
@@ -142,7 +147,7 @@ The `init` subcommand SHALL default each client's write target to that client's 
 
 #### Scenario: Default init touches no user-tree files
 - **WHEN** `sourcegraph-mcp init --yes` is invoked with no `--user-*` or `--claude-desktop` flags, in a repo with a `.slnx` and the user's machine has Claude Code, Cursor, and Claude Desktop all installed
-- **THEN** `<root>/.mcp.json` and `<root>/.cursor/mcp.json` are written; no file under the user's home directory is read or written; Claude Desktop is not wired
+- **THEN** `<root>/.mcp.json`, `<root>/.codex/config.toml`, and `<root>/.cursor/mcp.json` are written; no file under the user's home directory is written; read-only detection may inspect existing user-scope client configs for the onboarding summary, and Claude Desktop is not wired
 
 #### Scenario: --user-cursor writes to home
 - **WHEN** `sourcegraph-mcp init --yes --client cursor --user-cursor` is invoked
@@ -159,6 +164,24 @@ Each writer SHALL read any pre-existing target file before writing, parse it, an
 - `SkipUnsupported` — the selected client / scope combination has no writer support in v1 (e.g. `--user-copilot`, since Copilot's user-scope config requires editing VS Code's `settings.json` under `chat.mcp.servers`, which has no dedicated writer). Informational, exit `0`.
 
 Other servers' entries SHALL never be removed, modified, or reordered by any writer.
+
+For Codex TOML specifically, the writer SHALL strictly parse both the existing
+file and every write candidate. It SHALL preserve comments, unrelated
+settings, other MCP servers, extra `sourcegraph` options, and nested tables.
+`--force` SHALL patch only the source spans for the owned `command`, `args`,
+and `cwd` values or insert missing owned keys. Invalid UTF-8, invalid TOML,
+inline/dotted/implicit target tables, table arrays, or incompatible
+`mcp_servers` structures SHALL be left untouched even under `--force`. An
+owned value containing nested comments SHALL likewise be left untouched when
+updating it would discard those comments.
+
+#### Scenario: Codex force update preserves the shared TOML document
+- **WHEN** `.codex/config.toml` contains comments, another MCP server, extra `enabled` / timeout fields, a nested `mcp_servers.sourcegraph.env` table, and differing owned values, and `init --yes --client codex --force` runs
+- **THEN** only `command`, `args`, and `cwd` are updated; every other byte-level setting and comment remains present and the resulting document passes strict TOML parsing
+
+#### Scenario: Unsafe Codex TOML is never overwritten
+- **WHEN** `.codex/config.toml` is malformed or expresses `sourcegraph` through an inline, dotted, implicit, or array-table shape
+- **THEN** `init --yes --client codex --force` leaves the file untouched, reports manual intervention, and exits `2`
 
 #### Scenario: Existing other-server is preserved
 - **WHEN** `<root>/.mcp.json` already contains `mcpServers.other-server` and `init --yes --client claude-code` runs

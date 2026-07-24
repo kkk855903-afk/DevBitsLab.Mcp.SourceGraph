@@ -132,6 +132,12 @@
           "System.Security.Cryptography.Pkcs": "10.0.10"
         }
       },
+      "Tomlyn": {
+        "type": "Direct",
+        "requested": "[2.10.1, )",
+        "resolved": "2.10.1",
+        "contentHash": "ykjOY3IpYmC4SpPcAZRTl/w2jTmhPMDydHq8xcV7tTBAQ22nKBsOkPqauIrZlMjHm03cmKfV23UOPscKp+J4Og=="
+      },
       "ClangSharp.Interop": {
         "type": "Transitive",
         "resolved": "21.1.8.4",

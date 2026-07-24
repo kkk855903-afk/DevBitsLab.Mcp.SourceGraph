@@ -116,6 +116,7 @@ internal static class OnboardingDetector
     private static IEnumerable<(ClientId Client, string Path)> ProjectConfigPaths(string root)
     {
         yield return (ClientId.ClaudeCode, Path.Join(root, ".mcp.json"));
+        yield return (ClientId.Codex, Path.Join(root, ".codex", "config.toml"));
         yield return (ClientId.Copilot, Path.Join(root, ".vscode", "mcp.json"));
         yield return (ClientId.Cursor, Path.Join(root, ".cursor", "mcp.json"));
         yield return (ClientId.Continue, Path.Join(root, ".continue", "mcp", "sourcegraph.yaml"));
@@ -158,14 +159,20 @@ internal static class OnboardingDetector
     {
         try
         {
-            // Continue uses YAML; the rest are JSON. We only need a coarse "is the entry there?"
-            // check here, not byte-exact equivalence. The writers do that at plan time.
+            // Continue uses YAML and Codex uses TOML; the rest are JSON. We only need a coarse
+            // "is the entry there?" check here, not byte-exact equivalence. The writers do that
+            // at plan time.
             if (client == ClientId.Continue)
             {
                 var text = File.ReadAllText(path);
                 return text.Contains("name: sourcegraph", StringComparison.Ordinal)
                     || text.Contains("name: 'sourcegraph'", StringComparison.Ordinal)
                     || text.Contains("name: \"sourcegraph\"", StringComparison.Ordinal);
+            }
+            if (client == ClientId.Codex)
+            {
+                return ClientConfigWriters.CodexWriter.ContainsSourcegraphEntry(
+                    File.ReadAllBytes(path));
             }
             using var fs = File.OpenRead(path);
             using var doc = JsonDocument.Parse(fs);
@@ -264,6 +271,7 @@ internal sealed record DetectedClientConfig(
 internal enum ClientId
 {
     ClaudeCode,
+    Codex,
     Copilot,
     Cursor,
     Continue,
@@ -275,6 +283,7 @@ internal static class ClientIdExtensions
     public static string ToSlug(this ClientId id) => id switch
     {
         ClientId.ClaudeCode => "claude-code",
+        ClientId.Codex => "codex",
         ClientId.Copilot => "copilot",
         ClientId.Cursor => "cursor",
         ClientId.Continue => "continue",
@@ -287,6 +296,7 @@ internal static class ClientIdExtensions
         switch (slug)
         {
             case "claude-code": id = ClientId.ClaudeCode; return true;
+            case "codex": id = ClientId.Codex; return true;
             case "copilot": id = ClientId.Copilot; return true;
             case "cursor": id = ClientId.Cursor; return true;
             case "continue": id = ClientId.Continue; return true;

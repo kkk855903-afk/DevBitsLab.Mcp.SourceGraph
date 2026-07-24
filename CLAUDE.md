@@ -3,7 +3,7 @@
 Live code source graph MCP server. Indexes C# via Roslyn, XAML via a custom
 profile-aware parser, and TypeScript / JavaScript / TSX / JSX via tree-sitter
 into SQLite + FTS5 and exposes graph queries to MCP clients (Claude Code,
-Cursor) over stdio.
+Codex, GitHub Copilot, Cursor) over stdio.
 
 ## Onboarding CLI: `init`, `doctor`, `demo`
 
@@ -11,8 +11,9 @@ Three subcommands handle first-run setup. `sourcegraph-mcp init` is interactive
 by default; flag-driven (`--yes`) for CI. It detects environment, picks MCP
 clients (project-scope by default, user-scope opt-in via `--user-<client>`),
 and writes per-client config files with merge-by-name semantics — first-class
-support for Claude Code, **GitHub Copilot** (distinct `servers`/`type` schema in
-`.vscode/mcp.json`), Cursor, Continue, and Claude Desktop. `doctor` runs a
+support for Claude Code, **Codex** (`.codex/config.toml`, project-only),
+**GitHub Copilot** (distinct `servers`/`type` schema in `.vscode/mcp.json`),
+Cursor, Continue, and Claude Desktop. `doctor` runs a
 read-only environment diagnostic with `pass | warn | fail` exit-code semantics.
 `demo` runs four canned operations (`ping`, `graph_stats`, `search_symbols`,
 `find_definition`) against the active scope and prints leaf-stamped markdown —
@@ -196,6 +197,12 @@ After every code change, `dotnet build` again so the next launch picks it up.
 The `${workspaceFolder}` token is expanded by Claude Code; if your client doesn't
 expand it, the server expands `${workspaceFolder}` itself by reading
 `WORKSPACE_FOLDER` / `CLAUDE_PROJECT_DIR` / `MCP_WORKSPACE_FOLDER` env vars.
+
+Codex uses the committed `.codex/config.toml` instead. Its writer emits
+`cwd = ".."` plus repo-relative paths because `${workspaceFolder}` expansion is
+not part of the Codex project-config contract. Project config loads only for a
+trusted repository; restart/open a new task after changes and verify the server
+with `/mcp` or `codex mcp list`.
 
 ### Alternative: global `dotnet tool` install
 

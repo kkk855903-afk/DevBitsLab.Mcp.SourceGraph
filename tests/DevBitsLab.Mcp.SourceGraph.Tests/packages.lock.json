@@ -751,7 +751,8 @@
           "DevBitsLab.Mcp.SourceGraph.Watcher": "[1.0.0, )",
           "Microsoft.Extensions.Hosting": "[10.0.10, )",
           "Microsoft.Extensions.Logging": "[10.0.10, )",
-          "ModelContextProtocol": "[1.2.0, )"
+          "ModelContextProtocol": "[1.2.0, )",
+          "Tomlyn": "[2.10.1, )"
         }
       },
       "devbitslab.mcp.sourcegraph.watcher": {
@@ -949,6 +950,12 @@
           "SQLitePCLRaw.config.e_sqlite3": "3.0.4",
           "SourceGear.sqlite3": "3.53.3"
         }
+      },
+      "Tomlyn": {
+        "type": "CentralTransitive",
+        "requested": "[2.10.1, )",
+        "resolved": "2.10.1",
+        "contentHash": "ykjOY3IpYmC4SpPcAZRTl/w2jTmhPMDydHq8xcV7tTBAQ22nKBsOkPqauIrZlMjHm03cmKfV23UOPscKp+J4Og=="
       },
       "TreeSitter.DotNet": {
         "type": "CentralTransitive",

@@ -35,6 +35,7 @@
 
     <!-- CLI -->
     <PackageVersion Include="System.CommandLine" Version="2.0.7" />
+    <PackageVersion Include="Tomlyn" Version="2.10.1" />
 
     <!-- Embeddings: ONNX Runtime + Microsoft.Extensions.AI abstraction + tokenizer library.
          Microsoft.ML.Tokenizers covers BPE (RoBERTa-style, used by Jina v2 base code and most

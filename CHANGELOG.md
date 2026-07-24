@@ -11,6 +11,10 @@ below note which package the change applies to.
 ## [Unreleased]
 
 ### Changed
+- **Fork-aware SourceLink package verification.** Release-package checks now
+  validate symbol URLs against the GitHub repository that produced the
+  checkout (or an explicit local override), while retaining the canonical
+  package metadata. This keeps package smoke checks trustworthy in forks.
 - **`ServerInstructions` slimmed; verbose body moved to `graph://help` resource.**
   The MCP `initialize` preamble dropped from ~22 lines to ~10: it keeps the leaf
   glyph, the prefer-graph rule, and the `usage_stats` reminder, plus a pointer
@@ -21,6 +25,14 @@ below note which package the change applies to.
   before. Leaf glyph unchanged on every surface.
 
 ### Added
+- **First-class Codex MCP onboarding.** `sourcegraph-mcp init` now includes
+  project-scoped `.codex/config.toml` in its defaults and accepts
+  `--client codex` / `--no-codex`. The dedicated TOML writer emits portable
+  repo-relative arguments with `cwd = ".."`, never relies on
+  `${workspaceFolder}`, strictly validates existing TOML, and patches only
+  `command` / `args` / `cwd` while preserving comments, extra options, and
+  other servers. `doctor`, English/Chinese help, tests, and installation smoke
+  coverage include Codex. User-level `~/.codex/config.toml` remains untouched.
 - **Bilingual CLI help.** `sourcegraph-mcp --help` remains English by default;
   pass `--lang zh` before or after `-h`/`--help` for Simplified Chinese, or
   `--lang en` to select English explicitly. Invalid and help-less language

@@ -20,6 +20,8 @@ public sealed class ReleasePackageGateTests
         "2222222222222222222222222222222222222222";
     private const string RepositoryUrl =
         "https://github.com/Jak3b0/DevBitsLab.Mcp.SourceGraph.git";
+    private const string ForkRepositoryUrl =
+        "https://github.com/example-fork/DevBitsLab.Mcp.SourceGraph.git";
     private const string ToolPackageId =
         "DevBitsLab.Mcp.SourceGraph.Tool";
     private const string ToolVersion = "0.9.0";
@@ -68,6 +70,29 @@ public sealed class ReleasePackageGateTests
         result.Output.Should().Contain("Verified tool 0.9.0");
     }
 
+    [Fact]
+    public async Task Gate_accepts_explicit_fork_source_link_repository()
+    {
+        var result = await RunGateScenarioAsync(
+            "valid",
+            ForkRepositoryUrl);
+
+        result.ExitCode.Should().Be(0, result.Output);
+        result.Output.Should().Contain("Verified tool 0.9.0");
+    }
+
+    [Fact]
+    public async Task Gate_accepts_fork_source_link_from_github_environment()
+    {
+        var result = await RunGateScenarioAsync(
+            "valid",
+            ForkRepositoryUrl,
+            useGitHubEnvironment: true);
+
+        result.ExitCode.Should().Be(0, result.Output);
+        result.Output.Should().Contain("Verified tool 0.9.0");
+    }
+
     [Theory]
     [InlineData(
         "missing-pdb-source-link",
@@ -99,7 +124,9 @@ public sealed class ReleasePackageGateTests
     }
 
     private static async Task<GateResult> RunGateScenarioAsync(
-        string scenario)
+        string scenario,
+        string sourceLinkRepositoryUrl = RepositoryUrl,
+        bool useGitHubEnvironment = false)
     {
         var root = FindRepositoryRoot();
         var packageDirectory = Path.Join(
@@ -109,8 +136,23 @@ public sealed class ReleasePackageGateTests
 
         try
         {
-            CreatePackageSet(root, packageDirectory, scenario);
-            return await RunGateAsync(root, packageDirectory);
+            CreatePackageSet(
+                root,
+                packageDirectory,
+                scenario,
+                sourceLinkRepositoryUrl);
+            return await RunGateAsync(
+                root,
+                packageDirectory,
+                useGitHubEnvironment || string.Equals(
+                    sourceLinkRepositoryUrl,
+                    RepositoryUrl,
+                    StringComparison.Ordinal)
+                    ? null
+                    : sourceLinkRepositoryUrl,
+                useGitHubEnvironment
+                    ? sourceLinkRepositoryUrl
+                    : null);
         }
         finally
         {
@@ -121,7 +163,8 @@ public sealed class ReleasePackageGateTests
     private static void CreatePackageSet(
         string root,
         string packageDirectory,
-        string scenario)
+        string scenario,
+        string sourceLinkRepositoryUrl)
     {
         var releasePackages = new List<(string Id, string Version)>
         {
@@ -161,6 +204,7 @@ public sealed class ReleasePackageGateTests
             sourceDocument,
             sourcePattern,
             sourceLinkCommit,
+            sourceLinkRepositoryUrl,
             includeSourceLink: true,
             includeEmbeddedDocument: true,
             sourceLinkOnDocument:
@@ -169,6 +213,7 @@ public sealed class ReleasePackageGateTests
             "/_/src/Missing.cs",
             sourcePattern,
             sourceLinkCommit,
+            sourceLinkRepositoryUrl,
             includeSourceLink: false,
             includeEmbeddedDocument: false,
             sourceLinkOnDocument: false);
@@ -317,6 +362,7 @@ public sealed class ReleasePackageGateTests
         string sourceDocumentName,
         string sourcePattern,
         string sourceLinkCommit,
+        string sourceLinkRepositoryUrl,
         bool includeSourceLink,
         bool includeEmbeddedDocument,
         bool sourceLinkOnDocument)
@@ -350,6 +396,17 @@ public sealed class ReleasePackageGateTests
 
         if (includeSourceLink)
         {
+            var sourceLinkRepositoryPath =
+                new Uri(sourceLinkRepositoryUrl)
+                    .AbsolutePath
+                    .Trim('/');
+            if (sourceLinkRepositoryPath.EndsWith(
+                    ".git",
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                sourceLinkRepositoryPath =
+                    sourceLinkRepositoryPath[..^4];
+            }
             var sourceLink = JsonSerializer.Serialize(
                 new
                 {
@@ -357,7 +414,7 @@ public sealed class ReleasePackageGateTests
                     {
                         [sourcePattern] =
                             "https://raw.githubusercontent.com/"
-                            + "Jak3b0/DevBitsLab.Mcp.SourceGraph/"
+                            + sourceLinkRepositoryPath + "/"
                             + $"{sourceLinkCommit}/*",
                     },
                 });
@@ -385,7 +442,9 @@ public sealed class ReleasePackageGateTests
 
     private static async Task<GateResult> RunGateAsync(
         string root,
-        string packageDirectory)
+        string packageDirectory,
+        string? sourceLinkRepositoryUrl,
+        string? githubEnvironmentRepositoryUrl)
     {
         var startInfo = new ProcessStartInfo("pwsh")
         {
@@ -411,6 +470,27 @@ public sealed class ReleasePackageGateTests
         startInfo.ArgumentList.Add(SdkVersion);
         startInfo.ArgumentList.Add("-ToolRuntimeIdentifiers");
         startInfo.ArgumentList.Add(RuntimeIdentifiers);
+        if (sourceLinkRepositoryUrl is not null)
+        {
+            startInfo.ArgumentList.Add("-SourceLinkRepositoryUrl");
+            startInfo.ArgumentList.Add(sourceLinkRepositoryUrl);
+        }
+        if (githubEnvironmentRepositoryUrl is not null)
+        {
+            var repositoryPath = new Uri(githubEnvironmentRepositoryUrl)
+                .AbsolutePath
+                .Trim('/');
+            if (repositoryPath.EndsWith(
+                    ".git",
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                repositoryPath = repositoryPath[..^4];
+            }
+            startInfo.Environment["GITHUB_SERVER_URL"] =
+                "https://github.com";
+            startInfo.Environment["GITHUB_REPOSITORY"] =
+                repositoryPath;
+        }
 
         using var process = Process.Start(startInfo)
             ?? throw new InvalidOperationException(

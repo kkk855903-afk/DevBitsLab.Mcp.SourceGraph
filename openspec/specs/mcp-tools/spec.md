@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Expose the code graph to MCP clients (Claude Code, Cursor, Continue, …) as a
+Expose the code graph to MCP clients (Claude Code, Codex, Cursor, Continue, …) as a
 set of stdio-callable tools so that an LLM coding agent can answer
 symbol-level questions via one structured call instead of dozens of
 `Grep` + `Read` operations.

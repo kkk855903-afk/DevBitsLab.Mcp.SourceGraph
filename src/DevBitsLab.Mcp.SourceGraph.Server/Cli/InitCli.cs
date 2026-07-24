@@ -277,10 +277,11 @@ internal static class InitCli
         }
         else
         {
-            // Default candidates: the four project-scoped clients. Claude Desktop is opt-in only.
+            // Default candidates: every project-scoped client. Claude Desktop is opt-in only.
             candidates = new HashSet<ClientId>
             {
                 ClientId.ClaudeCode,
+                ClientId.Codex,
                 ClientId.Copilot,
                 ClientId.Cursor,
                 ClientId.Continue,
@@ -359,6 +360,7 @@ internal static class InitCli
     private static IClientConfigWriter MakeWriter(ClientId id) => id switch
     {
         ClientId.ClaudeCode => new ClaudeCodeWriter(),
+        ClientId.Codex => new CodexWriter(),
         ClientId.Copilot => new CopilotWriter(),
         ClientId.Cursor => new CursorWriter(),
         ClientId.Continue => new ContinueWriter(),
