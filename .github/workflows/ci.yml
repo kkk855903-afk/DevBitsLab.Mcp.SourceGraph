@@ -95,38 +95,42 @@ jobs:
         run: dotnet pack src/DevBitsLab.Mcp.SourceGraph.Sdk -c Release --no-build -o ./out
 
       - name: Smoke installed tool package
-        shell: bash
-        run: |
-          smoke_config="$RUNNER_TEMP/sourcegraph-mcp-smoke-nuget.config"
-          smoke_dir="$RUNNER_TEMP/sourcegraph-mcp-tool"
-          printf '%s\n' \
-            '<?xml version="1.0" encoding="utf-8"?>' \
-            '<configuration>' \
-            '  <packageSources>' \
-            '    <clear />' \
-            "    <add key=\"local-pack-output\" value=\"$PWD/out\" />" \
-            '  </packageSources>' \
-            '</configuration>' \
-            > "$smoke_config"
-
-          dotnet tool install DevBitsLab.Mcp.SourceGraph.Tool \
-            --tool-path "$smoke_dir" \
-            --version 0.9.0 \
-            --configfile "$smoke_config"
-
-          tool_command="$smoke_dir/sourcegraph-mcp"
-          test -x "$tool_command"
-          "$tool_command" --help
-
-          SOURCEGRAPH_MCP_INTEGRATION_COMMAND="$tool_command" \
-            dotnet test tests/DevBitsLab.Mcp.SourceGraph.IntegrationTests \
-              -c Release \
-              --no-build \
-              --no-restore \
-              --filter "FullyQualifiedName=DevBitsLab.Mcp.SourceGraph.IntegrationTests.InitializeTests.Initialize_and_tools_list_against_Sample_complete_and_exit_cleanly"
+        shell: pwsh
+        run: >
+          ./.github/scripts/smoke-installed-tool.ps1
+          -PackageDirectory ./out
+          -RunMcpIntegration
 
       - name: Upload packages
         uses: actions/upload-artifact@v7
         with:
           name: nupkg
           path: ./out/*.nupkg
+
+  installed-runtime-smoke:
+    name: installed runtime smoke (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    needs: pack
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Download packages
+        uses: actions/download-artifact@v8
+        with:
+          name: nupkg
+          path: ./out
+
+      - name: Smoke installed runtime assets
+        shell: pwsh
+        run: >
+          ./.github/scripts/smoke-installed-tool.ps1
+          -PackageDirectory ./out

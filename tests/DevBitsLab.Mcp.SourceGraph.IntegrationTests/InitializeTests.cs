@@ -56,7 +56,7 @@ public sealed class InitializeTests
 
         // ListToolsAsync performs a real MCP `tools/list` request over the same stdio channel.
         // The pack job reruns this test with ServerHarness's command override pointed at the
-        // just-installed 0.9.0 executable, so this assertion cannot be satisfied by the
+        // just-installed package executable, so this assertion cannot be satisfied by the
         // in-repository build or by merely starting an idle child process.
         var tools = await harness.Client.ListToolsAsync();
         tools.Should().NotBeEmpty();
