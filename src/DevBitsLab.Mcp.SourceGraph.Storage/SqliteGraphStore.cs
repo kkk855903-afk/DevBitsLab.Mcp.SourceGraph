@@ -2707,6 +2707,60 @@ public sealed partial class SqliteGraphStore : IGraphStore
         return rows.Select(row => row.ToHit()).ToList();
     }
 
+    public async Task<IReadOnlyList<EdgeTraversalHit>> ListAuditableOutboundEdgesByKindsAsync(
+        long symbolId,
+        IReadOnlyCollection<string> edgeKinds,
+        int limit = 50,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(edgeKinds);
+        ArgumentOutOfRangeException.ThrowIfLessThan(limit, 1);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(limit, 1024);
+        if (edgeKinds.Count is < 1 or > 32)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(edgeKinds),
+                edgeKinds.Count,
+                "Between 1 and 32 edge kinds are required.");
+        }
+
+        var normalizedKinds = new SortedSet<string>(StringComparer.Ordinal);
+        foreach (var edgeKind in edgeKinds)
+        {
+            KebabCaseValidator.Validate(edgeKind, nameof(edgeKinds));
+            normalizedKinds.Add(edgeKind);
+        }
+
+        const string sql = """
+            SELECT s.id, s.name, s.fqn, s.kind_name AS Kind, f.path AS FilePath,
+                   s.start_line AS StartLine, s.start_col AS StartCol,
+                   s.end_line AS EndLine, s.end_col AS EndCol, s.signature,
+                   s.modifiers AS Modifiers, s.accessibility AS Accessibility,
+                   s.xml_summary AS XmlSummary, f.is_generated AS IsGenerated,
+                   s.test_framework AS TestFramework, s.canonical_key AS CanonicalKey,
+                   e.kind_name AS Relation, e.payload AS PayloadJson
+            FROM edges e
+            JOIN symbols s ON s.id = e.dst
+            JOIN files   f ON f.id = s.file_id
+            WHERE e.src = @id
+              AND e.kind_name IN @kinds
+              AND EXISTS (
+                  SELECT 1
+                  FROM edge_evidence ee
+                  WHERE ee.src = e.src
+                    AND ee.dst = e.dst
+                    AND ee.kind_name = e.kind_name
+              )
+            ORDER BY e.kind_name, f.path, s.start_line, s.start_col, s.id
+            LIMIT @limit;
+            """;
+        var rows = await _connection.QueryAsync<RawAuditableEdgeHit>(new CommandDefinition(
+            sql,
+            new { id = symbolId, kinds = normalizedKinds.ToArray(), limit },
+            cancellationToken: ct)).ConfigureAwait(false);
+        return rows.Select(row => row.ToHit()).ToList();
+    }
+
     public Task<IReadOnlyList<SymbolHit>> ListImplementationsAsync(long symbolId, int limit = 50, CancellationToken ct = default)
         => ListCallersAsync(symbolId, limit, "implements-member", ct);
 
@@ -2859,6 +2913,31 @@ public sealed partial class SqliteGraphStore : IGraphStore
             """;
         var row = await _connection.QueryFirstOrDefaultAsync<RawSymbolHit>(new CommandDefinition(
             sql, new { id = symbolId }, cancellationToken: ct)).ConfigureAwait(false);
+        return row?.ToHit();
+    }
+
+    public async Task<SymbolHit?> GetSymbolByCanonicalKeyAsync(
+        string canonicalKey,
+        CancellationToken ct = default)
+    {
+        CanonicalKeyValidator.Validate(canonicalKey, nameof(canonicalKey));
+
+        const string sql = """
+            SELECT s.id, s.name, s.fqn, s.kind_name AS Kind, f.path AS FilePath,
+                   s.start_line AS StartLine, s.start_col AS StartCol,
+                   s.end_line AS EndLine, s.end_col AS EndCol, s.signature,
+                   s.modifiers AS Modifiers, s.accessibility AS Accessibility,
+                   s.xml_summary AS XmlSummary, f.is_generated AS IsGenerated,
+                   s.test_framework AS TestFramework, s.canonical_key AS CanonicalKey
+            FROM symbols s
+            JOIN files f ON f.id = s.file_id
+            WHERE s.canonical_key = @canonicalKey;
+            """;
+        var row = await _connection.QueryFirstOrDefaultAsync<RawSymbolHit>(
+            new CommandDefinition(
+                sql,
+                new { canonicalKey },
+                cancellationToken: ct)).ConfigureAwait(false);
         return row?.ToHit();
     }
 

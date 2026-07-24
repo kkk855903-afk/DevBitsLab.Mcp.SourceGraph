@@ -395,6 +395,14 @@ public interface IGraphStore : IAsyncDisposable
     Task<SymbolHit?> GetSymbolByIdAsync(long symbolId, CancellationToken ct = default);
 
     /// <summary>
+    /// Gets the symbol whose canonical key exactly equals <paramref name="canonicalKey"/>.
+    /// Canonical keys are unique within a store; no fuzzy name or FQN matching is performed.
+    /// </summary>
+    Task<SymbolHit?> GetSymbolByCanonicalKeyAsync(
+        string canonicalKey,
+        CancellationToken ct = default);
+
+    /// <summary>
     /// Lists named callers of <paramref name="symbolId"/>. With the default
     /// <paramref name="edgeKind"/> = <c>"calls"</c> this preserves the legacy behaviour. Pass a
     /// different kebab-case kind (<c>"uses-type"</c>, <c>"renders-component"</c>, …) to walk
@@ -429,6 +437,18 @@ public interface IGraphStore : IAsyncDisposable
         long symbolId,
         int limit = 50,
         string? edgeKind = "calls",
+        CancellationToken ct = default);
+
+    /// <summary>
+    /// Lists evidence-backed outbound logical edges whose relation is one of
+    /// <paramref name="edgeKinds"/>. Filtering occurs in storage before the deterministic
+    /// ordering and <paramref name="limit"/> are applied, so unrelated relations cannot consume
+    /// the requested result budget.
+    /// </summary>
+    Task<IReadOnlyList<EdgeTraversalHit>> ListAuditableOutboundEdgesByKindsAsync(
+        long symbolId,
+        IReadOnlyCollection<string> edgeKinds,
+        int limit = 50,
         CancellationToken ct = default);
 
     /// <summary>Lists every member that satisfies the named interface member via <c>"implements-member"</c> edges.</summary>
