@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Collections.Immutable;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
+using System.Reflection;
 using System.Security.Cryptography;
 using DevBitsLab.Mcp.SourceGraph.Core;
 using DevBitsLab.Mcp.SourceGraph.Embeddings;
@@ -51,6 +52,14 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         OperatingSystem.IsWindows()
             ? StringComparison.OrdinalIgnoreCase
             : StringComparison.Ordinal;
+    private static readonly PropertyInfo? _documentStateProperty =
+        typeof(Document).GetProperty(
+            "DocumentState",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+    private static readonly PropertyInfo? _documentStateIsGeneratedProperty =
+        _documentStateProperty?.PropertyType.GetProperty(
+            "IsGenerated",
+            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
     private static readonly string[] _analysisEdgeProducer =
     [
         InteropFactProducers.Analysis,
@@ -240,15 +249,93 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                && requiresStructuralReload == _requiresStructuralReload;
     }
 
+    /// <summary>
+    /// Returns whether XAML may emit positive binding facts from the privacy-sanitized
+    /// compilation. Build-generated documents omitted only because they live below
+    /// <c>obj/</c> or <c>bin/</c> make the input incomplete, but do not invalidate a property
+    /// already declared directly by an allowed source type. Every other omission fails closed.
+    /// </summary>
+    public bool IsProjectXamlPositiveResolutionSafe(string projectFilePath)
+    {
+        var workspace = _workspace;
+        var sanitized = _sanitizedSolution;
+        var pathPolicy = _pathPolicy;
+        var analyzerReferenceState = _analyzerReferenceLoadCompleteByProject;
+        var requiresStructuralReload = _requiresStructuralReload;
+        if (workspace is null
+            || sanitized is null
+            || pathPolicy is null
+            || _disposed
+            || requiresStructuralReload)
+        {
+            return false;
+        }
+
+        var safe = IsProjectXamlPositiveResolutionSafe(
+            workspace.CurrentSolution,
+            sanitized,
+            projectFilePath,
+            pathPolicy,
+            analyzerReferenceState);
+
+        // A structural reload can swap either snapshot while this read-only comparison runs.
+        // Treat a mixed generation as unsafe and let the next dispatch retry.
+        return safe
+               && ReferenceEquals(workspace, _workspace)
+               && ReferenceEquals(sanitized, _sanitizedSolution)
+               && ReferenceEquals(pathPolicy, _pathPolicy)
+               && ReferenceEquals(
+                   analyzerReferenceState,
+                   _analyzerReferenceLoadCompleteByProject)
+               && requiresStructuralReload == _requiresStructuralReload;
+    }
+
     internal static bool IsProjectSemanticInputComplete(
         Solution rawSolution,
         Solution sanitized,
         string projectFilePath,
         IReadOnlyDictionary<ProjectId, bool>? analyzerReferenceLoadCompleteByProject = null)
+        => CompareProjectSemanticInputs(
+               rawSolution,
+               sanitized,
+               projectFilePath,
+               analyzerReferenceLoadCompleteByProject,
+               omittedGeneratedDocumentIsSafe: null)
+           == ProjectSemanticInputState.Complete;
+
+    internal static bool IsProjectXamlPositiveResolutionSafe(
+        Solution rawSolution,
+        Solution sanitized,
+        string projectFilePath,
+        ScopePathPolicy pathPolicy,
+        IReadOnlyDictionary<ProjectId, bool>? analyzerReferenceLoadCompleteByProject = null)
+    {
+        ArgumentNullException.ThrowIfNull(pathPolicy);
+        return CompareProjectSemanticInputs(
+                   rawSolution,
+                   sanitized,
+                   projectFilePath,
+                   analyzerReferenceLoadCompleteByProject,
+                   document =>
+                       IsBuildGeneratedDocument(document)
+                       && !pathPolicy.IsGeneratedDocumentExcluded(
+                           document.FilePath))
+               != ProjectSemanticInputState.Unsafe;
+    }
+
+    private static ProjectSemanticInputState CompareProjectSemanticInputs(
+        Solution rawSolution,
+        Solution sanitized,
+        string projectFilePath,
+        IReadOnlyDictionary<ProjectId, bool>? analyzerReferenceLoadCompleteByProject,
+        Func<Document, bool>? omittedGeneratedDocumentIsSafe)
     {
         ArgumentNullException.ThrowIfNull(rawSolution);
         ArgumentNullException.ThrowIfNull(sanitized);
-        if (string.IsNullOrWhiteSpace(projectFilePath)) return false;
+        if (string.IsNullOrWhiteSpace(projectFilePath))
+        {
+            return ProjectSemanticInputState.Unsafe;
+        }
 
         string normalizedProjectPath;
         try
@@ -261,7 +348,7 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                 or PathTooLongException
                 or System.Security.SecurityException)
         {
-            return false;
+            return ProjectSemanticInputState.Unsafe;
         }
 
         var rawMatches = rawSolution.Projects
@@ -269,8 +356,12 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                 project.Language == LanguageNames.CSharp
                 && ProjectPathMatches(project.FilePath, normalizedProjectPath))
             .ToArray();
-        if (rawMatches.Length == 0) return false;
+        if (rawMatches.Length == 0)
+        {
+            return ProjectSemanticInputState.Unsafe;
+        }
 
+        var result = ProjectSemanticInputState.Complete;
         var pending = new Stack<Project>(rawMatches);
         var visited = new HashSet<ProjectId>();
         while (pending.Count > 0)
@@ -284,10 +375,25 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                     && (!analyzerReferenceLoadCompleteByProject.TryGetValue(
                             rawProject.Id,
                             out var analyzerReferencesComplete)
-                        || !analyzerReferencesComplete))
-                || rawProject.Documents.Any(document =>
-                    safeProject.GetDocument(document.Id) is null)
-                || rawProject.AdditionalDocuments.Any(document =>
+                        || !analyzerReferencesComplete)))
+            {
+                return ProjectSemanticInputState.Unsafe;
+            }
+
+            foreach (var document in rawProject.Documents)
+            {
+                if (safeProject.GetDocument(document.Id) is not null)
+                {
+                    continue;
+                }
+                if (omittedGeneratedDocumentIsSafe?.Invoke(document) != true)
+                {
+                    return ProjectSemanticInputState.Unsafe;
+                }
+                result = ProjectSemanticInputState.PositiveResolutionSafe;
+            }
+
+            if (rawProject.AdditionalDocuments.Any(document =>
                     safeProject.GetAdditionalDocument(document.Id) is null)
                 || rawProject.AnalyzerConfigDocuments.Any(document =>
                     safeProject.GetAnalyzerConfigDocument(document.Id) is null)
@@ -296,18 +402,21 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                     || !safeProject.ProjectReferences.Any(candidate =>
                         candidate.ProjectId == reference.ProjectId)))
             {
-                return false;
+                return ProjectSemanticInputState.Unsafe;
             }
 
             foreach (var reference in rawProject.ProjectReferences)
             {
                 var referencedProject = rawSolution.GetProject(reference.ProjectId);
-                if (referencedProject is null) return false;
+                if (referencedProject is null)
+                {
+                    return ProjectSemanticInputState.Unsafe;
+                }
                 pending.Push(referencedProject);
             }
         }
 
-        return true;
+        return result;
 
         static bool ProjectPathMatches(string? candidatePath, string expectedPath)
         {
@@ -328,6 +437,32 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                 return false;
             }
         }
+    }
+
+    [SuppressMessage(
+        "ReflectionAnalysis",
+        "IL2075:UnrecognizedReflectionPattern",
+        Justification = "The pinned Roslyn workspace does not publicly expose DocumentInfo.IsGenerated from Document; missing or changed internals fail closed.")]
+    private static bool IsBuildGeneratedDocument(Document document)
+    {
+        try
+        {
+            var state = _documentStateProperty?.GetValue(document);
+            return state is not null
+                   && _documentStateIsGeneratedProperty?.GetValue(state)
+                       is true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private enum ProjectSemanticInputState
+    {
+        Unsafe,
+        PositiveResolutionSafe,
+        Complete,
     }
 
     public async Task OpenAsync(string solutionPath, CancellationToken ct = default)

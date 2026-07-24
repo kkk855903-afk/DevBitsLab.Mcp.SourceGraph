@@ -516,13 +516,93 @@ public sealed class XamlBindingOutcomeTests
                 """,
             ],
             xaml,
-            semanticInputComplete: false);
+            semanticInputComplete: false,
+            semanticPositiveResolutionSafe: true);
 
         AnnotationFor(events, "Hidden", "xaml-binding-outcome")
             .FullName.Should().Be("incomplete");
         events.OfType<IndexEvent.EdgeEmitted>().Should().NotContain(edge =>
             edge.SourceCanonicalKey.EndsWith("#Hidden", StringComparison.Ordinal)
             && edge.EdgeKindName == "binds-path");
+    }
+
+    [Fact]
+    public async Task BuildGeneratedOmissionCanResolveDirectMemberButNotMissingMember()
+    {
+        var xaml = $$"""
+            <Window xmlns="{{PresentationNamespace}}"
+                    xmlns:x="{{XamlNamespace}}"
+                    xmlns:vm="clr-namespace:Test"
+                    x:DataType="vm:Vm">
+                <TextBlock x:Name="Direct" Text="{Binding Existing}" />
+                <TextBlock x:Name="Absent" Text="{Binding Missing}" />
+            </Window>
+            """;
+        var events = await IndexMultiTargetAsync(
+            [
+                """
+                namespace Test
+                {
+                    public sealed partial class Vm
+                    {
+                        public string Existing { get; } = "";
+                    }
+                }
+                """,
+            ],
+            xaml,
+            semanticInputComplete: false,
+            semanticPositiveResolutionSafe: true);
+
+        events.OfType<IndexEvent.EdgeEmitted>().Should().ContainSingle(edge =>
+            edge.SourceCanonicalKey.EndsWith("#Direct", StringComparison.Ordinal)
+            && edge.EdgeKindName == "binds-path"
+            && edge.TargetCanonicalKey == CanonicalKeys.ForProperty(
+                "Test.Vm",
+                "Existing"));
+        AnnotationFor(events, "Absent", "xaml-binding-outcome")
+            .FullName.Should().Be("incomplete");
+        events.OfType<IndexEvent.AnnotationAttached>().Should().NotContain(
+            annotation =>
+                annotation.SymbolCanonicalKey.EndsWith(
+                    "#Absent",
+                    StringComparison.Ordinal)
+                && annotation.Flavor == "xaml-binding-finding");
+    }
+
+    [Fact]
+    public async Task BuildGeneratedOmissionDoesNotAuthorizeEventHandlerInference()
+    {
+        var xaml = $$"""
+            <Window xmlns="{{PresentationNamespace}}"
+                    xmlns:x="{{XamlNamespace}}"
+                    x:Class="Test.View">
+                <Button x:Name="UnsafeEvent" Click="OnClick" />
+            </Window>
+            """;
+        var events = await IndexMultiTargetAsync(
+            [
+                """
+                namespace Test
+                {
+                    public partial class View
+                    {
+                        private void OnClick(
+                            object sender,
+                            System.EventArgs args) { }
+                    }
+                }
+                """,
+            ],
+            xaml,
+            semanticInputComplete: false,
+            semanticPositiveResolutionSafe: true);
+
+        events.OfType<IndexEvent.EdgeEmitted>().Should().NotContain(edge =>
+            edge.SourceCanonicalKey.EndsWith(
+                "#UnsafeEvent",
+                StringComparison.Ordinal)
+            && edge.EdgeKindName == "handles-event");
     }
 
     [Fact]
@@ -894,7 +974,8 @@ public sealed class XamlBindingOutcomeTests
     private static async Task<IReadOnlyList<IndexEvent>> IndexMultiTargetAsync(
         IReadOnlyList<string> targetSources,
         string xaml,
-        bool? semanticInputComplete)
+        bool? semanticInputComplete,
+        bool? semanticPositiveResolutionSafe = null)
     {
         var root = Path.Combine(
             Path.GetTempPath(),
@@ -936,7 +1017,8 @@ public sealed class XamlBindingOutcomeTests
             var factory = semanticInputComplete is { } isComplete
                 ? new XamlLanguageProjectFactory(
                     () => solution,
-                    _ => isComplete)
+                    _ => isComplete,
+                    _ => semanticPositiveResolutionSafe ?? isComplete)
                 : new XamlLanguageProjectFactory(() => solution);
             var projects = await factory.DiscoverAsync(root, default);
             var xamlProject = projects.Should()

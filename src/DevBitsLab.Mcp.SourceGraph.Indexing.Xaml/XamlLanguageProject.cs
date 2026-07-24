@@ -38,6 +38,7 @@ public sealed class XamlLanguageProject : IDeclarationFirstLanguageProject
     private readonly Func<XamlResourceSnapshot>? _resourceSnapshotBuilder;
     private readonly Func<IReadOnlyList<Project>>? _roslynProjectsProvider;
     private readonly Func<bool>? _semanticInputCompleteProvider;
+    private readonly Func<bool>? _semanticPositiveResolutionSafeProvider;
 
     public XamlLanguageProject(
         string projectFilePath,
@@ -100,7 +101,8 @@ public sealed class XamlLanguageProject : IDeclarationFirstLanguageProject
                         ? Array.Empty<Project>()
                         : new[] { project };
                 },
-            semanticInputCompleteProvider: null)
+            semanticInputCompleteProvider: null,
+            semanticPositiveResolutionSafeProvider: null)
     {
     }
 
@@ -110,7 +112,8 @@ public sealed class XamlLanguageProject : IDeclarationFirstLanguageProject
         XamlResourceSnapshot resourceSnapshot,
         Func<XamlResourceSnapshot>? resourceSnapshotBuilder,
         Func<IReadOnlyList<Project>>? roslynProjectsProvider,
-        Func<bool>? semanticInputCompleteProvider)
+        Func<bool>? semanticInputCompleteProvider,
+        Func<bool>? semanticPositiveResolutionSafeProvider)
     {
         Id = projectFilePath;
         FilePaths = xamlFilePaths;
@@ -118,6 +121,8 @@ public sealed class XamlLanguageProject : IDeclarationFirstLanguageProject
         _resourceSnapshotBuilder = resourceSnapshotBuilder;
         _roslynProjectsProvider = roslynProjectsProvider;
         _semanticInputCompleteProvider = semanticInputCompleteProvider;
+        _semanticPositiveResolutionSafeProvider =
+            semanticPositiveResolutionSafeProvider;
     }
 
     /// <inheritdoc />
@@ -244,11 +249,16 @@ public sealed class XamlLanguageProject : IDeclarationFirstLanguageProject
     {
         IReadOnlyList<Project>? projects;
         bool semanticInputComplete;
+        bool semanticPositiveResolutionSafe;
         try
         {
             projects = _roslynProjectsProvider?.Invoke();
             semanticInputComplete =
                 _semanticInputCompleteProvider?.Invoke() ?? true;
+            semanticPositiveResolutionSafe =
+                semanticInputComplete
+                || (_semanticPositiveResolutionSafeProvider?.Invoke()
+                    ?? semanticInputComplete);
         }
         catch
         {
@@ -345,7 +355,10 @@ public sealed class XamlLanguageProject : IDeclarationFirstLanguageProject
         return new XamlCompilationState(
             selected.Compilation,
             semanticInputComplete && selected.IsComplete,
-            semanticInputComplete && selected.CanResolve);
+            semanticPositiveResolutionSafe && selected.CanResolve,
+            DirectBindingMembersOnly:
+                !semanticInputComplete
+                && semanticPositiveResolutionSafe);
     }
 
     private static bool HasWpfEvidence(Compilation compilation) =>
@@ -519,7 +532,8 @@ public sealed class XamlLanguageProject : IDeclarationFirstLanguageProject
 internal sealed record XamlCompilationState(
     Compilation Compilation,
     bool IsComplete,
-    bool CanResolve);
+    bool CanResolve,
+    bool DirectBindingMembersOnly);
 
 internal sealed record XamlCompilationCandidate(
     Compilation Compilation,

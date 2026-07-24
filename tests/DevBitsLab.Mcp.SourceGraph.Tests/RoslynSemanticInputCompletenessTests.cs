@@ -1,3 +1,4 @@
+using DevBitsLab.Mcp.SourceGraph.Core;
 using DevBitsLab.Mcp.SourceGraph.Indexing;
 using DevBitsLab.Mcp.SourceGraph.Storage;
 using FluentAssertions;
@@ -54,6 +55,86 @@ public sealed class RoslynSemanticInputCompletenessTests
                     projectPath)
                 .Should().BeFalse(
                     "an attacker-controlled .g.cs name and obj path cannot prove provenance");
+            RoslynIndexer.IsProjectXamlPositiveResolutionSafe(
+                    raw,
+                    raw.RemoveDocument(spoofedSourceId),
+                    projectPath,
+                    new ScopePathPolicy(root))
+                .Should().BeFalse(
+                    "a path and generated-looking name are not build provenance");
+        }
+        finally
+        {
+            try
+            {
+                Directory.Delete(root, recursive: true);
+            }
+            catch
+            {
+                // Best-effort cleanup; assertion failures remain the useful signal.
+            }
+        }
+    }
+
+    [Fact]
+    public void BuildGeneratedSourceUnderObjOnlyAllowsPositiveXamlResolution()
+    {
+        var root = Path.Combine(
+            Path.GetTempPath(),
+            "sourcegraph-semantic-build-generated-" + Guid.NewGuid().ToString("N"));
+        var projectDirectory = Path.Combine(root, "App");
+        Directory.CreateDirectory(projectDirectory);
+        try
+        {
+            using var workspace = new AdhocWorkspace();
+            var projectPath = Path.Combine(projectDirectory, "App.csproj");
+            var projectId = ProjectId.CreateNewId();
+            var generatedId = DocumentId.CreateNewId(projectId);
+            var generatedPath = Path.Combine(
+                projectDirectory,
+                "obj",
+                "Debug",
+                "net10.0-windows",
+                "MainWindow.g.cs");
+            var raw = workspace.CurrentSolution
+                .AddProject(ProjectInfo.Create(
+                    projectId,
+                    VersionStamp.Create(),
+                    "App",
+                    "App",
+                    LanguageNames.CSharp,
+                    filePath: projectPath))
+                .AddDocument(
+                    DocumentId.CreateNewId(projectId),
+                    "App.cs",
+                    "internal sealed class AppAnchor { }",
+                    filePath: Path.Combine(projectDirectory, "App.cs"))
+                .AddDocument(DocumentInfo.Create(
+                    generatedId,
+                    "MainWindow.g.cs",
+                    sourceCodeKind: SourceCodeKind.Regular,
+                    loader: TextLoader.From(TextAndVersion.Create(
+                        SourceText.From(
+                            "internal partial class MainWindow { }"),
+                        VersionStamp.Create(),
+                        generatedPath)),
+                    filePath: generatedPath,
+                    isGenerated: true));
+            var sanitized = raw.RemoveDocument(generatedId);
+
+            RoslynIndexer.IsProjectSemanticInputComplete(
+                    raw,
+                    sanitized,
+                    projectPath)
+                .Should().BeFalse(
+                    "a build side effect is still absent from the authoritative compilation");
+            RoslynIndexer.IsProjectXamlPositiveResolutionSafe(
+                    raw,
+                    sanitized,
+                    projectPath,
+                    new ScopePathPolicy(root))
+                .Should().BeTrue(
+                    "Roslyn build provenance permits only direct positive XAML facts");
         }
         finally
         {

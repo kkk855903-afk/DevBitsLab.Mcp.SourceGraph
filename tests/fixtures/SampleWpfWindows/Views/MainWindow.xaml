@@ -19,5 +19,7 @@
                 Content="Run" />
         <TextBlock Margin="0,16,0,0"
                    Text="{Binding Status}" />
+        <TextBlock x:Name="MissingBinding"
+                   Text="{Binding DoesNotExist}" />
     </StackPanel>
 </Window>

@@ -649,7 +649,8 @@ static async Task<int> RunIndexAsync(CommandLine cli)
         projectFactoryRegistry.Register(
             new DevBitsLab.Mcp.SourceGraph.Indexing.Xaml.XamlLanguageProjectFactory(
                 () => indexer.SanitizedSolution,
-                indexer.IsProjectSemanticInputComplete));
+                indexer.IsProjectSemanticInputComplete,
+                indexer.IsProjectXamlPositiveResolutionSafe));
         foreach (var record in pluginHost.Plugins.Where(p => p.Status == PluginStatus.Loaded))
         {
             foreach (var lpf in record.LanguageProjectFactories) projectFactoryRegistry.Register(lpf, record);

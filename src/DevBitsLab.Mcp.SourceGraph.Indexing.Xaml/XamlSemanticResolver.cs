@@ -19,6 +19,7 @@ internal sealed class XamlSemanticResolver
     private readonly Compilation _compilation;
     private readonly bool _compilationIsComplete;
     private readonly bool _semanticResolutionIsSafe;
+    private readonly bool _directBindingMembersOnly;
     private readonly Dictionary<XamlElement, XamlBindingContextResolution> _bindingContexts = new();
     private readonly Dictionary<XamlElement, IReadOnlyList<XamlViewModelAssociation>>
         _viewModelAssociations = new();
@@ -27,11 +28,13 @@ internal sealed class XamlSemanticResolver
         Compilation compilation,
         bool compilationIsComplete,
         bool semanticResolutionIsSafe,
+        bool directBindingMembersOnly,
         XamlDocument document)
     {
         _compilation = compilation;
         _compilationIsComplete = compilationIsComplete;
         _semanticResolutionIsSafe = semanticResolutionIsSafe;
+        _directBindingMembersOnly = directBindingMembersOnly;
         BuildBindingContexts(
             document.Root,
             XamlBindingContextResolution.Unknown("no-known-data-context"));
@@ -52,6 +55,7 @@ internal sealed class XamlSemanticResolver
                 compilationState.Compilation,
                 compilationState.IsComplete,
                 compilationState.CanResolve,
+                compilationState.DirectBindingMembersOnly,
                 document);
     }
 
@@ -88,7 +92,10 @@ internal sealed class XamlSemanticResolver
         }
 
         var context = contextResolution.Context;
-        var propertyResolution = ResolvePropertyPath(context.Type, path);
+        var propertyResolution = ResolvePropertyPath(
+            context.Type,
+            path,
+            _directBindingMembersOnly);
         if (propertyResolution.Property is null)
         {
             if (propertyResolution.Outcome.Status == XamlResolutionStatus.Missing
@@ -143,7 +150,10 @@ internal sealed class XamlSemanticResolver
 
     public IMethodSymbol? ResolveEventHandler(string? xClass, string handlerName)
     {
-        if (!_semanticResolutionIsSafe) return null;
+        if (!_semanticResolutionIsSafe || _directBindingMembersOnly)
+        {
+            return null;
+        }
         if (string.IsNullOrWhiteSpace(xClass) || string.IsNullOrWhiteSpace(handlerName))
         {
             return null;
@@ -340,7 +350,10 @@ internal sealed class XamlSemanticResolver
             return inherited;
         }
 
-        var property = ResolvePropertyPath(inherited.Context.Type, path);
+        var property = ResolvePropertyPath(
+            inherited.Context.Type,
+            path,
+            _directBindingMembersOnly);
         if (property.Property is null)
         {
             var outcome = property.Outcome.Status == XamlResolutionStatus.Missing
@@ -590,7 +603,8 @@ internal sealed class XamlSemanticResolver
 
     private XamlPropertyResolution ResolvePropertyPath(
         INamedTypeSymbol rootType,
-        string path)
+        string path,
+        bool directMembersOnly)
     {
         var segments = path.Split('.');
 
@@ -599,7 +613,10 @@ internal sealed class XamlSemanticResolver
         foreach (var rawSegment in segments)
         {
             var segment = rawSegment.Trim();
-            resolution = FindProperty(currentType, segment);
+            resolution = FindProperty(
+                currentType,
+                segment,
+                directMembersOnly);
             if (resolution.Property is null) return resolution;
             currentType = resolution.Property.Type;
         }
@@ -610,7 +627,10 @@ internal sealed class XamlSemanticResolver
                 "binding-path-is-empty");
     }
 
-    private static XamlPropertyResolution FindProperty(ITypeSymbol type, string name)
+    private static XamlPropertyResolution FindProperty(
+        ITypeSymbol type,
+        string name,
+        bool directMembersOnly)
     {
         var current = AsNamedType(type);
         if (current is null)
@@ -629,6 +649,10 @@ internal sealed class XamlSemanticResolver
             if (matches.Length == 1)
             {
                 return XamlPropertyResolution.Resolved(matches[0]);
+            }
+            if (directMembersOnly)
+            {
+                break;
             }
 
             if (current.TypeKind == TypeKind.Interface)

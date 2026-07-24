@@ -33,6 +33,8 @@ public sealed class XamlLanguageProjectFactory : IExclusionAwareLanguageProjectF
 {
     private readonly Func<Solution?>? _solutionProvider;
     private readonly Func<string, bool>? _semanticInputCompleteProvider;
+    private readonly Func<string, bool>?
+        _semanticPositiveResolutionSafeProvider;
     private readonly Action<XamlDiscoveryAccess, string>? _beforeAccess;
 
     public XamlLanguageProjectFactory()
@@ -50,6 +52,7 @@ public sealed class XamlLanguageProjectFactory : IExclusionAwareLanguageProjectF
         _solutionProvider = solutionProvider
             ?? throw new ArgumentNullException(nameof(solutionProvider));
         _semanticInputCompleteProvider = _ => false;
+        _semanticPositiveResolutionSafeProvider = _ => false;
     }
 
     /// <summary>
@@ -63,6 +66,25 @@ public sealed class XamlLanguageProjectFactory : IExclusionAwareLanguageProjectF
     {
         _semanticInputCompleteProvider = semanticInputCompleteProvider
             ?? throw new ArgumentNullException(nameof(semanticInputCompleteProvider));
+        _semanticPositiveResolutionSafeProvider =
+            semanticInputCompleteProvider;
+    }
+
+    /// <summary>
+    /// Creates a Roslyn-backed factory with separate probes for authoritative completeness and
+    /// positive-only binding safety. The latter may admit build-generated omissions, but never
+    /// authorizes missing-member findings or inherited-member binding edges.
+    /// </summary>
+    public XamlLanguageProjectFactory(
+        Func<Solution?> solutionProvider,
+        Func<string, bool> semanticInputCompleteProvider,
+        Func<string, bool> semanticPositiveResolutionSafeProvider)
+        : this(solutionProvider, semanticInputCompleteProvider)
+    {
+        _semanticPositiveResolutionSafeProvider =
+            semanticPositiveResolutionSafeProvider
+            ?? throw new ArgumentNullException(
+                nameof(semanticPositiveResolutionSafeProvider));
     }
 
     internal XamlLanguageProjectFactory(
@@ -216,6 +238,13 @@ public sealed class XamlLanguageProjectFactory : IExclusionAwareLanguageProjectF
         Func<bool>? semanticInputCompleteProvider = _solutionProvider is null
             ? null
             : () => _semanticInputCompleteProvider?.Invoke(fullProjectPath) ?? false;
+        Func<bool>? semanticPositiveResolutionSafeProvider =
+            _solutionProvider is null
+                ? null
+                : () =>
+                    _semanticPositiveResolutionSafeProvider?.Invoke(
+                        fullProjectPath)
+                    ?? false;
         return new XamlLanguageProject(
             fullProjectPath,
             xamlFiles,
@@ -225,7 +254,8 @@ public sealed class XamlLanguageProjectFactory : IExclusionAwareLanguageProjectF
                 pathPolicy,
                 CancellationToken.None),
             roslynProjectsProvider,
-            semanticInputCompleteProvider);
+            semanticInputCompleteProvider,
+            semanticPositiveResolutionSafeProvider);
     }
 
     private static IReadOnlyList<Project> FindRoslynProjects(

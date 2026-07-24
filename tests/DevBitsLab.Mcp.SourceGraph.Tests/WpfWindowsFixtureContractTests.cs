@@ -67,7 +67,7 @@ public sealed class WpfWindowsFixtureContractTests
     }
 
     [SkippableFact]
-    public async Task RealWpfBindingResolvesOnlyWithExplicitlyCompleteSemanticInputs()
+    public async Task RealWpfProductionIndexResolvesPositiveBindingsWithoutTrustingObj()
     {
         Skip.IfNot(
             OperatingSystem.IsWindows(),
@@ -112,14 +112,18 @@ public sealed class WpfWindowsFixtureContractTests
             filteredGeneratedSources.Should().Contain("MainWindow.g.cs");
             roslyn.IsProjectSemanticInputComplete(projectPath).Should().BeFalse(
                 "privacy-filtered WPF generated sources are part of the raw compiler input");
+            roslyn.IsProjectXamlPositiveResolutionSafe(projectPath)
+                .Should().BeTrue(
+                    "Roslyn build provenance permits direct positive facts without making absence authoritative");
 
             await DispatchXamlAsync(
                 store,
                 fixtureRoot,
-                "real-wpf-analysis-only",
+                "real-wpf-production",
                 new XamlLanguageProjectFactory(
                     () => roslyn.SanitizedSolution,
-                    _ => true));
+                    roslyn.IsProjectSemanticInputComplete,
+                    roslyn.IsProjectXamlPositiveResolutionSafe));
 
             var textBox = (await store.FindSymbolsAsync("QueryTextBox"))
                 .Single(symbol => symbol.Kind == "xaml-element");
@@ -133,30 +137,39 @@ public sealed class WpfWindowsFixtureContractTests
                     "SampleWpfWindows.ViewModels.MainViewModel",
                     "QueryText"));
 
-            await DispatchXamlAsync(
-                store,
-                fixtureRoot,
-                "real-wpf-production",
-                new XamlLanguageProjectFactory(
-                    () => roslyn.SanitizedSolution,
-                    roslyn.IsProjectSemanticInputComplete));
-
-            textBox = (await store.FindSymbolsAsync("QueryTextBox"))
+            var runButton = (await store.FindSymbolsAsync("RunButton"))
                 .Single(symbol => symbol.Kind == "xaml-element");
             (await store.ListCalleesAsync(
-                    textBox.Id,
+                    runButton.Id,
+                    limit: 10,
+                    edgeKind: "binds-path"))
+                .Should().ContainSingle(target =>
+                    target.CanonicalKey == CanonicalKeys.ForProperty(
+                        "SampleWpfWindows.ViewModels.MainViewModel",
+                        "RunCommand"));
+            (await store.ListCalleesAsync(
+                    runButton.Id,
+                    limit: 10,
+                    edgeKind: "handles-event"))
+                .Should().BeEmpty(
+                    "positive-only safety does not authorize event-handler inference");
+
+            var missing = (await store.FindSymbolsAsync("MissingBinding"))
+                .Single(symbol => symbol.Kind == "xaml-element");
+            (await store.ListCalleesAsync(
+                    missing.Id,
                     limit: 10,
                     edgeKind: "binds-path"))
                 .Should().BeEmpty(
-                    "production analysis must not retain or emit a resolved edge from incomplete inputs");
-            var outcome = (await store.GetAnnotationsForSymbolAsync(textBox.Id))
+                    "an omitted build output never authorizes a negative binding claim");
+            var outcome = (await store.GetAnnotationsForSymbolAsync(missing.Id))
                 .Should().ContainSingle(annotation =>
                     annotation.Flavor == "xaml-binding-outcome"
                     && annotation.FullName == "incomplete")
                 .Subject;
             using var outcomeJson = JsonDocument.Parse(outcome.ArgsJson!);
             outcomeJson.RootElement.GetProperty("reason").GetString()
-                .Should().Be("semantic-input-incomplete");
+                .Should().Be("compilation-has-errors");
         }
         finally
         {
