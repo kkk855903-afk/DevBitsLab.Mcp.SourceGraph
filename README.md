@@ -942,6 +942,7 @@ Common flags:
 
 | Flag | Effect |
 |---|---|
+| `--lang <en\|zh>` | Select English (`en`, default) or Simplified Chinese (`zh`) for `--help`. It must be used together with `-h`/`--help`; both `--help --lang zh` and `--lang zh --help` are accepted. |
 | `--solution <path>`, `-s` | Path to a `.sln` / `.slnx`. |
 | `--db <path>` | Override the database path for the **one-shot** commands (`index`, `stats`, `clear`). Ignored by `serve`, which always uses the per-scope layout under `<root>/.sourcegraph/scopes/<id>.db`. |
 | `--root <path>` | Repository root used for `.sourcegraph.json` discovery and scope databases. Defaults to the directory holding `--solution`, then CWD. |

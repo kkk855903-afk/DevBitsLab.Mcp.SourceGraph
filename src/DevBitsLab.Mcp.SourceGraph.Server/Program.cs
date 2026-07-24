@@ -42,7 +42,7 @@ catch (ArgumentException ex)
 
 if (cli.ShowHelp)
 {
-    Console.WriteLine(CommandLine.HelpText);
+    Console.WriteLine(cli.SelectedHelpText);
     return 0;
 }
 

@@ -21,6 +21,11 @@ below note which package the change applies to.
   before. Leaf glyph unchanged on every surface.
 
 ### Added
+- **Bilingual CLI help.** `sourcegraph-mcp --help` remains English by default;
+  pass `--lang zh` before or after `-h`/`--help` for Simplified Chinese, or
+  `--lang en` to select English explicitly. Invalid and help-less language
+  selections fail with exit code 2 instead of silently changing command
+  execution.
 - **`--no-tool-triggers` / `SOURCEGRAPH_NO_TOOL_TRIGGERS=1`.** Suppresses the
   `Use when: …` append on every tool description in `tools/list`. Useful when
   driving tool-selection guidance from your own `CLAUDE.md` instead. Gates at

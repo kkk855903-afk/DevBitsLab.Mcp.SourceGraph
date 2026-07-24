@@ -88,6 +88,14 @@ if (-not $help.Contains(
     throw 'Installed tool help did not contain its command name.'
 }
 
+$chineseHelp = (& $appHost.FullName --help --lang zh 2>&1 | Out-String)
+if ($LASTEXITCODE -ne 0) {
+    throw "Installed tool Chinese --help failed with exit code $LASTEXITCODE.`n$chineseHelp"
+}
+if (-not $chineseHelp.Contains('用法:', [StringComparison]::Ordinal)) {
+    throw 'Installed tool Chinese help did not contain its localized usage heading.'
+}
+
 $protocName = if ($IsWindows) {
     'protoc.exe'
 }

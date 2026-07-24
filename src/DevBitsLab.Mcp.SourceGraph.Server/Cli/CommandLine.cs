@@ -1,5 +1,11 @@
 namespace DevBitsLab.Mcp.SourceGraph.Server.Cli;
 
+internal enum CliHelpLanguage
+{
+    English,
+    Chinese,
+}
+
 internal sealed class CommandLine
 {
     public string Subcommand { get; private init; } = "serve";
@@ -7,6 +13,7 @@ internal sealed class CommandLine
     public string? DatabasePath { get; private init; }
     public string? RepoRoot { get; private init; }
     public bool ShowHelp { get; private init; }
+    public CliHelpLanguage HelpLanguage { get; private init; } = CliHelpLanguage.English;
     /// <summary>Override the default embedding model identity (Hugging Face-style id).</summary>
     public string? Model { get; private init; }
     /// <summary>Disable the embedding pipeline (no model download, no vec0 writes, semantic_search returns disabled-message).</summary>
@@ -82,7 +89,43 @@ internal sealed class CommandLine
                 NoModelDownload = forceNoModelDownload || !allowModelDownload,
             };
         }
-        if (args[0] is "-h" or "--help") return new CommandLine { ShowHelp = true };
+        if (args[0] == "--lang")
+        {
+            var i = 0;
+            var language = RequireHelpLanguage(args, ref i);
+            if (i + 1 < args.Length && args[i + 1] == "--lang")
+            {
+                throw new ArgumentException("--lang may only be specified once.");
+            }
+            if (++i >= args.Length || args[i] is not ("-h" or "--help"))
+            {
+                throw new ArgumentException("--lang can only be used together with --help.");
+            }
+
+            return new CommandLine
+            {
+                ShowHelp = true,
+                HelpLanguage = ParseHelpLanguageAfterHelp(
+                    args,
+                    helpIndex: i,
+                    language: language,
+                    alreadySpecified: true),
+                NoModelDownload = forceNoModelDownload || !allowModelDownload,
+            };
+        }
+        if (args[0] is "-h" or "--help")
+        {
+            return new CommandLine
+            {
+                ShowHelp = true,
+                HelpLanguage = ParseHelpLanguageAfterHelp(
+                    args,
+                    helpIndex: 0,
+                    language: CliHelpLanguage.English,
+                    alreadySpecified: false),
+                NoModelDownload = forceNoModelDownload || !allowModelDownload,
+            };
+        }
 
         var subcommand = args[0];
         string? solution = null;
@@ -115,6 +158,8 @@ internal sealed class CommandLine
         var solutions = new List<string>();
         var json = false;
         var noColor = false;
+        var helpLanguage = CliHelpLanguage.English;
+        var sawHelpLanguage = false;
 
         for (var i = 1; i < args.Length; i++)
         {
@@ -122,7 +167,25 @@ internal sealed class CommandLine
             switch (a)
             {
                 case "-h" or "--help":
-                    return new CommandLine { Subcommand = subcommand, ShowHelp = true };
+                    return new CommandLine
+                    {
+                        Subcommand = subcommand,
+                        ShowHelp = true,
+                        HelpLanguage = ParseHelpLanguageAfterHelp(
+                            args,
+                            i,
+                            helpLanguage,
+                            sawHelpLanguage),
+                        NoModelDownload = noModelDownload,
+                    };
+                case "--lang":
+                    if (sawHelpLanguage)
+                    {
+                        throw new ArgumentException("--lang may only be specified once.");
+                    }
+                    helpLanguage = RequireHelpLanguage(args, ref i);
+                    sawHelpLanguage = true;
+                    break;
                 case "--solution" or "-s":
                     solution = ExpandTokens(RequireArg(args, ref i, a));
                     solutions.Add(solution);
@@ -232,6 +295,10 @@ internal sealed class CommandLine
         if (solution is not null) AssertExpanded(solution, "--solution");
         if (db is not null) AssertExpanded(db, "--db");
         if (root is not null) AssertExpanded(root, "--root");
+        if (sawHelpLanguage)
+        {
+            throw new ArgumentException("--lang can only be used together with --help.");
+        }
         if (sawAllowModelDownload && sawNoModelDownload)
         {
             throw new ArgumentException(
@@ -284,6 +351,47 @@ internal sealed class CommandLine
         return args[i];
     }
 
+    private static CliHelpLanguage RequireHelpLanguage(string[] args, ref int i)
+    {
+        if (++i >= args.Length || args[i].StartsWith("-", StringComparison.Ordinal))
+        {
+            throw new ArgumentException("--lang requires a value: en or zh.");
+        }
+
+        var value = args[i];
+        return value.ToLowerInvariant() switch
+        {
+            "en" => CliHelpLanguage.English,
+            "zh" => CliHelpLanguage.Chinese,
+            _ => throw new ArgumentException(
+                $"Unsupported help language '{value}'. Expected en or zh."),
+        };
+    }
+
+    private static CliHelpLanguage ParseHelpLanguageAfterHelp(
+        string[] args,
+        int helpIndex,
+        CliHelpLanguage language,
+        bool alreadySpecified)
+    {
+        var languageFlagIndex = helpIndex + 1;
+        if (languageFlagIndex >= args.Length || args[languageFlagIndex] != "--lang")
+        {
+            return language;
+        }
+        if (alreadySpecified)
+        {
+            throw new ArgumentException("--lang may only be specified once.");
+        }
+
+        language = RequireHelpLanguage(args, ref languageFlagIndex);
+        if (languageFlagIndex + 1 < args.Length && args[languageFlagIndex + 1] == "--lang")
+        {
+            throw new ArgumentException("--lang may only be specified once.");
+        }
+        return language;
+    }
+
     private static int RequirePositiveInt(string[] args, ref int i, string flag)
     {
         var raw = RequireArg(args, ref i, flag);
@@ -329,10 +437,18 @@ internal sealed class CommandLine
         }
     }
 
+    public string SelectedHelpText => GetHelpText(HelpLanguage);
+
+    public static string GetHelpText(CliHelpLanguage language) =>
+        language == CliHelpLanguage.Chinese ? ChineseHelpText : HelpText;
+
     public static string HelpText => """
         sourcegraph-mcp — live code source graph MCP server for .NET
 
         Usage:
+          sourcegraph-mcp --help [--lang <en|zh>]
+              Print this help in English (`en`) or Simplified Chinese (`zh`).
+
           sourcegraph-mcp serve [--solution <path>] [--db <path>] [--root <repo>] [--model <id>] [--no-embeddings] [--allow-model-download|--no-model-download] [--no-history]
               Run the MCP stdio server. With --solution given, registers an implicit single-scope
               `default` mapped to that solution. Otherwise reads `.sourcegraph.json` from --root
@@ -415,6 +531,7 @@ internal sealed class CommandLine
               note and exits 0.
 
         Common flags:
+          --lang <en|zh>    Select the language used by --help. Must be used together with --help.
           --root <path>     Repository root used for `.sourcegraph.json` discovery and scope DBs.
                             Defaults to the directory holding `--solution`, then CWD.
           --model <id>      Override the embedding model identity (default:
@@ -458,6 +575,139 @@ internal sealed class CommandLine
           --db   ./.sourcegraph/scopes/default.db   (created if missing; legacy graph.db is migrated)
 
         Examples:
+          sourcegraph-mcp index ./MySln.sln
+          sourcegraph-mcp serve --solution ./MySln.sln
+          sourcegraph-mcp serve --root ./repo
+          sourcegraph-mcp init-scopes
+          sourcegraph-mcp scopes add backend --solution ./backend.slnx
+        """;
+
+    public static string ChineseHelpText => """
+        sourcegraph-mcp — .NET 实时代码源图 MCP 服务器
+
+        用法:
+          sourcegraph-mcp --help [--lang <en|zh>]
+              使用英文 (`en`) 或简体中文 (`zh`) 显示本帮助。
+
+          sourcegraph-mcp serve [--solution <path>] [--db <path>] [--root <repo>] [--model <id>] [--no-embeddings] [--allow-model-download|--no-model-download] [--no-history]
+              运行 MCP stdio 服务器。指定 --solution 时，将创建映射到该解决方案的隐式
+              `default` 单作用域；否则从 --root（或当前工作目录）读取 `.sourcegraph.json`
+              多作用域配置。
+
+          sourcegraph-mcp index <solution-path> [--scope <id>] [--db <path>] [--model <id>] [--no-embeddings] [--allow-model-download|--no-model-download] [--no-history]
+              构建或刷新指定 .sln/.slnx 的图数据库，然后退出。当多个已配置作用域包含
+              该解决方案时，必须指定 --scope。
+
+          sourcegraph-mcp stats [--db <path>]
+              输出数据库中的文件、符号、引用和边数量。
+
+          sourcegraph-mcp clear [--db <path>]
+              删除数据库中的所有数据行，但保留架构。
+
+          sourcegraph-mcp init [--yes] [--client <id>] [--no-<client>] [--user-<client>]
+                                [--claude-desktop] [--solution <path>] [--install-mode <mode>]
+                                [--print-only] [--force] [--prewarm | --no-prewarm]
+                                [--no-embeddings] [--no-history] [--root <path>]
+              运行交互式（默认）或参数驱动的初始化流程。检测环境、选择 MCP 客户端、
+              写入客户端配置文件（默认写入项目级配置），并可预热索引。首选客户端包括
+              claude-code、copilot、cursor、continue 和 claude-desktop。使用
+              --print-only 可仅预览配置而不写入文件，适用于 CI。
+
+          sourcegraph-mcp doctor [--root <path>] [--json]
+              执行只读环境诊断，检查 SDK、git、解决方案、配置和各客户端状态。
+              退出码 0 表示全部通过，2 表示至少一项警告，1 表示硬错误。
+              --json 输出机器可读的 {checks, exit_code} 文档。
+
+          sourcegraph-mcp demo [--scope <id>] [--root <path>] [--no-color]
+              对当前作用域数据库执行四项示例操作：ping、graph_stats、search_symbols
+              和 find_definition，并输出 MCP 客户端可看到的叶标记 Markdown，
+              用于快速确认安装和索引是否可用。
+
+          sourcegraph-mcp init-scopes [--root <path>]
+              在 <root>（默认为当前工作目录）中发现 .slnx 或 .sln，并生成
+              `.sourcegraph.json`，每个解决方案对应一个作用域。
+
+          sourcegraph-mcp scopes list [--root <path>]
+              列出仓库 `.sourcegraph.json` 中声明的作用域；未配置时列出合成的
+              default 作用域。
+
+          sourcegraph-mcp scopes info <name> [--root <path>] [--json]
+              显示一个作用域的详细信息，包括标识、项目集合、可选 `language` 字段
+              和可选 `enrichment` 块。--json 输出与 Markdown 各节对应的稳定结构。
+
+          sourcegraph-mcp scopes add <name> --solution <path> [--root <path>] [--isolated]
+              向 `.sourcegraph.json` 添加作用域。<name> 是 kebab-case 标识，
+              --solution 指定 .slnx/.sln；首次使用时会创建配置文件。
+
+          sourcegraph-mcp scopes remove <name> [--root <path>]
+              从 `.sourcegraph.json` 中删除一个作用域。
+
+          sourcegraph-mcp vocabulary list [--scope <id>] [--strict] [--root <path>]
+              按作用域诊断当前类型词汇表：列出每个 edge_kind、symbol_kind 和
+              annotation_flavor，标注来源（`[sdk]`、`[plugin: ...]` 或 `[unknown]`）
+              及实际数量。每类后还会列出“漂移候选”，即同一作用域中编辑距离不超过
+              2 的近似标识（例如 `bind-path` 与 `binds-path`）。默认退出码为 0；
+              使用 --strict 后，发现漂移候选时退出码为 2。
+
+          sourcegraph-mcp embeddings status [--model <id>]
+              显示模型缓存目录、当前模型标识和维度、各文件是否存在、大小、SHA-256
+              以及缓存卷剩余空间。默认离线模式报告缓存为空时，可先运行此命令。
+
+          sourcegraph-mcp embeddings pull [--model <id>]
+              同步下载当前模型（或 --model 指定模型）的清单。该操作幂等：
+              缓存完整时不会重复下载。
+
+          sourcegraph-mcp embeddings remove [--model <id>] [--all]
+              清除当前模型缓存（默认）、一个指定模型缓存，或使用 --all 清除全部缓存。
+              --model 不能与 --all 同时使用。
+
+          sourcegraph-mcp embeddings verify [--model <id>]
+              重新计算每个缓存文件的 SHA。默认模型带有固定 SHA，校验不匹配时退出码为 2。
+              自定义 --model 路径使用不含固定 SHA 的尽力清单，只显示计算结果和
+              “informational only”说明，并以 0 退出。
+
+        通用参数:
+          --lang <en|zh>    选择 --help 的显示语言；必须与 --help 一起使用。
+          --root <path>     `.sourcegraph.json` 发现和作用域数据库使用的仓库根目录。
+                            默认为 --solution 所在目录，其次为当前工作目录。
+          --model <id>      覆盖嵌入模型标识（默认：
+                            jinaai/jina-embeddings-v2-base-code），用于 serve/index。
+          --no-embeddings   完全跳过嵌入流程，不下载模型、不写入 vec0。
+                            semantic_search 返回禁用说明，其他工具不受影响。
+          --allow-model-download
+                            显式允许 serve/index 在本地缓存为空时从 Hugging Face
+                            自动下载模型。默认禁止自动联网。等价于
+                            SOURCEGRAPH_ALLOW_MODEL_DOWNLOAD=1。
+          --no-model-download
+                            显式保持默认离线模式。使用已有缓存；缓存为空时退化为
+                            --no-embeddings。保留 SOURCEGRAPH_NO_MODEL_DOWNLOAD=1
+                            作为向后兼容的故障关闭设置。
+          --no-history      禁用 git-blame 历史流程，适用于 PATH 中没有 git
+                            或不需要逐符号历史信息的 CI 环境。
+          --no-instructions 不在 MCP `initialize` 响应中发布服务器端使用指引。
+                            等价于 SOURCEGRAPH_NO_INSTRUCTIONS=1。
+          --no-leaf         不在工具响应和 `ServerInstructions` 中添加绿色叶子标记。
+                            等价于 SOURCEGRAPH_NO_LEAF=1。
+          --no-tool-triggers
+                            不在 tools/list 的工具说明末尾附加 `Use when: …`。
+                            可减少首次载荷，但代理选择工具时获得的指引也会减少。
+                            等价于 SOURCEGRAPH_NO_TOOL_TRIGGERS=1。
+          --scope <id>      将操作限制到一个作用域，用于 index、demo 和
+                            vocabulary list。
+          --strict          将警告视为错误。目前用于 vocabulary list；发现漂移候选时
+                            以退出码 2 结束。
+          --query-timeout-seconds <int>
+                            query_graph MCP 工具的语句超时秒数，默认为 5。
+                            等价于 SOURCEGRAPH_QUERY_TIMEOUT_SECONDS=<int>。
+          --query-row-limit <int>
+                            query_graph 每次调用最多返回的行数，默认为 5000。
+                            超出时返回最多 <int> 行并报告 truncated: true。
+                            等价于 SOURCEGRAPH_QUERY_ROW_LIMIT=<int>。
+
+        默认值:
+          --db   ./.sourcegraph/scopes/default.db   （不存在时创建；旧 graph.db 会迁移）
+
+        示例:
           sourcegraph-mcp index ./MySln.sln
           sourcegraph-mcp serve --solution ./MySln.sln
           sourcegraph-mcp serve --root ./repo

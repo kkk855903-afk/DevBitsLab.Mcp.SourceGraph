@@ -34,12 +34,26 @@ The CLI SHALL accept four top-level subcommands (`serve`, `index`, `stats`,
 
 ### Requirement: Help and error UX
 The CLI SHALL show a usage block on `--help` / `-h` and on argument errors,
-listing every supported subcommand and flag.
+listing every supported subcommand and flag. Help SHALL default to English and
+accept `--lang en` or `--lang zh` before or after `--help` / `-h` to select
+English or Simplified Chinese. `--lang` without help, a missing value, and an
+unsupported language SHALL fail with exit code `2`.
 
 #### Scenario: Display help
 - **WHEN** the user runs `sourcegraph-mcp --help`
 - **THEN** the help text lists `serve`, `index`, `stats`, `clear` plus the
   `--solution`, `-s`, and `--db` flags and their defaults
+
+#### Scenario: Display Simplified Chinese help
+- **WHEN** the user runs `sourcegraph-mcp --help --lang zh` or
+  `sourcegraph-mcp --lang zh --help`
+- **THEN** the process exits `0`, writes a Simplified Chinese usage block to
+  stdout, and preserves the same command and flag tokens as English help
+
+#### Scenario: Reject invalid help language usage
+- **WHEN** `--lang` is used without `--help` / `-h`, has no value, or names a
+  language other than `en` or `zh`
+- **THEN** parsing fails with an explanatory error and the process exits `2`
 
 ### Requirement: Token expansion in path arguments
 The CLI SHALL expand `${VAR}` placeholders in `--solution` and `--db` values
