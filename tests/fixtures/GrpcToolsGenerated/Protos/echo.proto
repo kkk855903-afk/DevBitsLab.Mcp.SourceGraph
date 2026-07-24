@@ -1,0 +1,17 @@
+syntax = "proto3";
+
+package grpc.tools.fixture.v1;
+
+option csharp_namespace = "GrpcToolsGenerated.Generated";
+
+service EchoApi {
+  rpc Echo(EchoRequest) returns (EchoReply);
+}
+
+message EchoRequest {
+  string value = 1;
+}
+
+message EchoReply {
+  string value = 1;
+}

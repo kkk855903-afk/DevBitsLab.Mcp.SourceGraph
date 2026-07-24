@@ -1,6 +1,7 @@
 using DevBitsLab.Mcp.SourceGraph.Core;
 using DevBitsLab.Mcp.SourceGraph.Embeddings;
 using DevBitsLab.Mcp.SourceGraph.Indexing;
+using DevBitsLab.Mcp.SourceGraph.Server.Grpc;
 using DevBitsLab.Mcp.SourceGraph.Server.Interop;
 using DevBitsLab.Mcp.SourceGraph.Sdk;
 using DevBitsLab.Mcp.SourceGraph.Storage;
@@ -70,6 +71,11 @@ public sealed class ScopeHost : IAsyncDisposable
     public NativeInteropRuntimeState? NativeInteropState =>
         NativeInteropCoordinator?.State;
     internal NativeInteropCoordinator? NativeInteropCoordinator { get; set; }
+    /// <summary>
+    /// Query-safe status of the most recent evidence-backed C# ↔ protobuf gRPC projection.
+    /// Null means the projection has not run for this host yet.
+    /// </summary>
+    public GrpcLinkRuntimeState? GrpcLinkState { get; internal set; }
     /// <summary>
     /// Whether the stored managed-import universe came from a complete Roslyn pass. Native
     /// rematching fails closed while this is false.

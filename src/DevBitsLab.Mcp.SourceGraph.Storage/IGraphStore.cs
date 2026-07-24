@@ -44,6 +44,21 @@ public interface IGraphStore : IAsyncDisposable
             "This graph-store implementation predates atomic producer edge-evidence replacement.");
 
     /// <summary>
+    /// Atomically replaces every edge-evidence occurrence owned by one producer across the
+    /// complete scope database. Each candidate occurrence names its indexed producing file
+    /// through <see cref="FileEvidenceFact.Location"/>. All files, canonical endpoints, and
+    /// evidence are resolved and validated before any prior producer row is changed. This is
+    /// intended for cross-file projections that must never expose a mix of old and new
+    /// generations; an empty candidate list performs a producer-wide cleanup.
+    /// </summary>
+    Task ReplaceProducerEdgeEvidenceProjectionAsync(
+        string producer,
+        IReadOnlyList<ProducerEdgeEvidenceFact> edges,
+        CancellationToken ct = default) =>
+        throw new NotSupportedException(
+            "This graph-store implementation predates atomic producer projection replacement.");
+
+    /// <summary>
     /// Atomically replaces a file-owned derived projection consisting of selected annotation
     /// flavors and edge evidence from one exact producer. Candidate annotations and edge
     /// endpoints are fully resolved before prior projection rows are changed. Empty fact
@@ -91,12 +106,12 @@ public interface IGraphStore : IAsyncDisposable
             "This graph-store implementation predates atomic file-facts replacement.");
 
     /// <summary>
-    /// Atomically replaces all annotations owned by lower-case <c>c:</c>/<c>cpp:</c>
-    /// declarations in the selected native interop flavors and upserts their physical-file
-    /// declarations. Managed <c>csharp:</c> ABI-record annotations and existing non-interop
-    /// facts are preserved. Prior native symbols are deliberately retained until the caller
-    /// has successfully refreshed every managed boundary, so last-good interop edges remain
-    /// resolvable if downstream analysis fails.
+    /// Atomically replaces all annotations and direct-call evidence owned by lower-case
+    /// <c>c:</c>/<c>cpp:</c> native declarations and upserts their physical-file declarations.
+    /// Managed <c>csharp:</c>, protobuf, and independently-produced facts are preserved. Prior
+    /// native symbols are deliberately retained until the caller has successfully refreshed
+    /// every managed boundary, so last-good interop edges remain resolvable if downstream
+    /// analysis fails.
     /// </summary>
     Task<NativeInteropSnapshotReplacementResult>
         ReplaceNativeInteropSnapshotAsync(
@@ -106,9 +121,9 @@ public interface IGraphStore : IAsyncDisposable
             "This graph-store implementation predates atomic native interop snapshots.");
 
     /// <summary>
-    /// Transactionally deletes only the requested stale C/C++ native-export or struct
-    /// declarations that are proven orphaned. A declaration is retained when it still owns or
-    /// participates in any stored fact, including a <c>pinvoke-maps-to</c> edge targeting it.
+    /// Transactionally deletes only the requested stale C/C++ native-export, struct, function,
+    /// or method declarations that are proven orphaned. A declaration is retained when it still
+    /// owns or participates in any stored fact, including a <c>pinvoke-maps-to</c> edge targeting it.
     /// Callers must invoke this only after a complete native snapshot publication and a
     /// successful refresh of every managed boundary.
     /// </summary>

@@ -275,6 +275,140 @@ public sealed class ProducerEdgeEvidenceReplacementTests : IAsyncLifetime
         evidence[0].Metadata.Should().Contain("value", "old");
     }
 
+    [Fact]
+    public async Task ReplaceProducerProjection_validates_all_files_before_replacing_any_generation()
+    {
+        var firstPath = Path.Join(_tempDir, "First.cs");
+        var secondPath = Path.Join(_tempDir, "Second.cs");
+        var nativePath = Path.Join(_tempDir, "native.h");
+        var firstFileId = await SeedFileAsync(firstPath);
+        var secondFileId = await SeedFileAsync(secondPath);
+        var nativeFileId = await SeedFileAsync(nativePath);
+        var firstSourceKey = "csharp:M:NativeMethods.First";
+        var secondSourceKey = "csharp:M:NativeMethods.Second";
+        var firstSourceId = await SeedSymbolAsync(
+            firstFileId,
+            firstSourceKey,
+            "First");
+        var secondSourceId = await SeedSymbolAsync(
+            secondFileId,
+            secondSourceKey,
+            "Second");
+        var oldFirstId = await SeedSymbolAsync(
+            nativeFileId,
+            "native:function:old_first",
+            "old_first");
+        var oldSecondId = await SeedSymbolAsync(
+            nativeFileId,
+            "native:function:old_second",
+            "old_second");
+        var newFirstId = await SeedSymbolAsync(
+            nativeFileId,
+            "native:function:new_first",
+            "new_first");
+        var newSecondId = await SeedSymbolAsync(
+            nativeFileId,
+            "native:function:new_second",
+            "new_second");
+        await _store!.BulkInsertEdgesAsync(
+        [
+            EdgeWithEvidence(
+                firstSourceId,
+                oldFirstId,
+                firstFileId,
+                firstPath,
+                3,
+                Producer,
+                "old-first"),
+            EdgeWithEvidence(
+                secondSourceId,
+                oldSecondId,
+                secondFileId,
+                secondPath,
+                4,
+                Producer,
+                "old-second"),
+        ]);
+
+        var invalidReplace = () =>
+            _store.ReplaceProducerEdgeEvidenceProjectionAsync(
+                Producer,
+                [
+                    Fact(
+                        firstSourceKey,
+                        "native:function:new_first",
+                        firstPath,
+                        10,
+                        "new-first"),
+                    Fact(
+                        secondSourceKey,
+                        "native:function:missing",
+                        secondPath,
+                        11,
+                        "missing"),
+                ]);
+
+        await invalidReplace.Should().ThrowAsync<InvalidOperationException>()
+            .WithMessage("*native:function:missing*");
+        (await _store.ListEdgeEvidenceAsync(
+                firstSourceId,
+                oldFirstId,
+                "pinvoke-maps-to"))
+            .Should().ContainSingle(evidence =>
+                evidence.Metadata!["value"] == "old-first");
+        (await _store.ListEdgeEvidenceAsync(
+                secondSourceId,
+                oldSecondId,
+                "pinvoke-maps-to"))
+            .Should().ContainSingle(evidence =>
+                evidence.Metadata!["value"] == "old-second");
+        (await EdgeExistsAsync(
+                firstSourceId,
+                newFirstId,
+                "pinvoke-maps-to"))
+            .Should().BeFalse();
+
+        await _store.ReplaceProducerEdgeEvidenceProjectionAsync(
+            Producer,
+            [
+                Fact(
+                    secondSourceKey,
+                    "native:function:new_second",
+                    secondPath,
+                    21,
+                    "new-second"),
+                Fact(
+                    firstSourceKey,
+                    "native:function:new_first",
+                    firstPath,
+                    20,
+                    "new-first"),
+            ]);
+
+        (await EdgeExistsAsync(
+                firstSourceId,
+                oldFirstId,
+                "pinvoke-maps-to"))
+            .Should().BeFalse();
+        (await EdgeExistsAsync(
+                secondSourceId,
+                oldSecondId,
+                "pinvoke-maps-to"))
+            .Should().BeFalse();
+        (await _store.ListEdgeEvidenceAsync(
+                firstSourceId,
+                newFirstId,
+                "pinvoke-maps-to"))
+            .Should().ContainSingle(evidence =>
+                evidence.Location.FilePath == firstPath);
+        (await _store.ListEdgeEvidenceAsync(
+                secondSourceId,
+                newSecondId,
+                "pinvoke-maps-to"))
+            .Should().ContainSingle(evidence =>
+                evidence.Location.FilePath == secondPath);
+    }
+
     private async Task AssertStableReplacementAsync(long sourceId, long targetId)
     {
         var evidence = await _store!.ListEdgeEvidenceAsync(

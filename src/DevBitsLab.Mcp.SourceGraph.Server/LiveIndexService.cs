@@ -4,6 +4,7 @@ using DevBitsLab.Mcp.SourceGraph.Core.Security;
 using DevBitsLab.Mcp.SourceGraph.Embeddings;
 using DevBitsLab.Mcp.SourceGraph.Indexing;
 using DevBitsLab.Mcp.SourceGraph.Sdk;
+using DevBitsLab.Mcp.SourceGraph.Server.Grpc;
 using DevBitsLab.Mcp.SourceGraph.Server.Interop;
 using DevBitsLab.Mcp.SourceGraph.Server.Observability;
 using DevBitsLab.Mcp.SourceGraph.Server.Plugins;
@@ -580,6 +581,7 @@ public sealed class LiveIndexService : BackgroundService
         var nonCSharpProducedUsableOutput = false;
         var nativeProducedUsableOutput = false;
         var nativeInteropPartial = false;
+        var grpcLinkPartial = false;
         var projectDiscoveryFailed = false;
 
         try
@@ -702,6 +704,24 @@ public sealed class LiveIndexService : BackgroundService
                 await DispatchAnalyzersForScopeAsync(host, ct).ConfigureAwait(false);
             }
 
+            host.ProgressSource.Emit(
+                new ModelContextProtocol.ProgressNotificationValue
+                {
+                    Progress = 0.8f,
+                    Total = 1.0f,
+                    Message = "linking gRPC contracts",
+                });
+            var grpc = await RunGrpcLinkProjectionAsync(
+                    host,
+                    host.ManagedInteropInputComplete
+                    && projectMapResult.Succeeded
+                    && languageResult.FailedProjects.Count == 0
+                    && languageResult.FailedFiles.Count == 0,
+                    ct)
+                .ConfigureAwait(false);
+            grpcLinkPartial =
+                grpc.State.Status == GrpcLinkRuntimeStatus.Partial;
+
             if (host.NativeInteropCoordinator is not null)
             {
                 host.ProgressSource.Emit(
@@ -737,6 +757,15 @@ public sealed class LiveIndexService : BackgroundService
                         native.State.Findings);
                 }
             }
+            else
+            {
+                // A scope can retain the same database when its interop block is removed.
+                // Clear only the native-owned annotations/call evidence and proven orphan
+                // declarations; managed, protobuf, and independently-produced edges survive.
+                await new NativeInteropSnapshotPublisher(host.Store)
+                    .ClearAsync(ct)
+                    .ConfigureAwait(false);
+            }
 
             // Settle against both this pass and the graph that remains transactionally stored.
             // A failed project-map rebuild intentionally preserves the last good graph; treating
@@ -756,14 +785,28 @@ public sealed class LiveIndexService : BackgroundService
                 failedProjectCount,
                 failedFileCount,
                 projectDiscoveryFailed);
-            if (nativeInteropPartial && status.Status != "degraded")
+            if ((grpcLinkPartial || nativeInteropPartial)
+                && status.Status != "degraded")
             {
+                var reasons = new List<string>(2);
+                if (grpcLinkPartial)
+                {
+                    reasons.Add(
+                        "gRPC contract linking is incomplete; last-good links were retained. "
+                        + GrpcLinkFailureSummary(host.GrpcLinkState!));
+                }
+                if (nativeInteropPartial)
+                {
+                    reasons.Add(
+                        "Native interop indexing is incomplete; last-good interop evidence was retained. "
+                        + NativeInteropFailureSummary(host.NativeInteropState!));
+                }
                 status = new ColdIndexStatusResolution(
                     "partial",
-                    "Native interop indexing is incomplete; last-good interop evidence was retained. "
-                    + NativeInteropFailureSummary(host.NativeInteropState!),
+                    string.Join(" ", reasons),
                     status.UsesRetainedGraph
-                    || host.NativeInteropState!.RetainedLastGood);
+                    || (host.GrpcLinkState?.RetainedLastGood ?? false)
+                    || (host.NativeInteropState?.RetainedLastGood ?? false));
             }
             host.Status = status.Status;
             host.StatusMessage = status.StatusMessage;
@@ -1174,6 +1217,13 @@ public sealed class LiveIndexService : BackgroundService
                                 host,
                                 languageResult,
                                 stoppingToken).ConfigureAwait(false);
+                            await RunLiveGrpcLinkAsync(
+                                    host,
+                                    host.ManagedInteropInputComplete
+                                    && languageResult.FailedProjects.Count == 0
+                                    && languageResult.FailedFiles.Count == 0,
+                                    stoppingToken)
+                                .ConfigureAwait(false);
                             await RunLiveNativeInteropAsync(
                                     host,
                                     stoppingToken)
@@ -1288,6 +1338,20 @@ public sealed class LiveIndexService : BackgroundService
                                 host,
                                 languageResult,
                                 stoppingToken).ConfigureAwait(false);
+                            if (ShouldRefreshGrpcProjection(
+                                    projectControlChanged,
+                                    batch.Paths))
+                            {
+                                await RunLiveGrpcLinkAsync(
+                                        host,
+                                        host.ManagedInteropInputComplete
+                                        && languageResult
+                                            .FailedProjects.Count == 0
+                                        && languageResult
+                                            .FailedFiles.Count == 0,
+                                        stoppingToken)
+                                    .ConfigureAwait(false);
+                            }
                             var refreshNativeInterop =
                                 projectControlChanged
                                 || csharpPaths.Length > 0
@@ -1468,6 +1532,76 @@ public sealed class LiveIndexService : BackgroundService
             result.FailedFiles.Count);
     }
 
+    internal static bool ShouldRefreshGrpcProjection(
+        bool projectControlChanged,
+        IReadOnlyCollection<string> paths) =>
+        projectControlChanged
+        || paths.Any(path =>
+            string.Equals(
+                Path.GetExtension(path),
+                ".cs",
+                StringComparison.OrdinalIgnoreCase)
+            || string.Equals(
+                Path.GetExtension(path),
+                ".proto",
+                StringComparison.OrdinalIgnoreCase));
+
+    private async Task<GrpcLinkProjectionResult> RunGrpcLinkProjectionAsync(
+        ScopeHost host,
+        bool sourceUniverseComplete,
+        CancellationToken ct)
+    {
+        var result = await new GrpcContractLinker(host.Store)
+            .RunAsync(sourceUniverseComplete, ct)
+            .ConfigureAwait(false);
+        host.GrpcLinkState = result.State;
+        if (result.State.Status == GrpcLinkRuntimeStatus.Partial)
+        {
+            _logger.LogWarning(
+                "Scope `{Id}` gRPC link projection retained last-good evidence: {Reason}",
+                host.Scope.Id,
+                GrpcLinkFailureSummary(result.State));
+        }
+        else
+        {
+            _logger.LogInformation(
+                "Scope `{Id}` gRPC link projection complete ({Contracts} RPC contracts, {ClientLinks} client links, {ServerLinks} server links, {MatchFailures} unmatched/ambiguous candidates)",
+                host.Scope.Id,
+                result.State.ProtoContracts,
+                result.State.ClientLinks,
+                result.State.ServerLinks,
+                result.State.FailureCount);
+        }
+        return result;
+    }
+
+    private async Task RunLiveGrpcLinkAsync(
+        ScopeHost host,
+        bool sourceUniverseComplete,
+        CancellationToken ct)
+    {
+        var result = await RunGrpcLinkProjectionAsync(
+                host,
+                sourceUniverseComplete,
+                ct)
+            .ConfigureAwait(false);
+        if (result.State.Status == GrpcLinkRuntimeStatus.Partial)
+        {
+            host.Status = "partial";
+            host.StatusMessage =
+                "gRPC contract linking is incomplete; last-good links were retained. "
+                + GrpcLinkFailureSummary(result.State);
+        }
+        else if (host.FailedProjects.Count == 0
+            && host.FailedFiles.Count == 0
+            && host.NativeInteropState?.Status
+                != NativeInteropRuntimeStatus.Partial)
+        {
+            host.Status = "ok";
+            host.StatusMessage = null;
+        }
+    }
+
     private async Task RunLiveNativeInteropAsync(
         ScopeHost host,
         CancellationToken ct)
@@ -1495,7 +1629,9 @@ public sealed class LiveIndexService : BackgroundService
         else
         {
             if (host.FailedProjects.Count == 0
-                && host.FailedFiles.Count == 0)
+                && host.FailedFiles.Count == 0
+                && host.GrpcLinkState?.Status
+                    != GrpcLinkRuntimeStatus.Partial)
             {
                 host.Status = "ok";
                 host.StatusMessage = null;
@@ -1567,6 +1703,28 @@ public sealed class LiveIndexService : BackgroundService
         if (projectCount > 0) parts.Add($"{projectCount} project(s)");
         if (fileCount > 0) parts.Add($"{fileCount} file(s)");
         return $"{prefix}: {string.Join(", ", parts)} failed.";
+    }
+
+    private static string GrpcLinkFailureSummary(
+        GrpcLinkRuntimeState state)
+    {
+        if (state.Failures.Count == 0)
+        {
+            return "Reason unavailable.";
+        }
+        var codes = state.Failures
+            .Select(failure => failure.Code)
+            .Where(code => !string.IsNullOrWhiteSpace(code))
+            .Distinct(StringComparer.Ordinal)
+            .OrderBy(code => code, StringComparer.Ordinal)
+            .Take(4)
+            .ToArray();
+        var omitted = Math.Max(
+            state.OmittedFailures,
+            state.FailureCount - codes.Length);
+        return omitted == 0
+            ? $"Reason code(s): {string.Join(", ", codes)}."
+            : $"Reason code(s): {string.Join(", ", codes)} (+{omitted} omitted).";
     }
 
     private static string NativeInteropFailureSummary(

@@ -7,6 +7,7 @@ using DevBitsLab.Mcp.SourceGraph.Indexing;
 using DevBitsLab.Mcp.SourceGraph.Sdk;
 using DevBitsLab.Mcp.SourceGraph.Server;
 using DevBitsLab.Mcp.SourceGraph.Server.Cli;
+using DevBitsLab.Mcp.SourceGraph.Server.Grpc;
 using DevBitsLab.Mcp.SourceGraph.Server.Interop;
 using DevBitsLab.Mcp.SourceGraph.Server.Observability;
 using DevBitsLab.Mcp.SourceGraph.Server.Plugins;
@@ -486,6 +487,7 @@ static async Task<int> RunIndexAsync(CommandLine cli)
     IReadOnlyList<FileFailure> nonCSharpFailedFiles = Array.Empty<FileFailure>();
     IReadOnlyList<ProjectFailure> nonCSharpFailedProjects =
         Array.Empty<ProjectFailure>();
+    var grpcLinkFailed = false;
     var nativeInteropFailed = false;
     var solutionFull = Path.GetFullPath(cli.SolutionPath);
     var repoRootForIndex = cli.ResolvedRepoRoot();
@@ -730,6 +732,36 @@ static async Task<int> RunIndexAsync(CommandLine cli)
         }
     }
 
+    var grpc = await new GrpcContractLinker(store).RunAsync(
+            result.FailedProjects.Count == 0
+            && result.FailedFiles.Count == 0
+            && nonCSharpFailedProjects.Count == 0
+            && nonCSharpFailedFiles.Count == 0)
+        .ConfigureAwait(false);
+    grpcLinkFailed =
+        grpc.State.Status == GrpcLinkRuntimeStatus.Partial;
+    if (grpcLinkFailed)
+    {
+        var codes = grpc.State.Failures
+            .Select(failure => failure.Code)
+            .Distinct(StringComparer.Ordinal)
+            .OrderBy(code => code, StringComparer.Ordinal)
+            .Take(8);
+        await Console.Error.WriteLineAsync(
+                "[sourcegraph-mcp] gRPC contract linking is partial; "
+                + "last-good links were retained"
+                + $" ({string.Join(", ", codes)})")
+            .ConfigureAwait(false);
+    }
+    else
+    {
+        Console.WriteLine(
+            "gRPC links: "
+            + $"{grpc.State.ProtoContracts} contracts, "
+            + $"{grpc.State.ClientLinks} client links, "
+            + $"{grpc.State.ServerLinks} server links");
+    }
+
     if (selectedScope.Interop is not null)
     {
         await using var nativeCoordinator = new NativeInteropCoordinator(
@@ -766,6 +798,12 @@ static async Task<int> RunIndexAsync(CommandLine cli)
                 + $"{native.State.Findings} findings");
         }
     }
+    else
+    {
+        await new NativeInteropSnapshotPublisher(store)
+            .ClearAsync()
+            .ConfigureAwait(false);
+    }
 
     if (embedService is not null)
     {
@@ -781,6 +819,7 @@ static async Task<int> RunIndexAsync(CommandLine cli)
     if (historyDisabled) Console.WriteLine("history: disabled (--no-history or git unavailable)");
     return nonCSharpFailedFiles.Count == 0
         && nonCSharpFailedProjects.Count == 0
+        && !grpcLinkFailed
         && !nativeInteropFailed
             ? 0
             : 1;

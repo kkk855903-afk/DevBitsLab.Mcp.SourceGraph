@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Google.Protobuf" Version="3.35.1" />
+    <PackageReference Include="Grpc.Core.Api" Version="2.71.0" />
+    <PackageReference Include="Grpc.Tools" Version="2.82.0" PrivateAssets="all" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Keep generated code inside the fixture source tree so the normal scope policy indexes
+         it. Remove it from the default glob because Grpc.Tools adds the predicted outputs to
+         Compile itself. -->
+    <Compile Remove="Generated\**\*.cs" />
+    <Protobuf Include="Protos\echo.proto"
+              GrpcServices="Both"
+              OutputDir="$(MSBuildProjectDirectory)\Generated"
+              GrpcOutputDir="$(MSBuildProjectDirectory)\Generated" />
+  </ItemGroup>
+
+</Project>

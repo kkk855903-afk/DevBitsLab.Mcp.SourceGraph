@@ -1,3 +1,5 @@
+using System.Threading;
+using System.Threading.Tasks;
 using MedInteropChain.GrpcService.Generated;
 
 namespace MedInteropChain.GrpcService;
@@ -8,7 +10,7 @@ public sealed class AlgorithmService(AlgorithmApi.AlgorithmApiClient client)
     {
         var reply = await client.CalculateAsync(
             new CalculateRequest { PatientAge = patientAge },
-            cancellationToken);
+            cancellationToken: cancellationToken);
         return reply.Value;
     }
 }

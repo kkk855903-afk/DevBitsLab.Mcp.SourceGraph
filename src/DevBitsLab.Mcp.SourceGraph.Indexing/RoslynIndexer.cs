@@ -2215,15 +2215,22 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                     switch (node)
                     {
                         case IdentifierNameSyntax id when id.Parent is not (NamespaceDeclarationSyntax or BaseTypeDeclarationSyntax or MethodDeclarationSyntax or PropertyDeclarationSyntax or VariableDeclaratorSyntax or ParameterSyntax or TypeParameterSyntax):
-                            referenced = model.GetSymbolInfo(id, ct).Symbol;
+                            referenced = id.Parent is InvocationExpressionSyntax invocationId
+                                && invocationId.Expression == id
+                                    ? model.GetSymbolInfo(invocationId, ct).Symbol
+                                    : model.GetSymbolInfo(id, ct).Symbol;
                             refNode = id;
-                            kind = id.Parent is InvocationExpressionSyntax inv && inv.Expression == id
+                            kind = id.Parent is InvocationExpressionSyntax inv
+                                && inv.Expression == id
                                 ? ReferenceKind.Call
                                 : ClassifyReadWrite(id, referenced) ?? ReferenceKind.Reference;
                             break;
 
                         case GenericNameSyntax gn:
-                            referenced = model.GetSymbolInfo(gn, ct).Symbol;
+                            referenced = gn.Parent is InvocationExpressionSyntax invocationGeneric
+                                && invocationGeneric.Expression == gn
+                                    ? model.GetSymbolInfo(invocationGeneric, ct).Symbol
+                                    : model.GetSymbolInfo(gn, ct).Symbol;
                             refNode = gn;
                             kind = gn.Parent is InvocationExpressionSyntax invGn
                                 && invGn.Expression == gn
@@ -2232,7 +2239,10 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                             break;
 
                         case MemberAccessExpressionSyntax mae:
-                            referenced = model.GetSymbolInfo(mae.Name, ct).Symbol;
+                            referenced = mae.Parent is InvocationExpressionSyntax invocationMember
+                                && invocationMember.Expression == mae
+                                    ? model.GetSymbolInfo(invocationMember, ct).Symbol
+                                    : model.GetSymbolInfo(mae.Name, ct).Symbol;
                             refNode = mae.Name;
                             kind = mae.Parent is InvocationExpressionSyntax invMa && invMa.Expression == mae
                                 ? ReferenceKind.Call
@@ -2252,7 +2262,10 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                             break;
 
                         case MemberBindingExpressionSyntax mbe:
-                            referenced = model.GetSymbolInfo(mbe.Name, ct).Symbol;
+                            referenced = mbe.Parent is InvocationExpressionSyntax invocationBinding
+                                && invocationBinding.Expression == mbe
+                                    ? model.GetSymbolInfo(invocationBinding, ct).Symbol
+                                    : model.GetSymbolInfo(mbe.Name, ct).Symbol;
                             refNode = mbe.Name;
                             kind = mbe.Parent is InvocationExpressionSyntax invMb
                                 && invMb.Expression == mbe
