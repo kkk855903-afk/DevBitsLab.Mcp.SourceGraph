@@ -16,9 +16,14 @@ public static class Schema
     /// drops all data tables when the on-disk version is below this, since the index can always be
     /// rebuilt from source.
     /// </summary>
-    public const int Version = 13;
+    public const int Version = 14;
 
     /// <summary>
+    /// V14 adds the insert-only <c>grpc_contract_baselines</c> table. Each exact protobuf
+    /// canonical key retains its first complete successful contract payload and source range;
+    /// later checks can therefore prove field-number and streaming changes against real prior
+    /// evidence instead of treating the current observation as a change.
+    ///
     /// V13 separates logical edges from their one-to-many evidence rows. The
     /// <c>edge_evidence</c> table records the producing file, exact range, confidence, producer,
     /// and occurrence-specific payload, allowing repeated call/binding sites to survive
@@ -43,9 +48,9 @@ public static class Schema
     /// test/history awareness, V8 added <c>files.is_generated</c> and <c>diagnostics</c>,
     /// V7 wired in <c>sqlite-vec</c>, V6 added <c>attributes</c> + <c>attributes_fts</c>,
     /// V5 enriched symbols with modifiers/accessibility/xml_summary, V3 dropped FK constraints
-    /// from refs/edges. V13 is the cumulative drop-and-rebuild target — there is no preserved
+    /// from refs/edges. V14 is the cumulative drop-and-rebuild target — there is no preserved
     /// data path; <see cref="SqliteGraphStore.EnsureSchemaAsync"/> calls <see cref="DropAll"/>
-    /// when the on-disk version is anything below 13.
+    /// when the on-disk version is anything below 14.
     /// </summary>
     internal const string V1 = """
         CREATE TABLE IF NOT EXISTS schema_version (
@@ -183,6 +188,20 @@ public static class Schema
         );
         CREATE INDEX IF NOT EXISTS idx_symbol_history_authored_at ON symbol_history(last_authored_at);
 
+        -- First complete protobuf contract observation per exact canonical key. Rows are
+        -- insert-only during normal indexing; source deletion does not erase history, and a
+        -- recreated declaration is still compared with its real prior successful baseline.
+        CREATE TABLE IF NOT EXISTS grpc_contract_baselines (
+            symbol_canonical_key TEXT PRIMARY KEY,
+            contract_json TEXT NOT NULL,
+            file_path TEXT NOT NULL,
+            start_line INTEGER NOT NULL,
+            start_col INTEGER NOT NULL,
+            end_line INTEGER NOT NULL,
+            end_col INTEGER NOT NULL,
+            observed_at INTEGER NOT NULL
+        );
+
         -- Convenience view of "recently changed" symbols. Window is parameterised at query time
         -- via WHERE clauses; this view just keeps the joins ready so callers can stay declarative.
         CREATE VIEW IF NOT EXISTS vw_recent_changes AS
@@ -296,6 +315,7 @@ public static class Schema
     /// </summary>
     internal const string DropAll = """
         DROP VIEW    IF EXISTS vw_recent_changes;
+        DROP TABLE   IF EXISTS grpc_contract_baselines;
         DROP TABLE   IF EXISTS symbol_history;
         DROP TABLE   IF EXISTS diagnostics;
         DROP TRIGGER IF EXISTS annotations_ad;

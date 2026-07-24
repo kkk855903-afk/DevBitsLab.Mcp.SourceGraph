@@ -71,6 +71,17 @@ public sealed class GrpcContractLinkerTests : IAsyncLifetime
         result.State.ClientLinks.Should().Be(1);
         result.State.ServerLinks.Should().Be(1);
         result.State.RetainedLastGood.Should().BeFalse();
+        var baselines = await _store!
+            .ListGrpcContractBaselinesAsync(100);
+        baselines.Should().HaveCount(3);
+        ProtoContractPayloadCodec.Decode(
+                baselines.Single(row =>
+                    row.SymbolCanonicalKey
+                    == ProtoCanonicalKeys.ForRpc(
+                        Service,
+                        "Calculate"))
+                    .ContractJson)
+            .Rpc!.ServerStreaming.Should().BeFalse();
         var clientEvidence = await _store!.ListEdgeEvidenceAsync(
             _graph!.ClientCallerId,
             _graph.RpcId,
@@ -228,6 +239,11 @@ public sealed class GrpcContractLinkerTests : IAsyncLifetime
         var linker = new GrpcContractLinker(_store!);
         (await linker.RunAsync(true)).State.Status.Should()
             .Be(GrpcLinkRuntimeStatus.Complete);
+        var baselineBefore =
+            (await _store!.ListGrpcContractBaselinesAsync(100))
+            .Single(row =>
+                row.SymbolCanonicalKey
+                == ProtoCanonicalKeys.ForRpc(Service, "Calculate"));
 
         if (invalidity == "malformed")
         {
@@ -265,6 +281,11 @@ public sealed class GrpcContractLinkerTests : IAsyncLifetime
             || failure.Code == "grpc-contract-partial"
             || failure.Code == "grpc-contract-fact-missing"
             || failure.Code == "grpc-contract-duplicate");
+        (await _store.ListGrpcContractBaselinesAsync(100))
+            .Single(row =>
+                row.SymbolCanonicalKey
+                == ProtoCanonicalKeys.ForRpc(Service, "Calculate"))
+            .Should().Be(baselineBefore);
         (await _store!.ListEdgeEvidenceAsync(
                 _graph!.ClientCallerId,
                 _graph.RpcId,
@@ -499,6 +520,20 @@ public sealed class GrpcContractLinkerTests : IAsyncLifetime
                 evidence.Metadata!["evidence_role"] == "managed-override")
             .Location.FilePath.Should().Be(
                 Path.Join(fixtureRoot, "EchoService.cs"));
+
+        var trace = await new GrpcContractQueryService().TraceAsync(
+            "test",
+            "ok",
+            store,
+            result.State,
+            rpc.CanonicalKey,
+            GrpcContractQueryService.MaximumRelationsPerRpc);
+        trace.Status.Should().Be("ok");
+        trace.Rpcs.Should().ContainSingle();
+        trace.Rpcs[0].Clients.Should().ContainSingle(relation =>
+            relation.ManagedSymbol == caller.CanonicalKey);
+        trace.Rpcs[0].Servers.Should().ContainSingle(relation =>
+            relation.ManagedSymbol == server.CanonicalKey);
     }
 
     private async Task<SeededGraph> SeedCompleteUnaryGraphAsync()

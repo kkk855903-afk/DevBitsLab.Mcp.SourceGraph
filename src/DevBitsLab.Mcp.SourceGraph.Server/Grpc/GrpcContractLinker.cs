@@ -14,7 +14,9 @@ public enum GrpcLinkRuntimeStatus
 public sealed record GrpcLinkFailure(
     string Code,
     string Message,
-    string? SymbolCanonicalKey);
+    string? SymbolCanonicalKey,
+    string? ProtoCanonicalKey = null,
+    string? GeneratedRole = null);
 
 public sealed record GrpcLinkRuntimeState(
     GrpcLinkRuntimeStatus Status,
@@ -88,6 +90,8 @@ public sealed class GrpcContractLinker
                 return Partial(failures, snapshot.Rpcs.Count);
             }
 
+            await EnsureBaselinesAsync(snapshot.Facts, ct)
+                .ConfigureAwait(false);
             await PublishAsync(candidate.Edges, ct)
                 .ConfigureAwait(false);
             return new GrpcLinkProjectionResult(
@@ -315,7 +319,12 @@ public sealed class GrpcContractLinker
         return new Snapshot(
             symbolKeys,
             messages,
-            rpcs);
+            rpcs,
+            factsByKey.Values
+                .OrderBy(
+                    fact => fact.Fact.SymbolCanonicalKey,
+                    StringComparer.Ordinal)
+                .ToArray());
     }
 
     private async Task<CandidateProjection?> BuildCandidateAsync(
@@ -391,6 +400,13 @@ public sealed class GrpcContractLinker
                     method.Symbol.CanonicalKey);
                 continue;
             }
+            var descriptorAssociatedContracts = possibleContracts
+                .Where(rpc => HasDescriptorContractAssociation(
+                    method,
+                    rpc,
+                    snapshot.Messages,
+                    symbols))
+                .ToArray();
             var matchingContracts = possibleContracts
                 .Where(rpc => MatchesContract(
                     method,
@@ -407,7 +423,16 @@ public sealed class GrpcContractLinker
                     matchingContracts.Length == 0
                         ? "The generated gRPC member's descriptor shape, request/response, or streaming signature did not match a proto RPC."
                         : "The generated gRPC member matched more than one proto RPC contract.",
-                    method.Symbol.CanonicalKey);
+                    method.Symbol.CanonicalKey,
+                    matchingContracts.Length == 0
+                        && descriptorAssociatedContracts.Length == 1
+                            ? descriptorAssociatedContracts[0]
+                                .Fact.SymbolCanonicalKey
+                            : null,
+                    matchingContracts.Length == 0
+                        && descriptorAssociatedContracts.Length == 1
+                            ? ToRoleToken(method.Role)
+                            : null);
                 continue;
             }
 
@@ -579,6 +604,29 @@ public sealed class GrpcContractLinker
                 Producer,
                 edges,
                 ct)
+            .ConfigureAwait(false);
+    }
+
+    private async Task EnsureBaselinesAsync(
+        IReadOnlyList<ProtoFactRow> facts,
+        CancellationToken ct)
+    {
+        var baselines = facts
+            .OrderBy(
+                fact => fact.Fact.SymbolCanonicalKey,
+                StringComparer.Ordinal)
+            .Select(fact => new GrpcContractBaselineFact(
+                fact.Fact.SymbolCanonicalKey,
+                fact.Row.ArgsJson
+                    ?? throw new InvalidOperationException(
+                        "A validated proto contract had no payload."),
+                fact.Row.FilePath,
+                Math.Max(1, fact.Symbol.StartLine),
+                Math.Max(1, fact.Symbol.StartCol),
+                Math.Max(1, fact.Symbol.EndLine),
+                Math.Max(1, fact.Symbol.EndCol)))
+            .ToArray();
+        await _store.EnsureGrpcContractBaselinesAsync(baselines, ct)
             .ConfigureAwait(false);
     }
 
@@ -762,6 +810,33 @@ public sealed class GrpcContractLinker
                 requestShape,
                 responseShape,
                 requireOverride: false);
+    }
+
+    private static bool HasDescriptorContractAssociation(
+        GeneratedMethod method,
+        ProtoFactRow contract,
+        IReadOnlyDictionary<string, ProtoFactRow> messages,
+        IReadOnlyDictionary<string, SymbolHit> symbols)
+    {
+        var rpc = contract.Fact.Rpc;
+        if (rpc is null
+            || !messages.TryGetValue(rpc.InputType, out var request)
+            || !messages.TryGetValue(rpc.OutputType, out var response))
+        {
+            return false;
+        }
+        var rpcName = LastSegment(contract.Fact.FullName);
+        var methodFieldKey =
+            $"csharp:F:{method.OuterTypeName}.__Method_{rpcName}";
+        if (!symbols.TryGetValue(methodFieldKey, out var descriptor)
+            || descriptor.Kind != SymbolKinds.Field
+            || !HasModifiers(descriptor.Modifiers, "static", "readonly"))
+        {
+            return false;
+        }
+        return SignatureEndsWith(
+            descriptor.Signature,
+            $"Method<{ToGeneratedTypeShape(request.Fact)}, {ToGeneratedTypeShape(response.Fact)}> __Method_{rpcName}");
     }
 
     private static bool MatchesClientSignature(
@@ -993,6 +1068,14 @@ public sealed class GrpcContractLinker
             Core.EvidenceConfidence.Semantic => "semantic",
             Core.EvidenceConfidence.Exact => "exact",
             _ => throw new ArgumentOutOfRangeException(nameof(confidence)),
+        };
+
+    private static string ToRoleToken(GeneratedMethodRole role) =>
+        role switch
+        {
+            GeneratedMethodRole.Client => "client",
+            GeneratedMethodRole.Server => "server",
+            _ => throw new ArgumentOutOfRangeException(nameof(role)),
         };
 
     private static bool IsClientCallTail(
@@ -1242,7 +1325,8 @@ public sealed class GrpcContractLinker
     private sealed record Snapshot(
         IReadOnlyList<SymbolKeyRow> SymbolKeys,
         IReadOnlyDictionary<string, ProtoFactRow> Messages,
-        IReadOnlyList<ProtoFactRow> Rpcs);
+        IReadOnlyList<ProtoFactRow> Rpcs,
+        IReadOnlyList<ProtoFactRow> Facts);
 
     private sealed record ProtoFactRow(
         ProtoContractFact Fact,
@@ -1338,7 +1422,9 @@ public sealed class GrpcContractLinker
         public void Add(
             string code,
             string message,
-            string? symbolCanonicalKey = null)
+            string? symbolCanonicalKey = null,
+            string? protoCanonicalKey = null,
+            string? generatedRole = null)
         {
             TotalCount++;
             if (_items.Count >= MaximumFailures) return;
@@ -1348,7 +1434,9 @@ public sealed class GrpcContractLinker
             _items.Add(new GrpcLinkFailure(
                 code,
                 safeMessage,
-                symbolCanonicalKey));
+                symbolCanonicalKey,
+                protoCanonicalKey,
+                generatedRole));
         }
     }
 }

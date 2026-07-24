@@ -1182,3 +1182,34 @@ The indexer SHALL emit exactly one `IndexEvent.FileScanned` per `IndexAsync` cal
 - **WHEN** a file's content exceeds `LanguageIndexerOptions.MaxFileSizeBytes` (default 10 MB)
 - **THEN** the indexer returns an empty event list — no `FileScanned`, no symbols
 
+### Requirement: gRPC projection and baseline share every index lifecycle
+
+Cold indexing, live `.cs`/`.proto` refresh, project-control refresh, and the
+one-shot `index` command SHALL all run the same strict `GrpcContractLinker`
+after managed and protobuf inputs settle. A complete candidate SHALL establish
+new first-observation baselines transactionally before replacing linker-owned
+`grpc-calls` / `implements-rpc` evidence. An incomplete source universe or any
+malformed/partial contract fact SHALL retain both the last-good edge projection
+and every prior baseline.
+
+The linker SHALL preserve generated-member mismatch diagnostics only when one
+generated client/base candidate is associated with one exact proto RPC by the
+available generated-container, descriptor type-shape, request/response, and
+streaming-signature evidence. A merely similar method or service name SHALL
+not create a relationship or contract finding.
+
+#### Scenario: Cold and one-shot index establish the same baseline
+- **GIVEN** the same complete C# and `.proto` source universe in two fresh scope databases
+- **WHEN** one is indexed by server cold start and the other by the one-shot `index` command
+- **THEN** both persist the same exact proto canonical keys, gRPC relations, and contract payload/range baselines
+
+#### Scenario: Partial live save retains last-good state
+- **GIVEN** a complete prior gRPC projection and baseline
+- **WHEN** a watched `.proto` save temporarily contains an incomplete descriptor payload
+- **THEN** the linker reports `partial` with `retained_last_good = true`; prior gRPC edge evidence and the baseline remain unchanged, and contract checks emit no change finding from the incomplete input
+
+#### Scenario: Deleted proto declaration is no longer current
+- **GIVEN** an indexed RPC with client/server relationships and a baseline
+- **WHEN** its owning `.proto` file is successfully deleted and the complete projection reruns
+- **THEN** the current RPC symbol and its relationships are absent; the dormant baseline history may remain but is not returned as a current contract or finding
+

@@ -410,3 +410,32 @@ Subsequent tool calls against a scope that this dispatch marked `degraded` SHALL
 - **WHEN** `ScopedExecution` catches and the verification call also throws
 - **THEN** `heals.jsonl` contains one line with `kind = "corruption-detected"`, `ok = false`, `details` carrying the verification exception's message; the registry row is marked `degraded` with the same details; the original exception propagates to the agent
 
+### Requirement: Persisted first-successful protobuf contract baselines
+
+Each scope database SHALL store at most one gRPC contract baseline per exact
+`proto:` canonical key. A baseline row SHALL contain the strict versioned
+contract payload, source file/range, and storage-assigned observation time.
+The baseline is established only from a complete, fully validated protobuf
+contract universe and is insert-only: later observations of an existing key
+SHALL NOT overwrite its prior payload or evidence. A transaction SHALL
+validate the complete candidate set before inserting any newly observed key.
+
+Source deletion SHALL remove current declarations and graph relations but
+SHALL NOT erase this history row. Contract checks ignore baseline rows without
+a current declaration.
+
+#### Scenario: First complete observation establishes a baseline
+- **GIVEN** no baseline exists for `proto:F:medical.v1.Request.age`
+- **WHEN** a complete successful protobuf/link projection observes field number `1`
+- **THEN** one baseline row is inserted with number `1` and the exact source range; no field-number-change finding is produced
+
+#### Scenario: Later observation does not rewrite history
+- **GIVEN** the field above has a persisted number-`1` baseline
+- **WHEN** a later complete observation reports number `9`
+- **THEN** the baseline remains number `1`; a reader can compare current number `9` with real prior number `1` and both source evidence ranges
+
+#### Scenario: Invalid candidate retains every last-good baseline
+- **GIVEN** valid baseline rows already exist
+- **WHEN** the current protobuf universe is partial, malformed, duplicated, exceeds its bound, or the index pass is incomplete
+- **THEN** baseline storage is not called (or its transaction rolls back), and every prior baseline remains byte-for-byte unchanged
+

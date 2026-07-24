@@ -59,6 +59,29 @@ public interface IGraphStore : IAsyncDisposable
             "This graph-store implementation predates atomic producer projection replacement.");
 
     /// <summary>
+    /// Transactionally establishes the first complete protobuf contract baseline for each exact
+    /// canonical key. Existing rows are deliberately never overwritten. The caller must pass a
+    /// fully validated, complete contract universe; any invalid or duplicate candidate rolls the
+    /// entire insert back, preserving every prior baseline.
+    /// </summary>
+    Task<int> EnsureGrpcContractBaselinesAsync(
+        IReadOnlyList<GrpcContractBaselineFact> facts,
+        CancellationToken ct = default) =>
+        throw new NotSupportedException(
+            "This graph-store implementation predates gRPC contract baselines.");
+
+    /// <summary>
+    /// Reads persisted first-successful protobuf baselines in exact canonical-key order. The
+    /// concrete store rejects invalid or unbounded limits.
+    /// </summary>
+    Task<IReadOnlyList<GrpcContractBaselineRow>>
+        ListGrpcContractBaselinesAsync(
+            int limit,
+            CancellationToken ct = default) =>
+        throw new NotSupportedException(
+            "This graph-store implementation predates gRPC contract baselines.");
+
+    /// <summary>
     /// Atomically replaces a file-owned derived projection consisting of selected annotation
     /// flavors and edge evidence from one exact producer. Candidate annotations and edge
     /// endpoints are fully resolved before prior projection rows are changed. Empty fact

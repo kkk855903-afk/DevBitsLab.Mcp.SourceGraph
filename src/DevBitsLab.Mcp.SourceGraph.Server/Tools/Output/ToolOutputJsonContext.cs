@@ -48,6 +48,10 @@ namespace DevBitsLab.Mcp.SourceGraph.Server.Tools.Output;
 [JsonSerializable(typeof(TraceCommandResult))]
 [JsonSerializable(typeof(CheckResourcesResult))]
 [JsonSerializable(typeof(CompareStructResult))]
+[JsonSerializable(typeof(MatchPInvokeResult))]
+[JsonSerializable(typeof(AnalyzeNativeBoundaryResult))]
+[JsonSerializable(typeof(TraceRpcResult))]
+[JsonSerializable(typeof(CheckProtoContractResult))]
 internal partial class ToolOutputJsonContext : JsonSerializerContext
 {
 }

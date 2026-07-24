@@ -1220,3 +1220,61 @@ When `PruneOrphanedAsync` itself throws, the caller SHALL log at warning level a
 - **WHEN** `repair_scope(scope = "backend", mode = "minimal")` runs against a scope with 3 orphan embeddings rows
 - **THEN** the prune step within minimal mode emits one `embeddings-pruned` heal line with `details = "removed 3 orphan rows"`, in addition to the `repair-scope-invoked` heal line that the tool itself emits
 
+### Requirement: Evidence-backed gRPC tools
+
+The server SHALL expose read-only, idempotent `trace_rpc` and
+`check_proto_contract` MCP tools with named object-root output schemas and
+`structuredContent`. Both tools SHALL accept `scope = "<id>"`, `"*"`, or a
+comma-separated list, reject selections above 16 scopes, sort per-scope output
+by scope id, deterministically bound rows/evidence, and keep the complete
+`CallToolResult` below 50,000 serialized characters.
+
+`trace_rpc` SHALL accept only an exact `proto:R:` RPC canonical key or exact
+`csharp:` managed canonical key. It SHALL traverse only stored auditable
+`grpc-calls` and `implements-rpc` relations. Both relations are stored with the
+managed symbol as source and the proto RPC as target; results SHALL state that
+orientation and state that a proto-started query used reverse/inbound
+traversal. Name-only candidates SHALL NOT be returned.
+
+`check_proto_contract` SHALL report:
+
+- `Grpc001` for a current RPC with no evidence-backed `implements-rpc` edge,
+  only when the current source/link universe is complete;
+- `Grpc002` for a field-number difference against the persisted prior
+  first-successful baseline for the same exact field key;
+- `Grpc003` for client/server streaming differences against that prior
+  baseline for the same exact RPC key; and
+- `Grpc004` for a uniquely associated generated client/server signature that
+  is proven inconsistent with the current strict RPC contract.
+
+Change findings SHALL carry current and baseline source evidence plus explicit
+baseline policy. Current-state findings SHALL mark the baseline as not
+applicable. Findings SHALL use semantic confidence unless their complete
+derivation is exact; structural generated-code association SHALL NOT be
+reported as exact. Partial/malformed input SHALL return a partial,
+`retained_last_good` result with no speculative findings.
+
+#### Scenario: trace_rpc reverses the stored direction
+- **GIVEN** `Client.Send ->(grpc-calls) proto:R:medical.v1.Api.Run` and `Server.Run ->(implements-rpc) proto:R:medical.v1.Api.Run`, each with stored occurrence evidence
+- **WHEN** `trace_rpc(rpc = "proto:R:medical.v1.Api.Run")` is invoked
+- **THEN** it returns the client and server through reverse/inbound traversal, includes their stored evidence, and reports `stored_orientation = "managed-source-to-proto-rpc-target"`
+
+#### Scenario: Exact managed start follows only its persisted RPC edge
+- **WHEN** `trace_rpc(rpc = "csharp:M:Medical.Client.Send(...)")` is invoked
+- **THEN** only proto RPC targets of that exact symbol's auditable `grpc-calls` / `implements-rpc` edges are selected; similarly named methods create no candidate
+
+#### Scenario: First observation is not a change
+- **GIVEN** a complete field/RPC contract has no prior baseline
+- **WHEN** indexing and `check_proto_contract` run for the first time
+- **THEN** the observation establishes its baseline and neither `Grpc002` nor `Grpc003` is returned
+
+#### Scenario: Field and streaming changes carry two evidence generations
+- **GIVEN** prior baselines for field number `1` and unary streaming flags
+- **WHEN** current complete facts report field number `9` and server streaming
+- **THEN** `check_proto_contract` returns `Grpc002` and `Grpc003`, each with semantic confidence, current evidence, baseline evidence, and `baseline_policy = "first-complete-successful-observation-per-exact-canonical-key"`
+
+#### Scenario: Partial current input produces no speculative check
+- **GIVEN** last-good edges and baselines exist
+- **WHEN** the latest protobuf/index pass is partial or malformed
+- **THEN** `check_proto_contract` returns `partial = true`, `retained_last_good = true`, zero new findings, and a bounded failure describing why the current universe was not analyzed
+
