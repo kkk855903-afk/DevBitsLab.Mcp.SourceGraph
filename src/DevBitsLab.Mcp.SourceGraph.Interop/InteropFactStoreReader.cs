@@ -91,14 +91,44 @@ public static class InteropFactStoreReader
             InteropFactPayloadCodec.EncodeAbiRecord,
             cancellationToken);
 
+    public static Task<StoredInteropFactSnapshot<InteropMatchProjection>>
+        ReadMatchesAsync(
+            IGraphStore store,
+            int maximumRows = DefaultMaximumRows,
+            CancellationToken cancellationToken = default) =>
+        ReadAsync(
+            store,
+            InteropAnnotationFlavors.Match,
+            maximumRows,
+            (json, _) => InteropFactPayloadCodec.DecodeMatch(json),
+            fact => fact.ManagedSymbolCanonicalKey,
+            InteropFactPayloadCodec.EncodeMatch,
+            cancellationToken);
+
+    public static Task<StoredInteropFactSnapshot<InteropFindingProjection>>
+        ReadFindingsAsync(
+            IGraphStore store,
+            int maximumRows = DefaultMaximumRows,
+            CancellationToken cancellationToken = default) =>
+        ReadAsync(
+            store,
+            InteropAnnotationFlavors.Finding,
+            maximumRows,
+            (json, _) => InteropFactPayloadCodec.DecodeFinding(json),
+            fact => fact.ManagedSymbolCanonicalKey,
+            InteropFactPayloadCodec.EncodeFinding,
+            cancellationToken,
+            InteropFactPayloadCodec.EncodeFinding);
+
     private static async Task<StoredInteropFactSnapshot<T>> ReadAsync<T>(
         IGraphStore store,
         string flavor,
         int maximumRows,
         Func<string, long, T> decode,
-        Func<T, string> canonicalKey,
+        Func<T, string> hostCanonicalKey,
         Func<T, string> encode,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Func<T, string>? identityKey = null)
     {
         ArgumentNullException.ThrowIfNull(store);
         if (maximumRows is < 1 or > MaximumRows)
@@ -110,11 +140,11 @@ public static class InteropFactStoreReader
         }
 
         var failures = new List<InteropFactLoadFailure>();
-        var factsByKey =
+        var factsByIdentity =
             new Dictionary<string, StoredInteropFact<T>>(StringComparer.Ordinal);
-        var canonicalPayloadByKey =
+        var canonicalPayloadByIdentity =
             new Dictionary<string, string>(StringComparer.Ordinal);
-        var conflictingKeys = new HashSet<string>(StringComparer.Ordinal);
+        var conflictingIdentities = new HashSet<string>(StringComparer.Ordinal);
         var rowsRead = 0;
         long afterId = 0;
 
@@ -144,7 +174,7 @@ public static class InteropFactStoreReader
                     }
 
                     var fact = decode(row.ArgsJson, row.FileId);
-                    var factKey = canonicalKey(fact);
+                    var factKey = hostCanonicalKey(fact);
                     if (!string.Equals(
                             factKey,
                             row.SymbolCanonicalKey,
@@ -154,13 +184,14 @@ public static class InteropFactStoreReader
                             "The payload canonical key does not match its annotation host.");
                     }
 
+                    var factIdentity = identityKey?.Invoke(fact) ?? factKey;
                     var canonicalPayload = encode(fact);
-                    if (conflictingKeys.Contains(factKey))
+                    if (conflictingIdentities.Contains(factIdentity))
                     {
                         continue;
                     }
-                    if (canonicalPayloadByKey.TryGetValue(
-                            factKey,
+                    if (canonicalPayloadByIdentity.TryGetValue(
+                            factIdentity,
                             out var previousPayload))
                     {
                         if (string.Equals(
@@ -171,9 +202,9 @@ public static class InteropFactStoreReader
                             continue;
                         }
 
-                        factsByKey.Remove(factKey);
-                        canonicalPayloadByKey.Remove(factKey);
-                        conflictingKeys.Add(factKey);
+                        factsByIdentity.Remove(factIdentity);
+                        canonicalPayloadByIdentity.Remove(factIdentity);
+                        conflictingIdentities.Add(factIdentity);
                         failures.Add(new InteropFactLoadFailure(
                             row.AnnotationId,
                             flavor,
@@ -182,10 +213,12 @@ public static class InteropFactStoreReader
                         continue;
                     }
 
-                    factsByKey.Add(
-                        factKey,
+                    factsByIdentity.Add(
+                        factIdentity,
                         new StoredInteropFact<T>(row, fact));
-                    canonicalPayloadByKey.Add(factKey, canonicalPayload);
+                    canonicalPayloadByIdentity.Add(
+                        factIdentity,
+                        canonicalPayload);
                 }
                 catch (OperationCanceledException)
                 {
@@ -228,7 +261,7 @@ public static class InteropFactStoreReader
             }
         }
 
-        var facts = factsByKey
+        var facts = factsByIdentity
             .OrderBy(pair => pair.Key, StringComparer.Ordinal)
             .Select(pair => pair.Value)
             .ToArray();

@@ -82,6 +82,50 @@ public sealed class InteropFactStoreReaderTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task Reads_match_and_multiple_findings_for_one_managed_boundary()
+    {
+        var managed = await SeedOwnerAsync(
+            "analysis.cs",
+            "csharp:M:Native.Analyze",
+            "Analyze");
+        var match = MatchFact(managed.Key);
+        var firstFinding = FindingFact(
+            managed.Key,
+            "Interop003",
+            "Parameter 0 has an ABI mismatch.");
+        var secondFinding = FindingFact(
+            managed.Key,
+            "Interop003",
+            "Parameter 1 has an ABI mismatch.");
+        await _store!.BulkInsertAnnotationsAsync(
+        [
+            Annotation(
+                managed.SymbolId,
+                InteropAnnotationFlavors.Match,
+                InteropFactPayloadCodec.EncodeMatch(match)),
+            Annotation(
+                managed.SymbolId,
+                InteropAnnotationFlavors.Finding,
+                InteropFactPayloadCodec.EncodeFinding(firstFinding)),
+            Annotation(
+                managed.SymbolId,
+                InteropAnnotationFlavors.Finding,
+                InteropFactPayloadCodec.EncodeFinding(secondFinding)),
+        ]);
+
+        var matches = await InteropFactStoreReader.ReadMatchesAsync(_store);
+        var findings = await InteropFactStoreReader.ReadFindingsAsync(_store);
+
+        matches.IsComplete.Should().BeTrue();
+        matches.Facts.Should().ContainSingle()
+            .Which.Fact.Should().BeEquivalentTo(match);
+        findings.IsComplete.Should().BeTrue();
+        findings.Facts.Select(item => item.Fact)
+            .Should()
+            .BeEquivalentTo([firstFinding, secondFinding]);
+    }
+
+    [Fact]
     public async Task Malformed_and_host_mismatched_rows_fail_closed()
     {
         var malformed = await SeedOwnerAsync(
@@ -316,6 +360,38 @@ public sealed class InteropFactStoreReaderTests : IAsyncLifetime
             Fields: [],
             InteropTarget.WindowsX64Msvc,
             EvidenceFor(ownerFileId, "types.h"));
+
+    private static InteropMatchProjection MatchFact(string managedKey) =>
+        new(
+            managedKey,
+            "cpp:function:run",
+            InteropMatchStatus.Matched,
+            EvidenceConfidence.Exact,
+            ["The source and verified export match."],
+            InteropTarget.WindowsX64Msvc,
+            CandidateCount: 1,
+            SnapshotComplete: true,
+            [ProjectedEvidence()]);
+
+    private static InteropFindingProjection FindingFact(
+        string managedKey,
+        string ruleId,
+        string message) =>
+        new(
+            ruleId,
+            InteropFindingSeverity.Error,
+            message,
+            managedKey,
+            "cpp:function:run",
+            InteropTarget.WindowsX64Msvc,
+            EvidenceConfidence.Exact,
+            [ProjectedEvidence()]);
+
+    private static InteropEvidenceProjection ProjectedEvidence() =>
+        new(
+            new SourceLocation("analysis.cs", 1, 1, 1, 5),
+            EvidenceConfidence.Exact,
+            "interop-analysis");
 
     private static Evidence EvidenceFor(long ownerFileId, string path) =>
         new(
