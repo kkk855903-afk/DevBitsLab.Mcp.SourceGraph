@@ -102,7 +102,8 @@ public sealed class InteropMatcher
                 ["Entry-point candidates exist, but none were analyzed for the managed target ABI."],
                 Combine(
                     managed.Evidence,
-                    sameEntryPoint.Select(item => item.Evidence)));
+                    sameEntryPoint.Select(item => item.Evidence)),
+                sameEntryPoint.Length);
         }
 
         foreach (var spelling in lookup.Spellings)
@@ -148,7 +149,8 @@ public sealed class InteropMatcher
                     ],
                     Combine(
                         managed.Evidence,
-                        libraryMatches.Select(item => item.Evidence)));
+                        libraryMatches.Select(item => item.Evidence)),
+                    libraryMatches.Length);
             }
             if (candidatesWithoutLibrary.Length > 0)
             {
@@ -165,7 +167,8 @@ public sealed class InteropMatcher
                     ],
                     Combine(
                         managed.Evidence,
-                        spellingCandidates.Select(item => item.Evidence)));
+                        spellingCandidates.Select(item => item.Evidence)),
+                    spellingCandidates.Length);
             }
             if (libraryMatches.Length == 0) continue;
 
@@ -195,7 +198,8 @@ public sealed class InteropMatcher
                         ? "The export was verified in the native binary."
                         : "A unique source export matches, but it has not been verified in the final native binary.",
                 ],
-                evidence);
+                evidence,
+                candidateCount: 1);
         }
 
         return Result(
@@ -362,14 +366,18 @@ public sealed class InteropMatcher
         InteropMatchStatus status,
         EvidenceConfidence confidence,
         IReadOnlyList<string> reasons,
-        IReadOnlyList<Evidence> evidence) =>
+        IReadOnlyList<Evidence> evidence,
+        int candidateCount = 0) =>
         new(
             managed.SymbolCanonicalKey,
             native?.SymbolCanonicalKey,
             status,
             confidence,
             reasons,
-            evidence);
+            evidence)
+        {
+            CandidateCount = candidateCount,
+        };
 
     private static bool SameTarget(InteropTarget left, InteropTarget right) =>
         left.IsAbiEquivalentTo(right);

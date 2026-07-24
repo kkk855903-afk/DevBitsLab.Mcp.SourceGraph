@@ -400,7 +400,15 @@ public sealed record InteropMatch(
     InteropMatchStatus Status,
     EvidenceConfidence Confidence,
     IReadOnlyList<string> Reasons,
-    IReadOnlyList<Evidence> Evidence);
+    IReadOnlyList<Evidence> Evidence)
+{
+    /// <summary>
+    /// Number of runtime-legal candidates that remain relevant to this outcome. A proven
+    /// match has one, an ambiguity has at least two, and an unmatched result has zero.
+    /// Unknown results retain the observed count without selecting a native symbol.
+    /// </summary>
+    public int CandidateCount { get; init; }
+}
 
 public sealed record AbiCompatibilityResult(
     string ManagedSymbolCanonicalKey,

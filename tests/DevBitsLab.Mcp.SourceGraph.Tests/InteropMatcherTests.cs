@@ -17,6 +17,7 @@ public sealed class InteropMatcherTests
 
         match.Status.Should().Be(InteropMatchStatus.Matched);
         match.NativeSymbolCanonicalKey.Should().Be(native.SymbolCanonicalKey);
+        match.CandidateCount.Should().Be(1);
         match.Confidence.Should().Be(EvidenceConfidence.Semantic);
         match.Evidence.Should().HaveCount(2);
         match.Reasons.Should().Contain(reason => reason.Contains(
@@ -33,6 +34,7 @@ public sealed class InteropMatcherTests
 
         match.Status.Should().Be(InteropMatchStatus.Unmatched);
         match.NativeSymbolCanonicalKey.Should().BeNull();
+        match.CandidateCount.Should().Be(0);
         match.Reasons.Should().ContainSingle(reason => reason.Contains(
             "no candidate belongs",
             StringComparison.Ordinal));
@@ -49,6 +51,7 @@ public sealed class InteropMatcherTests
 
         match.Status.Should().Be(InteropMatchStatus.Unknown);
         match.Confidence.Should().Be(EvidenceConfidence.Inferred);
+        match.CandidateCount.Should().Be(1);
         match.Evidence.Should().HaveCount(2);
     }
 
@@ -70,6 +73,7 @@ public sealed class InteropMatcherTests
 
         match.Status.Should().Be(InteropMatchStatus.SourceMatched);
         match.NativeSymbolCanonicalKey.Should().Be(native.SymbolCanonicalKey);
+        match.CandidateCount.Should().Be(1);
         match.Reasons.Should().Contain(reason => reason.Contains(
             "not been verified",
             StringComparison.OrdinalIgnoreCase));
@@ -87,6 +91,7 @@ public sealed class InteropMatcherTests
 
         match.Status.Should().Be(InteropMatchStatus.Unknown);
         match.NativeSymbolCanonicalKey.Should().BeNull();
+        match.CandidateCount.Should().Be(2);
         match.Evidence.Should().HaveCount(3);
         match.Reasons.Should().ContainSingle(reason => reason.Contains(
             "uniqueness is not proven",
@@ -105,6 +110,7 @@ public sealed class InteropMatcherTests
 
         match.Status.Should().Be(InteropMatchStatus.Ambiguous);
         match.NativeSymbolCanonicalKey.Should().BeNull();
+        match.CandidateCount.Should().Be(2);
         match.Evidence.Should().HaveCount(3);
     }
 
@@ -122,6 +128,7 @@ public sealed class InteropMatcherTests
             ]);
 
         match.Status.Should().Be(InteropMatchStatus.Unknown);
+        match.CandidateCount.Should().Be(1);
         match.Reasons.Should().ContainSingle(reason => reason.Contains(
             "target ABI",
             StringComparison.Ordinal));
