@@ -121,7 +121,8 @@ public sealed class TabularRenderingTests : IAsyncLifetime, IDisposable
         // "Add" should match Calculator.Add (and likely several test methods that mention Add).
         var output = CallToolResultHelpers.ProseText(await GraphTools.SearchSymbolsAsync(_router!, "Add"));
         output.Should().Contain("hits for 'Add':");
-        output.Should().Contain("| Symbol | Kind | Location |");
+        output.Should().Contain(
+            "| Symbol | Kind | Relation | Confidence | Location |");
         var firstLine = output.Split('\n')[0];
         firstLine.Should().NotStartWith("|");
     }

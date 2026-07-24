@@ -11,16 +11,23 @@ namespace DevBitsLab.Mcp.SourceGraph.Server.Tools.Output;
 public sealed record SearchSymbolsResult(IReadOnlyList<SearchSymbolHit> Hits);
 
 /// <summary>
-/// One symbol match returned by <c>search_symbols</c>. Mirrors the per-row prose:
-/// <see cref="Fqn"/>, <see cref="Kind"/>, and the file:line:col triple. <see cref="Signature"/>
-/// is null on namespaces and other symbols without a signature; <see cref="XmlSummary"/> is null
-/// on symbols without doc comments.
+/// One persisted declaration matched by <c>search_symbols</c>. The query may be fuzzy, but the
+/// returned graph identity, declaration range, <see cref="Relation"/>, and
+/// <see cref="Confidence"/> describe the exact stored definition rather than a guessed code
+/// relationship. <see cref="CanonicalKey"/> is null only for legacy/plugin symbols that did not
+/// publish one.
 /// </summary>
 public sealed record SearchSymbolHit(
+    [property: JsonPropertyName("symbol_id")] long SymbolId,
+    [property: JsonPropertyName("canonical_key")] string? CanonicalKey,
     string Fqn,
     string Kind,
+    string Relation,
+    string Confidence,
     [property: JsonPropertyName("file_path")] string FilePath,
-    int Line,
-    int Column,
+    [property: JsonPropertyName("start_line")] int StartLine,
+    [property: JsonPropertyName("start_column")] int StartColumn,
+    [property: JsonPropertyName("end_line")] int EndLine,
+    [property: JsonPropertyName("end_column")] int EndColumn,
     string? Signature,
     [property: JsonPropertyName("xml_summary")] string? XmlSummary);

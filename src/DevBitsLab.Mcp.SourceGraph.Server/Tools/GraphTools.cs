@@ -1450,16 +1450,34 @@ public static class GraphTools
                         {
                             $"**{h.Fqn}**",
                             KindLabel(h.Kind),
+                            "defines",
+                            "exact",
                             Format.Location(h.FilePath, h.StartLine, h.StartCol),
                         });
                     }
-                    Format.AppendTable(sb, new[] { "Symbol", "Kind", "Location" }, rows);
+                    Format.AppendTable(
+                        sb,
+                        new[]
+                        {
+                            "Symbol",
+                            "Kind",
+                            "Relation",
+                            "Confidence",
+                            "Location",
+                        },
+                        rows);
                 }
                 else
                 {
                     foreach (var h in hits)
                     {
-                        sb.AppendLine($"- **{h.Fqn}** ({KindLabel(h.Kind)}) at {Format.Location(h.FilePath, h.StartLine, h.StartCol)}");
+                        sb.AppendLine(
+                            $"- **{h.Fqn}** ({KindLabel(h.Kind)}; "
+                            + "`defines`, exact) at "
+                            + Format.Location(
+                                h.FilePath,
+                                h.StartLine,
+                                h.StartCol));
                     }
                 }
                 return BuildSearchSymbolsResult(
@@ -1499,11 +1517,17 @@ public static class GraphTools
 
         var structuredHits = hits
             .Select(h => new SearchSymbolHit(
+                SymbolId: h.Id,
+                CanonicalKey: h.CanonicalKey,
                 Fqn: h.Fqn,
                 Kind: h.Kind,
+                Relation: "defines",
+                Confidence: "exact",
                 FilePath: h.FilePath,
-                Line: h.StartLine,
-                Column: h.StartCol,
+                StartLine: h.StartLine,
+                StartColumn: h.StartCol,
+                EndLine: h.EndLine,
+                EndColumn: h.EndCol,
                 Signature: string.IsNullOrEmpty(h.Signature) ? null : h.Signature,
                 XmlSummary: string.IsNullOrEmpty(h.XmlSummary) ? null : h.XmlSummary))
             .ToList();

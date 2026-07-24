@@ -250,6 +250,20 @@ public sealed class StructuredContentInvariantTests : IAsyncLifetime, IDisposabl
     {
         var result = await GraphTools.SearchSymbolsAsync(_router!, "Add");
         AssertStructuredArrayMatchesProse(result, hitWord: "hits", proseHeader: "Add");
+
+        var dto = JsonSerializer.Deserialize(
+            result.StructuredContent!.Value.GetRawText(),
+            ToolOutputJsonContext.Default.SearchSymbolsResult);
+        dto.Should().NotBeNull();
+        dto!.Hits.Should().NotBeEmpty();
+        dto.Hits.Should().OnlyContain(hit =>
+            hit.SymbolId > 0
+            && hit.Relation == "defines"
+            && hit.Confidence == "exact"
+            && hit.StartLine > 0
+            && hit.StartColumn > 0
+            && hit.EndLine >= hit.StartLine,
+            "fuzzy discovery must still return exact persisted declaration evidence");
     }
 
     [Fact]
