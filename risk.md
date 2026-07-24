@@ -1,122 +1,185 @@
-# MedInteropLens 风险登记（Phase 0）
+# MedInteropLens 风险登记
 
-> 分级：P0 = 阻断进入下一阶段；P1 = Phase 1 发布前必须关闭；P2 = 后续阶段门禁。  
-> “已发现”只表示有代码或环境证据，不表示问题已经修复。
+> 状态日期：2026-07-24
+> 本登记区分“已由代码控制”“仍需部署控制”和“产品固有限制”。`Mitigated` 不表示医疗认证或零风险，只表示仓库内已有可验证控制。
 
-## 1. 风险总览
+## 1. 当前风险总览
 
-| ID | 级别 | 风险 | 当前证据 | 缓解与关闭条件 |
-|---|---|---|---|---|
-| R-001 | P0 | 本地没有仓库基线 | 评估开始时为空；当前仅有四份 Phase 0 文档且不是 Git 仓库，没有项目源码 | 建立有效 Git；引入经批准的固定上游提交；记录许可证和 remote |
-| R-002 | P0 | 推荐上游当前无法通过依赖审计/restore | 对 `6b32a8b` 执行 `dotnet test -c Release`，restore 因 NU1903 高危告警失败，测试未启动 | 不得通过关闭审计作为验收；升级或替换受影响依赖，确保 restore/build/test 和 vulnerability scan 全部通过 |
-| R-003 | P1 | 图边不能满足“证据优先” | 上游 `Edge`/`edges` 无文件、行列、Evidence、Confidence | 添加逐边证据模型；六个 MCP 查询对每个 hop 输出位置和可信度；无证据不输出确定关系 |
-| R-004 | P1 | 医疗隐私默认排除不完整 | 上游各扫描入口的硬编码排除集合与工作计划不一致 | 建立单一、默认启用、大小写不敏感的排除策略；冷索引、watcher、漂移修复共享；用诱饵 PatientData/DICOM 测试 |
-| R-005 | P1 | XAML 索引可能陈旧 | 上游 `SolutionWatcher` 只监听 `*.cs`；非 C# 主要在冷索引分发 | 监听 `.xaml` 的新增/修改/改名/删除；测试等待 watcher 后图一致 |
-| R-006 | P1 | Binding/Command/ViewModel 关系可能误报或漏报 | Binding 目标可成为 placeholder；事件识别含启发式 | 为 unresolved/inferred 明确降级；优先用 `x:DataType`、DataContext、Roslyn 符号做语义解析；建立正反样例 |
-| R-007 | P1 | 缺少 `trace_call_path` 稳定工具 | 上游只有 caller/callee/impact，无目标工具 | 实现受限遍历、环检测、最大深度/节点数和逐 hop 证据测试 |
-| R-008 | P1 | 工具名称与合同不一致 | `find_references`、`list_callers`、`list_callees`、`impact_of_change` 与计划名称不同 | 增加兼容入口并冻结 MedInteropLens MCP schema；保留上游工具避免破坏 |
-| R-009 | P1 | .NET 10-only 与医疗遗留工程兼容性未知 | 上游目标 `net10.0`；`vswhere` 未发现 Visual Studio 实例，`cl/devenv` 不可调用；真实项目可能含 .NET Framework/旧 WPF | 用代表性遗留 solution 做 Spike；记录跳过/失败项目；必要时安装 Build Tools，而不是假定可加载 |
-| R-010 | P1 | 派生索引升级会整体重建 | 上游 schema 低版本会 drop/rebuild | 数据仍以源码为真；测量大型仓库重建时间、磁盘和查询不可用窗口；保留失败恢复 |
-| R-011 | P1 | 读只 SQL 逃生口可能扩大代码暴露 | `query_graph` 可读取全部可查询视图 | 保持 stdio/local-only；scope 隔离不视作安全边界；增加路径授权、结果大小限制和审计日志 |
-| R-012 | P2 | C/C++/proto 工具链缺失 | 本机无 Clang、CMake、Ninja、protoc、MSVC | 在进入对应阶段前锁版本安装；`Grpc.Tools` 可避免全局 protoc，但 Native fixture 仍需编译器 |
-| R-013 | P2 | `CodeGraph` 名称有多个不相干项目 | 工作计划未给 owner/URL/commit | 技术选型前写 ADR，固定仓库、提交、许可证、Windows 支持和输出证据能力 |
-| R-014 | P2 | 第三方 AST/DTO 泄漏会锁死架构 | 长期需同时接 Roslyn、protoc、Clang | MCP 和规则层只依赖 MedInteropLens 统一模型；第三方对象止于 analyzer adapter |
-| R-015 | P2 | 完整跨语言链的错误会累积 | 每个推断 hop 都可能降低可信度 | 路径置信度取最弱 hop；明确 exact/semantic/inferred；允许“未找到可靠路径”而不是补猜测 |
-| R-016 | P1 | 分析不可信 solution/plugin 可执行任意代码 | MSBuild、Roslyn analyzer/source generator 和 host 内插件都可能执行代码；上游安全策略明确列出该风险 | 可信仓库/插件白名单、非特权账户、默认禁第三方执行；不可信分析放隔离子进程并设超时/资源上限 |
-| R-017 | P2 | SDK 当前拒绝 proto/native canonical key | validator 只允许 `csharp/xaml/js/ts/jsx/tsx` | 进入对应阶段前扩展 `proto/c/cpp` scheme，写跨平台稳定性和冲突测试；不能假定外部插件已足够 |
-| R-018 | P1 | 上游仍是 pre-1.0 早期项目 | 评估基线 v0.8.0，API/schema 仍可能快速变化 | 固定 commit 后 fork；上游同步单独评审；MedInteropLens 自有稳定 DTO/测试隔离变化 |
+| ID | 等级 | 状态 | 风险 | 当前控制 / 仍需动作 |
+|---|---:|---|---|---|
+| R-001 | P0 | Closed | 初始工作区无 Git/源码/测试基线 | 已建立本地 Git，固定并保留上游历史，按小步提交演进 |
+| R-002 | P0 | Mitigated | 旧依赖 NU1903 / 供应链漏洞 | 中央版本、transitive pin、lock files 和 CI 漏洞门禁；每次发布仍需重新扫描 |
+| R-003 | P0 | Mitigated | 逻辑边去重导致证据或重复调用点丢失 | schema v13 `edge_evidence` 一对多，producer/file 精确清理和原子替换 |
+| R-004 | P0 | Mitigated | 患者数据、DICOM、图片或越界路径进入索引 | 不可覆盖的医疗排除、物理路径/reparse 解析、所有入口共享 policy、schema v12 强制重建 |
+| R-005 | P1 | Mitigated | 修改/删除后残留幽灵 symbol/edge/finding | 文件事务删除、producer ownership、结构 reload、漂移修复和删除/重命名测试 |
+| R-006 | P0 | Open | 恶意 `.sln`/MSBuild target/analyzer/source generator 在 host 权限下执行 | 仅处理可信工程；隐私 sanitizer 不是 sandbox。未来需把 MSBuild/Roslyn evaluation 移入受限 worker |
+| R-007 | P0 | Open | 插件可在 MCP host 内执行任意代码 | `AssemblyLoadContext` 仅隔离依赖；生产部署应禁用未审核插件并使用外部白名单/最小权限 |
+| R-008 | P0 | Mitigated | libclang 崩溃、卡死或恶意 native 输入影响 host | 用户信任门禁、独立 worker、固定协议/大小/深度/时间上限；仍建议 OS sandbox 和低权限账户 |
+| R-009 | P1 | Open | 错误 target/compile flags/pack 产生错误 ABI 结论 | 所有事实带 `InteropTarget`；缺少或冲突输入时 partial/unknown。部署必须维护真实 compile commands 和 target matrix |
+| R-010 | P1 | Mitigated | 把源码 `dllexport` 当成最终 binary export | 可选 PE export verifier 核对 architecture/module/entry；没有完整 artifact universe 就不做权威 absence |
+| R-011 | P1 | Mitigated | gRPC 首次观察被误报为“变更”，或失败刷新破坏历史 | v14 insert-only 首次成功 baseline；partial/malformed 输入不更新 baseline、不生成推测 finding |
+| R-012 | P1 | Mitigated | WPF Binding/event/thread 规则误报 | 只报告唯一可证形状，unsupported/ambiguous 记录 unknown；仍可能漏掉动态 DataContext、alias 和间接 callback |
+| R-013 | P1 | Mitigated | 路径查询混合两个索引代际 | 查询前后比较 SQLite read version 与 runtime-state identity；变化时标记 `query-snapshot` partial，absence 非权威 |
+| R-014 | P1 | Mitigated | 失败刷新后 last-good 被误当当前事实 | gRPC/native 显式 `Partial`、`RetainedLastGood`、failure/stale counts；查询完整性门禁禁止权威否定 |
+| R-015 | P1 | Mitigated | 大图/恶意查询造成 CPU、内存或 MCP 输出耗尽 | query/scope/depth/node/row/evidence/时间限制及约 50K 输出预算；仍需大仓库性能基线 |
+| R-016 | P0 | Open | 用户把分析结果当作医疗合规/安全认证 | 文档和工具必须持续声明：静态证据用于开发辅助，不是临床、法规或医疗设备认证 |
+| R-017 | P2 | Open | 单一 E2E fixture 不能代表真实 WPF/Native 工程 | 完整链使用 buildable generated-shape stubs，并为可重复性注入 native extractor/export verifier；真实 WPF/Clang/worker/PE 由独立测试覆盖 |
+| R-018 | P1 | Open | 多 RID 原生 runtime/工具打包漂移 | NuGet runtime graph、安装后 `--help`/stdio smoke 和平台 CI；发布前仍需逐 RID 验证 |
+| R-019 | P1 | Open | 本地日志/MCP evidence 暴露敏感路径或代码片段 | 本地 stdio、最小 evidence、隐私路径排除和日志测试；使用者仍应保护 `.sourcegraph` DB 与客户端会话 |
+| R-020 | P1 | Open | 静态图漏掉反射、动态代理、function pointer 或运行时 dispatch | 结果必须表述为“已找到证据”，完整性状态只覆盖配置的静态分析 universe |
 
-## 2. 供应链阻断详情
+## 2. 证据正确性原则
 
-在临时浅克隆的固定上游提交上执行：
-
-```powershell
-dotnet test DevBitsLab.Mcp.SourceGraph.slnx --configuration Release --nologo
-```
-
-restore 因仓库启用 `TreatWarningsAsErrors` 而被 NU1903 阻断，至少包括：
-
-- `SQLitePCLRaw.lib.e_sqlite3 2.1.11`：
-  [GHSA-2m69-gcr7-jv3q](https://github.com/advisories/GHSA-2m69-gcr7-jv3q)
-- `System.Security.Cryptography.Xml 10.0.7`：
-  [GHSA-23rf-6693-g89p](https://github.com/advisories/GHSA-23rf-6693-g89p)、
-  [GHSA-8q5v-6pqq-x66h](https://github.com/advisories/GHSA-8q5v-6pqq-x66h)、
-  [GHSA-cvvh-rhrc-wg4q](https://github.com/advisories/GHSA-cvvh-rhrc-wg4q)、
-  [GHSA-g8r8-53c2-pm3f](https://github.com/advisories/GHSA-g8r8-53c2-pm3f)、
-  [GHSA-mmjf-rqrv-855v](https://github.com/advisories/GHSA-mmjf-rqrv-855v)
-
-这不是 MedInteropLens 本地项目的构建失败，因为本地还没有项目；它是“推荐上游
-在当前日期和 NuGet 审计数据下不能作为未修改绿色基线”的证据。
-
-为分离“代码/测试失败”与“供应链门禁失败”，另做了一次明确标注的诊断运行：
-
-```powershell
-dotnet test DevBitsLab.Mcp.SourceGraph.slnx --configuration Release `
-  --nologo -p:NuGetAudit=false
-```
-
-该运行编译成功，IntegrationTests 通过 22/22，单元测试通过 784、跳过 2、失败 0。
-这说明固定提交的测试主体在本机可运行，但因为命令关闭了安全审计，不能算作绿色
-基线，也不能关闭 R-002。
-
-以下做法不能关闭 R-002：
-
-- 永久关闭 NuGetAudit；
-- 将 NU1903 从 warning-as-error 中豁免；
-- 只记录“上游 CI 曾通过”；
-- 未扫描 transitive dependencies 就发布。
-
-关闭 R-002 的验收命令至少包括：
-
-```powershell
-dotnet restore --locked-mode
-dotnet build --configuration Release --no-restore
-dotnet test --configuration Release --no-build
-dotnet list package --vulnerable --include-transitive
-```
-
-验收结果必须记录 SDK、操作系统、提交 SHA、包锁文件和命令退出码。
-漏洞查询命令即使列出漏洞也可能退出 0，因此 CI 还必须解析其 JSON/结构化输出并
-显式断言没有 High/Critical 项，不能只检查退出码。
-
-## 3. 正确性与可信度风险
-
-MedInteropLens 面向医疗设备软件，静态分析的“不确定”必须成为数据，而不是被文字
-掩盖：
+MedInteropLens 的核心安全约束不是“尽量给答案”，而是区分已证明、推断和未知：
 
 | 可信度 | 允许来源 | 示例 |
 |---|---|---|
-| `Exact` | 语法/描述符能唯一确定，且有精确 source span | XAML `x:Class`；proto field number；显式 `DllImport.EntryPoint` |
-| `Semantic` | 编译器/类型系统解析到唯一符号 | Roslyn resolved invocation；接口实现 |
-| `Inferred` | 规则或命名启发式 | 未知 DataContext 的 Binding；疑似 routed event |
+| `Exact` | 语法/descriptor/binary 能唯一确定且有精确 source span | proto field number、XAML resource declaration、已核验 export |
+| `Semantic` | 编译器或类型系统唯一解析 | Roslyn invocation、Binding property、gRPC generated signature |
+| `Inferred` | 受控启发式或信息不全 | 明确标注的兼容性未知，不得升级为 absence 证明 |
 
-规则：
+强制规则：
 
-1. 每条返回边都带 producer、证据位置和可信度。
-2. 传递路径的整体可信度不得高于最弱 hop。
-3. placeholder 不得伪装成真实 ViewModel/C++ 符号。
-4. ambiguous symbol 必须返回候选集或错误，不能任选一个。
-5. 删除/改名后旧边必须被清理，避免“幽灵路径”。
+1. 逻辑边至少有一条 occurrence evidence 才能进入 evidence-backed 路径。
+2. 每条 evidence 带 file、1-based range、confidence 和 producer。
+3. 跨域 linker 只消费完整上游事实；payload 解码失败使投影 partial。
+4. exact canonical key 不允许 fuzzy fallback；名称歧义返回候选/错误。
+5. 路径整体可信度不高于最弱 hop。
+6. query 被截断、图发生变化或任一 projection 不完整时，空结果不是权威 absence。
 
-## 4. 隐私与本地运行风险
+这些控制降低 false certainty，但不会消除 false negative；R-012、R-020 因此保持开放
+的产品限制。
 
-scope 的 `isolated` 只是查询 fan-out 提示，不是安全边界。Phase 1 必须把以下条件作为
-测试事实：
+## 3. 隐私和本地数据风险
 
-- 默认不遍历患者数据、DICOM、医学图片、日志和数据库目录；
-- 不把文件内容用于遥测；
-- embeddings 默认关闭或离线，下载模型不等于允许上传代码；
-- MCP 输出仅包含回答查询所需的最小证据片段；
-- 日志不记录完整源码、患者标识或未脱敏绝对路径；
-- 用户显式 include 也不能绕过硬性医疗数据扩展名策略，除非有单独高风险开关和审计。
+硬性排除：
 
-此外，上游的 `AssemblyLoadContext` 只隔离依赖，不是安全沙箱。加载工程前必须区分
-“受信任内部仓库”和“不受信任输入”；后一类不能在主 MCP 进程中执行 MSBuild、
-analyzer、source generator 或插件。Native/protoc 子进程同样需要固定二进制、
-hash 校验、超时、stdout/stderr 上限和最小权限。
+```text
+Directories:
+  bin obj .vs Debug Release Images PatientData Database Logs
+  .git .sourcegraph node_modules
+Files:
+  *.dcm *.jpg *.jpeg *.png
+```
 
-## 5. Phase 0 风险结论
+scope 自定义 exclude 只能进一步缩小范围。冷索引、Roslyn sanitizer、XAML/proto
+secondary discovery、language dispatcher、watcher、native include closure、删除和
+history 都使用同一边界。路径先做 lexical pruning，再解析现有 symlink/junction/
+reparse components；无法建立物理身份的非排除路径会失败，而不是被乐观接受。
 
-当前没有可安全进入功能开发的绿色仓库基线。下一阶段第一项工作不是 Clang、Interop
-或更多 MCP 工具，而是依次关闭 R-001 和 R-002；随后用测试驱动关闭 R-003 至
-R-008。R-012 及之后风险在对应阶段开始前重新评估。
+仍需运维控制：
+
+- `.sourcegraph/scopes/*.db`、usage log 和 MCP 客户端 transcript 可能包含允许索引的
+  源文件路径、符号和短 evidence，应按源代码同等级保护；
+- 本地运行不等于匿名化；不要把客户端会话或数据库同步到未批准的云端；
+- 当前排除是面向已知医疗目录/扩展名的默认防线，不是内容级 PHI/DLP 扫描；
+- embedding model 本地运行，但模型下载仍是网络行为，默认必须显式 opt in。
+
+## 4. 执行与隔离风险
+
+### 4.1 MSBuild / Roslyn
+
+`MSBuildWorkspace.OpenSolutionAsync` 在 sanitizer 得到 `Solution` 之前已经评估工程。
+恶意 `.targets`、SDK resolver、analyzer 或 source generator 可能执行代码。当前
+`ExecutionCapability` 合同虽然包含 `MsBuildEvaluation` 和
+`ProjectSourceGenerators`，主 cold-index 路径尚未将整个 evaluation 放入独立 worker。
+
+因此 R-006 是当前最重要的残余安全风险：
+
+- 只对可信内部仓库运行；
+- 使用非管理员、无生产凭据、最小网络/文件权限账户；
+- CI 对外部 PR 使用隔离 runner；
+- 后续将 workspace open、generator 和 analyzer 迁移到受限进程，返回有界事实而非
+  Roslyn 对象。
+
+### 4.2 插件
+
+NuGet/path plugin 会在 host 中加载。`AssemblyLoadContext` 防止依赖版本互相污染，
+不能阻止文件、网络、进程或环境变量访问。信任文档和 bundle fingerprint 能用于
+授权设计，但未审核插件仍不得在医疗代码环境启用。
+
+### 4.3 Native
+
+Native extraction 已移到 worker，且 trust file 必须位于 repository 外并拒绝
+reparse-point 绕过。协议限制为 1 MiB request、16 MiB response、64 KiB stderr，
+并限制函数、调用、类型深度和集合数量；进程超时不超过十分钟。
+
+剩余风险是 worker 仍以启动它的 OS 用户身份运行。更强部署应增加 job object/
+low-integrity token（Windows）、seccomp/container（Linux）、无网络和只读 source
+mount。worker 崩溃只会产生 partial/last-good，不应被解释为 native 没有风险。
+
+## 5. ABI 与跨语言语义风险
+
+ABI 结果始终绑定：
+
+- OS / architecture / runtime identifier；
+- toolchain ABI；
+- pointer width；
+- calling convention；
+- pack/alignment；
+- translation-unit compiler arguments；
+- 可用时的实际 binary architecture/export table。
+
+同一源码在 Win-x86、Win-x64、Linux-x64 和 ARM64 上可能得到不同结论。没有真实
+编译参数、include closure 或 artifact 时，系统应返回 incomplete/unknown，而不是
+用 host 默认值代替目标。
+
+gRPC linker 同样要求 generated container、descriptor field、request/response type、
+streaming shape 和 exact proto contract 一致。代码生成器模式超出已识别形状时会漏链，
+不会按方法名猜测。
+
+## 6. WPF 规则的已知盲区
+
+当前五类规则刻意偏向高精度：
+
+- 未知/运行时 DataContext、`RelativeSource`、显式 `Source`、复杂 converter 不会被
+  猜成唯一 Binding target；
+- event lifetime 只处理 source-defined static event + 当前实例 named method；
+  lambda、delegate alias、外部 framework event 和间接 removal 是 unknown；
+- UI thread 只处理 `Task.Run`、ThreadPool queue 和立即 `new Thread(lambda).Start()`；
+  method group、任意 scheduler、Rx 和第三方 dispatcher 不在证明范围；
+- 资源结论依赖完整的 project resource snapshot；动态加载字典可能不可见。
+
+因此“没有 WPF finding”只代表未发现符合当前证明模式的风险。
+
+## 7. gRPC 历史基线风险
+
+`grpc_contract_baselines` 保存同一 canonical key 的本地首次完整成功观察，解决了
+“首次索引即变更”的错误。但它不是 Git tag、发布版本或组织 API registry：
+
+- 删除再创建同一 key 仍会与首次观察比较，这是有意的历史语义；
+- 删除 scope DB 会删除该本地历史；
+- 多分支共享 DB 可能把另一分支的首次观察作为 baseline；
+- field rename 若 canonical key 改变，不等同于同 key number change。
+
+需要发布级兼容治理时，应另行导入/导出签名化 baseline，而不是修改当前事实表去模拟
+版本管理。
+
+## 8. 验证和发布门禁
+
+每次交付至少执行：
+
+```powershell
+dotnet restore DevBitsLab.Mcp.SourceGraph.slnx --locked-mode
+dotnet build DevBitsLab.Mcp.SourceGraph.slnx -c Release --no-restore
+dotnet test DevBitsLab.Mcp.SourceGraph.slnx -c Release --no-build
+dotnet list DevBitsLab.Mcp.SourceGraph.slnx package --vulnerable --include-transitive
+```
+
+发布还必须 pack 0.9.0 工具和 2.5.0 SDK，从本地 feed 安装工具，执行 `--help` 和真实
+stdio `tools/list`。Native/ABI 变更需运行 Clang tests 和至少一个真实目标 artifact；
+WPF 变更需保留 Windows WPF fixture；storage 变更需包含旧版本 rebuild、事务失败和
+删除测试。
+
+漏洞命令可能在列出漏洞时仍退出 0，CI 必须解析结构化结果，不能只看退出码。测试
+通过也不关闭 R-006、R-007、R-016、R-020 这类架构/产品风险。
+
+## 9. Phase 0 历史风险
+
+Phase 0 曾记录“没有可安全进入开发的绿色仓库基线”。当时 R-001 是空工作区，R-002
+是固定上游的 NU1903。它们推动了 Git 基线、依赖升级、lock files 和验证门禁，现已
+不再阻断功能实现。
+
+历史记录不应被删除，但也不能继续表述成当前状态。当前最高优先级已经从“建立仓库”
+转为：隔离不可信 MSBuild/plugin、持续多 RID/供应链验证，以及避免把静态分析结果
+误用为医疗认证。
