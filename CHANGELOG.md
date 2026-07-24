@@ -41,14 +41,15 @@ plugin SDK is `2.5.0`.
 
 ### Added
 
-- **A validated eight-hop UI-to-native execution trace.** `trace_call` and
-  `trace_call_path` accept `profile="execution"` and traverse only
-  `binds-path` → `command-executes` → `calls` → `grpc-calls` →
-  `rpc-dispatches-to` → `calls` → `pinvoke-maps-to` → `calls`. The production
-  fixture proves one contiguous route from a XAML element through its command,
-  view-model method, managed gRPC client, protobuf RPC, server handler, managed
-  import, and native export to the C++ implementation. Every hop carries
-  occurrence-level file/range/producer/confidence evidence.
+- **A validated UI-to-native execution state machine.** `trace_call` and
+  `trace_call_path` accept `profile="execution"` and enforce the ordered stages
+  `binds-path` → `command-executes` → managed `calls` → `grpc-calls` →
+  `rpc-dispatches-to` → server `calls` → `pinvoke-maps-to` → native `calls`.
+  Calls may repeat only inside their current managed/server/native stage;
+  skipped, reversed, and repeated cross-domain transitions are rejected. With
+  an exact canonical `from`, callers may omit `to` to discover every proven
+  native leaf algorithm. The production fixture proves the minimal contiguous
+  eight-hop route, with occurrence-level file/range/producer/confidence evidence.
 - **Stable MedInteropLens MCP names.** Added compatibility entry points
   `search_code`, `find_symbol`, `trace_call`, and `impact_analysis`, plus the
   domain tools `trace_binding`, `trace_command`, `check_resources`,
@@ -78,24 +79,29 @@ plugin SDK is `2.5.0`.
   against a first complete successful baseline.
 - **Target-aware native extraction and graph publication.** Explicit
   per-scope RID/compiler-ABI/pointer-size/pack configuration drives libclang
-  translation-unit extraction for C/C++ declarations, record layouts, direct
-  calls, exports, callbacks, exception escape, allocation provenance, and
-  optional binary-export verification. Stable Clang USRs resolve direct calls
-  across translation units; content-bound snapshots prevent stale evidence
-  from being published after source changes.
+  translation-unit extraction for C/C++ functions, structs, unions, enums,
+  typedefs, record layouts, direct calls, exports, callbacks, exception escape,
+  allocation provenance, and optional binary-export verification. Stable Clang
+  USRs resolve direct calls and type identities across translation units;
+  content-bound snapshots prevent stale evidence from being published after
+  source changes.
 - **Managed/native matching and rule pack.** Roslyn extracts
   `DllImport`/`LibraryImport`, callback rooting, and return-release usage.
-  Exact managed/native matching publishes `pinvoke-maps-to`; boundary analysis
-  reports proven `Interop001` calling-convention, `Interop003` parameter-type,
-  `Interop004` callback-GC, `Interop005` native-exception, and `Interop006`
-  allocator-mismatch risks. `compare_struct` performs target-specific,
-  field-by-field ABI comparison and emits `Interop002`; nested records require
-  explicit mappings and are never guessed by name.
+  Exact managed/native matching publishes `pinvoke-maps-to`; uniquely identified
+  binary-verified record arguments also publish `struct-maps-to`. Boundary
+  analysis reports proven `Interop001` calling-convention, `Interop003`
+  parameter-type, `Interop004` callback-GC, `Interop005` native-exception, and
+  `Interop006` allocator-mismatch risks. `compare_struct` performs
+  target-specific, field-by-field ABI comparison and emits `Interop002`; nested
+  records require explicit mappings and are never guessed by name.
 - **RID-complete 0.9 packaging.** The outer .NET tool selects implementation
-  packages for `win-x64`, `win-arm64`, `linux-x64`, `linux-arm64`, `osx-x64`,
-  and `osx-arm64`, including native libclang and bundled protoc assets. CI
-  installs the packed tool locally, exercises `--help`, and completes a real
-  stdio MCP `tools/list` handshake against the installed command.
+  packages for `win-x64`, `win-arm64`, `linux-x64`, `linux-arm64`, and
+  `osx-arm64`, including native libclang and bundled protoc assets. The pinned
+  LLVM 21 runtime set has no matching Intel-macOS ClangSharp payload, so
+  `osx-x64` is not published. CI installs the packed tool, exercises `--help`,
+  bundled `protoc`, and a real native worker/libclang parse on installed Ubuntu,
+  Windows, and ARM64 macOS runtimes; Ubuntu also completes a stdio MCP
+  `tools/list` handshake.
 
 ### Changed
 
@@ -493,7 +499,9 @@ Initial public release covering Roslyn-backed indexing, FTS5 name search,
 optional ONNX semantic search, multi-solution scopes, the live file/git
 watcher, and the plugin SDK.
 
-[Unreleased]: https://github.com/Jak3b0/DevBitsLab.Mcp.SourceGraph/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/Jak3b0/DevBitsLab.Mcp.SourceGraph/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/Jak3b0/DevBitsLab.Mcp.SourceGraph/compare/v0.8.0...v0.9.0
+[0.8.0]: https://github.com/Jak3b0/DevBitsLab.Mcp.SourceGraph/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/Jak3b0/DevBitsLab.Mcp.SourceGraph/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/Jak3b0/DevBitsLab.Mcp.SourceGraph/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/Jak3b0/DevBitsLab.Mcp.SourceGraph/releases/tag/v0.6.0

@@ -79,16 +79,21 @@ calls with a single structured tool call:
   number changes, and streaming changes.
 - **Target-specific managed/native interop.** Roslyn extracts
   `DllImport`/`LibraryImport` declarations and caller-owned callback/release
-  facts; libclang extracts configured C/C++ exports, record layouts, and direct
-  native calls for an explicit RID, compiler ABI, pointer size, and packing.
-  Optional binary-export verification strengthens export identity. Matching,
-  boundary analysis, and ABI comparison always return stored source evidence.
+  facts; libclang extracts configured C/C++ exports, structs, unions, enums,
+  typedefs, record layouts, and direct native calls for an explicit RID,
+  compiler ABI, pointer size, and packing. Optional binary-export verification
+  strengthens export identity. Exact, binary-verified record arguments publish
+  `struct-maps-to` only when both type identities are unique. Matching, boundary
+  analysis, and ABI comparison always return stored source evidence.
 - **One UI-to-native execution trace.** `trace_call` and `trace_call_path` with
-  `profile="execution"` traverse the validated eight-hop relation sequence:
-  `binds-path` → `command-executes` → `calls` → `grpc-calls` →
-  `rpc-dispatches-to` → `calls` → `pinvoke-maps-to` → `calls`. This connects a
-  XAML element to its command, view-model method, gRPC client and RPC, server
-  handler, managed import, native export, and final C/C++ implementation.
+  `profile="execution"` enforce an ordered state machine: `binds-path` →
+  `command-executes` → one or more managed `calls` → `grpc-calls` →
+  `rpc-dispatches-to` → one or more server `calls` → `pinvoke-maps-to` → one or
+  more native `calls`. This connects a XAML element to its command, view-model
+  method, gRPC client and RPC, server handler, managed import, native export, and
+  final C/C++ implementation without accepting out-of-order cross-domain hops.
+  With an exact canonical `from`, omit `to` to discover every proven terminal
+  native algorithm.
 - **Conservative completeness.** Every cross-domain result carries
   occurrence-level evidence. Exact canonical keys are never fuzzily
   substituted, ambiguous candidates are not guessed, incomplete projections
@@ -298,9 +303,11 @@ Make sure `~/.dotnet/tools` is on your `PATH`. The installed command is
 [Pin a version per repo](#pin-a-version-per-repo) below.
 
 The 0.9.0 tool package contains runtime-specific payloads for `win-x64`,
-`win-arm64`, `linux-x64`, `linux-arm64`, `osx-x64`, and `osx-arm64`; the .NET
-tool shim selects the current host RID. These payloads include the native
-libclang assets used by the isolated interop worker.
+`win-arm64`, `linux-x64`, `linux-arm64`, and `osx-arm64`; the .NET tool shim
+selects the current host RID. These payloads include the native libclang assets
+used by the isolated interop worker. Intel macOS is not published because the
+pinned LLVM 21 runtime set does not provide a matching `osx-x64` ClangSharp
+payload.
 
 ## Quickstart (60 seconds)
 
@@ -482,7 +489,7 @@ never build, mutate, or run the indexed application.
 |---|---|
 | `search_code` | Search indexed names, qualified names, and signatures. Compatibility name for `search_symbols`. |
 | `find_symbol` | Resolve a symbol query without guessing among ambiguous matches. Compatibility name for `search_symbols`. |
-| `trace_call` | Trace an evidence-backed relation path. Set `profile="execution"` (and omit `kind`) for the fixed UI-to-native relation whitelist and completeness disclosure. |
+| `trace_call` | Trace an evidence-backed relation path. Set `profile="execution"` (and omit `kind`) for the ordered UI-to-native state machine and completeness disclosure. With an exact canonical `from`, omit `to` to discover proven terminal native algorithms. |
 | `impact_analysis` | Compute bounded upstream change impact with an evidence-backed predecessor path. Compatibility name for `impact_of_change`. |
 | `trace_binding` | Resolve a WPF binding from an element and/or path, including explicit resolved, missing, ambiguous, incomplete, unsupported, or unknown outcomes and occurrence evidence. |
 | `trace_command` | Resolve a WPF `Command` binding to its canonical command property with the same conservative outcome model. |
@@ -491,9 +498,9 @@ never build, mutate, or run the indexed application.
 | `check_proto_contract` | Check complete current contracts for missing server implementations, uniquely proven generated signature mismatches, field-number changes, and streaming changes against the first complete baseline. |
 | `match_pinvoke` | Match one uniquely selected managed `DllImport`/`LibraryImport` to persisted native exports; zero or multiple candidates are reported, not guessed. |
 | `compare_struct` | Compare one managed and one native ABI record for the configured target. Nested records require explicit `nested_mappings`; incompatible results carry `Interop002`. |
-| `analyze_native_boundary` | Return target-specific persisted boundary facts and proven `Interop001`/`Interop003`–`Interop006` findings. Struct-layout compatibility belongs to `compare_struct`. |
+| `analyze_native_boundary` | Return target-specific persisted boundary facts and proven `Interop001`/`Interop003`–`Interop006` findings. Exact binary-verified record arguments also persist `struct-maps-to`; detailed struct-layout compatibility belongs to `compare_struct`. |
 
-The execution profile's validated eight-hop route is:
+The fixture's minimal validated eight-hop route is:
 
 ```text
 XAML element
@@ -515,6 +522,11 @@ missing, partial, refreshing, retained from a last-good snapshot, failed, or
 changed generation during the bounded read. A returned path remains
 evidence-backed even when the completeness state is partial.
 
+Execution traversal rejects skipped, reversed, or repeated cross-domain stages.
+When `to` is omitted, a terminal is a native node reached after at least one
+post-P/Invoke `calls` hop that has no auditable outbound `calls` edge. Depth,
+node, or path truncation makes terminal absence non-authoritative.
+
 ### Discovery & navigation
 
 | Tool | Question it answers |
@@ -532,7 +544,7 @@ evidence-backed even when the completeness state is partial.
 | `module_summary` | Top symbols in a namespace or directory by inbound call count |
 | `impact_of_change` | Transitive upstream callers of X up to `maxDepth` |
 | `impact_analysis` | Phase 1 compatibility name for `impact_of_change`. |
-| `trace_call_path` | Bounded, cycle-safe directed paths from one symbol to another. Defaults to one `calls` relation; set `profile="execution"` for the fixed cross-domain whitelist and `execution_state` completeness disclosure. Every hop includes source/target canonical identities, relation, confidence, and occurrence-level evidence; configurable depth, path, and node caps report truncation explicitly. |
+| `trace_call_path` | Bounded, cycle-safe directed paths from one symbol to another. Defaults to one `calls` relation; set `profile="execution"` for the ordered cross-domain state machine and `execution_state` completeness disclosure. Execution mode may omit `to` for exact-canonical terminal discovery. Every hop includes source/target canonical identities, relation, confidence, and occurrence-level evidence; configurable depth, path, and node caps report truncation explicitly. |
 | `find_data_bindings` | Walks `binds-path` edges with payload-aware filters (`path`, `mode`, `converter`, plus optional `target` / `source` canonical keys). Answers "where does this property bind?", "find every TwoWay binding", "which views use this converter?". Soft-empty `note:` when the active scope hasn't loaded an indexer that emits `binds-path`. |
 | `find_event_handlers` | Walks `handles-event` edges with `event` / `command` payload filters and optional `handler` / `element` canonical keys. Answers "find all Click handlers", "where is OnSave wired up?". Same soft-empty pattern as `find_data_bindings`. |
 
@@ -1106,19 +1118,23 @@ The curated tools have no built-in timeout — they honour the MCP client's `Can
 
 ## Platform support
 
-The 0.9 outer .NET tool package selects one of six RID-specific implementation
+The 0.9 outer .NET tool package selects one of five RID-specific implementation
 packages, each carrying the matching native dependencies:
 
 | Operating system | Published RIDs | CI host |
 |---|---|---|
 | Windows | `win-x64`, `win-arm64` | Windows latest |
 | Linux | `linux-x64`, `linux-arm64` | Ubuntu latest |
-| macOS | `osx-x64`, `osx-arm64` | macOS latest |
+| macOS | `osx-arm64` | macOS latest (ARM64) |
 
 Install all of them through the same command:
 `dotnet tool install -g DevBitsLab.Mcp.SourceGraph.Tool --version 0.9.0`.
-CI validates package creation, local tool installation, `--help`, and a real
-stdio MCP `tools/list` handshake from the installed command.
+CI validates all seven package identities (outer tool, five implementations,
+and SDK), local tool installation, `--help`, bundled `protoc`, a real native
+worker/libclang parse, and a stdio MCP `tools/list` handshake from the installed
+command. Installed runtime smoke runs on Ubuntu x64, Windows x64, and macOS
+ARM64. The `osx-arm64` payload uses Grpc.Tools' x64 `protoc`, so macOS hosts also
+need x86_64 translation support (Rosetta 2).
 
 The published tool targets **`net10.0`**. Earlier .NET runtimes (8, 9) are not
 currently supported — see [GOVERNANCE.md](GOVERNANCE.md#roadmap-items-currently-parked)

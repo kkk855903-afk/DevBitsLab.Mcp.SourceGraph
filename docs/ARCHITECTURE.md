@@ -121,10 +121,10 @@ resolved property to make a path connect.
 
 ### Native and Interop
 
-`Indexing.Clang` uses ClangSharp/libclang for target-aware declarations, layouts,
-exports, direct calls, callback retention, exception escape, and allocation
-facts. Production extraction runs in a child process managed by `Server`, not
-inside the MCP process.
+`Indexing.Clang` uses ClangSharp/libclang for target-aware function, struct,
+union, enum, typedef, layout, export, direct-call, callback-retention,
+exception-escape, and allocation facts. Production extraction runs in a child
+process managed by `Server`, not inside the MCP process.
 
 `Interop` consumes normalized managed/native facts. It owns matching, PE export
 verification, ABI record comparison, and the initial `Interop001`–`Interop006`
@@ -273,6 +273,12 @@ user trust decision
   → proven orphan cleanup
 ```
 
+Complete native snapshots publish function and type declarations into the same
+symbol graph. An exact binary-verified P/Invoke boundary publishes
+`struct-maps-to` only when the managed and native record identities are unique
+at the same signature position; duplicate qualified native types remain
+unmapped rather than being guessed.
+
 The worker protocol rejects unknown members and limits request/response/stderr,
 strings, collections, compiler arguments, and type depth. The client enforces a
 bounded process timeout. The snapshot hashes every approved translation unit and
@@ -322,7 +328,7 @@ creates speculative findings.
 
 ## Complete execution traversal
 
-`trace_call_path(profile="execution")` uses a fixed relation whitelist to answer
+`trace_call_path(profile="execution")` uses an ordered stage machine to answer
 the end-to-end question:
 
 ```text
@@ -340,6 +346,13 @@ XAML Button
 Every hop must have persisted evidence. The traversal is bounded by query length,
 scope fan-out, depth, path count, expanded nodes, evidence per hop, total evidence,
 cancellation, and the common output budget.
+
+Only `calls` may repeat, and only inside the current managed-client,
+managed-server, or native stage. Cross-domain stages cannot be skipped, reversed,
+or repeated. With an exact canonical starting key, `to` may be omitted; terminal
+discovery then returns native nodes reached after at least one post-P/Invoke call
+that have no auditable outbound `calls` edge. Any traversal truncation makes an
+empty terminal result non-authoritative.
 
 At the start and end of traversal it compares:
 
@@ -410,10 +423,14 @@ Tests are layered:
    `implements-rpc` audit edge.
 
 The portable end-to-end contract injects native extraction/export verification
-for deterministic execution. Real Clang extraction, worker protocol, PE parsing,
-and a Windows WPF fixture have dedicated tests. Release validation additionally
-performs locked restore, Release build/test, transitive vulnerability scanning,
-package installation, `--help`, and a real stdio `tools/list` smoke.
+for deterministic execution. A separate fixture feeds the six negative cases
+through real Roslyn and libclang facts and proves `Interop001`–`Interop006`.
+Dedicated tests cover worker protocol, PE parsing, real WPF binding resolution,
+and both WPF risk rules on a complete WindowsDesktop compilation. Release
+validation additionally performs locked restore, Release build/test, structured
+transitive vulnerability scanning, exact seven-package identity/version checks,
+package installation, `--help`, bundled `protoc`, a real native worker/libclang
+parse, and a stdio `tools/list` smoke.
 
 ## Versioning boundaries
 
@@ -431,6 +448,8 @@ within a current v14 database it is intentionally historical and insert-only.
 
 - Static analysis does not prove arbitrary reflection, runtime DI, dynamic
   proxies, delegate aliases, function pointers, or every virtual dispatch.
+- The execution profile follows control/call relations; arbitrary value/taint
+  propagation from a parameter into hardware I/O side effects is not modeled.
 - WPF rules deliberately favor narrow proofs over recall.
 - ABI results are valid only for the configured OS, architecture, toolchain,
   compiler arguments, pack, and verified artifact.
