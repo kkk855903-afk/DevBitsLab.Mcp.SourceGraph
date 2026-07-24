@@ -3397,6 +3397,85 @@ public sealed partial class SqliteGraphStore : IGraphStore
         return rows.AsList();
     }
 
+    public async Task<IReadOnlyList<StoredAnnotationRow>>
+        ListAnnotationsForFilesByFlavorsAsync(
+            IReadOnlyCollection<string> filePaths,
+            IReadOnlyCollection<string> flavors,
+            int limit,
+            CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(filePaths);
+        ArgumentNullException.ThrowIfNull(flavors);
+        ArgumentOutOfRangeException.ThrowIfLessThan(limit, 1);
+        ct.ThrowIfCancellationRequested();
+
+        var requestedPaths = filePaths
+            .Select((path, index) =>
+            {
+                ArgumentException.ThrowIfNullOrWhiteSpace(
+                    path,
+                    $"{nameof(filePaths)}[{index}]");
+                return path;
+            })
+            .Distinct(StringComparer.Ordinal)
+            .OrderBy(path => path, StringComparer.Ordinal)
+            .ToArray();
+        var requestedFlavors = flavors
+            .Select((flavor, index) =>
+            {
+                KebabCaseValidator.Validate(
+                    flavor,
+                    $"{nameof(flavors)}[{index}]");
+                return flavor;
+            })
+            .Distinct(StringComparer.Ordinal)
+            .OrderBy(flavor => flavor, StringComparer.Ordinal)
+            .ToArray();
+        if (requestedPaths.Length == 0 || requestedFlavors.Length == 0)
+        {
+            return [];
+        }
+
+        const string sql = """
+            WITH requested_paths(path) AS (
+                SELECT CAST(value AS TEXT)
+                FROM json_each(@pathsJson)
+            ),
+            requested_flavors(flavor) AS (
+                SELECT CAST(value AS TEXT)
+                FROM json_each(@flavorsJson)
+            )
+            SELECT a.id                  AS AnnotationId,
+                   s.id                  AS SymbolId,
+                   s.canonical_key       AS SymbolCanonicalKey,
+                   f.id                  AS FileId,
+                   f.path                AS FilePath,
+                   a.name                AS Name,
+                   a.full_name           AS FullName,
+                   a.flavor              AS Flavor,
+                   a.args_json           AS ArgsJson,
+                   a.attribute_symbol_id AS AttributeSymbolId
+            FROM annotations a
+            JOIN symbols s ON s.id = a.symbol_id
+            JOIN files f ON f.id = s.file_id
+            JOIN requested_paths p ON p.path = f.path
+            JOIN requested_flavors rf ON rf.flavor = a.flavor
+            ORDER BY f.path, a.flavor, s.canonical_key, a.id
+            LIMIT @limit;
+            """;
+        var rows = await _connection.QueryAsync<StoredAnnotationRow>(
+            new CommandDefinition(
+                sql,
+                new
+                {
+                    pathsJson = JsonSerializer.Serialize(requestedPaths),
+                    flavorsJson = JsonSerializer.Serialize(requestedFlavors),
+                    limit,
+                },
+                cancellationToken: ct)).ConfigureAwait(false);
+        return rows.AsList();
+    }
+
     public async Task<IReadOnlyList<string>> GetDistinctEdgeKindsAsync(CancellationToken ct = default)
     {
         // SELECT DISTINCT delivers dedup; ORDER BY uses the same column so the result is sorted.

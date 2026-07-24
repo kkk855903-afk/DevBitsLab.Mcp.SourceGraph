@@ -10,6 +10,50 @@ namespace DevBitsLab.Mcp.SourceGraph.Tests;
 public sealed class ManagedInteropProjectionIndexingTests
 {
     [Fact]
+    public async Task Bounded_projection_read_validates_bounds_empty_sets_and_cancellation()
+    {
+        var root = CreateTempRoot();
+        try
+        {
+            await using var store =
+                new SqliteGraphStore(Path.Join(root, "graph.db"));
+
+            (await store.ListAnnotationsForFilesByFlavorsAsync(
+                    [],
+                    [InteropAnnotationFlavors.ManagedImport],
+                    limit: 1))
+                .Should().BeEmpty();
+            (await store.ListAnnotationsForFilesByFlavorsAsync(
+                    ["Managed.cs"],
+                    [],
+                    limit: 1))
+                .Should().BeEmpty();
+
+            Func<Task> invalidLimit = async () =>
+                await store.ListAnnotationsForFilesByFlavorsAsync(
+                    ["Managed.cs"],
+                    [InteropAnnotationFlavors.ManagedImport],
+                    limit: 0);
+            await invalidLimit.Should()
+                .ThrowAsync<ArgumentOutOfRangeException>();
+
+            using var cancellation = new CancellationTokenSource();
+            await cancellation.CancelAsync();
+            Func<Task> cancelled = async () =>
+                await store.ListAnnotationsForFilesByFlavorsAsync(
+                    [],
+                    [],
+                    limit: 1,
+                    cancellation.Token);
+            await cancelled.Should().ThrowAsync<OperationCanceledException>();
+        }
+        finally
+        {
+            TryDeleteDirectory(root);
+        }
+    }
+
+    [Fact]
     public async Task Cold_and_incremental_index_replace_real_managed_import_projection()
     {
         var root = CreateTempRoot();
@@ -72,7 +116,9 @@ public sealed class ManagedInteropProjectionIndexingTests
         {
             var (solutionPath, sourcePath) =
                 await WriteSingleProjectSolutionAsync(root, multiTarget);
-            await File.WriteAllTextAsync(sourcePath, ImportSource("run"));
+            await File.WriteAllTextAsync(
+                sourcePath,
+                ImportSourceWithOutgoingReference());
             var dbPath = Path.Join(root, "graph.db");
             await using var store = new SqliteGraphStore(dbPath);
 
@@ -83,6 +129,9 @@ public sealed class ManagedInteropProjectionIndexingTests
             }
             var original = (await ReadImportsAsync(store))
                 .Should().ContainSingle().Subject;
+            (await store.HasOutgoingReferencesAsync(original.FileId))
+                .Should().BeTrue(
+                    "the regression must not be repaired by the legacy zombie-file fallback");
             await store.ReplaceAnnotationsForFileByFlavorAsync(
                 original.FilePath,
                 InteropAnnotationFlavors.ManagedImport,
@@ -118,7 +167,9 @@ public sealed class ManagedInteropProjectionIndexingTests
         {
             var (solutionPath, sourcePath) =
                 await WriteSingleProjectSolutionAsync(root);
-            await File.WriteAllTextAsync(sourcePath, RecordSource());
+            await File.WriteAllTextAsync(
+                sourcePath,
+                RecordStructSourceWithOutgoingReference());
             await using var store =
                 new SqliteGraphStore(Path.Join(root, "graph.db"));
 
@@ -129,6 +180,9 @@ public sealed class ManagedInteropProjectionIndexingTests
             }
             var original = (await ReadRecordsAsync(store))
                 .Should().ContainSingle().Subject;
+            (await store.HasOutgoingReferencesAsync(original.FileId))
+                .Should().BeTrue(
+                    "the regression must not be repaired by the legacy zombie-file fallback");
             await store.ReplaceAnnotationsForFileByFlavorAsync(
                 original.FilePath,
                 InteropAnnotationFlavors.AbiRecord,
@@ -142,6 +196,132 @@ public sealed class ManagedInteropProjectionIndexingTests
             }
 
             (await ReadRecordsAsync(store)).Should().ContainSingle();
+        }
+        finally
+        {
+            TryDeleteDirectory(root);
+        }
+    }
+
+    [Fact]
+    public async Task Unchanged_cold_start_regenerates_partially_missing_projection()
+    {
+        var root = CreateTempRoot();
+        try
+        {
+            var (solutionPath, sourcePath) =
+                await WriteSingleProjectSolutionAsync(root);
+            await File.WriteAllTextAsync(
+                sourcePath,
+                MultipleInteropProjectionSource());
+            var databasePath = Path.Join(root, "graph.db");
+            await using var store = new SqliteGraphStore(databasePath);
+
+            await using (var first = CreateIndexer(store, root))
+            {
+                await first.OpenAsync(solutionPath);
+                (await first.IndexAllAsync()).FailedFiles.Should().BeEmpty();
+            }
+            var imports = await ReadImportsAsync(store);
+            var records = await ReadRecordsAsync(store);
+            imports.Should().HaveCount(2);
+            records.Should().HaveCount(2);
+            (await store.HasOutgoingReferencesAsync(imports[0].FileId))
+                .Should().BeTrue(
+                    "the regression must not be repaired by the legacy zombie-file fallback");
+
+            await DeleteAnnotationAsync(
+                databasePath,
+                imports[0].AnnotationId);
+            await DeleteAnnotationAsync(
+                databasePath,
+                records[0].AnnotationId);
+            (await ReadImportsAsync(store)).Should().ContainSingle();
+            (await ReadRecordsAsync(store)).Should().ContainSingle();
+
+            await using (var restarted = CreateIndexer(store, root))
+            {
+                await restarted.OpenAsync(solutionPath);
+                (await restarted.IndexAllAsync()).FailedFiles.Should().BeEmpty();
+            }
+
+            (await ReadImportsAsync(store)).Should().HaveCount(2);
+            (await ReadRecordsAsync(store)).Should().HaveCount(2);
+        }
+        finally
+        {
+            TryDeleteDirectory(root);
+        }
+    }
+
+    [Fact]
+    public async Task Partial_record_projection_keeps_its_canonical_owner_across_recovery()
+    {
+        var root = CreateTempRoot();
+        try
+        {
+            var (solutionPath, firstSourcePath) =
+                await WriteSingleProjectSolutionAsync(root);
+            var secondSourcePath = Path.Join(
+                Path.GetDirectoryName(firstSourcePath)!,
+                "Packet.Part2.cs");
+            await File.WriteAllTextAsync(
+                firstSourcePath,
+                PartialRecordFirstSource());
+            await File.WriteAllTextAsync(
+                secondSourcePath,
+                PartialRecordSecondSource());
+            await using var store =
+                new SqliteGraphStore(Path.Join(root, "graph.db"));
+
+            await using (var first = CreateIndexer(store, root))
+            {
+                await first.OpenAsync(solutionPath);
+                (await first.IndexAllAsync()).FailedFiles.Should().BeEmpty();
+            }
+            var original = (await ReadRecordsAsync(store))
+                .Should().ContainSingle().Subject;
+            var sourceFiles = (await store.GetAllFilesAsync())
+                .Where(file =>
+                    file.Path.EndsWith(
+                        "NativeMethods.cs",
+                        StringComparison.OrdinalIgnoreCase)
+                    || file.Path.EndsWith(
+                        "Packet.Part2.cs",
+                        StringComparison.OrdinalIgnoreCase))
+                .ToArray();
+            sourceFiles.Should().HaveCount(2);
+            foreach (var sourceFile in sourceFiles)
+            {
+                (await store.HasOutgoingReferencesAsync(sourceFile.Id))
+                    .Should().BeTrue(
+                        "partial-owner stability must not depend on zombie recovery");
+            }
+
+            await using (var unchanged = CreateIndexer(store, root))
+            {
+                await unchanged.OpenAsync(solutionPath);
+                (await unchanged.IndexAllAsync()).FailedFiles.Should().BeEmpty();
+            }
+            var stable = (await ReadRecordsAsync(store))
+                .Should().ContainSingle().Subject;
+            stable.FilePath.Should().Be(original.FilePath);
+            stable.ArgsJson.Should().Be(original.ArgsJson);
+
+            await store.ReplaceAnnotationsForFileByFlavorAsync(
+                original.FilePath,
+                InteropAnnotationFlavors.AbiRecord,
+                []);
+            await using (var recovering = CreateIndexer(store, root))
+            {
+                await recovering.OpenAsync(solutionPath);
+                (await recovering.IndexAllAsync()).FailedFiles.Should().BeEmpty();
+            }
+
+            var recovered = (await ReadRecordsAsync(store))
+                .Should().ContainSingle().Subject;
+            recovered.FilePath.Should().Be(original.FilePath);
+            recovered.ArgsJson.Should().Be(original.ArgsJson);
         }
         finally
         {
@@ -604,6 +784,116 @@ public sealed class ManagedInteropProjectionIndexingTests
         }
         """;
 
+    private static string ImportSourceWithOutgoingReference() =>
+        """
+        using System.Runtime.InteropServices;
+
+        namespace Fixture;
+
+        internal static class NativeMethods
+        {
+            [DllImport(
+                "medalgo",
+                EntryPoint = "run",
+                CallingConvention = CallingConvention.Cdecl,
+                ExactSpelling = true)]
+            internal static extern int Run(int value);
+
+            internal static int ExerciseGraph(int value) => Identity(value);
+
+            private static int Identity(int value) => value;
+        }
+        """;
+
+    private static string RecordStructSourceWithOutgoingReference() =>
+        """
+        using System.Runtime.InteropServices;
+
+        namespace Fixture;
+
+        [StructLayout(LayoutKind.Sequential, Pack = 1)]
+        internal record struct Packet
+        {
+            public int Count;
+        }
+
+        internal static class GraphAnchor
+        {
+            internal static int ExerciseGraph(int value) => Identity(value);
+
+            private static int Identity(int value) => value;
+        }
+        """;
+
+    private static string MultipleInteropProjectionSource() =>
+        """
+        using System.Runtime.InteropServices;
+
+        namespace Fixture;
+
+        internal static class NativeMethods
+        {
+            [DllImport("medalgo", EntryPoint = "run_a", ExactSpelling = true)]
+            internal static extern int RunA(int value);
+
+            [DllImport("medalgo", EntryPoint = "run_b", ExactSpelling = true)]
+            internal static extern int RunB(int value);
+
+            internal static int ExerciseGraph(int value) => Identity(value);
+
+            private static int Identity(int value) => value;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        internal struct FirstPacket
+        {
+            public int Value;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        internal record struct SecondPacket
+        {
+            public int Value;
+        }
+        """;
+
+    private static string PartialRecordFirstSource() =>
+        """
+        using System.Runtime.InteropServices;
+
+        namespace Fixture;
+
+        [StructLayout(LayoutKind.Sequential)]
+        internal partial struct Packet
+        {
+            public int First;
+        }
+
+        internal static class FirstGraphAnchor
+        {
+            internal static int ExerciseGraph(int value) => Identity(value);
+
+            private static int Identity(int value) => value;
+        }
+        """;
+
+    private static string PartialRecordSecondSource() =>
+        """
+        namespace Fixture;
+
+        internal partial struct Packet
+        {
+            public int Second;
+        }
+
+        internal static class SecondGraphAnchor
+        {
+            internal static int ExerciseGraph(int value) => Identity(value);
+
+            private static int Identity(int value) => value;
+        }
+        """;
+
     private static string RecordSource() =>
         """
         using System.Runtime.InteropServices;
@@ -627,6 +917,19 @@ public sealed class ManagedInteropProjectionIndexingTests
             public ushort[] Values;
         }
         """;
+
+    private static async Task DeleteAnnotationAsync(
+        string databasePath,
+        long annotationId)
+    {
+        await using var connection =
+            new SqliteConnection($"Data Source={databasePath}");
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = "DELETE FROM annotations WHERE id = $id;";
+        command.Parameters.AddWithValue("$id", annotationId);
+        (await command.ExecuteNonQueryAsync()).Should().Be(1);
+    }
 
     private static string CreateTempRoot()
     {

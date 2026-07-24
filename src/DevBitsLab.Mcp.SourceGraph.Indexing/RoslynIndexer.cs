@@ -1057,18 +1057,6 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
 
     private async Task<bool> HasStoredManagedImportInPathsAsync(
         IReadOnlySet<string> paths,
-        CancellationToken ct) =>
-        await HasStoredManagedInteropProjectionInPathsAsync(
-                InteropAnnotationFlavors.ManagedImport,
-                paths,
-                assumePresentWhenTruncated: true,
-                ct)
-            .ConfigureAwait(false);
-
-    private async Task<bool> HasStoredManagedInteropProjectionInPathsAsync(
-        string flavor,
-        IReadOnlySet<string> paths,
-        bool assumePresentWhenTruncated,
         CancellationToken ct)
     {
         long afterId = 0;
@@ -1081,7 +1069,7 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                 pageSize,
                 MaximumManagedImportFanoutProbeRows - rowsRead);
             var page = await _store.ListAnnotationsByFlavorAsync(
-                    flavor,
+                    InteropAnnotationFlavors.ManagedImport,
                     afterId,
                     limit,
                     ct)
@@ -1105,16 +1093,15 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
             }
         }
 
-        // An over-bound fact universe cannot prove whether a remaining row belongs to this
-        // file. Fanout callers conservatively assume it does; integrity callers conservatively
-        // force a rebuild.
+        // An over-bound fact universe cannot prove that none of the remaining rows belongs to a
+        // touched file. Fan out conservatively instead of publishing stale caller facts.
         var probe = await _store.ListAnnotationsByFlavorAsync(
-                flavor,
+                InteropAnnotationFlavors.ManagedImport,
                 afterId,
                 limit: 1,
                 ct)
             .ConfigureAwait(false);
-        return probe.Count > 0 && assumePresentWhenTruncated;
+        return probe.Count > 0;
     }
 
     private async Task<bool> HasStoredGeneratedManagedImportAsync(
@@ -1196,14 +1183,18 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         return false;
     }
 
-    private async Task<bool> DocumentsContainManagedAbiRecordAsync(
-        IReadOnlyList<Document> documents,
-        CancellationToken ct)
+    private async Task<IReadOnlyList<FileAnnotationFact>?>
+        TryBuildExpectedManagedInteropProjectionAsync(
+            string producingFilePath,
+            long producingFileId,
+            IReadOnlyList<Document> documents,
+            IReadOnlySet<string> ownedCanonicalKeys,
+            CancellationToken ct)
     {
-        if (_interopTarget is null)
-        {
-            return false;
-        }
+        var importPayloadByKey =
+            new Dictionary<string, string>(StringComparer.Ordinal);
+        var abiRecordPayloadByKey =
+            new Dictionary<string, string?>(StringComparer.Ordinal);
 
         foreach (var document in documents)
         {
@@ -1214,27 +1205,264 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                 .ConfigureAwait(false);
             if (root is null || model is null)
             {
-                continue;
+                return null;
             }
-            foreach (var declaration in root.DescendantNodes()
-                         .OfType<StructDeclarationSyntax>())
+
+            foreach (var declaration in EnumerateDeclarations(root))
             {
                 ct.ThrowIfCancellationRequested();
-                if (model.GetDeclaredSymbol(
-                        declaration,
-                        ct)
-                    is INamedTypeSymbol record
-                    && ManagedRecordLayoutExtractor.TryExtract(
-                            record,
-                            _interopTarget,
-                            producingFileId: 1)
-                        is not null)
+                var symbol = model.GetDeclaredSymbol(declaration, ct);
+                if (symbol is null || !SymbolMapping.IsIndexable(symbol))
                 {
-                    return true;
+                    continue;
+                }
+                var key = SymbolMapping.CanonicalKey(symbol);
+                if (key is null)
+                {
+                    continue;
+                }
+
+                if (symbol is IMethodSymbol interopMethod)
+                {
+                    var import = ManagedInteropExtractor.TryExtract(
+                        interopMethod,
+                        _interopTarget!,
+                        producingFileId,
+                        producingFilePath);
+                    if (import is not null)
+                    {
+                        var payload =
+                            InteropFactPayloadCodec.EncodeManagedImport(import);
+                        if (importPayloadByKey.TryGetValue(
+                                import.SymbolCanonicalKey,
+                                out var previousPayload)
+                            && !string.Equals(
+                                previousPayload,
+                                payload,
+                                StringComparison.Ordinal))
+                        {
+                            return null;
+                        }
+                        importPayloadByKey[import.SymbolCanonicalKey] = payload;
+                    }
+                }
+
+                if (symbol is INamedTypeSymbol
+                    {
+                        TypeKind: TypeKind.Struct,
+                    } interopRecord)
+                {
+                    var layout = ManagedRecordLayoutExtractor.TryExtract(
+                        interopRecord,
+                        _interopTarget!,
+                        producingFileId);
+                    var payload = layout is null
+                        ? null
+                        : InteropFactPayloadCodec.EncodeAbiRecord(layout);
+                    if (abiRecordPayloadByKey.TryGetValue(
+                            key,
+                            out var previousPayload)
+                        && !string.Equals(
+                            previousPayload,
+                            payload,
+                            StringComparison.Ordinal))
+                    {
+                        return null;
+                    }
+                    if (!abiRecordPayloadByKey.ContainsKey(key)
+                        && abiRecordPayloadByKey.Count
+                            >= MaximumManagedAbiRecordsPerFile)
+                    {
+                        return null;
+                    }
+                    abiRecordPayloadByKey[key] = payload;
                 }
             }
         }
-        return false;
+
+        var expected = importPayloadByKey
+            .Where(pair => ownedCanonicalKeys.Contains(pair.Key))
+            .OrderBy(pair => pair.Key, StringComparer.Ordinal)
+            .Select(pair => new FileAnnotationFact(
+                pair.Key,
+                ManagedInteropAnnotationName,
+                ManagedInteropAnnotationFullName,
+                InteropAnnotationFlavors.ManagedImport,
+                pair.Value,
+                AttributeCanonicalKey: null))
+            .ToList();
+        expected.AddRange(abiRecordPayloadByKey
+            .Where(pair =>
+                pair.Value is not null
+                && ownedCanonicalKeys.Contains(pair.Key))
+            .OrderBy(pair => pair.Key, StringComparer.Ordinal)
+            .Select(pair => new FileAnnotationFact(
+                pair.Key,
+                ManagedAbiRecordAnnotationName,
+                ManagedAbiRecordAnnotationFullName,
+                InteropAnnotationFlavors.AbiRecord,
+                pair.Value,
+                AttributeCanonicalKey: null)));
+        return expected;
+    }
+
+    private async Task<IReadOnlySet<string>>
+        FindManagedInteropProjectionRefreshPathsAsync(
+            IReadOnlyList<(
+                string StoragePath,
+                string DisplayPath,
+                bool IsGenerated,
+                List<Document> Documents)> documentGroups,
+            CancellationToken ct)
+    {
+        var refreshPaths = new HashSet<string>(_pathComparer);
+        var expectedByPath = new Dictionary<
+            string,
+            (long FileId, IReadOnlyList<FileAnnotationFact> Facts)>(
+            _pathComparer);
+
+        foreach (var group in documentGroups)
+        {
+            ct.ThrowIfCancellationRequested();
+            if (!_fileIdByPath.TryGetValue(group.StoragePath, out var fileId)
+                || !_keysByFileId.TryGetValue(fileId, out var ownedKeys))
+            {
+                // New or otherwise unhydrated owners already bypass the SHA gate.
+                continue;
+            }
+
+            try
+            {
+                var expected =
+                    await TryBuildExpectedManagedInteropProjectionAsync(
+                            group.StoragePath,
+                            fileId,
+                            group.Documents,
+                            ownedKeys.ToHashSet(StringComparer.Ordinal),
+                            ct)
+                        .ConfigureAwait(false);
+                if (expected is null)
+                {
+                    refreshPaths.Add(group.StoragePath);
+                    continue;
+                }
+                expectedByPath[group.StoragePath] = (fileId, expected);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                // A source-side integrity probe is advisory only. Re-walk the owner through the
+                // normal per-file failure boundary instead of trusting an unverifiable SHA skip.
+                _logger.LogDebug(
+                    ex,
+                    "Re-walking {Path}: managed interop projection could not be verified",
+                    group.StoragePath);
+                refreshPaths.Add(group.StoragePath);
+            }
+        }
+
+        if (expectedByPath.Count == 0)
+        {
+            return refreshPaths;
+        }
+
+        var expectedCount =
+            expectedByPath.Values.Sum(item => (long)item.Facts.Count);
+        if (expectedCount >= int.MaxValue)
+        {
+            refreshPaths.UnionWith(expectedByPath.Keys);
+            return refreshPaths;
+        }
+        var queryLimit = checked((int)expectedCount + 1);
+        var stored = await _store.ListAnnotationsForFilesByFlavorsAsync(
+                expectedByPath.Keys.ToArray(),
+                [
+                    InteropAnnotationFlavors.ManagedImport,
+                    InteropAnnotationFlavors.AbiRecord,
+                ],
+                queryLimit,
+                ct)
+            .ConfigureAwait(false);
+        if (stored.Count == queryLimit)
+        {
+            // More rows exist than the complete Roslyn projection can contain. Rebuild all
+            // queried owners because the bounded result cannot identify every extra owner.
+            refreshPaths.UnionWith(expectedByPath.Keys);
+            return refreshPaths;
+        }
+
+        var storedByPath = stored.ToLookup(
+            row => row.FilePath,
+            _pathComparer);
+        foreach (var pair in expectedByPath)
+        {
+            if (!ManagedInteropProjectionMatches(
+                    pair.Key,
+                    pair.Value.FileId,
+                    pair.Value.Facts,
+                    storedByPath[pair.Key]))
+            {
+                refreshPaths.Add(pair.Key);
+            }
+        }
+        return refreshPaths;
+    }
+
+    private static bool ManagedInteropProjectionMatches(
+        string expectedFilePath,
+        long expectedFileId,
+        IReadOnlyList<FileAnnotationFact> expected,
+        IEnumerable<StoredAnnotationRow> stored)
+    {
+        var actualByIdentity =
+            new Dictionary<
+                (string CanonicalKey, string Flavor),
+                StoredAnnotationRow>();
+        foreach (var row in stored)
+        {
+            if (!actualByIdentity.TryAdd(
+                    (row.SymbolCanonicalKey, row.Flavor),
+                    row))
+            {
+                return false;
+            }
+        }
+        if (actualByIdentity.Count != expected.Count)
+        {
+            return false;
+        }
+
+        foreach (var fact in expected)
+        {
+            if (!actualByIdentity.TryGetValue(
+                    (fact.SymbolCanonicalKey, fact.Flavor),
+                    out var actual)
+                || actual.FileId != expectedFileId
+                || !string.Equals(
+                    actual.FilePath,
+                    expectedFilePath,
+                    StringComparison.Ordinal)
+                || !string.Equals(
+                    actual.Name,
+                    fact.Name,
+                    StringComparison.Ordinal)
+                || !string.Equals(
+                    actual.FullName,
+                    fact.FullName,
+                    StringComparison.Ordinal)
+                || !string.Equals(
+                    actual.ArgsJson,
+                    fact.ArgsJson,
+                    StringComparison.Ordinal)
+                || actual.AttributeSymbolId is not null)
+            {
+                return false;
+            }
+        }
+        return true;
     }
 
     private async Task<bool> DocumentContainsManagedImportAsync(
@@ -2426,6 +2654,14 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                 [owner.Document]));
         }
 
+        var managedInteropProjectionRefreshPaths =
+            !fullReset && forceInteropProjectionRefresh
+                ? await FindManagedInteropProjectionRefreshPathsAsync(
+                        documentGroups,
+                        ct)
+                    .ConfigureAwait(false)
+                : new HashSet<string>(_pathComparer);
+
         foreach (var documentsForOwner in documentGroups)
         {
             ct.ThrowIfCancellationRequested();
@@ -2490,34 +2726,12 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                 }
             }
 
-            // The source hash proves only that the document is unchanged; it does not prove
-            // that its independently stored interop projection survived. Re-walk an owner
-            // when its import or ABI-record projection is missing instead of sending it to
-            // the usage-only refresh below.
+            // A matching source hash does not prove that this file's independently stored
+            // managed-import/ABI projection survived. The preflight compares the complete
+            // Roslyn projection against one bounded batch read and marks only mismatched owners.
             var missingManagedInteropProjection =
                 unchanged
-                && !fullReset
-                && forceInteropProjectionRefresh
-                && (await DocumentsContainManagedImportAsync(
-                            groupedDocuments,
-                            ct)
-                        .ConfigureAwait(false)
-                    && !await HasStoredManagedInteropProjectionInPathsAsync(
-                            InteropAnnotationFlavors.ManagedImport,
-                            new HashSet<string>(_pathComparer) { path },
-                            assumePresentWhenTruncated: false,
-                            ct)
-                        .ConfigureAwait(false)
-                    || await DocumentsContainManagedAbiRecordAsync(
-                            groupedDocuments,
-                            ct)
-                        .ConfigureAwait(false)
-                    && !await HasStoredManagedInteropProjectionInPathsAsync(
-                            InteropAnnotationFlavors.AbiRecord,
-                            new HashSet<string>(_pathComparer) { path },
-                            assumePresentWhenTruncated: false,
-                            ct)
-                        .ConfigureAwait(false));
+                && managedInteropProjectionRefreshPaths.Contains(path);
             if (unchanged
                 && !fullReset
                 && !missingManagedInteropProjection

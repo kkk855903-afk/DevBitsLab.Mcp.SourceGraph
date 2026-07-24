@@ -299,6 +299,21 @@ public interface IGraphStore : IAsyncDisposable
             "This graph-store implementation predates paged annotation-flavor reads.");
 
     /// <summary>
+    /// Lists at most <paramref name="limit"/> annotations whose declaration owner path and flavor
+    /// exactly match the supplied sets. Both sets are submitted as bounded values in one store
+    /// round-trip; paths are not suffix- or fuzzy-matched. Callers can request one row beyond an
+    /// expected projection size to detect unexpected extras without scanning the global flavor
+    /// universe.
+    /// </summary>
+    Task<IReadOnlyList<StoredAnnotationRow>> ListAnnotationsForFilesByFlavorsAsync(
+        IReadOnlyCollection<string> filePaths,
+        IReadOnlyCollection<string> flavors,
+        int limit,
+        CancellationToken ct = default) =>
+        throw new NotSupportedException(
+            "This graph-store implementation predates bounded file/flavor annotation reads.");
+
+    /// <summary>
     /// Set <c>symbols.test_framework</c> for the given symbol ids. Pairs whose <c>symbol_id</c>
     /// is missing are silently skipped. Runs in a single transaction.
     /// </summary>
