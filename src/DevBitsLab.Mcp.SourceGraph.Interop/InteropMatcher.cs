@@ -11,6 +11,41 @@ public sealed class InteropMatcher
 {
     public InteropMatch Match(
         ManagedImport managed,
+        IEnumerable<NativeExport> nativeExports) =>
+        Match(managed, nativeExports, isExportUniverseComplete: true);
+
+    /// <summary>
+    /// Matches against one target-specific export snapshot. A partial snapshot may still prove
+    /// ambiguity, but it cannot prove absence or uniqueness because an unavailable translation
+    /// unit or artifact could contain another runtime-legal candidate.
+    /// </summary>
+    public InteropMatch Match(
+        ManagedImport managed,
+        IEnumerable<NativeExport> nativeExports,
+        bool isExportUniverseComplete)
+    {
+        var result = MatchCompleteSnapshot(managed, nativeExports);
+        if (isExportUniverseComplete
+            || result.Status is InteropMatchStatus.Ambiguous
+                or InteropMatchStatus.Unknown)
+        {
+            return result;
+        }
+
+        return result with
+        {
+            NativeSymbolCanonicalKey = null,
+            Status = InteropMatchStatus.Unknown,
+            Confidence = EvidenceConfidence.Inferred,
+            Reasons = result.Reasons
+                .Append(
+                    "The native export snapshot is incomplete, so absence and candidate uniqueness cannot be proven.")
+                .ToArray(),
+        };
+    }
+
+    private static InteropMatch MatchCompleteSnapshot(
+        ManagedImport managed,
         IEnumerable<NativeExport> nativeExports)
     {
         ArgumentNullException.ThrowIfNull(managed);
