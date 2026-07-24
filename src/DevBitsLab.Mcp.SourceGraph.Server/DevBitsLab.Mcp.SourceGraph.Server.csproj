@@ -8,6 +8,13 @@
     <!-- dotnet tool packaging -->
     <PackAsTool>true</PackAsTool>
     <ToolCommandName>sourcegraph-mcp</ToolCommandName>
+    <!--
+      ClangSharp's libclang packages resolve their native assets only for a concrete RID.
+      Emit the SDK's RID-specific implementation packages so an installed tool can run the
+      isolated native worker instead of shipping a platform-agnostic package without libclang.
+    -->
+    <ToolPackageRuntimeIdentifiers>win-x64;win-arm64;linux-x64;linux-arm64;osx-arm64</ToolPackageRuntimeIdentifiers>
+    <RuntimeIdentifiers>$(ToolPackageRuntimeIdentifiers)</RuntimeIdentifiers>
     <PackageId>DevBitsLab.Mcp.SourceGraph.Tool</PackageId>
     <Version>0.8.0</Version>
     <Description>🌿 Live code source graph MCP server for .NET solutions. Indexes C#/Roslyn into SQLite + FTS5 and exposes graph queries (find_definition, find_references, list_callers, neighborhood, impact_of_change, find_diagnostics, list_generated_files, list_tests_for, who_authored, recent_changes, ...) over stdio MCP. Watches the filesystem for incremental updates. v0.4 adds optional code-aware semantic_search backed by ONNX embeddings + sqlite-vec (gated behind --no-embeddings), Roslyn diagnostics indexing, source-generator document tracking, test-method discrimination + Tests edges, and per-symbol git blame history.</Description>
@@ -21,7 +28,9 @@
     <RepositoryType>git</RepositoryType>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <PublishRepositoryUrl>true</PublishRepositoryUrl>
-    <IncludeSymbols>true</IncludeSymbols>
+    <!-- The outer RID-selector package has no implementation symbols; each RID package does. -->
+    <IncludeSymbols Condition="'$(RuntimeIdentifier)' != ''">true</IncludeSymbols>
+    <IncludeSymbols Condition="'$(RuntimeIdentifier)' == ''">false</IncludeSymbols>
     <SymbolPackageFormat>snupkg</SymbolPackageFormat>
   </PropertyGroup>
 
