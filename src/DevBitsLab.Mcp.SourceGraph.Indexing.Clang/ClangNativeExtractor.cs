@@ -18,7 +18,13 @@ public static class ClangNativeExtractor
     private const string InvalidRequestCode = "CLANG0002";
     private const string ParseFailedCode = "CLANG0003";
     private const string TargetMismatchCode = "CLANG0004";
+    private const string UnsafeInputCode = "CLANG0005";
     private const string ClangDiagnosticCode = "CLANG1000";
+
+    private static StringComparer PathComparer =>
+        OperatingSystem.IsWindows()
+            ? StringComparer.OrdinalIgnoreCase
+            : StringComparer.Ordinal;
 
     private static readonly ClangNativeExtractionResult _emptyResult = new(
         Array.Empty<NativeFunctionFact>(),
@@ -52,10 +58,42 @@ public static class ClangNativeExtractor
             return WithDiagnostic(validation);
         }
 
-        var sourceFilePath = Path.GetFullPath(request.SourceFilePath);
-        var scopeRoot = Path.TrimEndingDirectorySeparator(
+        var lexicalScopeRoot = Path.TrimEndingDirectorySeparator(
             Path.GetFullPath(request.ScopeRoot));
-        var scopePolicy = new ScopePathPolicy(scopeRoot, request.ExcludePatterns);
+        var lexicalScopePolicy = new ScopePathPolicy(
+            lexicalScopeRoot,
+            request.ExcludePatterns);
+        if (!ScopePathPolicy.TryResolvePhysicalPath(
+                lexicalScopeRoot,
+                out var scopeRoot)
+            || !ClangInputPreflight.TryResolveAllowedFile(
+                request.SourceFilePath,
+                lexicalScopePolicy,
+                out var sourceFilePath))
+        {
+            return WithDiagnostic(UnsafeInput(
+                "The translation-unit source could not be resolved inside the approved scope."));
+        }
+        var scopePolicy = new ScopePathPolicy(
+            scopeRoot,
+            request.ExcludePatterns);
+        if (!ClangInputPreflight.TryNormalizeCompilerArguments(
+                request.CompilerArguments,
+                lexicalScopePolicy,
+                out var compilerArguments,
+                out var includeDirectories,
+                out var argumentRejection))
+        {
+            return WithDiagnostic(UnsafeInput(argumentRejection));
+        }
+        if (!ClangInputPreflight.TryValidateExplicitIncludeGraph(
+                sourceFilePath,
+                includeDirectories,
+                scopePolicy,
+                out var includeRejection))
+        {
+            return WithDiagnostic(UnsafeInput(includeRejection));
+        }
 
         try
         {
@@ -63,7 +101,7 @@ public static class ClangNativeExtractor
             var error = CXTranslationUnit.TryParse(
                 index,
                 sourceFilePath,
-                request.CompilerArguments.ToArray(),
+                compilerArguments,
                 ReadOnlySpan<CXUnsavedFile>.Empty,
                 CXTranslationUnit_Flags.CXTranslationUnit_KeepGoing,
                 out var handle);
@@ -81,6 +119,16 @@ public static class ClangNativeExtractor
                 translationUnit = TranslationUnit.GetOrCreate(handle);
                 using (translationUnit)
                 {
+                    if (!TryReadIncludedFiles(
+                            handle,
+                            sourceFilePath,
+                            scopePolicy,
+                            out var includedFiles,
+                            out var inclusionDiagnostic))
+                    {
+                        return WithDiagnostic(inclusionDiagnostic!);
+                    }
+
                     var diagnostics = ReadDiagnostics(handle, scopePolicy);
                     var targetDiagnostic = ValidateTranslationUnitTarget(
                         handle,
@@ -93,7 +141,10 @@ public static class ClangNativeExtractor
                             Array.Empty<NativeTypeDeclarationFact>(),
                             Array.Empty<NativeExport>(),
                             Array.Empty<AbiRecordLayout>(),
-                            diagnostics);
+                            diagnostics)
+                        {
+                            IncludedFiles = includedFiles,
+                        };
                     }
 
                     var collector = new Collector(
@@ -102,7 +153,10 @@ public static class ClangNativeExtractor
                         scopePolicy,
                         diagnostics);
                     collector.Visit(translationUnit.TranslationUnitDecl.Decls);
-                    return collector.BuildResult();
+                    return collector.BuildResult() with
+                    {
+                        IncludedFiles = includedFiles,
+                    };
                 }
             }
             finally
@@ -197,6 +251,12 @@ public static class ClangNativeExtractor
             ClangExtractionDiagnosticSeverity.Error,
             message);
 
+    private static ClangExtractionDiagnostic UnsafeInput(string message) =>
+        new(
+            UnsafeInputCode,
+            ClangExtractionDiagnosticSeverity.Error,
+            message);
+
     private static ClangNativeExtractionResult WithDiagnostic(
         ClangExtractionDiagnostic diagnostic) =>
         _emptyResult with
@@ -231,6 +291,88 @@ public static class ClangNativeExtractor
                 location));
         }
         return result;
+    }
+
+    private static unsafe bool TryReadIncludedFiles(
+        CXTranslationUnit translationUnit,
+        string sourceFilePath,
+        ScopePathPolicy scopePolicy,
+        out IReadOnlyList<string> includedFiles,
+        out ClangExtractionDiagnostic? diagnostic)
+    {
+        var observedPaths = new List<string>();
+        var visitorFailed = false;
+        CXInclusionVisitor visitor = (includedFile, _, _, _) =>
+        {
+            if (includedFile is null)
+            {
+                visitorFailed = true;
+                return;
+            }
+
+            try
+            {
+                var path = new CXFile((IntPtr)includedFile).Name.ToString();
+                if (string.IsNullOrWhiteSpace(path))
+                {
+                    visitorFailed = true;
+                    return;
+                }
+                observedPaths.Add(path);
+            }
+            catch
+            {
+                // Exceptions must not cross the unmanaged callback boundary.
+                visitorFailed = true;
+            }
+        };
+
+        try
+        {
+            translationUnit.GetInclusions(visitor, default);
+            GC.KeepAlive(visitor);
+        }
+        catch (Exception ex) when (
+            ex is InvalidOperationException
+                or NotSupportedException
+                or OverflowException)
+        {
+            visitorFailed = true;
+        }
+
+        if (visitorFailed)
+        {
+            includedFiles = Array.Empty<string>();
+            diagnostic = UnsafeInput(
+                "libclang returned an inclusion path that could not be validated safely.");
+            return false;
+        }
+
+        var allowedPaths = new HashSet<string>(PathComparer)
+        {
+            sourceFilePath,
+        };
+        foreach (var observedPath in observedPaths)
+        {
+            if (!ClangInputPreflight.TryResolveAllowedFile(
+                    observedPath,
+                    scopePolicy,
+                    out var physicalPath))
+            {
+                includedFiles = Array.Empty<string>();
+                diagnostic = UnsafeInput(
+                    "libclang observed an inclusion outside the approved scope.");
+                return false;
+            }
+            allowedPaths.Add(physicalPath);
+        }
+
+        includedFiles = allowedPaths
+            .OrderBy(path => path, PathComparer)
+            .ThenBy(path => path, StringComparer.Ordinal)
+            .ToArray();
+        diagnostic = null;
+        return true;
     }
 
     private static ClangExtractionDiagnostic? ValidateTranslationUnitTarget(
@@ -381,11 +523,6 @@ public static class ClangNativeExtractor
                     .ToArray(),
                 _diagnostics.ToArray());
         }
-
-        private static StringComparer PathComparer =>
-            OperatingSystem.IsWindows()
-                ? StringComparer.OrdinalIgnoreCase
-                : StringComparer.Ordinal;
 
         private void Visit(Decl declaration, bool hasCLinkageContext)
         {
@@ -944,14 +1081,21 @@ public static class ClangNativeExtractor
                 out var endPath,
                 out var endLine,
                 out var endColumn)
-            || !PathEquals(startPath, endPath)
-            || scopePolicy.IsExcluded(startPath))
+            || !ClangInputPreflight.TryResolveAllowedFile(
+                startPath,
+                scopePolicy,
+                out var physicalStartPath)
+            || !ClangInputPreflight.TryResolveAllowedFile(
+                endPath,
+                scopePolicy,
+                out var physicalEndPath)
+            || !PathEquals(physicalStartPath, physicalEndPath))
         {
             return false;
         }
 
         location = new CoreSourceLocation(
-            Path.GetFullPath(startPath),
+            physicalStartPath,
             startLine,
             startColumn,
             endLine,
@@ -968,12 +1112,15 @@ public static class ClangNativeExtractor
                 out var path,
                 out var line,
                 out var column)
-            || scopePolicy.IsExcluded(path))
+            || !ClangInputPreflight.TryResolveAllowedFile(
+                path,
+                scopePolicy,
+                out var physicalPath))
         {
             return null;
         }
         return new CoreSourceLocation(
-            Path.GetFullPath(path),
+            physicalPath,
             line,
             column,
             line,

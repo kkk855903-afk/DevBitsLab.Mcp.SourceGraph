@@ -95,23 +95,34 @@ public sealed class MedInteropBoundaryPipelineTests
             "fixtures",
             "MedInteropChain",
             "NativeLibrary");
-        var sourcePath = Path.Combine(nativeRoot, "src", "exports.cpp");
         var toolchainRoot = Path.Combine(
             Path.GetTempPath(),
             "sourcegraph-clang-tests",
             Guid.NewGuid().ToString("N"));
-        Directory.CreateDirectory(Path.Combine(toolchainRoot, "include"));
+        var isolatedNativeRoot = Path.Combine(toolchainRoot, "native");
+        Directory.CreateDirectory(Path.Combine(isolatedNativeRoot, "include"));
+        Directory.CreateDirectory(Path.Combine(isolatedNativeRoot, "src"));
+        File.Copy(
+            Path.Combine(nativeRoot, "include", "medalgo.h"),
+            Path.Combine(isolatedNativeRoot, "include", "medalgo.h"));
+        File.Copy(
+            Path.Combine(nativeRoot, "src", "algorithm.hpp"),
+            Path.Combine(isolatedNativeRoot, "src", "algorithm.hpp"));
+        File.Copy(
+            Path.Combine(nativeRoot, "src", "exports.cpp"),
+            Path.Combine(isolatedNativeRoot, "src", "exports.cpp"));
         File.WriteAllText(
-            Path.Combine(toolchainRoot, "include", "cstdint"),
+            Path.Combine(isolatedNativeRoot, "include", "cstdint"),
             """
             #pragma once
             namespace std { using int32_t = int; }
             """);
+        var sourcePath = Path.Combine(isolatedNativeRoot, "src", "exports.cpp");
 
         var nativeResult = ClangNativeExtractor.Extract(
             new ClangNativeExtractionRequest(
                 sourcePath,
-                nativeRoot,
+                isolatedNativeRoot,
                 ProducingFileId: 41,
                 InteropTarget.WindowsX64Msvc,
                 [
@@ -122,11 +133,9 @@ public sealed class MedInteropBoundaryPipelineTests
                     "-fms-extensions",
                     "-D_WIN32=1",
                     "-I",
-                    Path.Combine(toolchainRoot, "include"),
+                    Path.Combine(isolatedNativeRoot, "include"),
                     "-I",
-                    Path.Combine(nativeRoot, "include"),
-                    "-I",
-                    Path.Combine(nativeRoot, "src"),
+                    Path.Combine(isolatedNativeRoot, "src"),
                 ],
                 LibraryName: "medalgo.dll"));
         nativeResult.Diagnostics.Should().NotContain(diagnostic =>

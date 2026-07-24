@@ -79,6 +79,14 @@ public sealed record ClangNativeExtractionResult(
     IReadOnlyList<AbiRecordLayout> RecordLayouts,
     IReadOnlyList<ClangExtractionDiagnostic> Diagnostics)
 {
+    /// <summary>
+    /// Stable, deduplicated physical paths that own this translation unit's dependency graph.
+    /// A successful extraction includes the translation-unit source file itself as well as every
+    /// transitively included repository file observed by libclang. Paths that cannot be proven
+    /// inside the scope/privacy boundary are never returned.
+    /// </summary>
+    public IReadOnlyList<string> IncludedFiles { get; init; } = Array.Empty<string>();
+
     public bool HasErrors => Diagnostics.Any(
         diagnostic => diagnostic.Severity
             is ClangExtractionDiagnosticSeverity.Error

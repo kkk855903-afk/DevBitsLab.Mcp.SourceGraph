@@ -1,3 +1,4 @@
+using ClangSharp.Interop;
 using DevBitsLab.Mcp.SourceGraph.Core;
 using DevBitsLab.Mcp.SourceGraph.Indexing.Clang;
 using FluentAssertions;
@@ -11,16 +12,25 @@ public sealed class ClangNativeExtractorTests
     public void MedInteropFixture_extractsExportSignatureAndExactRecordLayouts()
     {
         var repoRoot = FindRepositoryRoot();
-        var nativeRoot = Path.Combine(
+        var fixtureNativeRoot = Path.Combine(
             repoRoot,
             "tests",
             "fixtures",
             "MedInteropChain",
             "NativeLibrary");
-        var sourcePath = Path.Combine(nativeRoot, "src", "exports.cpp");
-        using var toolchain = new NativeTestWorkspace();
-        var cstdintPath = toolchain.Write(
-            "include/cstdint",
+        using var workspace = new NativeTestWorkspace();
+        var nativeRoot = Path.Combine(workspace.Root, "native");
+        var sourcePath = workspace.Write(
+            "native/src/exports.cpp",
+            File.ReadAllText(Path.Combine(fixtureNativeRoot, "src", "exports.cpp")));
+        workspace.Write(
+            "native/src/algorithm.hpp",
+            File.ReadAllText(Path.Combine(fixtureNativeRoot, "src", "algorithm.hpp")));
+        workspace.Write(
+            "native/include/medalgo.h",
+            File.ReadAllText(Path.Combine(fixtureNativeRoot, "include", "medalgo.h")));
+        var cstdintPath = workspace.Write(
+            "native/toolchain/cstdint",
             """
             #pragma once
             namespace std { using int32_t = int; }
@@ -228,7 +238,106 @@ public sealed class ClangNativeExtractorTests
     }
 
     [Fact]
-    public void IncludedDeclarationsOutsideScopeAndPrivacyFolders_areIgnored()
+    public void NestedIncludes_areTrackedTransitivelyWithTranslationUnitAndStableOrdering()
+    {
+        using var workspace = new NativeTestWorkspace();
+        var nestedPath = workspace.Write(
+            "native/include/detail/nested.h",
+            """
+            #pragma once
+            struct NestedValue { int value; };
+            """);
+        var publicPath = workspace.Write(
+            "native/include/public.h",
+            """
+            #pragma once
+            #include "detail/nested.h"
+            """);
+        var sourcePath = workspace.Write(
+            "native/main.cpp",
+            """
+            #include "include/public.h"
+            extern "C" __declspec(dllexport) int allowed_api(NestedValue value);
+            """);
+
+        var first = ExtractWindows(workspace.Root, sourcePath);
+        var second = ExtractWindows(workspace.Root, sourcePath);
+
+        first.Diagnostics.Should().NotContain(
+            diagnostic =>
+                diagnostic.Severity == ClangExtractionDiagnosticSeverity.Error
+                || diagnostic.Severity == ClangExtractionDiagnosticSeverity.Fatal);
+        first.IncludedFiles.Should().Equal(
+            new[] { sourcePath, publicPath, nestedPath }
+                .Select(Path.GetFullPath)
+                .OrderBy(path => path, PathComparer)
+                .ThenBy(path => path, StringComparer.Ordinal));
+        second.IncludedFiles.Should().Equal(first.IncludedFiles);
+        first.IncludedFiles.Distinct(PathComparer)
+            .Should().HaveSameCount(first.IncludedFiles);
+    }
+
+    [Fact]
+    public void RepositoryRelativeIncludeDirectory_isNormalizedBeforeParse()
+    {
+        using var workspace = new NativeTestWorkspace();
+        var headerPath = workspace.Write(
+            "include/api.h",
+            "#pragma once");
+        var sourcePath = workspace.Write(
+            "native/main.cpp",
+            """
+            #include <api.h>
+            extern "C" __declspec(dllexport) int allowed_api();
+            """);
+
+        var result = ClangNativeExtractor.Extract(new ClangNativeExtractionRequest(
+            sourcePath,
+            workspace.Root,
+            ProducingFileId: 8,
+            InteropTarget.WindowsX64Msvc,
+            WindowsX64Arguments("include"),
+            LibraryName: "medical.dll"));
+
+        result.HasErrors.Should().BeFalse();
+        result.IncludedFiles.Should().Contain(Path.GetFullPath(headerPath));
+    }
+
+    [Fact]
+    public void IncludedFiles_resolveAllowedHeaderSymlinkToItsPhysicalTarget()
+    {
+        using var workspace = new NativeTestWorkspace();
+        var targetPath = workspace.Write(
+            "include/actual.h",
+            "#pragma once");
+        var aliasPath = Path.Combine(workspace.Root, "include", "alias.h");
+        try
+        {
+            File.CreateSymbolicLink(aliasPath, targetPath);
+        }
+        catch (Exception ex) when (
+            ex is UnauthorizedAccessException
+                or IOException
+                or NotSupportedException)
+        {
+            return;
+        }
+        var sourcePath = workspace.Write(
+            "native/main.cpp",
+            """
+            #include "../include/alias.h"
+            extern "C" __declspec(dllexport) int allowed_api();
+            """);
+
+        var result = ExtractWindows(workspace.Root, sourcePath);
+
+        result.HasErrors.Should().BeFalse();
+        result.IncludedFiles.Should().Contain(Path.GetFullPath(targetPath));
+        result.IncludedFiles.Should().NotContain(Path.GetFullPath(aliasPath));
+    }
+
+    [Fact]
+    public void OutOfRootIncludeDirectory_isRejectedBeforeLibclangParse()
     {
         using var scope = new NativeTestWorkspace();
         using var external = new NativeTestWorkspace();
@@ -250,28 +359,35 @@ public sealed class ClangNativeExtractorTests
             #include "../PatientData/secret.h"
             extern "C" __declspec(dllexport) int allowed_api();
             """);
+        var parseAttempted = false;
 
-        var result = ClangNativeExtractor.Extract(new ClangNativeExtractionRequest(
-            sourcePath,
-            scope.Root,
-            ProducingFileId: 9,
-            InteropTarget.WindowsX64Msvc,
-            WindowsX64Arguments(external.Root),
-            LibraryName: "medical.dll"));
+        var result = ClangNativeExtractor.Extract(
+            new ClangNativeExtractionRequest(
+                sourcePath,
+                scope.Root,
+                ProducingFileId: 9,
+                InteropTarget.WindowsX64Msvc,
+                WindowsX64Arguments(external.Root),
+                LibraryName: "medical.dll"),
+            () =>
+            {
+                parseAttempted = true;
+                return CXIndex.Create(
+                    excludeDeclarationsFromPch: true,
+                    displayDiagnostics: false);
+            });
 
-        result.Diagnostics.Should().NotContain(
-            diagnostic =>
-                diagnostic.Severity == ClangExtractionDiagnosticSeverity.Error
-                || diagnostic.Severity == ClangExtractionDiagnosticSeverity.Fatal);
-        result.Exports.Should().ContainSingle(
-            nativeExport => nativeExport.ExportName == "allowed_api");
-        result.Functions.Should().NotContain(function =>
-            function.Name == "outside_api" || function.Name == "private_api");
-        result.Types.Should().NotContain(type => type.Name == "OutsideRecord");
+        parseAttempted.Should().BeFalse();
+        result.HasErrors.Should().BeTrue();
+        result.Diagnostics.Should().ContainSingle(diagnostic =>
+            diagnostic.Code == "CLANG0005");
+        result.Functions.Should().BeEmpty();
+        result.Exports.Should().BeEmpty();
+        result.IncludedFiles.Should().BeEmpty();
     }
 
     [Fact]
-    public void DiagnosticOriginatingInExcludedHeader_isDroppedCompletely()
+    public void ExcludedHeader_isRejectedBeforeLibclangParse()
     {
         using var scope = new NativeTestWorkspace();
         scope.Write(
@@ -285,18 +401,114 @@ public sealed class ClangNativeExtractorTests
             #include "../PatientData/private_diagnostic.h"
             extern "C" __declspec(dllexport) int allowed_api();
             """);
+        var parseAttempted = false;
 
-        var result = ClangNativeExtractor.Extract(new ClangNativeExtractionRequest(
-            sourcePath,
-            scope.Root,
-            ProducingFileId: 11,
-            InteropTarget.WindowsX64Msvc,
-            WindowsX64Arguments(),
-            LibraryName: "medical.dll"));
+        var result = ClangNativeExtractor.Extract(
+            new ClangNativeExtractionRequest(
+                sourcePath,
+                scope.Root,
+                ProducingFileId: 11,
+                InteropTarget.WindowsX64Msvc,
+                WindowsX64Arguments(),
+                LibraryName: "medical.dll"),
+            () =>
+            {
+                parseAttempted = true;
+                return CXIndex.Create(
+                    excludeDeclarationsFromPch: true,
+                    displayDiagnostics: false);
+            });
 
-        result.Diagnostics.Should().BeEmpty();
-        result.Exports.Should().ContainSingle(
-            nativeExport => nativeExport.ExportName == "allowed_api");
+        parseAttempted.Should().BeFalse();
+        result.HasErrors.Should().BeTrue();
+        result.Diagnostics.Should().ContainSingle(diagnostic =>
+            diagnostic.Code == "CLANG0005"
+            && !diagnostic.Message.Contains(
+                "PatientData",
+                StringComparison.OrdinalIgnoreCase));
+        result.Exports.Should().BeEmpty();
+        result.IncludedFiles.Should().BeEmpty();
+    }
+
+    [Fact]
+    public void AbsoluteOutOfRootHeader_isRejectedBeforeLibclangParse()
+    {
+        using var scope = new NativeTestWorkspace();
+        using var external = new NativeTestWorkspace();
+        var externalHeader = external.Write(
+            "outside.h",
+            "struct OutsideRecord { int value; };");
+        var sourcePath = scope.Write(
+            "native/main.cpp",
+            $$"""
+            #include "{{externalHeader.Replace('\\', '/')}}"
+            extern "C" __declspec(dllexport) int allowed_api();
+            """);
+        var parseAttempted = false;
+
+        var result = ClangNativeExtractor.Extract(
+            new ClangNativeExtractionRequest(
+                sourcePath,
+                scope.Root,
+                ProducingFileId: 12,
+                InteropTarget.WindowsX64Msvc,
+                WindowsX64Arguments(),
+                LibraryName: "medical.dll"),
+            () =>
+            {
+                parseAttempted = true;
+                return CXIndex.Create(
+                    excludeDeclarationsFromPch: true,
+                    displayDiagnostics: false);
+            });
+
+        parseAttempted.Should().BeFalse();
+        result.Diagnostics.Should().ContainSingle(diagnostic =>
+            diagnostic.Code == "CLANG0005");
+        result.Functions.Should().BeEmpty();
+        result.IncludedFiles.Should().BeEmpty();
+    }
+
+    [Theory]
+    [InlineData("@compiler.rsp")]
+    [InlineData("-include")]
+    [InlineData("--sysroot=C:/toolchain")]
+    [InlineData("-isystem")]
+    [InlineData("-Xclang")]
+    [InlineData("-fmodule-map-file=module.modulemap")]
+    [InlineData("/FIprivate.h")]
+    public void UnprovablePathBearingCompilerArgument_isRejectedBeforeLibclangParse(
+        string dangerousArgument)
+    {
+        using var workspace = new NativeTestWorkspace();
+        var sourcePath = workspace.Write(
+            "native/main.cpp",
+            """extern "C" __declspec(dllexport) int allowed_api();""");
+        var parseAttempted = false;
+        var arguments = WindowsX64Arguments()
+            .Append(dangerousArgument)
+            .ToArray();
+
+        var result = ClangNativeExtractor.Extract(
+            new ClangNativeExtractionRequest(
+                sourcePath,
+                workspace.Root,
+                ProducingFileId: 13,
+                InteropTarget.WindowsX64Msvc,
+                arguments,
+                LibraryName: "medical.dll"),
+            () =>
+            {
+                parseAttempted = true;
+                return CXIndex.Create(
+                    excludeDeclarationsFromPch: true,
+                    displayDiagnostics: false);
+            });
+
+        parseAttempted.Should().BeFalse();
+        result.Diagnostics.Should().ContainSingle(diagnostic =>
+            diagnostic.Code == "CLANG0005");
+        result.IncludedFiles.Should().BeEmpty();
     }
 
     [Fact]
@@ -314,6 +526,7 @@ public sealed class ClangNativeExtractorTests
         result.Types.Should().BeEmpty();
         result.Exports.Should().BeEmpty();
         result.RecordLayouts.Should().BeEmpty();
+        result.IncludedFiles.Should().BeEmpty();
         result.Diagnostics.Should().ContainSingle(diagnostic =>
             diagnostic.Code == "CLANG0002"
             && diagnostic.Severity == ClangExtractionDiagnosticSeverity.Error);
@@ -408,6 +621,11 @@ public sealed class ClangNativeExtractorTests
         }
         return arguments.ToArray();
     }
+
+    private static StringComparer PathComparer =>
+        OperatingSystem.IsWindows()
+            ? StringComparer.OrdinalIgnoreCase
+            : StringComparer.Ordinal;
 
     private static string FindRepositoryRoot()
     {
