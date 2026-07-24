@@ -186,6 +186,36 @@ jobs:
             -SdkVersion $env:SDK_VERSION `
             -ToolRuntimeIdentifiers $env:TOOL_RUNTIME_IDENTIFIERS
 
+      - name: Install the packed tool for full-bundle preparation
+        shell: bash
+        env:
+          TOOL_VERSION: ${{ steps.versions.outputs.tool-version }}
+        run: |
+          set -euo pipefail
+          dotnet tool install DevBitsLab.Mcp.SourceGraph.Tool \
+            --tool-path ./release-tool \
+            --version "$TOOL_VERSION" \
+            --add-source ./out
+
+      - name: Pull and verify the full-bundle embedding model
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./release-tool/sourcegraph-mcp embeddings pull
+          ./release-tool/sourcegraph-mcp embeddings verify
+
+      - name: Build the Windows x64 full offline bundle
+        shell: pwsh
+        run: |
+          $modelDirectory = Join-Path $HOME (
+            ".cache/devbitslab.sourcegraph/models/" +
+            "jinaai_jina-embeddings-v2-base-code")
+          ./.github/scripts/build-full-offline-bundle.ps1 `
+            -PackageDirectory ./out `
+            -ModelDirectory $modelDirectory `
+            -OutputDirectory ./release-assets `
+            -RuntimeIdentifier win-x64
+
       - name: Commit version and push tag (workflow_dispatch only)
         if: github.event_name == 'workflow_dispatch'
         shell: bash
@@ -219,3 +249,20 @@ jobs:
             --api-key "$NUGET_API_KEY" \
             --source https://api.nuget.org/v3/index.json \
             --skip-duplicate
+
+      - name: Publish full offline bundle to GitHub Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && steps.bump.outputs.tag || github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          assets=(./release-assets/*.zip ./release-assets/*.sha256)
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber
+          else
+            gh release create "$RELEASE_TAG" "${assets[@]}" \
+              --verify-tag \
+              --generate-notes \
+              --title "$RELEASE_TAG"
+          fi

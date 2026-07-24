@@ -311,6 +311,35 @@ used by the isolated interop worker. Intel macOS is not published because the
 pinned LLVM 21 runtime set does not provide a matching `osx-x64` ClangSharp
 payload.
 
+### Full offline installer (Windows x64)
+
+Every GitHub release also provides
+`SourceGraph-MCP-Full-win-x64-v<version>.zip`. Unlike the small NuGet
+installation above, the full bundle includes the approximately 614 MB
+`jina-embeddings-v2-base-code` model, its pinned SHA-256 manifest, the model's
+Apache-2.0 license, and only the two NuGet packages needed by Windows x64.
+Installation and semantic search therefore work without contacting NuGet or
+Hugging Face.
+
+Extract the whole archive, open PowerShell in the root of the project you want
+to analyse, then run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File "C:\path\to\bundle\install-sourcegraph-mcp.ps1"
+```
+
+The installer verifies every package and model file, installs or updates the
+global tool from the archive, seeds the existing model cache, writes the
+project-scoped Codex configuration, pre-warms the index, and runs the demo
+health check. Pass `-Solution .\Specific.slnx` when the project has multiple
+solutions, or `-SkipPrewarm` to configure without immediately indexing.
+`-VerifyBundleOnly` performs integrity checks without installing anything.
+The archive includes `README-zh-CN.txt` with the same procedure in Chinese.
+
+The full bundle currently requires 64-bit Windows, an x64 PowerShell process,
+and the .NET 10 SDK. The regular NuGet package remains the recommended Lite
+installation for other supported platforms.
+
 ## Quickstart (60 seconds)
 
 From a fresh clone of any .NET solution:

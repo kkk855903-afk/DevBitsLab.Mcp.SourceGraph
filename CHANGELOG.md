@@ -36,6 +36,13 @@ below note which package the change applies to.
   before. Leaf glyph unchanged on every surface.
 
 ### Added
+- **Full Windows x64 offline installer.** Release automation now publishes a
+  self-verifying ZIP containing the Windows x64 tool packages, the pinned
+  `jina-embeddings-v2-base-code` ONNX model and tokenizer, licenses, and a
+  one-command installer. The installer works without NuGet or Hugging Face,
+  seeds the normal model cache atomically, configures project-scoped Codex,
+  pre-warms the graph, and runs the demo health check. The Lite NuGet package
+  remains unchanged.
 - **One-command Windows project setup.** `setup-sourcegraph-mcp.ps1` discovers
   a repository's solution, installs the global tool when missing, writes the
   Codex MCP configuration, pre-warms the graph, and verifies it with `demo`.

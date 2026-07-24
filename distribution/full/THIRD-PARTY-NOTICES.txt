@@ -1,0 +1,14 @@
+SourceGraph MCP Full Offline Bundle
+===================================
+
+This bundle redistributes the following third-party model:
+
+  Name: jina-embeddings-v2-base-code
+  Author: Jina AI
+  Source: https://huggingface.co/jinaai/jina-embeddings-v2-base-code
+  License: Apache License 2.0
+  Included files: model.onnx, tokenizer.json
+
+The model is used locally to generate code-search embeddings. It is not a
+conversational or generative language model. The full Apache License 2.0 text
+is included beside this notice as APACHE-2.0.txt.
