@@ -82,12 +82,15 @@ value, match, or compatibility claim.
 
 `InteropMatcher` SHALL derive runtime export spellings only from the managed entry point,
 `ExactSpelling`, proven character set, calling convention, and explicit target-runtime rules.
-`ExactSpelling = true` permits only the declared spelling. On Windows, a proven non-exact lookup
-policy MAY add the target-appropriate `A` or `W` spelling; an unknown character set SHALL NOT try
-both and select whichever happens to exist. x86 decorated spellings such as `_name@N` SHALL be
-viable only when the target/calling convention and checked parameter-byte calculation prove the
-decoration, or when an authoritative module definition or binary export table names it. The
-matcher SHALL NOT strip decoration or suffixes by similarity.
+`ExactSpelling = true` disables character-set suffix lookup and starts with only the declared
+spelling. On Windows, a proven non-exact lookup policy MAY add the target-appropriate `A` or `W`
+spelling; an unknown character set SHALL NOT try both and select whichever happens to exist.
+Windows x86 stdcall lookup independently probes `_name@N` after each undecorated character-set
+spelling, including when `ExactSpelling = true`; `_name@N` SHALL be viable only when the explicit
+target/calling convention and checked marshaled stack-byte calculation prove `N`, or when an
+authoritative module definition or binary export table names it. If the undecorated lookup fails
+and `N` cannot be proven, the outcome SHALL remain unknown rather than claim absence. The matcher
+SHALL NOT strip decoration or suffixes by similarity.
 
 The matcher SHALL also require the same `InteropTarget` and proven native module ownership. On
 Windows only, proven module names compare case-insensitively and a terminal `.dll` suffix is

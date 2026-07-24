@@ -277,9 +277,10 @@ public sealed record ManagedImport(
     Evidence Evidence)
 {
     /// <summary>
-    /// Whether the runtime must resolve <see cref="EntryPoint"/> exactly. A false value permits
-    /// the platform- and character-set-specific DllImport lookup sequence; <see langword="null"/>
-    /// means the lookup policy could not be proven.
+    /// Whether character-set name lookup must use only <see cref="EntryPoint"/>. A false value
+    /// permits the platform-specific A/W sequence; <see langword="null"/> means that policy is
+    /// unknown. On Windows x86, the runtime's independently proven stdcall decoration probe may
+    /// still follow each character-set spelling.
     /// </summary>
     public bool? ExactSpelling { get; init; }
 }

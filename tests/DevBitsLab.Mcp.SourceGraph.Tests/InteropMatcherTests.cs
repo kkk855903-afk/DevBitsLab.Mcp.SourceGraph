@@ -157,6 +157,109 @@ public sealed class InteropMatcherTests
     }
 
     [Fact]
+    public void WindowsX86StdCall_probesUndecoratedBeforeProvenDecoration()
+    {
+        var managed = Managed(
+            "medalgo",
+            "run",
+            exactSpelling: true,
+            characterSet: null,
+            target: InteropTarget.WindowsX86Msvc,
+            callingConvention: InteropCallingConvention.StdCall,
+            parameters:
+            [
+                Parameter(0, Int32()),
+                Parameter(1, Int16()),
+            ]);
+        var plain = Native(
+            "medalgo.dll",
+            "run",
+            "c:E:plain.cpp::run",
+            InteropTarget.WindowsX86Msvc);
+        var decorated = Native(
+            "medalgo.dll",
+            "_run@8",
+            "c:E:decorated.cpp::_run@8",
+            InteropTarget.WindowsX86Msvc);
+
+        new InteropMatcher()
+            .Match(managed, [decorated, plain])
+            .NativeSymbolCanonicalKey.Should().Be(plain.SymbolCanonicalKey);
+
+        var fallback = new InteropMatcher().Match(managed, [decorated]);
+        fallback.Status.Should().Be(InteropMatchStatus.Matched);
+        fallback.NativeSymbolCanonicalKey.Should().Be(
+            decorated.SymbolCanonicalKey);
+        fallback.Reasons.Should().Contain(reason => reason.Contains(
+            "@8",
+            StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void WindowsX86UnicodeStdCall_decoratesEachRuntimeLookupStep()
+    {
+        var managed = Managed(
+            "medalgo",
+            "run",
+            exactSpelling: false,
+            characterSet: "utf-16",
+            target: InteropTarget.WindowsX86Msvc,
+            callingConvention: InteropCallingConvention.StdCall,
+            parameters: [Parameter(0, Int32())]);
+        var wideDecorated = Native(
+            "medalgo.dll",
+            "_runW@4",
+            "c:E:wide.cpp::_runW@4",
+            InteropTarget.WindowsX86Msvc);
+        var plain = Native(
+            "medalgo.dll",
+            "run",
+            "c:E:plain.cpp::run",
+            InteropTarget.WindowsX86Msvc);
+
+        var match = new InteropMatcher().Match(
+            managed,
+            [plain, wideDecorated]);
+
+        match.Status.Should().Be(InteropMatchStatus.Matched);
+        match.NativeSymbolCanonicalKey.Should().Be(
+            wideDecorated.SymbolCanonicalKey);
+    }
+
+    [Fact]
+    public void UnknownX86StdCallStackSize_doesNotGuessDecorationOrAbsence()
+    {
+        var managed = Managed(
+            "medalgo",
+            "run",
+            exactSpelling: true,
+            characterSet: null,
+            target: InteropTarget.WindowsX86Msvc,
+            callingConvention: InteropCallingConvention.StdCall,
+            parameters:
+            [
+                Parameter(
+                    0,
+                    new AbiTypeRef(
+                        "UnknownRecord",
+                        AbiTypeCategory.Record)),
+            ]);
+        var decorated = Native(
+            "medalgo.dll",
+            "_run@12",
+            "c:E:native.cpp::_run@12",
+            InteropTarget.WindowsX86Msvc);
+
+        var match = new InteropMatcher().Match(managed, [decorated]);
+
+        match.Status.Should().Be(InteropMatchStatus.Unknown);
+        match.NativeSymbolCanonicalKey.Should().BeNull();
+        match.Reasons.Should().Contain(reason => reason.Contains(
+            "stack-byte count is unknown",
+            StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
     public void WindowsAnsiLookup_usesOriginalNameBeforeAFallback()
     {
         var original = Native("medalgo.dll", "run", "c:E:native.cpp::run");
@@ -351,15 +454,18 @@ public sealed class InteropMatcherTests
         string entryPoint,
         bool? exactSpelling = true,
         string? characterSet = null,
-        InteropTarget? target = null) =>
+        InteropTarget? target = null,
+        InteropCallingConvention callingConvention =
+            InteropCallingConvention.Cdecl,
+        IReadOnlyList<AbiParameter>? parameters = null) =>
         new(
             "csharp:M:Fixture.Native.Run",
             ManagedImportKind.DllImport,
             library,
             entryPoint,
-            InteropCallingConvention.Cdecl,
+            callingConvention,
             Int32(),
-            [],
+            parameters ?? [],
             CharacterSet: characterSet,
             SetLastError: false,
             target ?? InteropTarget.WindowsX64Msvc,
@@ -401,6 +507,29 @@ public sealed class InteropMatcherTests
             sizeBytes: 4,
             alignmentBytes: 4,
             isSigned: true);
+
+    private static AbiTypeRef Int16() =>
+        new(
+            "int16",
+            AbiTypeCategory.SignedInteger,
+            sizeBytes: 2,
+            alignmentBytes: 2,
+            isSigned: true);
+
+    private static AbiParameter Parameter(
+        int position,
+        AbiTypeRef type) =>
+        new(
+            position,
+            $"p{position}",
+            type,
+            AbiParameterDirection.In,
+            new SourceLocation(
+                "Managed.cs",
+                position + 2,
+                1,
+                position + 2,
+                5));
 
     private static Evidence EvidenceAt(
         long fileId,

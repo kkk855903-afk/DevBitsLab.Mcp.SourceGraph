@@ -74,11 +74,17 @@ public sealed class InteropMatcher
             return Result(
                 managed,
                 native: null,
-                InteropMatchStatus.Unmatched,
-                managed.Evidence.Confidence,
+                lookup.DecoratedLookupIncomplete
+                    ? InteropMatchStatus.Unknown
+                    : InteropMatchStatus.Unmatched,
+                lookup.DecoratedLookupIncomplete
+                    ? EvidenceConfidence.Inferred
+                    : managed.Evidence.Confidence,
                 [
                     lookup.Description,
-                    $"No native export has a runtime-legal entry-point spelling for '{managed.EntryPoint}'.",
+                    lookup.DecoratedLookupIncomplete
+                        ? $"No undecorated native export matches '{managed.EntryPoint}', and the x86 stdcall stack-byte count is unknown, so decorated lookup cannot be decided."
+                        : $"No native export has a runtime-legal entry-point spelling for '{managed.EntryPoint}'.",
                 ],
                 [managed.Evidence]);
         }
@@ -195,14 +201,20 @@ public sealed class InteropMatcher
         return Result(
             managed,
             native: null,
-            InteropMatchStatus.Unmatched,
-            Weakest(
-                Combine(
-                    managed.Evidence,
-                    sameTarget.Select(item => item.Evidence))),
+            lookup.DecoratedLookupIncomplete
+                ? InteropMatchStatus.Unknown
+                : InteropMatchStatus.Unmatched,
+            lookup.DecoratedLookupIncomplete
+                ? EvidenceConfidence.Inferred
+                : Weakest(
+                    Combine(
+                        managed.Evidence,
+                        sameTarget.Select(item => item.Evidence))),
             [
                 lookup.Description,
-                $"Runtime-legal entry points exist for the target ABI, but no candidate belongs to managed module '{managed.LibraryName}'.",
+                lookup.DecoratedLookupIncomplete
+                    ? $"Undecorated entry points do not prove a candidate in module '{managed.LibraryName}', and a possible x86 stdcall decoration cannot be calculated."
+                    : $"Runtime-legal entry points exist for the target ABI, but no candidate belongs to managed module '{managed.LibraryName}'.",
             ],
             Combine(
                 managed.Evidence,
@@ -216,40 +228,127 @@ public sealed class InteropMatcher
             return new EntryPointLookupPlan(
                 [],
                 "",
-                "Managed entry-point lookup policy is unknown; no export spelling can be selected safely.");
+                "Managed entry-point lookup policy is unknown; no export spelling can be selected safely.",
+                DecoratedLookupIncomplete: false);
         }
 
+        IReadOnlyList<string> baseSpellings;
+        string description;
         if (managed.ExactSpelling.Value)
         {
-            return new EntryPointLookupPlan(
-                [managed.EntryPoint],
-                $"Runtime lookup requires the exact entry-point spelling '{managed.EntryPoint}'.",
-                Error: null);
+            baseSpellings = [managed.EntryPoint];
+            description =
+                $"Character-set lookup requires the exact entry-point spelling '{managed.EntryPoint}'.";
+        }
+        else if (!IsWindows(managed.Target))
+        {
+            baseSpellings = [managed.EntryPoint];
+            description =
+                $"Runtime lookup for {managed.Target.RuntimeIdentifier} uses '{managed.EntryPoint}' without Windows A/W suffix probing.";
+        }
+        else
+        {
+            switch (managed.CharacterSet)
+            {
+                case "ansi":
+                    baseSpellings =
+                        [managed.EntryPoint, managed.EntryPoint + "A"];
+                    description =
+                        $"Windows ANSI runtime lookup order is '{managed.EntryPoint}', then '{managed.EntryPoint}A'.";
+                    break;
+                case "utf-16":
+                    baseSpellings =
+                        [managed.EntryPoint + "W", managed.EntryPoint];
+                    description =
+                        $"Windows Unicode runtime lookup order is '{managed.EntryPoint}W', then '{managed.EntryPoint}'.";
+                    break;
+                default:
+                    return new EntryPointLookupPlan(
+                        [],
+                        "",
+                        $"Character set '{managed.CharacterSet ?? "<unknown>"}' does not prove a Windows entry-point lookup sequence.",
+                        DecoratedLookupIncomplete: false);
+            }
         }
 
-        if (!IsWindows(managed.Target))
+        if (!RequiresX86StdCallDecorationPlan(managed))
         {
             return new EntryPointLookupPlan(
-                [managed.EntryPoint],
-                $"Runtime lookup for {managed.Target.RuntimeIdentifier} uses '{managed.EntryPoint}' without Windows A/W suffix probing.",
-                Error: null);
+                baseSpellings,
+                description,
+                Error: null,
+                DecoratedLookupIncomplete: false);
         }
 
-        return managed.CharacterSet switch
+        if (!TryCalculateX86StackArgumentBytes(managed, out var stackBytes))
         {
-            "ansi" => new EntryPointLookupPlan(
-                [managed.EntryPoint, managed.EntryPoint + "A"],
-                $"Windows ANSI runtime lookup order is '{managed.EntryPoint}', then '{managed.EntryPoint}A'.",
-                Error: null),
-            "utf-16" => new EntryPointLookupPlan(
-                [managed.EntryPoint + "W", managed.EntryPoint],
-                $"Windows Unicode runtime lookup order is '{managed.EntryPoint}W', then '{managed.EntryPoint}'.",
-                Error: null),
-            _ => new EntryPointLookupPlan(
-                [],
-                "",
-                $"Character set '{managed.CharacterSet ?? "<unknown>"}' does not prove a Windows entry-point lookup sequence."),
-        };
+            return new EntryPointLookupPlan(
+                baseSpellings,
+                description
+                + " The x86 stdcall decoration byte count is unknown.",
+                Error: null,
+                DecoratedLookupIncomplete: true);
+        }
+
+        var spellings = baseSpellings
+            .SelectMany(spelling => new[]
+            {
+                spelling,
+                $"_{spelling}@{stackBytes}",
+            })
+            .ToArray();
+        return new EntryPointLookupPlan(
+            spellings,
+            description
+            + $" Each x86 stdcall lookup step probes its undecorated spelling before the proven @{stackBytes} decoration.",
+            Error: null,
+            DecoratedLookupIncomplete: false);
+    }
+
+    private static bool RequiresX86StdCallDecorationPlan(
+        ManagedImport managed) =>
+        IsWindows(managed.Target)
+        && managed.Target.Architecture == InteropArchitecture.X86
+        && managed.Target.CompilerAbi == InteropCompilerAbi.Msvc
+        && managed.CallingConvention == InteropCallingConvention.StdCall;
+
+    private static bool TryCalculateX86StackArgumentBytes(
+        ManagedImport managed,
+        out int stackBytes)
+    {
+        stackBytes = 0;
+        foreach (var parameter in managed.Parameters)
+        {
+            var size = parameter.Type.SizeBytes;
+            if (size is null
+                || parameter.Type.Category is AbiTypeCategory.Void
+                    or AbiTypeCategory.Opaque
+                || size > ushort.MaxValue)
+            {
+                stackBytes = 0;
+                return false;
+            }
+
+            int slotSize;
+            try
+            {
+                slotSize = checked((size.Value + 3) & ~3);
+                stackBytes = checked(stackBytes + slotSize);
+            }
+            catch (OverflowException)
+            {
+                stackBytes = 0;
+                return false;
+            }
+
+            if (stackBytes > ushort.MaxValue)
+            {
+                stackBytes = 0;
+                return false;
+            }
+        }
+
+        return true;
     }
 
     private static bool IsWindows(InteropTarget target) =>
@@ -329,5 +428,6 @@ public sealed class InteropMatcher
     private sealed record EntryPointLookupPlan(
         IReadOnlyList<string> Spellings,
         string Description,
-        string? Error);
+        string? Error,
+        bool DecoratedLookupIncomplete);
 }
