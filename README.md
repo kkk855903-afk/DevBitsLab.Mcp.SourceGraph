@@ -339,6 +339,20 @@ sourcegraph-mcp doctor                                                  # enviro
 sourcegraph-mcp init --prewarm                                          # also pre-build the index
 ```
 
+On Windows, you can copy `setup-sourcegraph-mcp.ps1` into a .NET repository
+and run it directly from that repository:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\setup-sourcegraph-mcp.ps1
+```
+
+The script detects the repository's single `.slnx` (preferred) or `.sln`,
+installs the global tool when missing, writes the project Codex configuration,
+pre-warms the graph, and verifies it with `sourcegraph-mcp demo`. Use
+`-Solution .\Specific.slnx` when the root contains multiple solutions,
+`-SkipPrewarm` to configure only, or `-PullEmbeddings` to explicitly download
+and verify the optional embedding model.
+
 ## Wiring it into an MCP client
 
 `sourcegraph-mcp init` writes the right config for each client below

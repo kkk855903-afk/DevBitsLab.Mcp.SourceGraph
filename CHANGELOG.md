@@ -36,6 +36,11 @@ below note which package the change applies to.
   before. Leaf glyph unchanged on every surface.
 
 ### Added
+- **One-command Windows project setup.** `setup-sourcegraph-mcp.ps1` discovers
+  a repository's solution, installs the global tool when missing, writes the
+  Codex MCP configuration, pre-warms the graph, and verifies it with `demo`.
+  Optional switches select a solution, skip pre-warming, disable embeddings,
+  or explicitly download the embedding model.
 - **First-class Codex MCP onboarding.** `sourcegraph-mcp init` now includes
   project-scoped `.codex/config.toml` in its defaults and accepts
   `--client codex` / `--no-codex`. The dedicated TOML writer emits absolute
