@@ -80,12 +80,20 @@ public sealed class SqliteEmbeddingsStore : IEmbeddingsStore
 
     public async Task<bool> ShouldReembedAsync(long symbolId, byte[] contentHash, string modelVersion, CancellationToken ct = default)
     {
-        var existing = await _connection.QueryFirstOrDefaultAsync<EmbeddingMetaRow>(new CommandDefinition(
-            "SELECT content_hash AS ContentHash, model_version AS ModelVersion FROM embedding_meta WHERE symbol_id = @id;",
-            new { id = symbolId }, cancellationToken: ct)).ConfigureAwait(false);
-        if (existing is null) return true;
-        if (!string.Equals(existing.ModelVersion, modelVersion, StringComparison.Ordinal)) return true;
-        return !existing.ContentHash.AsSpan().SequenceEqual(contentHash);
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            var existing = await _connection.QueryFirstOrDefaultAsync<EmbeddingMetaRow>(new CommandDefinition(
+                "SELECT content_hash AS ContentHash, model_version AS ModelVersion FROM embedding_meta WHERE symbol_id = @id;",
+                new { id = symbolId }, cancellationToken: ct)).ConfigureAwait(false);
+            if (existing is null) return true;
+            if (!string.Equals(existing.ModelVersion, modelVersion, StringComparison.Ordinal)) return true;
+            return !existing.ContentHash.AsSpan().SequenceEqual(contentHash);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
     }
 
     public async Task<IReadOnlyList<EmbeddingHit>> SearchAsync(IReadOnlyList<float> queryEmbedding, int k, string? kindFilter = null, CancellationToken ct = default)
@@ -115,17 +123,33 @@ public sealed class SqliteEmbeddingsStore : IEmbeddingsStore
               {(kindFilter is null ? "" : "AND sym.kind_name = @kind")}
             ORDER BY s.distance;
             """;
-        var rows = await _connection.QueryAsync<RawHit>(new CommandDefinition(
-            sql, new { vec = bytes, k, kind = kindFilter }, cancellationToken: ct)).ConfigureAwait(false);
-        return rows.Select(r => new EmbeddingHit(r.SymbolId, CosineFromL2(r.Distance))).ToList();
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            var rows = await _connection.QueryAsync<RawHit>(new CommandDefinition(
+                sql, new { vec = bytes, k, kind = kindFilter }, cancellationToken: ct)).ConfigureAwait(false);
+            return rows.Select(r => new EmbeddingHit(r.SymbolId, CosineFromL2(r.Distance))).ToList();
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
     }
 
     public async Task<long> CountAsync(CancellationToken ct = default)
     {
         // symbol_embeddings is a virtual table; COUNT(*) on it returns the number of
         // (symbol_id, embedding) rows.
-        return await _connection.ExecuteScalarAsync<long>(new CommandDefinition(
-            "SELECT COUNT(*) FROM symbol_embeddings;", cancellationToken: ct)).ConfigureAwait(false);
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            return await _connection.ExecuteScalarAsync<long>(new CommandDefinition(
+                "SELECT COUNT(*) FROM symbol_embeddings;", cancellationToken: ct)).ConfigureAwait(false);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
     }
 
     public async Task<int> PruneOrphanedAsync(CancellationToken ct = default)
@@ -133,15 +157,24 @@ public sealed class SqliteEmbeddingsStore : IEmbeddingsStore
         // Match-by-symbol-id rather than rowid: vec0's virtual-table primary key is the
         // symbol_id column we wrote it with, not the synthetic rowid. The companion
         // `embedding_meta` table is keyed on (symbol_id) too — both prune in a single round-trip.
-        var pruned = await _connection.ExecuteAsync(new CommandDefinition(
-            "DELETE FROM symbol_embeddings WHERE symbol_id NOT IN (SELECT id FROM symbols);",
-            cancellationToken: ct)).ConfigureAwait(false);
-        // embedding_meta is internal bookkeeping (content_hash + model_version per symbol). Keep
-        // it in sync so a re-embed after later symbol resurrection doesn't see stale meta.
-        await _connection.ExecuteAsync(new CommandDefinition(
-            "DELETE FROM embedding_meta WHERE symbol_id NOT IN (SELECT id FROM symbols);",
-            cancellationToken: ct)).ConfigureAwait(false);
-        return pruned;
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            var pruned = await _connection.ExecuteAsync(new CommandDefinition(
+                "DELETE FROM symbol_embeddings WHERE symbol_id NOT IN (SELECT id FROM symbols);",
+                cancellationToken: ct)).ConfigureAwait(false);
+            // embedding_meta is internal bookkeeping (content_hash + model_version per symbol).
+            // Keep it in sync so a re-embed after later symbol resurrection doesn't see stale
+            // meta.
+            await _connection.ExecuteAsync(new CommandDefinition(
+                "DELETE FROM embedding_meta WHERE symbol_id NOT IN (SELECT id FROM symbols);",
+                cancellationToken: ct)).ConfigureAwait(false);
+            return pruned;
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
     }
 
     /// <summary>
