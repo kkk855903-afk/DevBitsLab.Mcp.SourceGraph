@@ -23,8 +23,12 @@ public static class ClangNativeExtractor
     private const string IncompleteCallGraphCode = "CLANG2000";
     private const string CallGraphLimitCode = "CLANG2001";
     private const string CallProducer = "clang-native-call";
+    private const string RetentionProducer = "clang-native-retention";
+    private const string ExceptionProducer = "clang-native-exception";
+    private const string AllocationProducer = "clang-native-allocation";
     internal const int MaximumExtractedFunctions = 4096;
     internal const int MaximumExtractedCalls = 8192;
+    internal const int MaximumRetainedCallbacksPerExport = 4096;
     internal const int MaximumDeclarationDepth = 128;
     internal const int MaximumStatementDepth = 256;
     internal const int MaximumVisitedStatements = 100_000;
@@ -158,8 +162,10 @@ public static class ClangNativeExtractor
 
                     var collector = new Collector(
                         request,
+                        sourceFilePath,
                         scopeRoot,
                         scopePolicy,
+                        includeDirectories,
                         diagnostics);
                     collector.Visit(translationUnit.TranslationUnitDecl.Decls);
                     return collector.BuildResult() with
@@ -469,8 +475,10 @@ public static class ClangNativeExtractor
     private sealed class Collector
     {
         private readonly ClangNativeExtractionRequest _request;
+        private readonly string _sourceFilePath;
         private readonly string _scopeRoot;
         private readonly ScopePathPolicy _scopePolicy;
+        private readonly IReadOnlyList<string> _trustedIncludeDirectories;
         private readonly List<ClangExtractionDiagnostic> _diagnostics;
         private readonly List<NativeFunctionFact> _functions = [];
         private readonly List<NativeTypeDeclarationFact> _types = [];
@@ -485,13 +493,17 @@ public static class ClangNativeExtractor
 
         public Collector(
             ClangNativeExtractionRequest request,
+            string sourceFilePath,
             string scopeRoot,
             ScopePathPolicy scopePolicy,
+            IReadOnlyList<string> trustedIncludeDirectories,
             List<ClangExtractionDiagnostic> diagnostics)
         {
             _request = request;
+            _sourceFilePath = sourceFilePath;
             _scopeRoot = scopeRoot;
             _scopePolicy = scopePolicy;
+            _trustedIncludeDirectories = trustedIncludeDirectories;
             _diagnostics = diagnostics;
         }
 
@@ -747,6 +759,18 @@ public static class ClangNativeExtractor
                 }
             }
 
+            var bodyFacts = NativeExportBodyFacts.Empty;
+            if (function.IsThisDeclarationADefinition
+                && function.HasBody
+                && function.Body is { } body)
+            {
+                bodyFacts = CollectBodyFacts(
+                    body,
+                    graphKey,
+                    isGraphExport ? function : null,
+                    parameters);
+            }
+
             if (isGraphExport)
             {
                 var nativeExport = new NativeExport(
@@ -764,6 +788,9 @@ public static class ClangNativeExtractor
                     ModuleIdentitySource = _request.LibraryName is null
                         ? NativeModuleIdentitySource.Unknown
                         : NativeModuleIdentitySource.Configuration,
+                    RetainedCallbacks = bodyFacts.RetainedCallbacks,
+                    ExceptionEscape = bodyFacts.ExceptionEscape,
+                    ReturnAllocation = bodyFacts.ReturnAllocation,
                 };
                 _exportCandidates.Add(new NativeExportCandidate(
                     string.IsNullOrWhiteSpace(usr)
@@ -772,30 +799,64 @@ public static class ClangNativeExtractor
                     function.IsThisDeclarationADefinition,
                     nativeExport));
             }
-
-            if (function.IsThisDeclarationADefinition
-                && function.HasBody
-                && function.Body is { } body)
-            {
-                CollectDirectCalls(body, graphKey);
-            }
         }
 
-        private void CollectDirectCalls(
+        private NativeExportBodyFacts CollectBodyFacts(
             Stmt body,
-            string callerGraphKey)
+            string callerGraphKey,
+            FunctionDecl? exportFunction,
+            IReadOnlyList<AbiParameter> exportParameters)
         {
-            var pending = new Stack<(Stmt Statement, int Depth)>();
-            pending.Push((body, 0));
+            var callbackParameters =
+                new Dictionary<CXCursor, int>();
+            if (exportFunction is not null)
+            {
+                for (var parameterIndex = 0;
+                     parameterIndex < exportFunction.Parameters.Count;
+                     parameterIndex++)
+                {
+                    if (exportParameters[parameterIndex].Type.Category
+                        == AbiTypeCategory.FunctionPointer)
+                    {
+                        callbackParameters[
+                            exportFunction.Parameters[parameterIndex].Handle] =
+                            parameterIndex;
+                    }
+                }
+            }
+
+            var callbackStorageWrites =
+                new Dictionary<CXCursor, CallbackStorageWriteState>();
+            NativeExceptionEscape? exceptionEscape = null;
+            var returnedAllocations =
+                new List<NativeReturnAllocation>();
+            var returnStatementCount = 0;
+            var returnFlowProven = true;
+            var traversalComplete = true;
+            var canThrowAcrossBoundary =
+                exportFunction is not null
+                && CanProveThrowMayCrossBoundary(exportFunction);
+            var pending =
+                new Stack<(
+                    Stmt Statement,
+                    int Depth,
+                    bool InsideTryCatch,
+                    bool ControlFlowProven)>();
+            pending.Push((body, 0, false, true));
             while (pending.Count > 0)
             {
-                var (statement, depth) = pending.Pop();
+                var (
+                    statement,
+                    depth,
+                    insideTryCatch,
+                    controlFlowProven) = pending.Pop();
                 if (depth > MaximumStatementDepth)
                 {
                     MarkCallGraphIncomplete(
                         CallGraphLimitCode,
                         $"Statement nesting exceeds the {MaximumStatementDepth}-level limit.",
                         TryCreatePointLocation(statement.Location, _scopePolicy));
+                    traversalComplete = false;
                     continue;
                 }
                 if (_visitedStatements >= MaximumVisitedStatements)
@@ -804,7 +865,8 @@ public static class ClangNativeExtractor
                         CallGraphLimitCode,
                         $"Statement traversal exceeds the {MaximumVisitedStatements}-node limit.",
                         TryCreatePointLocation(statement.Location, _scopePolicy));
-                    return;
+                    traversalComplete = false;
+                    break;
                 }
                 _visitedStatements++;
 
@@ -812,20 +874,699 @@ public static class ClangNativeExtractor
                 {
                     continue;
                 }
+                if (exportFunction is not null
+                    && statement is DeclRefExpr
+                    {
+                        Decl: VarDecl referencedStorage,
+                    }
+                    && referencedStorage is not ParmVarDecl
+                    && referencedStorage.HasGlobalStorage
+                    && IsFunctionPointerStorage(
+                        referencedStorage.Type)
+                    && TryGetOrCreateCallbackStorageState(
+                        referencedStorage,
+                        statement,
+                        callbackStorageWrites,
+                        ref traversalComplete,
+                        out var referencedState))
+                {
+                    referencedState.ObservedReferences++;
+                }
                 if (statement is CallExpr call)
                 {
                     AddDirectCall(call, callerGraphKey);
+                    if (exportFunction is not null)
+                    {
+                        // A later call may mutate any globally-addressable callback storage.
+                        // Without interprocedural side-effect proof, a prior assignment cannot
+                        // establish that the callback is still retained at an exit.
+                        foreach (var state in callbackStorageWrites.Values)
+                        {
+                            state.ProvenRetention = null;
+                        }
+                    }
+                }
+                if (exportFunction is not null)
+                {
+                    if (statement is BinaryOperator
+                        {
+                            Opcode:
+                                CXBinaryOperatorKind.CXBinaryOperator_Assign,
+                        } assignment)
+                    {
+                        if (!RecordCallbackStorageWrite(
+                                assignment,
+                                callbackParameters,
+                                callbackStorageWrites,
+                                controlFlowProven,
+                                ref traversalComplete))
+                        {
+                            // An assignment through a local/reference/pointer can alias a
+                            // previously proven global callback slot. Without alias proof,
+                            // preserve Unknown rather than claiming the slot survives to exit.
+                            foreach (var state in
+                                     callbackStorageWrites.Values)
+                            {
+                                state.ProvenRetention = null;
+                            }
+                        }
+                    }
+
+                    if (statement is CXXThrowExpr throwExpression
+                        && !insideTryCatch
+                        && controlFlowProven
+                        && canThrowAcrossBoundary
+                        && exceptionEscape is null)
+                    {
+                        if (TryCreateNativeFactEvidence(
+                                throwExpression.Extent,
+                                ExceptionProducer,
+                                new Dictionary<string, string>(
+                                    StringComparer.Ordinal)
+                                {
+                                    ["escapeKind"] = "direct-throw",
+                                },
+                                out var exceptionEvidence))
+                        {
+                            exceptionEscape = new NativeExceptionEscape(
+                                _request.Target,
+                                exceptionEvidence);
+                        }
+                        else
+                        {
+                            MarkCallGraphIncomplete(
+                                IncompleteCallGraphCode,
+                                "A direct native throw has no approved source location.",
+                                TryCreatePointLocation(
+                                    throwExpression.Location,
+                                    _scopePolicy));
+                            traversalComplete = false;
+                        }
+                    }
+
+                    if (statement is ReturnStmt returnStatement)
+                    {
+                        if (!controlFlowProven)
+                        {
+                            returnFlowProven = false;
+                        }
+                        else
+                        {
+                            returnStatementCount++;
+                            var allocationAnalysis =
+                                AnalyzeKnownReturnAllocation(
+                                    returnStatement,
+                                    out var allocation);
+                            if (allocationAnalysis
+                                == ReturnAllocationAnalysis.Known)
+                            {
+                                returnedAllocations.Add(allocation);
+                            }
+                            else if (allocationAnalysis
+                                     == ReturnAllocationAnalysis.Incomplete)
+                            {
+                                traversalComplete = false;
+                                returnFlowProven = false;
+                            }
+                        }
+                    }
+                }
+
+                if (statement is CXXTryStmt tryStatement)
+                {
+                    var handlerEntryProven =
+                        controlFlowProven
+                        && TryBlockStartsWithDirectThrow(
+                            tryStatement.TryBlock);
+                    for (var handlerIndex =
+                             tryStatement.Handlers.Count - 1;
+                         handlerIndex >= 0;
+                         handlerIndex--)
+                    {
+                        var handler =
+                            tryStatement.Handlers[handlerIndex];
+                        pending.Push((
+                            handler,
+                            checked(depth + 1),
+                            insideTryCatch,
+                            handlerEntryProven
+                            && handlerIndex == 0
+                            && IsCatchAll(handler)));
+                    }
+                    pending.Push((
+                        tryStatement.TryBlock,
+                        checked(depth + 1),
+                        InsideTryCatch: true,
+                        controlFlowProven));
+                    continue;
                 }
 
                 var children = statement.Children;
+                if (statement is CompoundStmt)
+                {
+                    var childControlFlow =
+                        new bool[children.Count];
+                    var nextChildIsProven = controlFlowProven;
+                    for (var childIndex = 0;
+                         childIndex < children.Count;
+                         childIndex++)
+                    {
+                        childControlFlow[childIndex] =
+                            nextChildIsProven;
+                        nextChildIsProven =
+                            nextChildIsProven
+                            && CanProveSimpleFallthrough(
+                                children[childIndex]);
+                    }
+                    for (var childIndex = children.Count - 1;
+                         childIndex >= 0;
+                         childIndex--)
+                    {
+                        pending.Push((
+                            children[childIndex],
+                            checked(depth + 1),
+                            insideTryCatch,
+                            childControlFlow[childIndex]));
+                    }
+                    continue;
+                }
+
+                var childControlFlowProven =
+                    controlFlowProven
+                    && statement is not CallExpr
+                    && !IntroducesConditionalControlFlow(statement);
                 for (var childIndex = children.Count - 1;
                      childIndex >= 0;
                      childIndex--)
                 {
                     pending.Push((
                         children[childIndex],
-                        checked(depth + 1)));
+                        checked(depth + 1),
+                        insideTryCatch,
+                        childControlFlowProven));
                 }
+            }
+
+            var retainedCallbacks =
+                new Dictionary<int, NativeCallbackRetention>();
+            foreach (var state in callbackStorageWrites.Values)
+            {
+                if (state.WriteCount != 1
+                    || state.ObservedReferences
+                        != state.DirectWriteReferences
+                    || state.ProvenRetention is not { } retention)
+                {
+                    continue;
+                }
+                retainedCallbacks.TryAdd(
+                    retention.ParameterPosition,
+                    retention);
+            }
+            NativeReturnAllocation? returnAllocation = null;
+            if (traversalComplete
+                && returnFlowProven
+                && returnStatementCount > 0
+                && returnedAllocations.Count == returnStatementCount
+                && returnedAllocations.All(allocation =>
+                    allocation.AllocatorFamily
+                    == returnedAllocations[0].AllocatorFamily))
+            {
+                returnAllocation = returnedAllocations[0];
+            }
+
+            return new NativeExportBodyFacts(
+                retainedCallbacks.Values
+                    .OrderBy(
+                        retention => retention.ParameterPosition)
+                    .ToArray(),
+                exceptionEscape,
+                returnAllocation);
+        }
+
+        private bool RecordCallbackStorageWrite(
+            BinaryOperator assignment,
+            IReadOnlyDictionary<CXCursor, int> callbackParameters,
+            IDictionary<CXCursor, CallbackStorageWriteState> storageWrites,
+            bool controlFlowProven,
+            ref bool traversalComplete)
+        {
+            var left = IgnoreTransparentExpression(assignment.LHS);
+            if (left is not DeclRefExpr
+                {
+                    Decl: VarDecl storage,
+                }
+                || storage is ParmVarDecl
+                || !storage.HasGlobalStorage
+                || !IsFunctionPointerStorage(storage.Type))
+            {
+                return false;
+            }
+
+            if (!TryGetOrCreateCallbackStorageState(
+                    storage,
+                    assignment,
+                    storageWrites,
+                    ref traversalComplete,
+                    out var state))
+            {
+                return true;
+            }
+
+            state.WriteCount++;
+            state.DirectWriteReferences++;
+            if (state.WriteCount != 1 || !controlFlowProven)
+            {
+                state.ProvenRetention = null;
+                return true;
+            }
+
+            var right = IgnoreTransparentExpression(assignment.RHS);
+            if (right is not DeclRefExpr
+                {
+                    Decl: ParmVarDecl parameter,
+                }
+                || !callbackParameters.TryGetValue(
+                    parameter.Handle,
+                    out var parameterPosition))
+            {
+                return true;
+            }
+
+            if (TryCreateNativeFactEvidence(
+                    assignment.Extent,
+                    RetentionProducer,
+                    new Dictionary<string, string>(
+                        StringComparer.Ordinal)
+                    {
+                        ["parameterPosition"] =
+                            parameterPosition.ToString(
+                                System.Globalization
+                                    .CultureInfo.InvariantCulture),
+                    },
+                    out var retentionEvidence))
+            {
+                state.ProvenRetention =
+                    new NativeCallbackRetention(
+                        parameterPosition,
+                        _request.Target,
+                        retentionEvidence);
+                return true;
+            }
+
+            MarkCallGraphIncomplete(
+                IncompleteCallGraphCode,
+                "A proven callback-retention assignment has no approved source location.",
+                TryCreatePointLocation(
+                    assignment.Location,
+                    _scopePolicy));
+            traversalComplete = false;
+            return true;
+        }
+
+        private bool TryGetOrCreateCallbackStorageState(
+            VarDecl storage,
+            Stmt occurrence,
+            IDictionary<CXCursor, CallbackStorageWriteState> storageWrites,
+            ref bool traversalComplete,
+            out CallbackStorageWriteState state)
+        {
+            if (storageWrites.TryGetValue(storage.Handle, out state!))
+            {
+                return true;
+            }
+            if (storageWrites.Count
+                >= MaximumRetainedCallbacksPerExport)
+            {
+                MarkCallGraphIncomplete(
+                    CallGraphLimitCode,
+                    $"Callback-storage tracking exceeds the {MaximumRetainedCallbacksPerExport}-item limit.",
+                    TryCreatePointLocation(
+                        occurrence.Location,
+                        _scopePolicy));
+                traversalComplete = false;
+                state = null!;
+                return false;
+            }
+            state = new CallbackStorageWriteState();
+            storageWrites.Add(storage.Handle, state);
+            return true;
+        }
+
+        private ReturnAllocationAnalysis AnalyzeKnownReturnAllocation(
+            ReturnStmt returnStatement,
+            out NativeReturnAllocation allocation)
+        {
+            allocation = null!;
+            if (returnStatement.RetValue is not { } returnedExpression
+                || IgnoreTransparentExpression(returnedExpression)
+                    is not CallExpr call)
+            {
+                return ReturnAllocationAnalysis.NotKnown;
+            }
+
+            FunctionDecl? directCallee;
+            InteropAllocatorFamily allocatorFamily;
+            string allocatorIdentity;
+            try
+            {
+                directCallee = call.DirectCallee;
+                if (directCallee is null
+                    || !TryMapKnownAllocator(
+                        call,
+                        directCallee,
+                        out allocatorFamily,
+                        out allocatorIdentity))
+                {
+                    return ReturnAllocationAnalysis.NotKnown;
+                }
+            }
+            catch (Exception ex) when (
+                ex is InvalidOperationException
+                    or NotSupportedException
+                    or OverflowException)
+            {
+                MarkCallGraphIncomplete(
+                    IncompleteCallGraphCode,
+                    "A direct return allocator could not be resolved completely.",
+                    TryCreatePointLocation(
+                        returnStatement.Location,
+                        _scopePolicy));
+                return ReturnAllocationAnalysis.Incomplete;
+            }
+            if (!TryCreateNativeFactEvidence(
+                    returnStatement.Extent,
+                    AllocationProducer,
+                    new Dictionary<string, string>(StringComparer.Ordinal)
+                    {
+                        ["allocator"] = allocatorIdentity,
+                        ["allocatorFamily"] = "crt_heap",
+                    },
+                    out var allocationEvidence))
+            {
+                MarkCallGraphIncomplete(
+                    IncompleteCallGraphCode,
+                    "A proven native return allocation has no approved source location.",
+                    TryCreatePointLocation(
+                        returnStatement.Location,
+                        _scopePolicy));
+                return ReturnAllocationAnalysis.Incomplete;
+            }
+
+            allocation = new NativeReturnAllocation(
+                allocatorFamily,
+                _request.Target,
+                allocationEvidence);
+            return ReturnAllocationAnalysis.Known;
+        }
+
+        private bool TryMapKnownAllocator(
+            CallExpr call,
+            FunctionDecl declaration,
+            out InteropAllocatorFamily allocatorFamily,
+            out string allocatorIdentity)
+        {
+            allocatorFamily = InteropAllocatorFamily.Unknown;
+            allocatorIdentity = string.Empty;
+            var function = declaration.CanonicalDecl;
+            if (!function.IsGlobal
+                || !function.IsExternC
+                || function.IsVariadic
+                || function.LinkageInternal
+                    != CXLinkageKind.CXLinkage_External
+                || function.IsDefined
+                || !IsTrustedStandardAllocatorReference(
+                    call,
+                    function))
+            {
+                return false;
+            }
+
+            var qualifiedName = string.IsNullOrWhiteSpace(
+                    function.QualifiedName)
+                ? function.Name
+                : function.QualifiedName;
+            if (function.Name is not (
+                    "malloc"
+                    or "calloc"
+                    or "realloc")
+                || !IsVoidPointer(function.ReturnType))
+            {
+                return false;
+            }
+
+            var name = function.Name;
+            var hasKnownSignature = name switch
+            {
+                "malloc" =>
+                    function.Parameters.Count == 1
+                    && IsPointerWidthUnsignedInteger(
+                        function.Parameters[0].Type,
+                        _request.Target.PointerSizeBytes),
+                "calloc" =>
+                    function.Parameters.Count == 2
+                    && IsPointerWidthUnsignedInteger(
+                        function.Parameters[0].Type,
+                        _request.Target.PointerSizeBytes)
+                    && IsPointerWidthUnsignedInteger(
+                        function.Parameters[1].Type,
+                        _request.Target.PointerSizeBytes),
+                "realloc" =>
+                    function.Parameters.Count == 2
+                    && IsVoidPointer(function.Parameters[0].Type)
+                    && IsPointerWidthUnsignedInteger(
+                        function.Parameters[1].Type,
+                        _request.Target.PointerSizeBytes),
+                _ => false,
+            };
+            if (!hasKnownSignature)
+            {
+                return false;
+            }
+
+            allocatorFamily = InteropAllocatorFamily.CrtHeap;
+            allocatorIdentity = qualifiedName;
+            return true;
+        }
+
+        private bool IsTrustedStandardAllocatorReference(
+            CallExpr call,
+            FunctionDecl declaration)
+        {
+            var callee = IgnoreTransparentExpression(call.Callee);
+            if (callee is not DeclRefExpr reference
+                || reference.FoundDecl is not NamedDecl found
+                || !found.IsInStdNamespace)
+            {
+                return false;
+            }
+
+            var declarationLocation = TryCreatePointLocation(
+                declaration.Location,
+                _scopePolicy);
+            var usingLocation = TryCreatePointLocation(
+                found.Location,
+                _scopePolicy);
+            return declarationLocation is not null
+                && usingLocation is not null
+                && IsTrustedAllocatorHeader(
+                    declarationLocation.FilePath)
+                && IsTrustedAllocatorHeader(usingLocation.FilePath);
+        }
+
+        private bool IsTrustedAllocatorHeader(string filePath)
+        {
+            if (PathEquals(filePath, _sourceFilePath))
+            {
+                return false;
+            }
+
+            var fileName = Path.GetFileName(filePath);
+            if (!PathComparer.Equals(fileName, "cstdlib")
+                && !PathComparer.Equals(fileName, "stdlib.h")
+                && !PathComparer.Equals(fileName, "malloc.h"))
+            {
+                return false;
+            }
+
+            return _trustedIncludeDirectories.Any(
+                directory => IsPathInsideDirectory(
+                    filePath,
+                    directory));
+        }
+
+        private static bool IsPathInsideDirectory(
+            string filePath,
+            string directoryPath)
+        {
+            try
+            {
+                var relative = Path.GetRelativePath(
+                    directoryPath,
+                    filePath);
+                return !Path.IsPathFullyQualified(relative)
+                    && !string.Equals(
+                        relative,
+                        "..",
+                        StringComparison.Ordinal)
+                    && !relative.StartsWith(
+                        $"..{Path.DirectorySeparatorChar}",
+                        StringComparison.Ordinal)
+                    && !relative.StartsWith(
+                        $"..{Path.AltDirectorySeparatorChar}",
+                        StringComparison.Ordinal);
+            }
+            catch (Exception ex) when (
+                ex is ArgumentException
+                    or NotSupportedException
+                    or PathTooLongException)
+            {
+                return false;
+            }
+        }
+
+        private static bool IsPointerWidthUnsignedInteger(
+            ClangSharp.Type type,
+            int pointerSizeBytes)
+        {
+            var canonical = type.Handle.CanonicalType;
+            return canonical.kind is
+                    CXTypeKind.CXType_UChar
+                    or CXTypeKind.CXType_UShort
+                    or CXTypeKind.CXType_UInt
+                    or CXTypeKind.CXType_ULong
+                    or CXTypeKind.CXType_ULongLong
+                    or CXTypeKind.CXType_UInt128
+                && canonical.SizeOf > 0
+                && canonical.SizeOf == pointerSizeBytes;
+        }
+
+        private static bool IsFunctionPointerStorage(
+            ClangSharp.Type type)
+        {
+            var canonical = type.Handle.CanonicalType;
+            return canonical.kind == CXTypeKind.CXType_Pointer
+                && canonical.PointeeType.CanonicalType.kind
+                    is CXTypeKind.CXType_FunctionProto
+                        or CXTypeKind.CXType_FunctionNoProto;
+        }
+
+        private static bool IsVoidPointer(ClangSharp.Type type)
+        {
+            var canonical = type.Handle.CanonicalType;
+            return canonical.kind == CXTypeKind.CXType_Pointer
+                && canonical.PointeeType.CanonicalType.kind
+                    == CXTypeKind.CXType_Void;
+        }
+
+        private static bool CanProveThrowMayCrossBoundary(
+            FunctionDecl function) =>
+            function.ExceptionSpecType is
+                CXCursor_ExceptionSpecificationKind
+                    .CXCursor_ExceptionSpecificationKind_None
+                or CXCursor_ExceptionSpecificationKind
+                    .CXCursor_ExceptionSpecificationKind_MSAny;
+
+        private static bool IntroducesConditionalControlFlow(
+            Stmt statement) =>
+            statement is IfStmt
+                or ForStmt
+                or CXXForRangeStmt
+                or WhileStmt
+                or DoStmt
+                or SwitchStmt
+                or ConditionalOperator
+                or BinaryConditionalOperator
+            || statement is BinaryOperator
+            {
+                Opcode:
+                    CXBinaryOperatorKind.CXBinaryOperator_LAnd
+                    or CXBinaryOperatorKind.CXBinaryOperator_LOr,
+            };
+
+        private static bool CanProveSimpleFallthrough(
+            Stmt statement)
+        {
+            if (statement is NullStmt)
+            {
+                return true;
+            }
+            if (statement is DeclStmt
+                {
+                    IsSingleDecl: true,
+                    SingleDecl: VarDecl
+                    {
+                        HasInit: true,
+                    } variable,
+                })
+            {
+                return IgnoreTransparentExpression(variable.Init)
+                    is CXXNullPtrLiteralExpr;
+            }
+            if (statement is not BinaryOperator
+                {
+                    Opcode:
+                        CXBinaryOperatorKind.CXBinaryOperator_Assign,
+                } assignment)
+            {
+                return false;
+            }
+            return IgnoreTransparentExpression(assignment.LHS)
+                    is DeclRefExpr
+                && IgnoreTransparentExpression(assignment.RHS)
+                    is DeclRefExpr;
+        }
+
+        private static bool TryBlockStartsWithDirectThrow(
+            Stmt statement)
+        {
+            if (statement is LambdaExpr)
+            {
+                return false;
+            }
+            if (statement is CXXThrowExpr)
+            {
+                return true;
+            }
+            if (statement is not CompoundStmt)
+            {
+                return false;
+            }
+            foreach (var child in statement.Children)
+            {
+                if (child is NullStmt)
+                {
+                    continue;
+                }
+                return child is CXXThrowExpr;
+            }
+            return false;
+        }
+
+        private static bool IsCatchAll(
+            CXXCatchStmt handler)
+        {
+            try
+            {
+                return handler.ExceptionDecl is null;
+            }
+            catch (Exception ex) when (
+                ex is InvalidOperationException
+                    or NotSupportedException)
+            {
+                return false;
+            }
+        }
+
+        private static Expr IgnoreTransparentExpression(Expr expression)
+        {
+            while (true)
+            {
+                var unwrapped = expression.IgnoreParens.IgnoreImplicit;
+                if (unwrapped.Handle.Equals(expression.Handle))
+                {
+                    return expression;
+                }
+                expression = unwrapped;
             }
         }
 
@@ -930,6 +1671,37 @@ public static class ClangNativeExtractor
                     ["callKind"] = "direct",
                     ["target"] = _request.Target.RuntimeIdentifier,
                 });
+            return true;
+        }
+
+        private bool TryCreateNativeFactEvidence(
+            CXSourceRange range,
+            string producer,
+            IReadOnlyDictionary<string, string> factMetadata,
+            out Evidence evidence)
+        {
+            evidence = null!;
+            if (!TryCreateSourceLocation(range, _scopePolicy, out var location))
+            {
+                return false;
+            }
+
+            var metadata = new Dictionary<string, string>(
+                factMetadata.Count + 1,
+                StringComparer.Ordinal)
+            {
+                ["target"] = _request.Target.RuntimeIdentifier,
+            };
+            foreach (var item in factMetadata)
+            {
+                metadata.Add(item.Key, item.Value);
+            }
+            evidence = new Evidence(
+                _request.ProducingFileId,
+                location,
+                CoreEvidenceConfidence.Exact,
+                producer,
+                metadata);
             return true;
         }
 
@@ -1494,4 +2266,31 @@ public static class ClangNativeExtractor
         string CallerSymbolCanonicalKey,
         string ReferencedDeclarationUsr,
         Evidence Evidence);
+
+    private enum ReturnAllocationAnalysis
+    {
+        NotKnown,
+        Known,
+        Incomplete,
+    }
+
+    private sealed class CallbackStorageWriteState
+    {
+        public int WriteCount { get; set; }
+
+        public int DirectWriteReferences { get; set; }
+
+        public int ObservedReferences { get; set; }
+
+        public NativeCallbackRetention? ProvenRetention { get; set; }
+    }
+
+    private sealed record NativeExportBodyFacts(
+        IReadOnlyList<NativeCallbackRetention> RetainedCallbacks,
+        NativeExceptionEscape? ExceptionEscape,
+        NativeReturnAllocation? ReturnAllocation)
+    {
+        public static NativeExportBodyFacts Empty { get; } =
+            new([], null, null);
+    }
 }
