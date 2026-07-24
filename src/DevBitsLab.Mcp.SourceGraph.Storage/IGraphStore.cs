@@ -27,6 +27,22 @@ public interface IGraphStore : IAsyncDisposable
         throw new NotSupportedException(
             "This graph-store implementation predates producer-specific edge-evidence cleanup.");
 
+    /// <summary>
+    /// Atomically replaces every edge-evidence occurrence owned by the exact indexed
+    /// <paramref name="producingFilePath"/> + <paramref name="producer"/> pair. All canonical
+    /// endpoints and evidence are resolved and validated before prior evidence is changed.
+    /// Empty <paramref name="edges"/> therefore performs a precise producer cleanup. Logical
+    /// edges retain evidence from other producers and keep their compatibility payload aligned
+    /// with the earliest surviving occurrence.
+    /// </summary>
+    Task ReplaceProducerEdgeEvidenceAsync(
+        string producingFilePath,
+        string producer,
+        IReadOnlyList<ProducerEdgeEvidenceFact> edges,
+        CancellationToken ct = default) =>
+        throw new NotSupportedException(
+            "This graph-store implementation predates atomic producer edge-evidence replacement.");
+
     /// <summary>Delete every symbol declared in <paramref name="fileId"/> whose canonical key is not in
     /// <paramref name="keysToKeep"/>, plus all refs/edges that touch those removed symbols.</summary>
     Task DeleteSymbolsForFileNotInAsync(long fileId, IReadOnlyCollection<string> keysToKeep, CancellationToken ct = default);
