@@ -1,3 +1,5 @@
+using System.Buffers;
+using System.Security.Cryptography;
 using DevBitsLab.Mcp.SourceGraph.Core;
 using DevBitsLab.Mcp.SourceGraph.Indexing.Clang;
 using DevBitsLab.Mcp.SourceGraph.Interop;
@@ -10,11 +12,17 @@ internal enum NativeInteropSnapshotFailureKind
     InvalidConfiguration,
     TranslationUnitPathRejected,
     TranslationUnitMissing,
-    BinaryPathNotConfigured,
     BinaryPathRejected,
     ExtractionFailed,
     ExtractionDiagnostics,
     DependencyPathRejected,
+    DependencySetChanged,
+    FactLocationRejected,
+    CollectionLimitExceeded,
+    BinaryCollectionLimitExceeded,
+    ContentHashFailed,
+    ContentHashLimitExceeded,
+    InputContentChanged,
     BinaryVerificationFailed,
     BinaryVerificationIncomplete,
     BinaryVerificationInvalid,
@@ -38,12 +46,18 @@ internal sealed record NativeInteropSnapshotDiagnostic(
     string ConfiguredPath,
     ClangExtractionDiagnostic Diagnostic);
 
+internal sealed record NativeInteropFileContentHash(
+    string FilePath,
+    long LengthBytes,
+    byte[] Sha256);
+
 internal sealed record NativeInteropTranslationUnitContribution(
     int ConfigurationIndex,
     InteropTranslationUnitConfig Configuration,
     string? SourceFilePath,
     string? BinaryFilePath,
     IReadOnlyList<string> IncludedFiles,
+    IReadOnlyList<NativeInteropFileContentHash> ContentHashes,
     IReadOnlyList<NativeExport> SourceExports,
     IReadOnlyList<NativeExport> VerifiedExports,
     IReadOnlyList<AbiRecordLayout> RecordLayouts,
@@ -57,6 +71,7 @@ internal sealed record NativeInteropSnapshot(
     IReadOnlyList<NativeInteropTranslationUnitContribution> Contributions,
     IReadOnlyList<string> IncludedFiles,
     IReadOnlyDictionary<string, IReadOnlyList<string>> DependencyFanout,
+    IReadOnlyDictionary<string, NativeInteropFileContentHash> ContentHashes,
     IReadOnlyList<NativeExport> SourceExports,
     IReadOnlyList<NativeExport> VerifiedExports,
     IReadOnlyList<AbiRecordLayout> RecordLayouts,
@@ -82,8 +97,40 @@ internal delegate Task<BinaryExportVerificationResult> NativeInteropBinaryVerifi
 /// </summary>
 internal sealed class NativeInteropSnapshotBuilder
 {
+    internal const int MaximumTranslationUnits = 256;
+    internal const int MaximumCompilerArguments = 4096;
+    internal const int MaximumIncludedFilesPerTranslationUnit = 4096;
+    internal const int MaximumDiagnosticsPerTranslationUnit = 4096;
+    internal const int MaximumExportsPerTranslationUnit = 4096;
+    internal const int MaximumRecordLayoutsPerTranslationUnit = 4096;
+    internal const int MaximumParametersPerExport = 4096;
+    internal const int MaximumFieldsPerRecord = 4096;
+    internal const int MaximumRetainedCallbacksPerExport = 4096;
+    internal const int MaximumNestedFactsPerTranslationUnit = 65_536;
+    internal const int MaximumEvidenceMetadataEntries = 256;
+    internal const int MaximumBinaryExports = 65_536;
+    internal const int MaximumBinaryExportNames = 65_536;
+    internal const long MaximumHashedFileBytes = 32L * 1024 * 1024;
+    internal const long MaximumHashBytesPerTranslationUnit =
+        256L * 1024 * 1024;
+
+    private const int HashReadBufferBytes = 64 * 1024;
+
     private readonly NativeInteropExtractor _extractor;
     private readonly NativeInteropBinaryVerifier _binaryVerifier;
+
+    private sealed record ExtractionAttempt(
+        ClangNativeExtractionResult? Extraction,
+        NativeInteropSnapshotFailure? Failure);
+
+    private sealed record PreparedExtraction(
+        IReadOnlyList<string> IncludedFiles,
+        IReadOnlyList<ClangExtractionDiagnostic> Diagnostics,
+        NativeInteropSnapshotFailure? Failure);
+
+    private sealed record ContentHashBatch(
+        IReadOnlyList<NativeInteropFileContentHash> Hashes,
+        NativeInteropSnapshotFailure? Failure);
 
     private static readonly StringComparer _pathComparer =
         OperatingSystem.IsWindows()
@@ -134,26 +181,39 @@ internal sealed class NativeInteropSnapshotBuilder
                 "At least one native translation unit is required.");
             return EmptySnapshot(configuration.Target, [failure]);
         }
+        if (configuration.TranslationUnits.Count > MaximumTranslationUnits)
+        {
+            var failure = new NativeInteropSnapshotFailure(
+                NativeInteropSnapshotFailureKind.CollectionLimitExceeded,
+                null,
+                null,
+                $"Translation-unit count exceeds the {MaximumTranslationUnits}-item limit.");
+            return EmptySnapshot(configuration.Target, [failure]);
+        }
 
         var contributions =
             new List<NativeInteropTranslationUnitContribution>(
                 configuration.TranslationUnits.Count);
-        foreach (var entry in configuration.TranslationUnits.Select(
-                     (value, index) => (Value: value, Index: index)))
+        for (var index = 0;
+             index < configuration.TranslationUnits.Count;
+             index++)
         {
             cancellationToken.ThrowIfCancellationRequested();
             contributions.Add(await BuildContributionAsync(
                     lexicalRoot,
                     effectivePolicy,
                     configuration.Target,
-                    entry.Value,
-                    entry.Index,
+                    configuration.TranslationUnits[index],
+                    index,
                     cancellationToken)
                 .ConfigureAwait(false));
         }
 
         cancellationToken.ThrowIfCancellationRequested();
-        return BuildAggregate(configuration.Target, contributions);
+        return BuildAggregate(
+            configuration.Target,
+            contributions,
+            cancellationToken);
     }
 
     private async Task<NativeInteropTranslationUnitContribution>
@@ -169,8 +229,7 @@ internal sealed class NativeInteropSnapshotBuilder
         if (translationUnit is null
             || string.IsNullOrWhiteSpace(translationUnit.Path)
             || string.IsNullOrWhiteSpace(translationUnit.Library)
-            || translationUnit.Arguments is not { Count: > 0 }
-            || translationUnit.Arguments.Any(string.IsNullOrWhiteSpace))
+            || translationUnit.Arguments is not { Count: > 0 })
         {
             failures.Add(Failure(
                 NativeInteropSnapshotFailureKind.InvalidConfiguration,
@@ -178,6 +237,31 @@ internal sealed class NativeInteropSnapshotBuilder
                 translationUnit?.Path,
                 "Translation-unit path, library, and compiler arguments are required."));
             return EmptyContribution(index, translationUnit!, failures);
+        }
+        if (translationUnit.Arguments.Count > MaximumCompilerArguments)
+        {
+            failures.Add(CollectionLimitFailure(
+                index,
+                translationUnit.Path,
+                "Compiler argument",
+                MaximumCompilerArguments));
+            return EmptyContribution(index, translationUnit, failures);
+        }
+        for (var argumentIndex = 0;
+             argumentIndex < translationUnit.Arguments.Count;
+             argumentIndex++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (string.IsNullOrWhiteSpace(
+                    translationUnit.Arguments[argumentIndex]))
+            {
+                failures.Add(Failure(
+                    NativeInteropSnapshotFailureKind.InvalidConfiguration,
+                    index,
+                    translationUnit.Path,
+                    "Compiler arguments cannot contain blank values."));
+                return EmptyContribution(index, translationUnit, failures);
+            }
         }
 
         if (!TryAuthorizeConfiguredPath(
@@ -222,260 +306,400 @@ internal sealed class NativeInteropSnapshotBuilder
                 sourceFilePath);
         }
 
-        ClangNativeExtractionResult extraction;
-        try
-        {
-            extraction = await _extractor(
-                    new ClangNativeExtractionRequest(
-                        sourceFilePath,
-                        scopeRoot,
-                        checked((long)index + 1),
-                        target,
-                        translationUnit.Arguments,
-                        translationUnit.Library,
-                        pathPolicy.ConfiguredExcludePatterns),
-                    cancellationToken)
-                .ConfigureAwait(false);
-            cancellationToken.ThrowIfCancellationRequested();
-        }
-        catch (OperationCanceledException)
-        {
-            throw;
-        }
-        catch (Exception ex)
-        {
-            failures.Add(Failure(
-                NativeInteropSnapshotFailureKind.ExtractionFailed,
-                index,
-                translationUnit.Path,
-                $"Native extraction failed ({ex.GetType().Name})."));
-            return EmptyContribution(
-                index,
-                translationUnit,
-                failures,
-                sourceFilePath,
-                binaryFilePath);
-        }
-
-        if (extraction is null)
-        {
-            failures.Add(Failure(
-                NativeInteropSnapshotFailureKind.ExtractionFailed,
-                index,
-                translationUnit.Path,
-                "Native extractor returned no result."));
-            return EmptyContribution(
-                index,
-                translationUnit,
-                failures,
-                sourceFilePath,
-                binaryFilePath);
-        }
-
-        var diagnostics = OrderDiagnostics(extraction.Diagnostics ?? []);
-        if (diagnostics.Any(diagnostic =>
-                diagnostic.Severity is ClangExtractionDiagnosticSeverity.Error
-                    or ClangExtractionDiagnosticSeverity.Fatal))
-        {
-            failures.Add(Failure(
-                NativeInteropSnapshotFailureKind.ExtractionDiagnostics,
-                index,
-                translationUnit.Path,
-                "Native extraction returned one or more error diagnostics."));
-            return new NativeInteropTranslationUnitContribution(
-                index,
-                translationUnit,
-                sourceFilePath,
-                binaryFilePath,
-                [],
-                [],
-                [],
-                [],
-                diagnostics,
-                null,
-                IsComplete: false,
-                OrderFailures(failures));
-        }
-
-        if (extraction.IncludedFiles is null
-            || !TryAuthorizeDependencies(
-                sourceFilePath,
-                extraction.IncludedFiles,
+        var extractionRequest = new ClangNativeExtractionRequest(
+            sourceFilePath,
+            scopeRoot,
+            checked((long)index + 1),
+            target,
+            translationUnit.Arguments,
+            translationUnit.Library,
+            pathPolicy.ConfiguredExcludePatterns);
+        var sourceHashBeforeDiscovery = await HashApprovedFilesAsync(
+                [sourceFilePath],
                 pathPolicy,
-                out var includedFiles))
-        {
-            failures.Add(Failure(
-                NativeInteropSnapshotFailureKind.DependencyPathRejected,
                 index,
                 translationUnit.Path,
-                "Extractor dependency paths were incomplete or outside the approved scope."));
-            return new NativeInteropTranslationUnitContribution(
+                cancellationToken)
+            .ConfigureAwait(false);
+        if (sourceHashBeforeDiscovery.Failure is not null)
+        {
+            return EmptyContribution(
+                index,
+                translationUnit,
+                [sourceHashBeforeDiscovery.Failure],
+                sourceFilePath,
+                binaryFilePath);
+        }
+
+        var discoveryAttempt = await ExtractOnceAsync(
+                extractionRequest,
+                index,
+                translationUnit.Path,
+                cancellationToken)
+            .ConfigureAwait(false);
+        if (discoveryAttempt.Failure is not null)
+        {
+            return EmptyContribution(
+                index,
+                translationUnit,
+                [discoveryAttempt.Failure],
+                sourceFilePath,
+                binaryFilePath);
+        }
+        var discovery = PrepareExtraction(
+            discoveryAttempt.Extraction!,
+            sourceFilePath,
+            pathPolicy,
+            index,
+            translationUnit.Path,
+            cancellationToken);
+        if (discovery.Failure is not null)
+        {
+            return PreparedFailureContribution(
                 index,
                 translationUnit,
                 sourceFilePath,
                 binaryFilePath,
-                [],
-                [],
-                [],
-                [],
-                diagnostics,
-                null,
-                IsComplete: false,
-                OrderFailures(failures));
+                discovery);
         }
 
-        if (extraction.Exports is null || extraction.RecordLayouts is null)
-        {
-            failures.Add(Failure(
-                NativeInteropSnapshotFailureKind.InvalidFact,
+        var hashesBeforeReparse = await HashApprovedFilesAsync(
+                discovery.IncludedFiles,
+                pathPolicy,
                 index,
                 translationUnit.Path,
-                "Native extractor returned null fact collections."));
+                cancellationToken)
+            .ConfigureAwait(false);
+        if (hashesBeforeReparse.Failure is not null)
+        {
+            return EmptyContribution(
+                index,
+                translationUnit,
+                [hashesBeforeReparse.Failure],
+                sourceFilePath,
+                binaryFilePath);
         }
-        var sourceExports = OrderExports((extraction.Exports ?? [])
-            .Where(export =>
-            {
-                var valid = export is not null
-                    && export.Target.IsAbiEquivalentTo(target)
-                    && !export.IsBinaryVerified
-                    && export.ModuleIdentitySource
-                        != NativeModuleIdentitySource.Binary
-                    && export.LibraryName is not null
-                    && LibrariesMatch(
-                        translationUnit.Library,
-                        export.LibraryName,
-                        target);
-                if (!valid)
-                {
-                    failures.Add(Failure(
-                        NativeInteropSnapshotFailureKind.InvalidFact,
-                        index,
-                        translationUnit.Path,
-                        "Source export does not match the configured target and module.",
-                        export?.SymbolCanonicalKey));
-                }
-                return valid;
-            }));
-        var records = OrderRecords((extraction.RecordLayouts ?? [])
-            .Where(record =>
-            {
-                var valid = record is not null
-                    && record.Target.IsAbiEquivalentTo(target);
-                if (!valid)
-                {
-                    failures.Add(Failure(
-                        NativeInteropSnapshotFailureKind.InvalidFact,
-                        index,
-                        translationUnit.Path,
-                        "Native record does not match the configured target.",
-                        record?.SymbolCanonicalKey));
-                }
-                return valid;
-            }));
-        if (translationUnit.BinaryPath is null)
+        if (!HasSameHash(
+                sourceHashBeforeDiscovery.Hashes[0],
+                hashesBeforeReparse.Hashes.Single(hash =>
+                    _pathComparer.Equals(hash.FilePath, sourceFilePath))))
         {
-            failures.Add(Failure(
-                NativeInteropSnapshotFailureKind.BinaryPathNotConfigured,
+            return EmptyContribution(
+                index,
+                translationUnit,
+                [
+                    Failure(
+                        NativeInteropSnapshotFailureKind.InputContentChanged,
+                        index,
+                        translationUnit.Path,
+                        "Translation-unit content changed during dependency discovery."),
+                ],
+                sourceFilePath,
+                binaryFilePath);
+        }
+
+        var reparseAttempt = await ExtractOnceAsync(
+                extractionRequest,
                 index,
                 translationUnit.Path,
-                "No authoritative binary artifact is configured."));
-            return new NativeInteropTranslationUnitContribution(
+                cancellationToken)
+            .ConfigureAwait(false);
+        if (reparseAttempt.Failure is not null)
+        {
+            return EmptyContribution(
+                index,
+                translationUnit,
+                [reparseAttempt.Failure],
+                sourceFilePath,
+                binaryFilePath);
+        }
+        var reparse = PrepareExtraction(
+            reparseAttempt.Extraction!,
+            sourceFilePath,
+            pathPolicy,
+            index,
+            translationUnit.Path,
+            cancellationToken);
+        if (reparse.Failure is not null)
+        {
+            return PreparedFailureContribution(
                 index,
                 translationUnit,
                 sourceFilePath,
-                null,
-                includedFiles,
-                sourceExports,
-                [],
-                records,
-                diagnostics,
-                null,
-                IsComplete: false,
-                OrderFailures(failures));
+                binaryFilePath,
+                reparse);
+        }
+        if (!PathSetsEqual(
+                discovery.IncludedFiles,
+                reparse.IncludedFiles))
+        {
+            return EmptyContribution(
+                index,
+                translationUnit,
+                [
+                    Failure(
+                        NativeInteropSnapshotFailureKind.DependencySetChanged,
+                        index,
+                        translationUnit.Path,
+                        "Included-file set changed between dependency discovery and reparse."),
+                ],
+                sourceFilePath,
+                binaryFilePath);
         }
 
-        BinaryExportVerificationResult binaryVerification;
-        try
+        var hashesAfterReparse = await HashApprovedFilesAsync(
+                reparse.IncludedFiles,
+                pathPolicy,
+                index,
+                translationUnit.Path,
+                cancellationToken)
+            .ConfigureAwait(false);
+        if (hashesAfterReparse.Failure is not null)
         {
-            binaryVerification = await _binaryVerifier(
-                    binaryFilePath!,
-                    target,
-                    cancellationToken)
-                .ConfigureAwait(false);
+            return EmptyContribution(
+                index,
+                translationUnit,
+                [hashesAfterReparse.Failure],
+                sourceFilePath,
+                binaryFilePath);
+        }
+        if (!HashSetsEqual(
+                hashesBeforeReparse.Hashes,
+                hashesAfterReparse.Hashes))
+        {
+            return EmptyContribution(
+                index,
+                translationUnit,
+                [
+                    Failure(
+                        NativeInteropSnapshotFailureKind.InputContentChanged,
+                        index,
+                        translationUnit.Path,
+                        "Translation-unit or included-file content changed during reparse."),
+                ],
+                sourceFilePath,
+                binaryFilePath);
+        }
+
+        var extraction = reparseAttempt.Extraction!;
+        var includedFiles = reparse.IncludedFiles;
+        var includedFileSet = new HashSet<string>(
+            includedFiles,
+            _pathComparer);
+        var diagnostics = reparse.Diagnostics;
+
+        var sourceExportList = new List<NativeExport>(extraction.Exports!.Count);
+        for (var exportIndex = 0;
+             exportIndex < extraction.Exports.Count;
+             exportIndex++)
+        {
             cancellationToken.ThrowIfCancellationRequested();
+            var export = extraction.Exports[exportIndex];
+            if (export is null
+                || export.Target is null
+                || !export.Target.IsAbiEquivalentTo(target)
+                || export.IsBinaryVerified
+                || export.ModuleIdentitySource
+                    == NativeModuleIdentitySource.Binary
+                || export.LibraryName is null
+                || !LibrariesMatch(
+                    translationUnit.Library,
+                    export.LibraryName,
+                    target))
+            {
+                failures.Add(Failure(
+                    NativeInteropSnapshotFailureKind.InvalidFact,
+                    index,
+                    translationUnit.Path,
+                    "Source export does not match the configured target and module.",
+                    export?.SymbolCanonicalKey));
+                continue;
+            }
+            if (!TryNormalizeExport(
+                    export,
+                    includedFileSet,
+                    pathPolicy,
+                    cancellationToken,
+                    out var normalizedExport,
+                    out var rejectionKind,
+                    out var rejectionMessage))
+            {
+                failures.Add(Failure(
+                    rejectionKind,
+                    index,
+                    translationUnit.Path,
+                    rejectionMessage,
+                    export.SymbolCanonicalKey));
+                continue;
+            }
+            sourceExportList.Add(normalizedExport);
         }
-        catch (OperationCanceledException)
-        {
-            throw;
-        }
-        catch (Exception ex)
-        {
-            failures.Add(Failure(
-                NativeInteropSnapshotFailureKind.BinaryVerificationFailed,
-                index,
-                translationUnit.Path,
-                $"Binary verification failed ({ex.GetType().Name})."));
-            return new NativeInteropTranslationUnitContribution(
-                index,
-                translationUnit,
-                sourceFilePath,
-                binaryFilePath,
-                includedFiles,
-                sourceExports,
-                [],
-                records,
-                diagnostics,
-                null,
-                IsComplete: false,
-                OrderFailures(failures));
-        }
+        var sourceExports = OrderExports(sourceExportList);
 
-        if (binaryVerification is null)
+        var recordList = new List<AbiRecordLayout>(
+            extraction.RecordLayouts!.Count);
+        for (var recordIndex = 0;
+             recordIndex < extraction.RecordLayouts.Count;
+             recordIndex++)
         {
-            failures.Add(Failure(
-                NativeInteropSnapshotFailureKind.BinaryVerificationFailed,
-                index,
-                translationUnit.Path,
-                "Binary verifier returned no result."));
+            cancellationToken.ThrowIfCancellationRequested();
+            var record = extraction.RecordLayouts[recordIndex];
+            if (record is null
+                || record.Target is null
+                || !record.Target.IsAbiEquivalentTo(target))
+            {
+                failures.Add(Failure(
+                    NativeInteropSnapshotFailureKind.InvalidFact,
+                    index,
+                    translationUnit.Path,
+                    "Native record does not match the configured target.",
+                    record?.SymbolCanonicalKey));
+                continue;
+            }
+            if (!TryNormalizeRecord(
+                    record,
+                    includedFileSet,
+                    pathPolicy,
+                    cancellationToken,
+                    out var normalizedRecord,
+                    out var rejectionKind,
+                    out var rejectionMessage))
+            {
+                failures.Add(Failure(
+                    rejectionKind,
+                    index,
+                    translationUnit.Path,
+                    rejectionMessage,
+                    record.SymbolCanonicalKey));
+                continue;
+            }
+            recordList.Add(normalizedRecord);
         }
-        else if (!binaryVerification.IsComplete)
-        {
-            failures.Add(Failure(
-                FailureKindFor(binaryVerification.Status),
-                index,
-                translationUnit.Path,
-                binaryVerification.Reason));
-        }
-        else if (binaryVerification.ImageArchitecture != target.Architecture)
-        {
-            failures.Add(Failure(
-                NativeInteropSnapshotFailureKind.BinaryTargetMismatch,
-                index,
-                translationUnit.Path,
-                "Complete binary result does not match the configured target."));
-        }
-        else if (binaryVerification.ModuleName is not null
-                 && !LibrariesMatch(
-                     translationUnit.Library,
-                     binaryVerification.ModuleName,
-                     target))
-        {
-            failures.Add(Failure(
-                NativeInteropSnapshotFailureKind.BinaryModuleMismatch,
-                index,
-                translationUnit.Path,
-                "PE module name does not match the configured native library."));
-        }
+        var records = OrderRecords(recordList);
 
+        BinaryExportVerificationResult? binaryVerification = null;
         var verifiedExports = Array.Empty<NativeExport>();
-        if (failures.Count == 0)
+        if (failures.Count == 0 && translationUnit.BinaryPath is not null)
+        {
+            try
+            {
+                binaryVerification = await _binaryVerifier(
+                        binaryFilePath!,
+                        target,
+                        cancellationToken)
+                    .ConfigureAwait(false);
+                cancellationToken.ThrowIfCancellationRequested();
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                failures.Add(Failure(
+                    NativeInteropSnapshotFailureKind
+                        .BinaryVerificationFailed,
+                    index,
+                    translationUnit.Path,
+                    $"Binary verification failed ({ex.GetType().Name})."));
+            }
+        }
+
+        if (failures.Count == 0 && translationUnit.BinaryPath is not null)
+        {
+            if (binaryVerification is null)
+            {
+                failures.Add(Failure(
+                    NativeInteropSnapshotFailureKind.BinaryVerificationFailed,
+                    index,
+                    translationUnit.Path,
+                    "Binary verifier returned no result."));
+            }
+            else if (!TryValidateBinaryCollectionBounds(
+                         binaryVerification,
+                         cancellationToken,
+                         out var binaryCollectionFailureKind,
+                         out var binaryCollectionMessage))
+            {
+                failures.Add(Failure(
+                    binaryCollectionFailureKind,
+                    index,
+                    translationUnit.Path,
+                    binaryCollectionMessage));
+            }
+            else if (!binaryVerification.IsComplete)
+            {
+                failures.Add(Failure(
+                    FailureKindFor(binaryVerification.Status),
+                    index,
+                    translationUnit.Path,
+                    binaryVerification.Reason));
+            }
+            else if (binaryVerification.ImageArchitecture
+                     != target.Architecture)
+            {
+                failures.Add(Failure(
+                    NativeInteropSnapshotFailureKind.BinaryTargetMismatch,
+                    index,
+                    translationUnit.Path,
+                    "Complete binary result does not match the configured target."));
+            }
+            else if (binaryVerification.ModuleName is not null
+                     && !LibrariesMatch(
+                         translationUnit.Library,
+                         binaryVerification.ModuleName,
+                         target))
+            {
+                failures.Add(Failure(
+                    NativeInteropSnapshotFailureKind.BinaryModuleMismatch,
+                    index,
+                    translationUnit.Path,
+                    "PE module name does not match the configured native library."));
+            }
+        }
+
+        if (failures.Count == 0 && binaryVerification is not null)
         {
             verifiedExports = AssociateExactBinaryExports(
                 sourceExports,
                 binaryVerification!,
                 translationUnit,
                 index,
-                failures);
+                failures,
+                cancellationToken);
+        }
+
+        IReadOnlyList<NativeInteropFileContentHash> contentHashes = [];
+        var hashesAfterBuild = await HashApprovedFilesAsync(
+                reparse.IncludedFiles,
+                pathPolicy,
+                index,
+                translationUnit.Path,
+                cancellationToken)
+            .ConfigureAwait(false);
+        if (hashesAfterBuild.Failure is not null)
+        {
+            failures.Add(hashesAfterBuild.Failure);
+            sourceExports = [];
+            verifiedExports = [];
+            records = [];
+        }
+        else if (!HashSetsEqual(
+                     hashesAfterReparse.Hashes,
+                     hashesAfterBuild.Hashes))
+        {
+            failures.Add(Failure(
+                NativeInteropSnapshotFailureKind.InputContentChanged,
+                index,
+                translationUnit.Path,
+                "Translation-unit or included-file content changed during fact validation or binary verification."));
+            sourceExports = [];
+            verifiedExports = [];
+            records = [];
+        }
+        else
+        {
+            contentHashes = hashesAfterBuild.Hashes;
         }
 
         return new NativeInteropTranslationUnitContribution(
@@ -484,6 +708,7 @@ internal sealed class NativeInteropSnapshotBuilder
             sourceFilePath,
             binaryFilePath,
             includedFiles,
+            contentHashes,
             sourceExports,
             verifiedExports,
             records,
@@ -493,17 +718,941 @@ internal sealed class NativeInteropSnapshotBuilder
             OrderFailures(failures));
     }
 
+    private async Task<ExtractionAttempt> ExtractOnceAsync(
+        ClangNativeExtractionRequest request,
+        int index,
+        string configuredPath,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            var extraction = await _extractor(request, cancellationToken)
+                .ConfigureAwait(false);
+            cancellationToken.ThrowIfCancellationRequested();
+            return extraction is null
+                ? new ExtractionAttempt(
+                    null,
+                    Failure(
+                        NativeInteropSnapshotFailureKind.ExtractionFailed,
+                        index,
+                        configuredPath,
+                        "Native extractor returned no result."))
+                : new ExtractionAttempt(extraction, null);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            return new ExtractionAttempt(
+                null,
+                Failure(
+                    NativeInteropSnapshotFailureKind.ExtractionFailed,
+                    index,
+                    configuredPath,
+                    $"Native extraction failed ({ex.GetType().Name})."));
+        }
+    }
+
+    private static PreparedExtraction PrepareExtraction(
+        ClangNativeExtractionResult extraction,
+        string sourceFilePath,
+        ScopePathPolicy pathPolicy,
+        int index,
+        string configuredPath,
+        CancellationToken cancellationToken)
+    {
+        if (!TryValidateTopLevelCollectionBounds(
+                extraction,
+                index,
+                configuredPath,
+                out var collectionFailure))
+        {
+            return new PreparedExtraction([], [], collectionFailure);
+        }
+        if (!TryValidateNestedFactBounds(
+                extraction,
+                index,
+                configuredPath,
+                cancellationToken,
+                out var nestedCollectionFailure))
+        {
+            return new PreparedExtraction(
+                [],
+                [],
+                nestedCollectionFailure);
+        }
+        if (extraction.IncludedFiles is null
+            || !TryAuthorizeDependencies(
+                sourceFilePath,
+                extraction.IncludedFiles,
+                pathPolicy,
+                cancellationToken,
+                out var includedFiles))
+        {
+            return new PreparedExtraction(
+                [],
+                [],
+                Failure(
+                    NativeInteropSnapshotFailureKind.DependencyPathRejected,
+                    index,
+                    configuredPath,
+                    "Extractor dependency paths were incomplete or outside the approved scope."));
+        }
+
+        var includedFileSet = new HashSet<string>(
+            includedFiles,
+            _pathComparer);
+        if (!TryNormalizeDiagnostics(
+                extraction.Diagnostics!,
+                includedFileSet,
+                pathPolicy,
+                cancellationToken,
+                out var diagnostics))
+        {
+            return new PreparedExtraction(
+                includedFiles,
+                [],
+                Failure(
+                    NativeInteropSnapshotFailureKind.FactLocationRejected,
+                    index,
+                    configuredPath,
+                    "Extractor diagnostic location is not one of the approved included files."));
+        }
+        if (diagnostics.Any(diagnostic =>
+                diagnostic.Severity is ClangExtractionDiagnosticSeverity.Error
+                    or ClangExtractionDiagnosticSeverity.Fatal))
+        {
+            return new PreparedExtraction(
+                includedFiles,
+                diagnostics,
+                Failure(
+                    NativeInteropSnapshotFailureKind.ExtractionDiagnostics,
+                    index,
+                    configuredPath,
+                    "Native extraction returned one or more error diagnostics."));
+        }
+        return new PreparedExtraction(includedFiles, diagnostics, null);
+    }
+
+    private static NativeInteropTranslationUnitContribution
+        PreparedFailureContribution(
+            int index,
+            InteropTranslationUnitConfig translationUnit,
+            string sourceFilePath,
+            string? binaryFilePath,
+            PreparedExtraction prepared) =>
+        new(
+            index,
+            translationUnit,
+            sourceFilePath,
+            binaryFilePath,
+            prepared.IncludedFiles,
+            [],
+            [],
+            [],
+            [],
+            prepared.Diagnostics,
+            null,
+            IsComplete: false,
+            [prepared.Failure!]);
+
+    private static async Task<ContentHashBatch> HashApprovedFilesAsync(
+        IReadOnlyList<string> paths,
+        ScopePathPolicy pathPolicy,
+        int index,
+        string configuredPath,
+        CancellationToken cancellationToken)
+    {
+        if (paths.Count > MaximumIncludedFilesPerTranslationUnit)
+        {
+            return new ContentHashBatch(
+                [],
+                Failure(
+                    NativeInteropSnapshotFailureKind.ContentHashLimitExceeded,
+                    index,
+                    configuredPath,
+                    $"Content-hash file count exceeds the {MaximumIncludedFilesPerTranslationUnit}-item limit."));
+        }
+
+        var hashes = new List<NativeInteropFileContentHash>(paths.Count);
+        var buffer = ArrayPool<byte>.Shared.Rent(HashReadBufferBytes);
+        long totalBytes = 0;
+        try
+        {
+            for (var pathIndex = 0;
+                 pathIndex < paths.Count;
+                 pathIndex++)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var path = paths[pathIndex];
+                if (!TryAuthorizeExistingAbsoluteFile(
+                        path,
+                        pathPolicy,
+                        out var physicalPath)
+                    || !_pathComparer.Equals(path, physicalPath))
+                {
+                    return new ContentHashBatch(
+                        [],
+                        Failure(
+                            NativeInteropSnapshotFailureKind.ContentHashFailed,
+                            index,
+                            configuredPath,
+                            "A content-hash input is no longer an approved physical file."));
+                }
+
+                try
+                {
+                    var writeTimeBefore = File.GetLastWriteTimeUtc(physicalPath);
+                    await using var stream = new FileStream(
+                        physicalPath,
+                        FileMode.Open,
+                        FileAccess.Read,
+                        FileShare.ReadWrite | FileShare.Delete,
+                        HashReadBufferBytes,
+                        FileOptions.Asynchronous
+                            | FileOptions.SequentialScan);
+                    var lengthBefore = stream.Length;
+                    if (lengthBefore < 0
+                        || lengthBefore > MaximumHashedFileBytes
+                        || lengthBefore
+                            > MaximumHashBytesPerTranslationUnit - totalBytes)
+                    {
+                        return new ContentHashBatch(
+                            [],
+                            Failure(
+                                NativeInteropSnapshotFailureKind
+                                    .ContentHashLimitExceeded,
+                                index,
+                                configuredPath,
+                                $"Content hashing exceeds the {MaximumHashedFileBytes}-byte per-file or {MaximumHashBytesPerTranslationUnit}-byte per-translation-unit limit."));
+                    }
+
+                    using var incrementalHash = IncrementalHash.CreateHash(
+                        HashAlgorithmName.SHA256);
+                    long fileBytes = 0;
+                    while (true)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                        var read = await stream.ReadAsync(
+                                buffer.AsMemory(0, HashReadBufferBytes),
+                                cancellationToken)
+                            .ConfigureAwait(false);
+                        if (read == 0)
+                        {
+                            break;
+                        }
+                        if (read > MaximumHashedFileBytes - fileBytes
+                            || read
+                                > MaximumHashBytesPerTranslationUnit
+                                    - totalBytes
+                                    - fileBytes)
+                        {
+                            return new ContentHashBatch(
+                                [],
+                                Failure(
+                                    NativeInteropSnapshotFailureKind
+                                        .ContentHashLimitExceeded,
+                                    index,
+                                    configuredPath,
+                                    "Content grew beyond the configured hashing limits."));
+                        }
+                        incrementalHash.AppendData(buffer, 0, read);
+                        fileBytes += read;
+                    }
+
+                    var lengthAfter = stream.Length;
+                    var writeTimeAfter =
+                        File.GetLastWriteTimeUtc(physicalPath);
+                    if (lengthBefore != lengthAfter
+                        || fileBytes != lengthAfter
+                        || writeTimeBefore != writeTimeAfter)
+                    {
+                        return new ContentHashBatch(
+                            [],
+                            Failure(
+                                NativeInteropSnapshotFailureKind
+                                    .InputContentChanged,
+                                index,
+                                configuredPath,
+                                "A native input changed while it was being hashed."));
+                    }
+
+                    hashes.Add(new NativeInteropFileContentHash(
+                        physicalPath,
+                        fileBytes,
+                        incrementalHash.GetHashAndReset()));
+                    totalBytes += fileBytes;
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch (Exception ex) when (
+                    ex is IOException
+                        or UnauthorizedAccessException
+                        or NotSupportedException
+                        or System.Security.SecurityException)
+                {
+                    return new ContentHashBatch(
+                        [],
+                        Failure(
+                            NativeInteropSnapshotFailureKind.ContentHashFailed,
+                            index,
+                            configuredPath,
+                            $"Native input hashing failed ({ex.GetType().Name})."));
+                }
+            }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
+        }
+
+        return new ContentHashBatch(hashes, null);
+    }
+
+    private static bool PathSetsEqual(
+        IReadOnlyList<string> first,
+        IReadOnlyList<string> second)
+    {
+        if (first.Count != second.Count)
+        {
+            return false;
+        }
+        for (var index = 0; index < first.Count; index++)
+        {
+            if (!_pathComparer.Equals(first[index], second[index]))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static bool HashSetsEqual(
+        IReadOnlyList<NativeInteropFileContentHash> first,
+        IReadOnlyList<NativeInteropFileContentHash> second)
+    {
+        if (first.Count != second.Count)
+        {
+            return false;
+        }
+        for (var index = 0; index < first.Count; index++)
+        {
+            if (!HasSameHash(first[index], second[index]))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static bool HasSameHash(
+        NativeInteropFileContentHash first,
+        NativeInteropFileContentHash second) =>
+        _pathComparer.Equals(first.FilePath, second.FilePath)
+        && first.LengthBytes == second.LengthBytes
+        && first.Sha256.AsSpan().SequenceEqual(second.Sha256);
+
+    private static bool TryValidateTopLevelCollectionBounds(
+        ClangNativeExtractionResult extraction,
+        int index,
+        string configuredPath,
+        out NativeInteropSnapshotFailure failure)
+    {
+        if (extraction.Diagnostics is null
+            || extraction.Exports is null
+            || extraction.RecordLayouts is null)
+        {
+            failure = Failure(
+                NativeInteropSnapshotFailureKind.InvalidFact,
+                index,
+                configuredPath,
+                "Native extractor returned null fact collections.");
+            return false;
+        }
+        if (extraction.Diagnostics.Count > MaximumDiagnosticsPerTranslationUnit)
+        {
+            failure = CollectionLimitFailure(
+                index,
+                configuredPath,
+                "Extraction diagnostic",
+                MaximumDiagnosticsPerTranslationUnit);
+            return false;
+        }
+        if (extraction.IncludedFiles is not null
+            && extraction.IncludedFiles.Count
+                > MaximumIncludedFilesPerTranslationUnit)
+        {
+            failure = CollectionLimitFailure(
+                index,
+                configuredPath,
+                "Included file",
+                MaximumIncludedFilesPerTranslationUnit);
+            return false;
+        }
+        if (extraction.Exports.Count > MaximumExportsPerTranslationUnit)
+        {
+            failure = CollectionLimitFailure(
+                index,
+                configuredPath,
+                "Native export",
+                MaximumExportsPerTranslationUnit);
+            return false;
+        }
+        if (extraction.RecordLayouts.Count
+            > MaximumRecordLayoutsPerTranslationUnit)
+        {
+            failure = CollectionLimitFailure(
+                index,
+                configuredPath,
+                "ABI record",
+                MaximumRecordLayoutsPerTranslationUnit);
+            return false;
+        }
+
+        failure = null!;
+        return true;
+    }
+
+    private static bool TryValidateNestedFactBounds(
+        ClangNativeExtractionResult extraction,
+        int index,
+        string configuredPath,
+        CancellationToken cancellationToken,
+        out NativeInteropSnapshotFailure failure)
+    {
+        long nestedFactCount = 0;
+        for (var exportIndex = 0;
+             exportIndex < extraction.Exports.Count;
+             exportIndex++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var export = extraction.Exports[exportIndex];
+            if (export is null)
+            {
+                continue;
+            }
+            if (export.Parameters is { Count: > MaximumParametersPerExport })
+            {
+                failure = CollectionLimitFailure(
+                    index,
+                    configuredPath,
+                    "Native export parameter",
+                    MaximumParametersPerExport);
+                return false;
+            }
+            if (export.RetainedCallbacks is
+                { Count: > MaximumRetainedCallbacksPerExport })
+            {
+                failure = CollectionLimitFailure(
+                    index,
+                    configuredPath,
+                    "Retained callback",
+                    MaximumRetainedCallbacksPerExport);
+                return false;
+            }
+            nestedFactCount += 1L
+                + (export.Parameters?.Count ?? 0)
+                + (export.RetainedCallbacks?.Count ?? 0)
+                + (export.ExceptionEscape is null ? 0 : 1)
+                + (export.ReturnAllocation is null ? 0 : 1);
+            if (nestedFactCount > MaximumNestedFactsPerTranslationUnit)
+            {
+                failure = CollectionLimitFailure(
+                    index,
+                    configuredPath,
+                    "Nested native fact",
+                    MaximumNestedFactsPerTranslationUnit);
+                return false;
+            }
+        }
+
+        for (var recordIndex = 0;
+             recordIndex < extraction.RecordLayouts.Count;
+             recordIndex++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var record = extraction.RecordLayouts[recordIndex];
+            if (record is null)
+            {
+                continue;
+            }
+            if (record.Fields is { Count: > MaximumFieldsPerRecord })
+            {
+                failure = CollectionLimitFailure(
+                    index,
+                    configuredPath,
+                    "ABI record field",
+                    MaximumFieldsPerRecord);
+                return false;
+            }
+            nestedFactCount += 1L + (record.Fields?.Count ?? 0);
+            if (nestedFactCount > MaximumNestedFactsPerTranslationUnit)
+            {
+                failure = CollectionLimitFailure(
+                    index,
+                    configuredPath,
+                    "Nested native fact",
+                    MaximumNestedFactsPerTranslationUnit);
+                return false;
+            }
+        }
+
+        failure = null!;
+        return true;
+    }
+
+    private static bool TryNormalizeDiagnostics(
+        IReadOnlyList<ClangExtractionDiagnostic> diagnostics,
+        IReadOnlySet<string> includedFiles,
+        ScopePathPolicy pathPolicy,
+        CancellationToken cancellationToken,
+        out ClangExtractionDiagnostic[] normalized)
+    {
+        var result = new List<ClangExtractionDiagnostic>(diagnostics.Count);
+        for (var diagnosticIndex = 0;
+             diagnosticIndex < diagnostics.Count;
+             diagnosticIndex++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var diagnostic = diagnostics[diagnosticIndex];
+            if (diagnostic is null)
+            {
+                normalized = [];
+                return false;
+            }
+            if (diagnostic.Location is null)
+            {
+                result.Add(diagnostic);
+                continue;
+            }
+            if (!TryNormalizeLocation(
+                    diagnostic.Location,
+                    includedFiles,
+                    pathPolicy,
+                    out var location))
+            {
+                normalized = [];
+                return false;
+            }
+            result.Add(diagnostic with { Location = location });
+        }
+        normalized = OrderDiagnostics(result);
+        return true;
+    }
+
+    private static bool TryNormalizeExport(
+        NativeExport export,
+        IReadOnlySet<string> includedFiles,
+        ScopePathPolicy pathPolicy,
+        CancellationToken cancellationToken,
+        out NativeExport normalized,
+        out NativeInteropSnapshotFailureKind rejectionKind,
+        out string rejectionMessage)
+    {
+        normalized = null!;
+        if (export.Parameters is null
+            || export.RetainedCallbacks is null
+            || export.Evidence is null)
+        {
+            rejectionKind = NativeInteropSnapshotFailureKind.InvalidFact;
+            rejectionMessage = "Native export contains null nested fact collections or evidence.";
+            return false;
+        }
+        if (export.Parameters.Count > MaximumParametersPerExport)
+        {
+            rejectionKind =
+                NativeInteropSnapshotFailureKind.CollectionLimitExceeded;
+            rejectionMessage =
+                $"Native export parameter count exceeds the {MaximumParametersPerExport}-item limit.";
+            return false;
+        }
+        if (export.RetainedCallbacks.Count
+            > MaximumRetainedCallbacksPerExport)
+        {
+            rejectionKind =
+                NativeInteropSnapshotFailureKind.CollectionLimitExceeded;
+            rejectionMessage =
+                $"Retained callback count exceeds the {MaximumRetainedCallbacksPerExport}-item limit.";
+            return false;
+        }
+        if (!TryNormalizeEvidence(
+                export.Evidence,
+                includedFiles,
+                pathPolicy,
+                cancellationToken,
+                out var evidence,
+                out rejectionKind,
+                out rejectionMessage))
+        {
+            return false;
+        }
+
+        var parameters = new List<AbiParameter>(export.Parameters.Count);
+        for (var parameterIndex = 0;
+             parameterIndex < export.Parameters.Count;
+             parameterIndex++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var parameter = export.Parameters[parameterIndex];
+            if (parameter is null || parameter.Location is null)
+            {
+                rejectionKind = NativeInteropSnapshotFailureKind.InvalidFact;
+                rejectionMessage =
+                    "Native export contains a null parameter or parameter location.";
+                return false;
+            }
+            if (!TryNormalizeLocation(
+                    parameter.Location,
+                    includedFiles,
+                    pathPolicy,
+                    out var location))
+            {
+                rejectionKind =
+                    NativeInteropSnapshotFailureKind.FactLocationRejected;
+                rejectionMessage =
+                    "Native export parameter location is not in the approved included-file set.";
+                return false;
+            }
+            parameters.Add(parameter with { Location = location });
+        }
+
+        var retainedCallbacks = new List<NativeCallbackRetention>(
+            export.RetainedCallbacks.Count);
+        for (var retentionIndex = 0;
+             retentionIndex < export.RetainedCallbacks.Count;
+             retentionIndex++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var retention = export.RetainedCallbacks[retentionIndex];
+            if (retention is null || retention.Evidence is null)
+            {
+                rejectionKind = NativeInteropSnapshotFailureKind.InvalidFact;
+                rejectionMessage =
+                    "Native export contains null callback-retention evidence.";
+                return false;
+            }
+            if (!TryNormalizeEvidence(
+                    retention.Evidence,
+                    includedFiles,
+                    pathPolicy,
+                    cancellationToken,
+                    out var retentionEvidence,
+                    out rejectionKind,
+                    out rejectionMessage))
+            {
+                return false;
+            }
+            retainedCallbacks.Add(
+                retention with { Evidence = retentionEvidence });
+        }
+
+        NativeExceptionEscape? exceptionEscape = null;
+        if (export.ExceptionEscape is not null)
+        {
+            if (export.ExceptionEscape.Evidence is null)
+            {
+                rejectionKind = NativeInteropSnapshotFailureKind.InvalidFact;
+                rejectionMessage =
+                    "Native export contains null exception-escape evidence.";
+                return false;
+            }
+            if (!TryNormalizeEvidence(
+                    export.ExceptionEscape.Evidence,
+                    includedFiles,
+                    pathPolicy,
+                    cancellationToken,
+                    out var exceptionEvidence,
+                    out rejectionKind,
+                    out rejectionMessage))
+            {
+                return false;
+            }
+            exceptionEscape = export.ExceptionEscape with
+            {
+                Evidence = exceptionEvidence,
+            };
+        }
+
+        NativeReturnAllocation? returnAllocation = null;
+        if (export.ReturnAllocation is not null)
+        {
+            if (export.ReturnAllocation.Evidence is null)
+            {
+                rejectionKind = NativeInteropSnapshotFailureKind.InvalidFact;
+                rejectionMessage =
+                    "Native export contains null return-allocation evidence.";
+                return false;
+            }
+            if (!TryNormalizeEvidence(
+                    export.ReturnAllocation.Evidence,
+                    includedFiles,
+                    pathPolicy,
+                    cancellationToken,
+                    out var allocationEvidence,
+                    out rejectionKind,
+                    out rejectionMessage))
+            {
+                return false;
+            }
+            returnAllocation = export.ReturnAllocation with
+            {
+                Evidence = allocationEvidence,
+            };
+        }
+
+        normalized = export with
+        {
+            Parameters = parameters,
+            RetainedCallbacks = retainedCallbacks,
+            ExceptionEscape = exceptionEscape,
+            ReturnAllocation = returnAllocation,
+            Evidence = evidence,
+        };
+        rejectionKind = default;
+        rejectionMessage = string.Empty;
+        return true;
+    }
+
+    private static bool TryNormalizeRecord(
+        AbiRecordLayout record,
+        IReadOnlySet<string> includedFiles,
+        ScopePathPolicy pathPolicy,
+        CancellationToken cancellationToken,
+        out AbiRecordLayout normalized,
+        out NativeInteropSnapshotFailureKind rejectionKind,
+        out string rejectionMessage)
+    {
+        normalized = null!;
+        if (record.Fields is null || record.Evidence is null)
+        {
+            rejectionKind = NativeInteropSnapshotFailureKind.InvalidFact;
+            rejectionMessage = "ABI record contains null fields or evidence.";
+            return false;
+        }
+        if (record.Fields.Count > MaximumFieldsPerRecord)
+        {
+            rejectionKind =
+                NativeInteropSnapshotFailureKind.CollectionLimitExceeded;
+            rejectionMessage =
+                $"ABI record field count exceeds the {MaximumFieldsPerRecord}-item limit.";
+            return false;
+        }
+        if (!TryNormalizeEvidence(
+                record.Evidence,
+                includedFiles,
+                pathPolicy,
+                cancellationToken,
+                out var evidence,
+                out rejectionKind,
+                out rejectionMessage))
+        {
+            return false;
+        }
+
+        var fields = new List<AbiFieldLayout>(record.Fields.Count);
+        for (var fieldIndex = 0;
+             fieldIndex < record.Fields.Count;
+             fieldIndex++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var field = record.Fields[fieldIndex];
+            if (field is null || field.Evidence is null)
+            {
+                rejectionKind = NativeInteropSnapshotFailureKind.InvalidFact;
+                rejectionMessage =
+                    "ABI record contains a null field or field evidence.";
+                return false;
+            }
+            if (!TryNormalizeEvidence(
+                    field.Evidence,
+                    includedFiles,
+                    pathPolicy,
+                    cancellationToken,
+                    out var fieldEvidence,
+                    out rejectionKind,
+                    out rejectionMessage))
+            {
+                return false;
+            }
+            fields.Add(field with { Evidence = fieldEvidence });
+        }
+
+        normalized = record with
+        {
+            Fields = fields,
+            Evidence = evidence,
+        };
+        rejectionKind = default;
+        rejectionMessage = string.Empty;
+        return true;
+    }
+
+    private static bool TryNormalizeEvidence(
+        Evidence evidence,
+        IReadOnlySet<string> includedFiles,
+        ScopePathPolicy pathPolicy,
+        CancellationToken cancellationToken,
+        out Evidence normalized,
+        out NativeInteropSnapshotFailureKind rejectionKind,
+        out string rejectionMessage)
+    {
+        normalized = null!;
+        if (evidence.Location is null
+            || !TryNormalizeLocation(
+                evidence.Location,
+                includedFiles,
+                pathPolicy,
+                out var location))
+        {
+            rejectionKind =
+                NativeInteropSnapshotFailureKind.FactLocationRejected;
+            rejectionMessage =
+                "Evidence location is not in the approved included-file set.";
+            return false;
+        }
+
+        IReadOnlyDictionary<string, string>? metadata = null;
+        if (evidence.Metadata is not null)
+        {
+            if (evidence.Metadata.Count > MaximumEvidenceMetadataEntries)
+            {
+                rejectionKind =
+                    NativeInteropSnapshotFailureKind.CollectionLimitExceeded;
+                rejectionMessage =
+                    $"Evidence metadata count exceeds the {MaximumEvidenceMetadataEntries}-item limit.";
+                return false;
+            }
+            var boundedMetadata =
+                new Dictionary<string, string>(StringComparer.Ordinal);
+            using var enumerator = evidence.Metadata.GetEnumerator();
+            var observedMetadataEntries = 0;
+            while (enumerator.MoveNext())
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (observedMetadataEntries
+                        >= MaximumEvidenceMetadataEntries
+                    || enumerator.Current.Key is null
+                    || enumerator.Current.Value is null)
+                {
+                    rejectionKind = observedMetadataEntries
+                        >= MaximumEvidenceMetadataEntries
+                            ? NativeInteropSnapshotFailureKind
+                                .CollectionLimitExceeded
+                            : NativeInteropSnapshotFailureKind.InvalidFact;
+                    rejectionMessage = observedMetadataEntries
+                        >= MaximumEvidenceMetadataEntries
+                            ? $"Evidence metadata count exceeds the {MaximumEvidenceMetadataEntries}-item limit."
+                            : "Evidence metadata contains a null key or value.";
+                    return false;
+                }
+                observedMetadataEntries++;
+                boundedMetadata[enumerator.Current.Key] =
+                    enumerator.Current.Value;
+            }
+            metadata = boundedMetadata;
+        }
+        normalized = evidence with
+        {
+            Location = location,
+            Metadata = metadata,
+        };
+        rejectionKind = default;
+        rejectionMessage = string.Empty;
+        return true;
+    }
+
+    private static bool TryNormalizeLocation(
+        SourceLocation location,
+        IReadOnlySet<string> includedFiles,
+        ScopePathPolicy pathPolicy,
+        out SourceLocation normalized)
+    {
+        normalized = null!;
+        if (!TryAuthorizeExistingAbsoluteFile(
+                location.FilePath,
+                pathPolicy,
+                out var physicalPath)
+            || !includedFiles.Contains(physicalPath))
+        {
+            return false;
+        }
+        normalized = location with { FilePath = physicalPath };
+        return true;
+    }
+
+    private static bool TryValidateBinaryCollectionBounds(
+        BinaryExportVerificationResult verification,
+        CancellationToken cancellationToken,
+        out NativeInteropSnapshotFailureKind failureKind,
+        out string message)
+    {
+        if (verification.Exports is null)
+        {
+            failureKind =
+                NativeInteropSnapshotFailureKind.BinaryVerificationInvalid;
+            message = "Binary verifier returned a null export collection.";
+            return false;
+        }
+        if (verification.Exports.Count > MaximumBinaryExports)
+        {
+            failureKind =
+                NativeInteropSnapshotFailureKind.BinaryCollectionLimitExceeded;
+            message =
+                $"Binary export count exceeds the {MaximumBinaryExports}-item limit.";
+            return false;
+        }
+
+        var nameCount = 0;
+        for (var entryIndex = 0;
+             entryIndex < verification.Exports.Count;
+             entryIndex++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var entry = verification.Exports[entryIndex];
+            if (entry is null || entry.Names is null)
+            {
+                failureKind =
+                    NativeInteropSnapshotFailureKind.BinaryVerificationInvalid;
+                message =
+                    "Binary verifier returned a null export entry or name collection.";
+                return false;
+            }
+            if (entry.Names.Count > MaximumBinaryExportNames - nameCount)
+            {
+                failureKind =
+                    NativeInteropSnapshotFailureKind.BinaryCollectionLimitExceeded;
+                message =
+                    $"Binary export-name count exceeds the {MaximumBinaryExportNames}-item limit.";
+                return false;
+            }
+            nameCount += entry.Names.Count;
+        }
+
+        failureKind = default;
+        message = string.Empty;
+        return true;
+    }
+
     private static NativeExport[] AssociateExactBinaryExports(
         IReadOnlyList<NativeExport> sourceExports,
         BinaryExportVerificationResult verification,
         InteropTranslationUnitConfig translationUnit,
         int index,
-        List<NativeInteropSnapshotFailure> failures)
+        List<NativeInteropSnapshotFailure> failures,
+        CancellationToken cancellationToken)
     {
         var entriesByName = new Dictionary<string, List<BinaryExportEntry>>(
             StringComparer.Ordinal);
-        foreach (var entry in verification.Exports ?? [])
+        for (var entryIndex = 0;
+             entryIndex < verification.Exports.Count;
+             entryIndex++)
         {
+            cancellationToken.ThrowIfCancellationRequested();
+            var entry = verification.Exports[entryIndex];
             if (entry.Names is not { Count: > 0 })
             {
                 failures.Add(Failure(
@@ -513,8 +1662,12 @@ internal sealed class NativeInteropSnapshotBuilder
                     "Ordinal-only PE exports are not associated with source declarations."));
                 continue;
             }
-            foreach (var name in entry.Names)
+            for (var nameIndex = 0;
+                 nameIndex < entry.Names.Count;
+                 nameIndex++)
             {
+                cancellationToken.ThrowIfCancellationRequested();
+                var name = entry.Names[nameIndex];
                 if (string.IsNullOrWhiteSpace(name))
                 {
                     failures.Add(Failure(
@@ -540,6 +1693,7 @@ internal sealed class NativeInteropSnapshotBuilder
         var associatedNames = new HashSet<string>(StringComparer.Ordinal);
         foreach (var pair in sourceByName.OrderBy(pair => pair.Key, StringComparer.Ordinal))
         {
+            cancellationToken.ThrowIfCancellationRequested();
             if (!entriesByName.TryGetValue(pair.Key, out var entries))
             {
                 continue;
@@ -579,6 +1733,7 @@ internal sealed class NativeInteropSnapshotBuilder
                      .Where(name => !associatedNames.Contains(name))
                      .OrderBy(name => name, StringComparer.Ordinal))
         {
+            cancellationToken.ThrowIfCancellationRequested();
             failures.Add(Failure(
                 NativeInteropSnapshotFailureKind.UnsupportedBinaryAssociation,
                 index,
@@ -623,8 +1778,10 @@ internal sealed class NativeInteropSnapshotBuilder
 
     private static NativeInteropSnapshot BuildAggregate(
         InteropTarget target,
-        IReadOnlyList<NativeInteropTranslationUnitContribution> contributions)
+        IReadOnlyList<NativeInteropTranslationUnitContribution> contributions,
+        CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         var failures = contributions
             .SelectMany(contribution => contribution.Failures)
             .ToList();
@@ -634,6 +1791,7 @@ internal sealed class NativeInteropSnapshotBuilder
             InteropFactPayloadCodec.EncodeNativeExport,
             NativeInteropSnapshotFailureKind.ExportConflict,
             failures,
+            cancellationToken,
             out var rejectedSourceExportKeys);
         var verifiedExports = AggregateFacts(
             contributions.SelectMany(contribution => contribution.VerifiedExports),
@@ -641,6 +1799,7 @@ internal sealed class NativeInteropSnapshotBuilder
             InteropFactPayloadCodec.EncodeNativeExport,
             NativeInteropSnapshotFailureKind.ExportConflict,
             failures,
+            cancellationToken,
             out _)
             .Where(export => !rejectedSourceExportKeys.Contains(
                 export.SymbolCanonicalKey))
@@ -651,17 +1810,63 @@ internal sealed class NativeInteropSnapshotBuilder
             InteropFactPayloadCodec.EncodeAbiRecord,
             NativeInteropSnapshotFailureKind.RecordConflict,
             failures,
+            cancellationToken,
             out _);
+
+        var contentHashes =
+            new Dictionary<string, NativeInteropFileContentHash>(_pathComparer);
+        var rejectedHashPaths = new HashSet<string>(_pathComparer);
+        foreach (var contribution in contributions)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            foreach (var hash in contribution.ContentHashes)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (rejectedHashPaths.Contains(hash.FilePath))
+                {
+                    continue;
+                }
+                if (contentHashes.TryGetValue(
+                        hash.FilePath,
+                        out var existing)
+                    && !HasSameHash(existing, hash))
+                {
+                    contentHashes.Remove(hash.FilePath);
+                    rejectedHashPaths.Add(hash.FilePath);
+                    failures.Add(Failure(
+                        NativeInteropSnapshotFailureKind.InputContentChanged,
+                        contribution.ConfigurationIndex,
+                        contribution.Configuration.Path,
+                        "One included file changed between translation-unit snapshots."));
+                    continue;
+                }
+                contentHashes[hash.FilePath] =
+                    new NativeInteropFileContentHash(
+                        hash.FilePath,
+                        hash.LengthBytes,
+                        hash.Sha256.ToArray());
+            }
+        }
+        var orderedContentHashes =
+            new Dictionary<string, NativeInteropFileContentHash>(_pathComparer);
+        foreach (var pair in contentHashes
+                     .OrderBy(pair => pair.Key, _pathComparer)
+                     .ThenBy(pair => pair.Key, StringComparer.Ordinal))
+        {
+            orderedContentHashes.Add(pair.Key, pair.Value);
+        }
 
         var fanoutSets = new Dictionary<string, HashSet<string>>(_pathComparer);
         foreach (var contribution in contributions)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             if (contribution.SourceFilePath is null)
             {
                 continue;
             }
             foreach (var dependency in contribution.IncludedFiles)
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 if (!fanoutSets.TryGetValue(dependency, out var owners))
                 {
                     owners = new HashSet<string>(_pathComparer);
@@ -676,12 +1881,15 @@ internal sealed class NativeInteropSnapshotBuilder
                      .OrderBy(pair => pair.Key, _pathComparer)
                      .ThenBy(pair => pair.Key, StringComparer.Ordinal))
         {
+            cancellationToken.ThrowIfCancellationRequested();
             dependencyFanout[pair.Key] = OrderPaths(pair.Value);
         }
 
         var orderedFailures = OrderFailures(failures);
         var sourceComplete = contributions.All(contribution =>
-                !contribution.Failures.Any(failure => failure.Kind is
+                contribution.ContentHashes.Count
+                    == contribution.IncludedFiles.Count
+                && !contribution.Failures.Any(failure => failure.Kind is
                     NativeInteropSnapshotFailureKind.InvalidScopeRoot
                     or NativeInteropSnapshotFailureKind.InvalidConfiguration
                     or NativeInteropSnapshotFailureKind.TranslationUnitPathRejected
@@ -690,10 +1898,17 @@ internal sealed class NativeInteropSnapshotBuilder
                     or NativeInteropSnapshotFailureKind.ExtractionFailed
                     or NativeInteropSnapshotFailureKind.ExtractionDiagnostics
                     or NativeInteropSnapshotFailureKind.DependencyPathRejected
+                    or NativeInteropSnapshotFailureKind.DependencySetChanged
+                    or NativeInteropSnapshotFailureKind.FactLocationRejected
+                    or NativeInteropSnapshotFailureKind.CollectionLimitExceeded
+                    or NativeInteropSnapshotFailureKind.ContentHashFailed
+                    or NativeInteropSnapshotFailureKind.ContentHashLimitExceeded
+                    or NativeInteropSnapshotFailureKind.InputContentChanged
                     or NativeInteropSnapshotFailureKind.InvalidFact))
             && !orderedFailures.Any(failure => failure.Kind
                 is NativeInteropSnapshotFailureKind.ExportConflict
-                or NativeInteropSnapshotFailureKind.RecordConflict);
+                or NativeInteropSnapshotFailureKind.RecordConflict
+                or NativeInteropSnapshotFailureKind.InputContentChanged);
         var exportUniverseComplete = sourceComplete
             && contributions.All(contribution => contribution.IsComplete);
 
@@ -702,6 +1917,7 @@ internal sealed class NativeInteropSnapshotBuilder
             contributions.ToArray(),
             OrderPaths(fanoutSets.Keys),
             dependencyFanout,
+            orderedContentHashes,
             sourceExports,
             verifiedExports,
             records,
@@ -731,6 +1947,7 @@ internal sealed class NativeInteropSnapshotBuilder
         Func<T, string> payloadEncoder,
         NativeInteropSnapshotFailureKind conflictKind,
         List<NativeInteropSnapshotFailure> failures,
+        CancellationToken cancellationToken,
         out HashSet<string> rejectedKeys)
     {
         var result = new List<T>();
@@ -739,10 +1956,12 @@ internal sealed class NativeInteropSnapshotBuilder
                      .GroupBy(keySelector, StringComparer.Ordinal)
                      .OrderBy(group => group.Key, StringComparer.Ordinal))
         {
+            cancellationToken.ThrowIfCancellationRequested();
             var payloads = new List<(T Fact, string Payload)>();
             var invalid = false;
             foreach (var fact in group)
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 try
                 {
                     payloads.Add((fact, payloadEncoder(fact)));
@@ -792,14 +2011,19 @@ internal sealed class NativeInteropSnapshotBuilder
         string sourceFilePath,
         IReadOnlyList<string> dependencies,
         ScopePathPolicy pathPolicy,
+        CancellationToken cancellationToken,
         out IReadOnlyList<string> includedFiles)
     {
         var approved = new HashSet<string>(_pathComparer)
         {
             sourceFilePath,
         };
-        foreach (var dependency in dependencies)
+        for (var dependencyIndex = 0;
+             dependencyIndex < dependencies.Count;
+             dependencyIndex++)
         {
+            cancellationToken.ThrowIfCancellationRequested();
+            var dependency = dependencies[dependencyIndex];
             if (!TryAuthorizeExistingAbsoluteFile(
                     dependency,
                     pathPolicy,
@@ -841,7 +2065,8 @@ internal sealed class NativeInteropSnapshotBuilder
                 or IOException
                 or UnauthorizedAccessException
                 or NotSupportedException
-                or PathTooLongException)
+                or PathTooLongException
+                or System.Security.SecurityException)
         {
             return false;
         }
@@ -894,7 +2119,8 @@ internal sealed class NativeInteropSnapshotBuilder
                 or IOException
                 or UnauthorizedAccessException
                 or NotSupportedException
-                or PathTooLongException)
+                or PathTooLongException
+                or System.Security.SecurityException)
         {
             return false;
         }
@@ -924,7 +2150,8 @@ internal sealed class NativeInteropSnapshotBuilder
                 or IOException
                 or UnauthorizedAccessException
                 or NotSupportedException
-                or PathTooLongException)
+                or PathTooLongException
+                or System.Security.SecurityException)
         {
             return false;
         }
@@ -985,6 +2212,7 @@ internal sealed class NativeInteropSnapshotBuilder
             [],
             [],
             [],
+            [],
             null,
             IsComplete: false,
             OrderFailures(failures));
@@ -997,6 +2225,7 @@ internal sealed class NativeInteropSnapshotBuilder
             [],
             [],
             new Dictionary<string, IReadOnlyList<string>>(_pathComparer),
+            new Dictionary<string, NativeInteropFileContentHash>(_pathComparer),
             [],
             [],
             [],
@@ -1013,6 +2242,17 @@ internal sealed class NativeInteropSnapshotBuilder
         string message,
         string? canonicalKey = null) =>
         new(kind, index, configuredPath, message, canonicalKey);
+
+    private static NativeInteropSnapshotFailure CollectionLimitFailure(
+        int? index,
+        string? configuredPath,
+        string collectionName,
+        int limit) =>
+        Failure(
+            NativeInteropSnapshotFailureKind.CollectionLimitExceeded,
+            index,
+            configuredPath,
+            $"{collectionName} count exceeds the {limit}-item limit.");
 
     private static NativeInteropSnapshotFailure[] OrderFailures(
         IEnumerable<NativeInteropSnapshotFailure> failures) =>

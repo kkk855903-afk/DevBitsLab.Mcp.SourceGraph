@@ -1,3 +1,4 @@
+using System.Security.Cryptography;
 using DevBitsLab.Mcp.SourceGraph.Core;
 using DevBitsLab.Mcp.SourceGraph.Indexing.Clang;
 using DevBitsLab.Mcp.SourceGraph.Interop;
@@ -58,7 +59,9 @@ public sealed class NativeInteropSnapshotBuilderTests : IDisposable
 
         calls.Should().Equal(
             "extract:one",
+            "extract:one",
             "binary:one",
+            "extract:two",
             "extract:two",
             "binary:two");
         snapshot.Contributions.Select(contribution => contribution.ConfigurationIndex)
@@ -140,6 +143,46 @@ public sealed class NativeInteropSnapshotBuilderTests : IDisposable
     }
 
     [Fact]
+    public async Task Omitted_optional_binary_keeps_source_export_universe_complete()
+    {
+        Write("native/api.cpp");
+        var verifierCalled = false;
+        var builder = new NativeInteropSnapshotBuilder(
+            (request, _) => Task.FromResult(Extraction(
+                request,
+                [
+                    Export(
+                        request,
+                        "c:E:native/api.cpp::medical",
+                        "medical"),
+                ])),
+            (_, _, _) =>
+            {
+                verifierCalled = true;
+                throw new InvalidOperationException("must not verify");
+            });
+
+        var snapshot = await builder.BuildAsync(
+            _root,
+            Config(new InteropTranslationUnitConfig(
+                "native/api.cpp",
+                "medical.dll",
+                ["-x", "c++"],
+                BinaryPath: null)),
+            new ScopePathPolicy(_root),
+            CancellationToken.None);
+
+        verifierCalled.Should().BeFalse();
+        snapshot.IsSourceComplete.Should().BeTrue();
+        snapshot.IsExportUniverseComplete.Should().BeTrue();
+        snapshot.IsComplete.Should().BeTrue();
+        snapshot.SourceExports.Should().ContainSingle();
+        snapshot.VerifiedExports.Should().BeEmpty();
+        snapshot.ContentHashes.Should().ContainSingle();
+        snapshot.Failures.Should().BeEmpty();
+    }
+
+    [Fact]
     public async Task Decorated_binary_name_is_unsupported_partial_and_never_guessed()
     {
         Write("native/api.cpp");
@@ -194,7 +237,7 @@ public sealed class NativeInteropSnapshotBuilderTests : IDisposable
             new ScopePathPolicy(_root),
             CancellationToken.None);
 
-        extractorCalls.Should().Be(1);
+        extractorCalls.Should().Be(2);
         snapshot.IsComplete.Should().BeFalse();
         snapshot.SourceExports.Should().ContainSingle();
         snapshot.VerifiedExports.Should().BeEmpty();
@@ -374,6 +417,798 @@ public sealed class NativeInteropSnapshotBuilderTests : IDisposable
                 .ThenBy(path => path, StringComparer.Ordinal));
     }
 
+    [Theory]
+    [InlineData("export")]
+    [InlineData("parameter")]
+    [InlineData("retention")]
+    [InlineData("exception")]
+    [InlineData("allocation")]
+    [InlineData("record")]
+    [InlineData("field")]
+    public async Task Unreported_nested_fact_locations_are_rejected(
+        string locationKind)
+    {
+        var sourcePath = Write("native/api.cpp");
+        var unreportedPath = Write("include/unreported.h");
+        var verifierCalled = false;
+        var builder = new NativeInteropSnapshotBuilder(
+            (request, _) =>
+            {
+                var sourceEvidence = TestEvidence(request, sourcePath);
+                var unreportedEvidence = TestEvidence(request, unreportedPath);
+                var export = Export(
+                    request,
+                    "c:E:native/api.cpp::medical",
+                    "medical");
+                var record = Record(
+                    request,
+                    "c:T:native/api.cpp::Payload",
+                    sourceEvidence);
+                switch (locationKind)
+                {
+                    case "export":
+                        export = export with { Evidence = unreportedEvidence };
+                        break;
+                    case "parameter":
+                        export = export with
+                        {
+                            Parameters =
+                            [
+                                new AbiParameter(
+                                    0,
+                                    "value",
+                                    IntType(),
+                                    AbiParameterDirection.In,
+                                    TestLocation(unreportedPath)),
+                            ],
+                        };
+                        break;
+                    case "retention":
+                        export = export with
+                        {
+                            RetainedCallbacks =
+                            [
+                                new NativeCallbackRetention(
+                                    0,
+                                    request.Target,
+                                    unreportedEvidence),
+                            ],
+                        };
+                        break;
+                    case "exception":
+                        export = export with
+                        {
+                            ExceptionEscape = new NativeExceptionEscape(
+                                request.Target,
+                                unreportedEvidence),
+                        };
+                        break;
+                    case "allocation":
+                        export = export with
+                        {
+                            ReturnAllocation = new NativeReturnAllocation(
+                                InteropAllocatorFamily.CrtHeap,
+                                request.Target,
+                                unreportedEvidence),
+                        };
+                        break;
+                    case "record":
+                        record = record with { Evidence = unreportedEvidence };
+                        break;
+                    case "field":
+                        record = record with
+                        {
+                            Fields =
+                            [
+                                record.Fields[0] with
+                                {
+                                    Evidence = unreportedEvidence,
+                                },
+                            ],
+                        };
+                        break;
+                }
+                return Task.FromResult(Extraction(
+                    request,
+                    locationKind is "record" or "field" ? [] : [export],
+                    locationKind is "record" or "field" ? [record] : []));
+            },
+            (_, _, _) =>
+            {
+                verifierCalled = true;
+                return Task.FromResult(CompleteBinary("medical.dll", "medical"));
+            });
+
+        var snapshot = await builder.BuildAsync(
+            _root,
+            Config(Tu("native/api.cpp", "medical", "artifacts/medical.dll")),
+            new ScopePathPolicy(_root),
+            CancellationToken.None);
+
+        verifierCalled.Should().BeFalse();
+        snapshot.IsComplete.Should().BeFalse();
+        snapshot.IsSourceComplete.Should().BeFalse();
+        snapshot.SourceExports.Should().BeEmpty();
+        snapshot.RecordLayouts.Should().BeEmpty();
+        snapshot.Failures.Should().ContainSingle(failure =>
+            failure.Kind == NativeInteropSnapshotFailureKind.FactLocationRejected);
+    }
+
+    [Fact]
+    public async Task Approved_location_is_normalized_to_its_physical_path()
+    {
+        var sourcePath = Write("native/api.cpp");
+        var nonNormalizedPath = Path.Join(
+            _root,
+            "native",
+            "..",
+            "native",
+            "api.cpp");
+        var builder = new NativeInteropSnapshotBuilder(
+            (request, _) => Task.FromResult(Extraction(
+                request,
+                [
+                    Export(
+                        request,
+                        "c:E:native/api.cpp::medical",
+                        "medical",
+                        nonNormalizedPath),
+                ])),
+            (_, _, _) => Task.FromResult(CompleteBinary("medical.dll", "medical")));
+
+        var snapshot = await builder.BuildAsync(
+            _root,
+            Config(Tu("native/api.cpp", "medical", "artifacts/medical.dll")),
+            new ScopePathPolicy(_root),
+            CancellationToken.None);
+
+        snapshot.IsComplete.Should().BeTrue();
+        snapshot.SourceExports.Should().ContainSingle();
+        snapshot.SourceExports[0].Evidence.Location.FilePath.Should().Be(sourcePath);
+    }
+
+    [Fact]
+    public async Task Physically_escaped_fact_location_is_rejected()
+    {
+        Write("native/api.cpp");
+        var escapedPath = Path.GetTempFileName();
+        try
+        {
+            var builder = new NativeInteropSnapshotBuilder(
+                (request, _) => Task.FromResult(Extraction(
+                    request,
+                    [
+                        Export(
+                            request,
+                            "c:E:native/api.cpp::medical",
+                            "medical",
+                            escapedPath),
+                    ])),
+                (_, _, _) => Task.FromResult(
+                    CompleteBinary("medical.dll", "medical")));
+
+            var snapshot = await builder.BuildAsync(
+                _root,
+                Config(Tu(
+                    "native/api.cpp",
+                    "medical",
+                    "artifacts/medical.dll")),
+                new ScopePathPolicy(_root),
+                CancellationToken.None);
+
+            snapshot.IsComplete.Should().BeFalse();
+            snapshot.SourceExports.Should().BeEmpty();
+            snapshot.Failures.Should().ContainSingle(failure =>
+                failure.Kind
+                    == NativeInteropSnapshotFailureKind.FactLocationRejected);
+        }
+        finally
+        {
+            File.Delete(escapedPath);
+        }
+    }
+
+    [Fact]
+    public async Task Complete_snapshot_carries_stable_source_and_header_hashes()
+    {
+        var sourcePath = Write("native/api.cpp", "// source");
+        var headerPath = Write("include/api.h", "// header");
+        var extractorCalls = 0;
+        var builder = new NativeInteropSnapshotBuilder(
+            (request, _) =>
+            {
+                extractorCalls++;
+                return Task.FromResult(Extraction(
+                    request,
+                    [
+                        Export(
+                            request,
+                            "c:E:include/api.h::medical",
+                            "medical",
+                            headerPath),
+                    ],
+                    includedFiles: [request.SourceFilePath, headerPath]));
+            },
+            (_, _, _) => Task.FromResult(
+                CompleteBinary("medical.dll", "medical")));
+
+        var snapshot = await builder.BuildAsync(
+            _root,
+            Config(Tu("native/api.cpp", "medical", "artifacts/medical.dll")),
+            new ScopePathPolicy(_root),
+            CancellationToken.None);
+
+        extractorCalls.Should().Be(2);
+        snapshot.IsComplete.Should().BeTrue();
+        snapshot.ContentHashes.Keys.Should().BeEquivalentTo(
+            sourcePath,
+            headerPath);
+        snapshot.ContentHashes[sourcePath].Sha256.Should().Equal(
+            SHA256.HashData(File.ReadAllBytes(sourcePath)));
+        snapshot.ContentHashes[headerPath].Sha256.Should().Equal(
+            SHA256.HashData(File.ReadAllBytes(headerPath)));
+        snapshot.Contributions.Should().ContainSingle();
+        snapshot.Contributions[0].ContentHashes.Should().HaveCount(2);
+    }
+
+    [Fact]
+    public async Task Translation_unit_change_during_discovery_is_partial()
+    {
+        Write("native/api.cpp", "// original");
+        var extractorCalls = 0;
+        var verifierCalled = false;
+        var builder = new NativeInteropSnapshotBuilder(
+            (request, _) =>
+            {
+                extractorCalls++;
+                var result = Extraction(
+                    request,
+                    [
+                        Export(
+                            request,
+                            "c:E:native/api.cpp::medical",
+                            "medical"),
+                    ]);
+                File.AppendAllText(request.SourceFilePath, "// changed");
+                return Task.FromResult(result);
+            },
+            (_, _, _) =>
+            {
+                verifierCalled = true;
+                return Task.FromResult(CompleteBinary("medical.dll", "medical"));
+            });
+
+        var snapshot = await builder.BuildAsync(
+            _root,
+            Config(Tu("native/api.cpp", "medical", "artifacts/medical.dll")),
+            new ScopePathPolicy(_root),
+            CancellationToken.None);
+
+        extractorCalls.Should().Be(1);
+        verifierCalled.Should().BeFalse();
+        snapshot.IsSourceComplete.Should().BeFalse();
+        snapshot.SourceExports.Should().BeEmpty();
+        snapshot.ContentHashes.Should().BeEmpty();
+        snapshot.Failures.Should().ContainSingle(failure =>
+            failure.Kind == NativeInteropSnapshotFailureKind.InputContentChanged);
+    }
+
+    [Fact]
+    public async Task Header_change_during_reparse_is_partial()
+    {
+        Write("native/api.cpp");
+        var headerPath = Write("include/api.h", "// original");
+        var extractorCalls = 0;
+        var verifierCalled = false;
+        var builder = new NativeInteropSnapshotBuilder(
+            (request, _) =>
+            {
+                extractorCalls++;
+                var result = Extraction(
+                    request,
+                    [
+                        Export(
+                            request,
+                            "c:E:include/api.h::medical",
+                            "medical",
+                            headerPath),
+                    ],
+                    includedFiles: [request.SourceFilePath, headerPath]);
+                if (extractorCalls == 2)
+                {
+                    File.AppendAllText(headerPath, "// changed");
+                }
+                return Task.FromResult(result);
+            },
+            (_, _, _) =>
+            {
+                verifierCalled = true;
+                return Task.FromResult(CompleteBinary("medical.dll", "medical"));
+            });
+
+        var snapshot = await builder.BuildAsync(
+            _root,
+            Config(Tu("native/api.cpp", "medical", "artifacts/medical.dll")),
+            new ScopePathPolicy(_root),
+            CancellationToken.None);
+
+        extractorCalls.Should().Be(2);
+        verifierCalled.Should().BeFalse();
+        snapshot.IsSourceComplete.Should().BeFalse();
+        snapshot.SourceExports.Should().BeEmpty();
+        snapshot.ContentHashes.Should().BeEmpty();
+        snapshot.Failures.Should().ContainSingle(failure =>
+            failure.Kind == NativeInteropSnapshotFailureKind.InputContentChanged);
+    }
+
+    [Fact]
+    public async Task Included_file_set_change_between_parses_is_partial()
+    {
+        Write("native/api.cpp");
+        var headerPath = Write("include/api.h");
+        var extractorCalls = 0;
+        var verifierCalled = false;
+        var builder = new NativeInteropSnapshotBuilder(
+            (request, _) =>
+            {
+                extractorCalls++;
+                return Task.FromResult(Extraction(
+                    request,
+                    includedFiles: extractorCalls == 1
+                        ? [request.SourceFilePath, headerPath]
+                        : [request.SourceFilePath]));
+            },
+            (_, _, _) =>
+            {
+                verifierCalled = true;
+                return Task.FromResult(CompleteBinary("medical.dll"));
+            });
+
+        var snapshot = await builder.BuildAsync(
+            _root,
+            Config(Tu("native/api.cpp", "medical", "artifacts/medical.dll")),
+            new ScopePathPolicy(_root),
+            CancellationToken.None);
+
+        extractorCalls.Should().Be(2);
+        verifierCalled.Should().BeFalse();
+        snapshot.IsSourceComplete.Should().BeFalse();
+        snapshot.ContentHashes.Should().BeEmpty();
+        snapshot.Failures.Should().ContainSingle(failure =>
+            failure.Kind == NativeInteropSnapshotFailureKind.DependencySetChanged);
+    }
+
+    [Fact]
+    public async Task Input_change_during_binary_verification_is_partial()
+    {
+        var sourcePath = Write("native/api.cpp", "// original");
+        var builder = new NativeInteropSnapshotBuilder(
+            (request, _) => Task.FromResult(Extraction(
+                request,
+                [
+                    Export(
+                        request,
+                        "c:E:native/api.cpp::medical",
+                        "medical"),
+                ])),
+            (_, _, _) =>
+            {
+                File.AppendAllText(sourcePath, "// changed");
+                return Task.FromResult(CompleteBinary("medical.dll", "medical"));
+            });
+
+        var snapshot = await builder.BuildAsync(
+            _root,
+            Config(Tu("native/api.cpp", "medical", "artifacts/medical.dll")),
+            new ScopePathPolicy(_root),
+            CancellationToken.None);
+
+        snapshot.IsSourceComplete.Should().BeFalse();
+        snapshot.SourceExports.Should().BeEmpty();
+        snapshot.VerifiedExports.Should().BeEmpty();
+        snapshot.ContentHashes.Should().BeEmpty();
+        snapshot.Failures.Should().ContainSingle(failure =>
+            failure.Kind == NativeInteropSnapshotFailureKind.InputContentChanged);
+    }
+
+    [Fact]
+    public async Task Cross_translation_unit_hash_conflict_is_partial()
+    {
+        var firstPath = Write("native/one.cpp");
+        var secondPath = Write("native/two.cpp");
+        var headerPath = Write("include/shared.h", "// version one");
+        var changedForSecondUnit = false;
+        var builder = new NativeInteropSnapshotBuilder(
+            (request, _) =>
+            {
+                if (!changedForSecondUnit
+                    && string.Equals(
+                        request.SourceFilePath,
+                        secondPath,
+                        PathComparison))
+                {
+                    File.AppendAllText(headerPath, "// version two");
+                    changedForSecondUnit = true;
+                }
+                return Task.FromResult(Extraction(
+                    request,
+                    [
+                        Export(
+                            request,
+                            "c:E:include/shared.h::medical",
+                            "medical",
+                            headerPath),
+                    ],
+                    includedFiles: [request.SourceFilePath, headerPath]));
+            },
+            (_, _, _) => Task.FromResult(
+                CompleteBinary("medical.dll", "medical")));
+
+        var snapshot = await builder.BuildAsync(
+            _root,
+            Config(
+                Tu("native/one.cpp", "medical", "artifacts/medical.dll"),
+                Tu("native/two.cpp", "medical", "artifacts/medical.dll")),
+            new ScopePathPolicy(_root),
+            CancellationToken.None);
+
+        File.Exists(firstPath).Should().BeTrue();
+        snapshot.Contributions.Should().HaveCount(2);
+        snapshot.Contributions.Should().OnlyContain(
+            contribution => contribution.IsComplete);
+        snapshot.IsSourceComplete.Should().BeFalse();
+        snapshot.IsComplete.Should().BeFalse();
+        snapshot.ContentHashes.Should().ContainKey(firstPath);
+        snapshot.ContentHashes.Should().ContainKey(secondPath);
+        snapshot.ContentHashes.Should().NotContainKey(headerPath);
+        snapshot.Failures.Should().ContainSingle(failure =>
+            failure.Kind == NativeInteropSnapshotFailureKind.InputContentChanged);
+    }
+
+    [Fact]
+    public async Task Oversized_translation_unit_is_rejected_before_extraction()
+    {
+        var sourcePath = Write("native/api.cpp");
+        using (var stream = new FileStream(
+                   sourcePath,
+                   FileMode.Open,
+                   FileAccess.Write,
+                   FileShare.Read))
+        {
+            stream.SetLength(
+                NativeInteropSnapshotBuilder.MaximumHashedFileBytes + 1);
+        }
+        var extractorCalled = false;
+        var builder = new NativeInteropSnapshotBuilder(
+            (_, _) =>
+            {
+                extractorCalled = true;
+                throw new InvalidOperationException("must not extract");
+            });
+
+        var snapshot = await builder.BuildAsync(
+            _root,
+            Config(Tu("native/api.cpp", "medical", "artifacts/medical.dll")),
+            new ScopePathPolicy(_root),
+            CancellationToken.None);
+
+        extractorCalled.Should().BeFalse();
+        snapshot.IsSourceComplete.Should().BeFalse();
+        snapshot.ContentHashes.Should().BeEmpty();
+        snapshot.Failures.Should().ContainSingle(failure =>
+            failure.Kind
+                == NativeInteropSnapshotFailureKind.ContentHashLimitExceeded);
+    }
+
+    [Fact]
+    public async Task Translation_unit_count_over_limit_fails_before_extraction()
+    {
+        var extractorCalled = false;
+        var units = Enumerable
+            .Repeat(
+                Tu("native/not-read.cpp", "medical", "artifacts/medical.dll"),
+                NativeInteropSnapshotBuilder.MaximumTranslationUnits + 1)
+            .ToArray();
+        var builder = new NativeInteropSnapshotBuilder(
+            (_, _) =>
+            {
+                extractorCalled = true;
+                throw new InvalidOperationException("must not extract");
+            });
+
+        var snapshot = await builder.BuildAsync(
+            _root,
+            Config(units),
+            new ScopePathPolicy(_root),
+            CancellationToken.None);
+
+        extractorCalled.Should().BeFalse();
+        snapshot.IsComplete.Should().BeFalse();
+        snapshot.Failures.Should().ContainSingle(failure =>
+            failure.Kind
+                == NativeInteropSnapshotFailureKind.CollectionLimitExceeded);
+    }
+
+    [Theory]
+    [InlineData("included-files")]
+    [InlineData("exports")]
+    [InlineData("records")]
+    [InlineData("diagnostics")]
+    public async Task Top_level_extraction_collection_over_limit_is_rejected(
+        string collectionKind)
+    {
+        Write("native/api.cpp");
+        var verifierCalled = false;
+        var builder = new NativeInteropSnapshotBuilder(
+            (request, _) =>
+            {
+                var export = Export(
+                    request,
+                    "c:E:native/api.cpp::medical",
+                    "medical");
+                var record = Record(
+                    request,
+                    "c:T:native/api.cpp::Payload",
+                    TestEvidence(request, request.SourceFilePath));
+                return Task.FromResult(collectionKind switch
+                {
+                    "included-files" => Extraction(
+                        request,
+                        includedFiles: Enumerable.Repeat(
+                                request.SourceFilePath,
+                                NativeInteropSnapshotBuilder
+                                    .MaximumIncludedFilesPerTranslationUnit + 1)
+                            .ToArray()),
+                    "exports" => Extraction(
+                        request,
+                        Enumerable.Repeat(
+                                export,
+                                NativeInteropSnapshotBuilder
+                                    .MaximumExportsPerTranslationUnit + 1)
+                            .ToArray()),
+                    "records" => Extraction(
+                        request,
+                        records: Enumerable.Repeat(
+                                record,
+                                NativeInteropSnapshotBuilder
+                                    .MaximumRecordLayoutsPerTranslationUnit + 1)
+                            .ToArray()),
+                    "diagnostics" => Extraction(
+                        request,
+                        diagnostics: Enumerable.Repeat(
+                                new ClangExtractionDiagnostic(
+                                    "CLANG1000",
+                                    ClangExtractionDiagnosticSeverity.Warning,
+                                    "bounded"),
+                                NativeInteropSnapshotBuilder
+                                    .MaximumDiagnosticsPerTranslationUnit + 1)
+                            .ToArray()),
+                    _ => throw new InvalidOperationException(),
+                });
+            },
+            (_, _, _) =>
+            {
+                verifierCalled = true;
+                return Task.FromResult(CompleteBinary("medical.dll", "medical"));
+            });
+
+        var snapshot = await builder.BuildAsync(
+            _root,
+            Config(Tu("native/api.cpp", "medical", "artifacts/medical.dll")),
+            new ScopePathPolicy(_root),
+            CancellationToken.None);
+
+        verifierCalled.Should().BeFalse();
+        snapshot.IsComplete.Should().BeFalse();
+        snapshot.IsSourceComplete.Should().BeFalse();
+        snapshot.SourceExports.Should().BeEmpty();
+        snapshot.RecordLayouts.Should().BeEmpty();
+        snapshot.Failures.Should().ContainSingle(failure =>
+            failure.Kind
+                == NativeInteropSnapshotFailureKind.CollectionLimitExceeded);
+    }
+
+    [Theory]
+    [InlineData("parameters")]
+    [InlineData("retention")]
+    [InlineData("fields")]
+    [InlineData("metadata")]
+    public async Task Nested_fact_collection_over_limit_rejects_the_fact(
+        string collectionKind)
+    {
+        Write("native/api.cpp");
+        var verifierCalled = false;
+        var builder = new NativeInteropSnapshotBuilder(
+            (request, _) =>
+            {
+                var evidence = TestEvidence(request, request.SourceFilePath);
+                var export = Export(
+                    request,
+                    "c:E:native/api.cpp::medical",
+                    "medical");
+                var record = Record(
+                    request,
+                    "c:T:native/api.cpp::Payload",
+                    evidence);
+                if (collectionKind == "parameters")
+                {
+                    var parameter = new AbiParameter(
+                        0,
+                        "value",
+                        IntType(),
+                        AbiParameterDirection.In,
+                        TestLocation(request.SourceFilePath));
+                    export = export with
+                    {
+                        Parameters = Enumerable.Repeat(
+                                parameter,
+                                NativeInteropSnapshotBuilder
+                                    .MaximumParametersPerExport + 1)
+                            .ToArray(),
+                    };
+                }
+                else if (collectionKind == "retention")
+                {
+                    var retention = new NativeCallbackRetention(
+                        0,
+                        request.Target,
+                        evidence);
+                    export = export with
+                    {
+                        RetainedCallbacks = Enumerable.Repeat(
+                                retention,
+                                NativeInteropSnapshotBuilder
+                                    .MaximumRetainedCallbacksPerExport + 1)
+                            .ToArray(),
+                    };
+                }
+                else if (collectionKind == "metadata")
+                {
+                    export = export with
+                    {
+                        Evidence = evidence with
+                        {
+                            Metadata = Enumerable.Range(
+                                    0,
+                                    NativeInteropSnapshotBuilder
+                                        .MaximumEvidenceMetadataEntries + 1)
+                                .ToDictionary(
+                                    value => "key-" + value,
+                                    value => "value-" + value,
+                                    StringComparer.Ordinal),
+                        },
+                    };
+                }
+                else
+                {
+                    record = record with
+                    {
+                        Fields = Enumerable.Repeat(
+                                record.Fields[0],
+                                NativeInteropSnapshotBuilder
+                                    .MaximumFieldsPerRecord + 1)
+                            .ToArray(),
+                    };
+                }
+                return Task.FromResult(Extraction(
+                    request,
+                    collectionKind == "fields" ? [] : [export],
+                    collectionKind == "fields" ? [record] : []));
+            },
+            (_, _, _) =>
+            {
+                verifierCalled = true;
+                return Task.FromResult(CompleteBinary("medical.dll", "medical"));
+            });
+
+        var snapshot = await builder.BuildAsync(
+            _root,
+            Config(Tu("native/api.cpp", "medical", "artifacts/medical.dll")),
+            new ScopePathPolicy(_root),
+            CancellationToken.None);
+
+        verifierCalled.Should().BeFalse();
+        snapshot.IsComplete.Should().BeFalse();
+        snapshot.SourceExports.Should().BeEmpty();
+        snapshot.RecordLayouts.Should().BeEmpty();
+        snapshot.Failures.Should().ContainSingle(failure =>
+            failure.Kind
+                == NativeInteropSnapshotFailureKind.CollectionLimitExceeded);
+    }
+
+    [Fact]
+    public async Task Aggregate_nested_fact_budget_is_enforced_before_validation()
+    {
+        Write("native/api.cpp");
+        var verifierCalled = false;
+        var builder = new NativeInteropSnapshotBuilder(
+            (request, _) =>
+            {
+                var parameter = new AbiParameter(
+                    0,
+                    "value",
+                    IntType(),
+                    AbiParameterDirection.In,
+                    TestLocation(request.SourceFilePath));
+                var export = Export(
+                    request,
+                    "c:E:native/api.cpp::medical",
+                    "medical") with
+                {
+                    Parameters = Enumerable.Repeat(parameter, 16).ToArray(),
+                };
+                return Task.FromResult(Extraction(
+                    request,
+                    Enumerable.Repeat(
+                            export,
+                            NativeInteropSnapshotBuilder
+                                .MaximumExportsPerTranslationUnit)
+                        .ToArray()));
+            },
+            (_, _, _) =>
+            {
+                verifierCalled = true;
+                return Task.FromResult(CompleteBinary("medical.dll", "medical"));
+            });
+
+        var snapshot = await builder.BuildAsync(
+            _root,
+            Config(Tu("native/api.cpp", "medical", "artifacts/medical.dll")),
+            new ScopePathPolicy(_root),
+            CancellationToken.None);
+
+        verifierCalled.Should().BeFalse();
+        snapshot.IsComplete.Should().BeFalse();
+        snapshot.SourceExports.Should().BeEmpty();
+        snapshot.Failures.Should().ContainSingle(failure =>
+            failure.Kind
+                == NativeInteropSnapshotFailureKind.CollectionLimitExceeded);
+    }
+
+    [Fact]
+    public async Task Binary_export_collection_over_limit_is_not_associated()
+    {
+        Write("native/api.cpp");
+        var binaryEntry = new BinaryExportEntry(
+            1,
+            0x1000,
+            ["medical"],
+            IsForwarder: false,
+            Forwarder: null);
+        var builder = new NativeInteropSnapshotBuilder(
+            (request, _) => Task.FromResult(Extraction(
+                request,
+                [
+                    Export(
+                        request,
+                        "c:E:native/api.cpp::medical",
+                        "medical"),
+                ])),
+            (_, _, _) => Task.FromResult(new BinaryExportVerificationResult(
+                BinaryExportVerificationStatus.Complete,
+                InteropArchitecture.X64,
+                0x8664,
+                "medical.dll",
+                Enumerable.Repeat(
+                        binaryEntry,
+                        NativeInteropSnapshotBuilder.MaximumBinaryExports + 1)
+                    .ToArray(),
+                "complete")));
+
+        var snapshot = await builder.BuildAsync(
+            _root,
+            Config(Tu("native/api.cpp", "medical", "artifacts/medical.dll")),
+            new ScopePathPolicy(_root),
+            CancellationToken.None);
+
+        snapshot.IsComplete.Should().BeFalse();
+        snapshot.IsSourceComplete.Should().BeTrue();
+        snapshot.VerifiedExports.Should().BeEmpty();
+        snapshot.Failures.Should().ContainSingle(failure =>
+            failure.Kind
+                == NativeInteropSnapshotFailureKind.BinaryCollectionLimitExceeded);
+    }
+
     [Fact]
     public async Task Cancellation_is_propagated_between_delegate_steps()
     {
@@ -471,6 +1306,48 @@ public sealed class NativeInteropSnapshotBuilderTests : IDisposable
             LibraryName = request.LibraryName,
             ModuleIdentitySource = NativeModuleIdentitySource.Configuration,
         };
+
+    private static AbiRecordLayout Record(
+        ClangNativeExtractionRequest request,
+        string canonicalKey,
+        Evidence evidence) =>
+        new(
+            canonicalKey,
+            AbiRecordKind.Native,
+            SizeBytes: 4,
+            AlignmentBytes: 4,
+            Pack: null,
+            [
+                new AbiFieldLayout(
+                    0,
+                    "value",
+                    IntType(),
+                    OffsetBytes: 0,
+                    SizeBytes: 4,
+                    evidence),
+            ],
+            request.Target,
+            evidence);
+
+    private static AbiTypeRef IntType() =>
+        new(
+            "int",
+            AbiTypeCategory.SignedInteger,
+            sizeBytes: 4,
+            alignmentBytes: 4,
+            isSigned: true);
+
+    private static Evidence TestEvidence(
+        ClangNativeExtractionRequest request,
+        string path) =>
+        new(
+            request.ProducingFileId,
+            TestLocation(path),
+            EvidenceConfidence.Exact,
+            "snapshot-test");
+
+    private static SourceLocation TestLocation(string path) =>
+        new(path, 1, 1, 1, 8);
 
     private static BinaryExportVerificationResult CompleteBinary(
         string? moduleName,
