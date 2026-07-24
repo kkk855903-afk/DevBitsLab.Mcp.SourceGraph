@@ -22,6 +22,7 @@ public sealed class ScopePathPolicy
     private readonly PrivacyPathPolicy _privacyPathPolicy;
     private readonly string? _physicalRepoRoot;
     private readonly PrivacyPathPolicy? _physicalPrivacyPathPolicy;
+    private readonly IReadOnlyList<string> _configuredExcludePatterns;
     private readonly IReadOnlyList<GlobPattern> _excludePatterns;
 
     public ScopePathPolicy(string repoRoot, IReadOnlyList<string>? excludePatterns = null)
@@ -40,13 +41,16 @@ public sealed class ScopePathPolicy
             _physicalRepoRoot = physicalRepoRoot;
             _physicalPrivacyPathPolicy = new PrivacyPathPolicy(physicalRepoRoot);
         }
-        var configuredPatterns = excludePatterns ?? Array.Empty<string>();
-        var parsedPatterns = new List<GlobPattern>(configuredPatterns.Count);
-        for (var i = 0; i < configuredPatterns.Count; i++)
+        _configuredExcludePatterns =
+            (excludePatterns ?? Array.Empty<string>()).ToArray();
+        var parsedPatterns =
+            new List<GlobPattern>(_configuredExcludePatterns.Count);
+        for (var i = 0; i < _configuredExcludePatterns.Count; i++)
         {
             try
             {
-                parsedPatterns.Add(GlobPattern.Create(configuredPatterns[i]));
+                parsedPatterns.Add(
+                    GlobPattern.Create(_configuredExcludePatterns[i]));
             }
             catch (ArgumentException ex)
             {
@@ -58,6 +62,14 @@ public sealed class ScopePathPolicy
         }
         _excludePatterns = parsedPatterns;
     }
+
+    /// <summary>
+    /// Immutable snapshot of the scope-supplied excludes. Index hosts pass this snapshot to
+    /// language adapters that may read secondary inputs (for example native include files), so
+    /// those adapters can enforce the same boundary before opening them.
+    /// </summary>
+    public IReadOnlyList<string> ConfiguredExcludePatterns =>
+        _configuredExcludePatterns;
 
     /// <summary>
     /// Returns <see langword="true"/> when the path violates the mandatory privacy boundary or

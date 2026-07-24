@@ -981,7 +981,13 @@ public sealed class LanguageIndexerDispatcher
         }
         var sha = SHA256.HashData(contents);
         var project = SelectLanguageProject(filePath, projectMap, projects);
-        var ctx = new IndexContext(filePath, contents, scopeId, repoRoot, project);
+        var ctx = new IndexContext(
+            filePath,
+            contents,
+            scopeId,
+            repoRoot,
+            project,
+            pathPolicy.ConfiguredExcludePatterns);
         var languageEvents =
             await indexer.IndexAsync(ctx, ct).ConfigureAwait(false);
         IReadOnlyList<IndexEvent> events = languageEvents;

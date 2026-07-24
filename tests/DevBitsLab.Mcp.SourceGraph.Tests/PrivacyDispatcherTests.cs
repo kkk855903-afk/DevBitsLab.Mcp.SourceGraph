@@ -52,6 +52,8 @@ public sealed class PrivacyDispatcherTests : IDisposable
         dispatched.IndexedFiles.Should().Be(1);
         dispatched.FailedFiles.Should().BeEmpty();
         indexer.Paths.Should().Equal(allowed);
+        indexer.ExcludeSnapshots.Should().ContainSingle()
+            .Which.Should().BeEmpty();
     }
 
     [Fact]
@@ -83,6 +85,8 @@ public sealed class PrivacyDispatcherTests : IDisposable
         dispatched.IndexedFiles.Should().Be(1);
         dispatched.FailedFiles.Should().BeEmpty();
         indexer.Paths.Should().Equal(allowed);
+        indexer.ExcludeSnapshots.Should().ContainSingle()
+            .Which.Should().Equal("**/generated/**");
     }
 
     [SkippableFact]
@@ -191,10 +195,12 @@ public sealed class PrivacyDispatcherTests : IDisposable
         public IReadOnlyCollection<string> FileExtensions { get; } = new[] { ".privacytest", ".dcm" };
 
         public List<string> Paths { get; } = new();
+        public List<IReadOnlyList<string>> ExcludeSnapshots { get; } = new();
 
         public Task<IReadOnlyList<IndexEvent>> IndexAsync(IndexContext ctx, CancellationToken ct)
         {
             Paths.Add(ctx.FilePath);
+            ExcludeSnapshots.Add(ctx.ExcludePatterns.ToArray());
             IReadOnlyList<IndexEvent> events = new IndexEvent[]
             {
                 new IndexEvent.FileScanned(ctx.FilePath, SHA256.HashData(ctx.Contents)),

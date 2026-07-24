@@ -62,12 +62,39 @@ public abstract class LanguageIndexerBase : ILanguageIndexer
 public sealed class IndexContext
 {
     public IndexContext(string filePath, byte[] contents, string scopeId, string repoRoot, ILanguageProject? project = null)
+        : this(
+            filePath,
+            contents,
+            scopeId,
+            repoRoot,
+            project,
+            System.Array.Empty<string>())
     {
+    }
+
+    /// <summary>
+    /// Creates a context with the scope's configured exclude snapshot. This overload preserves
+    /// the original constructor for binary compatibility while allowing built-in and plugin
+    /// adapters to apply the host boundary before reading secondary inputs.
+    /// </summary>
+    public IndexContext(
+        string filePath,
+        byte[] contents,
+        string scopeId,
+        string repoRoot,
+        ILanguageProject? project,
+        IReadOnlyList<string> excludePatterns)
+    {
+        if (excludePatterns is null)
+        {
+            throw new System.ArgumentNullException(nameof(excludePatterns));
+        }
         FilePath = filePath;
         Contents = contents;
         ScopeId = scopeId;
         RepoRoot = repoRoot;
         Project = project;
+        ExcludePatterns = new List<string>(excludePatterns).AsReadOnly();
     }
 
     /// <summary>Absolute path to the file being indexed.</summary>
@@ -90,6 +117,13 @@ public sealed class IndexContext
     /// the file isn't owned by any discovered project.
     /// </summary>
     public ILanguageProject? Project { get; }
+
+    /// <summary>
+    /// Scope-configured excludes captured by the host. These complement mandatory privacy and
+    /// repository-containment checks; adapters that follow includes or other secondary inputs
+    /// must apply both before reading bytes.
+    /// </summary>
+    public IReadOnlyList<string> ExcludePatterns { get; }
 
     /// <summary>Convenience: <see cref="System.Text.Encoding.UTF8"/>-decoded text view of <see cref="Contents"/>.</summary>
     public string GetText() => System.Text.Encoding.UTF8.GetString(Contents);

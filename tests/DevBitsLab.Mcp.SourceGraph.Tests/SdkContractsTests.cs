@@ -149,6 +149,24 @@ public sealed class SdkContractsTests
     {
         var ctx = new IndexContext("/x", System.Text.Encoding.UTF8.GetBytes("héllo"), "s", "/r");
         ctx.GetText().Should().Be("héllo");
+        ctx.ExcludePatterns.Should().BeEmpty();
+    }
+
+    [Fact]
+    public void IndexContext_capturesAnImmutableExcludeSnapshot()
+    {
+        var excludes = new List<string> { "**/private/**" };
+        var ctx = new IndexContext(
+            "/x",
+            System.Text.Encoding.UTF8.GetBytes("hello"),
+            "s",
+            "/r",
+            project: null,
+            excludes);
+
+        excludes[0] = "**/changed/**";
+
+        ctx.ExcludePatterns.Should().Equal("**/private/**");
     }
 
     [Fact]
