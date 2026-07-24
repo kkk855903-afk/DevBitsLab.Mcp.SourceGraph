@@ -73,6 +73,21 @@ public interface IGraphStore : IAsyncDisposable
         throw new NotSupportedException(
             "This graph-store implementation predates atomic file-facts replacement.");
 
+    /// <summary>
+    /// Atomically replaces annotations of one exact <paramref name="flavor"/> on declarations
+    /// owned by the indexed <paramref name="filePath"/>. Every annotation host is resolved by
+    /// canonical key and verified to belong to that file before prior rows are changed. An empty
+    /// <paramref name="annotations"/> collection therefore clears only that file/flavor
+    /// projection while preserving all other annotation flavors and files.
+    /// </summary>
+    Task ReplaceAnnotationsForFileByFlavorAsync(
+        string filePath,
+        string flavor,
+        IReadOnlyList<FileAnnotationFact> annotations,
+        CancellationToken ct = default) =>
+        throw new NotSupportedException(
+            "This graph-store implementation predates atomic annotation-flavor replacement.");
+
     /// <summary>Upsert a symbol by canonical key. Returns the symbol's stable id (existing or newly created).</summary>
     Task<long> UpsertSymbolAsync(string canonicalKey, Symbol symbol, CancellationToken ct = default);
 

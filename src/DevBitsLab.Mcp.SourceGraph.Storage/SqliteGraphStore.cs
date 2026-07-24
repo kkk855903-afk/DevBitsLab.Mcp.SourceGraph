@@ -1,6 +1,7 @@
 using System.Text.Json;
 using Dapper;
 using DevBitsLab.Mcp.SourceGraph.Core;
+using DevBitsLab.Mcp.SourceGraph.Sdk.Validation;
 using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -576,6 +577,165 @@ public sealed class SqliteGraphStore : IGraphStore
                 await _connection.ExecuteAsync(new CommandDefinition(
                     syncLogicalPayloadSql,
                     new { edge.Src, edge.Dst, edge.Kind },
+                    transaction: tx,
+                    cancellationToken: ct)).ConfigureAwait(false);
+            }
+
+            tx.Commit();
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public async Task ReplaceAnnotationsForFileByFlavorAsync(
+        string filePath,
+        string flavor,
+        IReadOnlyList<FileAnnotationFact> annotations,
+        CancellationToken ct = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(filePath);
+        KebabCaseValidator.Validate(flavor, nameof(flavor));
+        ArgumentNullException.ThrowIfNull(annotations);
+
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            using var tx = _connection.BeginTransaction();
+            var indexedFile = await _connection.QuerySingleOrDefaultAsync<RawProducingFile>(
+                new CommandDefinition(
+                    """
+                    SELECT id AS FileId, path AS FilePath
+                    FROM files
+                    WHERE path = @FilePath;
+                    """,
+                    new { FilePath = filePath },
+                    transaction: tx,
+                    cancellationToken: ct)).ConfigureAwait(false)
+                ?? throw new InvalidOperationException(
+                    $"Annotation replacement could not resolve indexed file `{filePath}`.");
+
+            // Resolve and validate the complete candidate set before deleting prior rows. This
+            // keeps validation, lookup, cancellation, and SQL failures rollback-safe.
+            var symbols = new Dictionary<string, RawAnnotationSymbol>(StringComparer.Ordinal);
+            async Task<RawAnnotationSymbol> ResolveSymbolAsync(string canonicalKey)
+            {
+                CanonicalKeyValidator.Validate(canonicalKey, nameof(annotations));
+                if (symbols.TryGetValue(canonicalKey, out var cached)) return cached;
+
+                var resolved = await _connection.QuerySingleOrDefaultAsync<RawAnnotationSymbol>(
+                    new CommandDefinition(
+                        """
+                        SELECT id AS SymbolId, file_id AS FileId
+                        FROM symbols
+                        WHERE canonical_key = @CanonicalKey;
+                        """,
+                        new { CanonicalKey = canonicalKey },
+                        transaction: tx,
+                        cancellationToken: ct)).ConfigureAwait(false)
+                    ?? throw new InvalidOperationException(
+                        $"Annotation replacement could not resolve symbol `{canonicalKey}`.");
+                symbols[canonicalKey] = resolved;
+                return resolved;
+            }
+
+            var resolvedAnnotations = new List<ResolvedFileAnnotationFact>(annotations.Count);
+            for (var index = 0; index < annotations.Count; index++)
+            {
+                var annotation = annotations[index]
+                    ?? throw new ArgumentException(
+                        $"Annotation replacement contains a null fact at index {index}.",
+                        nameof(annotations));
+                if (!string.Equals(annotation.Flavor, flavor, StringComparison.Ordinal))
+                {
+                    throw new ArgumentException(
+                        "Every replacement annotation flavor must exactly match "
+                        + $"the requested flavor `{flavor}` (index {index}).",
+                        nameof(annotations));
+                }
+                ArgumentException.ThrowIfNullOrWhiteSpace(annotation.Name);
+                ArgumentException.ThrowIfNullOrWhiteSpace(annotation.FullName);
+                if (annotation.ArgsJson is not null)
+                {
+                    try
+                    {
+                        using var _ = JsonDocument.Parse(annotation.ArgsJson);
+                    }
+                    catch (JsonException ex)
+                    {
+                        throw new ArgumentException(
+                            $"Annotation args_json must contain valid JSON (index {index}).",
+                            nameof(annotations),
+                            ex);
+                    }
+                }
+
+                var host = await ResolveSymbolAsync(annotation.SymbolCanonicalKey)
+                    .ConfigureAwait(false);
+                if (host.FileId != indexedFile.FileId)
+                {
+                    throw new InvalidOperationException(
+                        "Annotation replacement hosts must belong to indexed file "
+                        + $"`{indexedFile.FilePath}`; `{annotation.SymbolCanonicalKey}` is external.");
+                }
+
+                long? attributeSymbolId = null;
+                if (annotation.AttributeCanonicalKey is not null)
+                {
+                    attributeSymbolId = (await ResolveSymbolAsync(annotation.AttributeCanonicalKey)
+                        .ConfigureAwait(false)).SymbolId;
+                }
+
+                resolvedAnnotations.Add(new ResolvedFileAnnotationFact(
+                    annotation.SymbolCanonicalKey,
+                    host.SymbolId,
+                    annotation.Name,
+                    annotation.FullName,
+                    flavor,
+                    annotation.ArgsJson,
+                    annotation.AttributeCanonicalKey,
+                    attributeSymbolId));
+            }
+
+            // Exact duplicates collapse and canonical ordering makes row order independent of
+            // extractor traversal order.
+            var orderedAnnotations = resolvedAnnotations
+                .Distinct()
+                .OrderBy(annotation => annotation.SymbolCanonicalKey, StringComparer.Ordinal)
+                .ThenBy(annotation => annotation.Name, StringComparer.Ordinal)
+                .ThenBy(annotation => annotation.FullName, StringComparer.Ordinal)
+                .ThenBy(annotation => annotation.ArgsJson ?? string.Empty, StringComparer.Ordinal)
+                .ThenBy(
+                    annotation => annotation.AttributeCanonicalKey ?? string.Empty,
+                    StringComparer.Ordinal)
+                .ToList();
+
+            await _connection.ExecuteAsync(new CommandDefinition(
+                """
+                DELETE FROM annotations
+                WHERE flavor = @Flavor
+                  AND symbol_id IN (
+                      SELECT id
+                      FROM symbols
+                      WHERE file_id = @FileId
+                  );
+                """,
+                new { Flavor = flavor, indexedFile.FileId },
+                transaction: tx,
+                cancellationToken: ct)).ConfigureAwait(false);
+
+            const string insertSql = """
+                INSERT INTO annotations(
+                    symbol_id, name, full_name, flavor, args_json, attribute_symbol_id)
+                VALUES (
+                    @SymbolId, @Name, @FullName, @Flavor, @ArgsJson, @AttributeSymbolId);
+                """;
+            foreach (var annotation in orderedAnnotations)
+            {
+                await _connection.ExecuteAsync(new CommandDefinition(
+                    insertSql,
+                    annotation,
                     transaction: tx,
                     cancellationToken: ct)).ConfigureAwait(false);
             }
@@ -2323,6 +2483,18 @@ public sealed class SqliteGraphStore : IGraphStore
         long EndColumn);
 
     private sealed record RawProducingFile(long FileId, string FilePath);
+
+    private sealed record RawAnnotationSymbol(long SymbolId, long FileId);
+
+    private sealed record ResolvedFileAnnotationFact(
+        string SymbolCanonicalKey,
+        long SymbolId,
+        string Name,
+        string FullName,
+        string Flavor,
+        string? ArgsJson,
+        string? AttributeCanonicalKey,
+        long? AttributeSymbolId);
 
     private sealed record ResolvedProducerEdgeEvidenceFact(
         string SourceCanonicalKey,
