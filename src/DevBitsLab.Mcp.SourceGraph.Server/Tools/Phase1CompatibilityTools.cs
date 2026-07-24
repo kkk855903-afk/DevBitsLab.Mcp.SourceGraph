@@ -21,6 +21,7 @@ public static class Phase1CompatibilityTools
     [McpServerTool(
         UseStructuredContent = true,
         OutputSchemaType = typeof(SearchSymbolsResult))]
+    [ToolAnnotation(ReadOnlyHint = true, IdempotentHint = true)]
     [ToolTrigger("\"search indexed code for a name or signature fragment\"")]
     [Description(
         "Search indexed code symbols by partial name, qualified name, or signature using the local FTS index. " +
@@ -43,6 +44,7 @@ public static class Phase1CompatibilityTools
     [McpServerTool(
         UseStructuredContent = true,
         OutputSchemaType = typeof(SearchSymbolsResult))]
+    [ToolAnnotation(ReadOnlyHint = true, IdempotentHint = true)]
     [ToolTrigger("\"find an indexed symbol\"")]
     [Description(
         "Find indexed symbols by name, qualified name, or signature fragment. " +
@@ -63,6 +65,7 @@ public static class Phase1CompatibilityTools
             ct);
 
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(FindReferencesResult))]
+    [ToolAnnotation(ReadOnlyHint = true, IdempotentHint = true)]
     [ToolTrigger("\"find references to X\"")]
     [Description("Find each indexed reference occurrence for a symbol. Compatibility name for find_references; returns the same file, line, column, and reference-kind evidence.")]
     public static Task<CallToolResult> FindReferenceAsync(
@@ -75,6 +78,7 @@ public static class Phase1CompatibilityTools
         GraphTools.FindReferencesAsync(router, symbol, limit, includeGenerated, scope, ct);
 
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(ListCallersResult))]
+    [ToolAnnotation(ReadOnlyHint = true, IdempotentHint = true)]
     [ToolTrigger("\"find callers of X\"")]
     [Description("Find evidence-backed inbound relations to a target. Compatibility name for list_callers; each row includes canonical source/target identities, the actual relation and confidence, plus stored occurrence file/range evidence.")]
     public static Task<CallToolResult> FindCallersAsync(
@@ -87,6 +91,7 @@ public static class Phase1CompatibilityTools
         GraphTools.ListCallersAsync(router, symbol, limit, kind, scope, ct);
 
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(ListCalleesResult))]
+    [ToolAnnotation(ReadOnlyHint = true, IdempotentHint = true)]
     [ToolTrigger("\"find callees of X\"")]
     [Description("Find evidence-backed outbound relations from a source. Compatibility name for list_callees; each row includes canonical source/target identities, the actual relation and confidence, plus stored occurrence file/range evidence.")]
     public static Task<CallToolResult> FindCalleesAsync(
@@ -160,6 +165,7 @@ public static class Phase1CompatibilityTools
             ct);
 
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(ImpactOfChangeResult))]
+    [ToolAnnotation(ReadOnlyHint = true, IdempotentHint = true)]
     [ToolTrigger("\"analyze the impact of changing X\"")]
     [Description("Compute bounded evidence-backed upstream impact. Compatibility name for impact_of_change; every row includes its BFS predecessor and a source-to-target path whose hops carry real occurrence evidence.")]
     public static Task<CallToolResult> ImpactAnalysisAsync(

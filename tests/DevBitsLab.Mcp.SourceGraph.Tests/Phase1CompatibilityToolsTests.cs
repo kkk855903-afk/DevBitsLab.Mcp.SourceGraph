@@ -10,6 +10,21 @@ namespace DevBitsLab.Mcp.SourceGraph.Tests;
 
 public sealed class Phase1CompatibilityToolsTests
 {
+    [Fact]
+    public void FindDefinition_is_declared_read_only_and_idempotent()
+    {
+        var annotation = typeof(GraphTools)
+            .GetMethod(
+                nameof(GraphTools.FindDefinitionAsync),
+                BindingFlags.Public | BindingFlags.Static)!
+            .GetCustomAttribute<ToolAnnotationAttribute>();
+
+        annotation.Should().Match<ToolAnnotationAttribute>(value =>
+            value.ReadOnlyHint
+            && value.IdempotentHint
+            && !value.DestructiveHint);
+    }
+
     [Theory]
     [InlineData(nameof(Phase1CompatibilityTools.SearchCodeAsync), "search_code", typeof(SearchSymbolsResult))]
     [InlineData(nameof(Phase1CompatibilityTools.FindSymbolAsync), "find_symbol", typeof(SearchSymbolsResult))]
@@ -32,6 +47,11 @@ public sealed class Phase1CompatibilityToolsTests
         attribute.Should().NotBeNull();
         attribute!.UseStructuredContent.Should().BeTrue();
         attribute.OutputSchemaType.Should().Be(expectedOutputSchema);
+        method.GetCustomAttribute<ToolAnnotationAttribute>()
+            .Should().Match<ToolAnnotationAttribute>(annotation =>
+                annotation.ReadOnlyHint
+                && annotation.IdempotentHint
+                && !annotation.DestructiveHint);
 
         var tool = McpServerTool.Create(method, target: null, new McpServerToolCreateOptions());
         tool.ProtocolTool.Name.Should().Be(expectedToolName);

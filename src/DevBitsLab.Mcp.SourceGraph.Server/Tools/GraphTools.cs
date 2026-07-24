@@ -32,6 +32,7 @@ public static class GraphTools
     // prose without a structured payload while still feeding the leaf chokepoint.
 
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(FindDefinitionResult))]
+    [ToolAnnotation(ReadOnlyHint = true, IdempotentHint = true)]
     [ToolTrigger("\"where is X defined?\"")]
     [Description("Find the definition of a symbol by name or fully-qualified name. Returns symbol id, exact declaration range, defines relation, confidence, kind, signature, accessibility, modifiers, and one-line XML summary for each match.")]
     public static Task<CallToolResult> FindDefinitionAsync(
