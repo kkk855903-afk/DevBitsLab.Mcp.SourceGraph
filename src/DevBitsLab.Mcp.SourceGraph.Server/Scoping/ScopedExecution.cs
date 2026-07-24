@@ -12,6 +12,8 @@ namespace DevBitsLab.Mcp.SourceGraph.Server.Scoping;
 /// </summary>
 public static class ScopedExecution
 {
+    private const int MaxDiagnosticChars = 2_048;
+
     /// <summary>
     /// Resolve <paramref name="scope"/> via the router and short-circuit with an error string when
     /// the resolution fails. <paramref name="onResolved"/> is invoked once per matching scope and
@@ -26,7 +28,7 @@ public static class ScopedExecution
         IProgress<ProgressNotificationValue>? progress = null)
     {
         var resolution = router.Resolve(scope);
-        if (resolution.IsError) return resolution.ErrorMessage!;
+        if (resolution.IsError) return BoundDiagnostic(resolution.ErrorMessage!);
 
         // Skip degraded scopes silently when the user asked for a wildcard or an explicit list of
         // healthy scopes. When the user explicitly asks for a degraded scope, surface the message.
@@ -48,7 +50,8 @@ public static class ScopedExecution
             await WaitUntilReadyAsync(host, ct, progress).ConfigureAwait(false);
             if (host.Status == "degraded")
             {
-                return $"scope `{host.Scope.Id}` is degraded: {host.StatusMessage ?? "(no message)"}";
+                return BoundDiagnostic(
+                    $"scope `{host.Scope.Id}` is degraded: {host.StatusMessage ?? "(no message)"}");
             }
             return await onResolved(host).ConfigureAwait(false);
         }
@@ -62,7 +65,9 @@ public static class ScopedExecution
             await WaitUntilReadyAsync(h, ct, progress).ConfigureAwait(false);
             if (h.Status == "degraded")
             {
-                return (h.Scope.Id, $"scope is degraded: {h.StatusMessage ?? "(no message)"}");
+                return (
+                    h.Scope.Id,
+                    BoundDiagnostic($"scope is degraded: {h.StatusMessage ?? "(no message)"}"));
             }
             try
             {
@@ -72,7 +77,7 @@ public static class ScopedExecution
             catch (OperationCanceledException) { throw; }
             catch (Exception ex)
             {
-                return (h.Scope.Id, $"scope query failed: {ex.Message}");
+                return (h.Scope.Id, BoundDiagnostic($"scope query failed: {ex.Message}"));
             }
         })).ConfigureAwait(false);
 
@@ -100,23 +105,83 @@ public static class ScopedExecution
     ///   <item>Multi-host fan-out — runs <paramref name="onResolved"/> per host in parallel, then
     ///     concatenates the resulting <see cref="CallToolResult.Content"/> lists with a
     ///     per-scope <c>### scope: `id`</c> header text block, mirroring the legacy overload's
-    ///     prose merge. Per-call <see cref="CallToolResult.StructuredContent"/> values are dropped
-    ///     in this path — the wire shape of merged structured output is sweep-level work and not
-    ///     wired up by the vertical slice.</item>
+    ///     prose merge. Tools whose output schema defines a multi-scope shape use the sibling
+    ///     overload with a structured merge callback.</item>
     /// </list>
     /// </summary>
-    public static async Task<CallToolResult> RunAsync(
+    public static Task<CallToolResult> RunAsync(
         ScopeRouter router,
         object? scope,
         Func<ScopeHost, Task<CallToolResult>> onResolved,
         CancellationToken ct,
-        IProgress<ProgressNotificationValue>? progress = null)
+        IProgress<ProgressNotificationValue>? progress = null) =>
+        RunTypedAsync(
+            router,
+            scope,
+            (host, _, _) => onResolved(host),
+            mergeResults: null,
+            ct,
+            progress,
+            maxHosts: null);
+
+    /// <summary>
+    /// Typed multi-scope execution for tools that publish a schema-valid merged
+    /// <see cref="CallToolResult.StructuredContent"/> payload. The per-host callback receives its
+    /// zero-based position and the total host count so callers can divide a call-wide row/size
+    /// budget without resolving the router twice. On a multi-host call,
+    /// <paramref name="mergeResults"/> receives every per-scope outcome, including
+    /// degraded/query-error diagnostics; it must return a payload valid for the tool's declared
+    /// output schema. Single-host results continue to pass through verbatim. When
+    /// <paramref name="maxHosts"/> is set, an oversized selection is rejected before any
+    /// per-scope callback runs so callers can guarantee a bounded response shape.
+    /// </summary>
+    public static Task<CallToolResult> RunAsync(
+        ScopeRouter router,
+        object? scope,
+        Func<ScopeHost, int, int, Task<CallToolResult>> onResolved,
+        Func<IReadOnlyList<ScopedCallToolResult>, CallToolResult> mergeResults,
+        CancellationToken ct,
+        IProgress<ProgressNotificationValue>? progress = null,
+        int? maxHosts = null) =>
+        RunTypedAsync(
+            router,
+            scope,
+            onResolved,
+            mergeResults,
+            ct,
+            progress,
+            maxHosts);
+
+    private static async Task<CallToolResult> RunTypedAsync(
+        ScopeRouter router,
+        object? scope,
+        Func<ScopeHost, int, int, Task<CallToolResult>> onResolved,
+        Func<IReadOnlyList<ScopedCallToolResult>, CallToolResult>? mergeResults,
+        CancellationToken ct,
+        IProgress<ProgressNotificationValue>? progress,
+        int? maxHosts)
     {
         var resolution = router.Resolve(scope);
-        if (resolution.IsError) return DiagnosticResult.Error(resolution.ErrorMessage!);
+        if (resolution.IsError)
+        {
+            return DiagnosticResult.Error(BoundDiagnostic(resolution.ErrorMessage!));
+        }
 
         var hosts = resolution.Hosts;
         if (hosts.Count == 0) return DiagnosticResult.Error("No scopes matched.");
+        if (maxHosts is <= 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(maxHosts),
+                maxHosts,
+                "The scope fan-out limit must be positive.");
+        }
+        if (maxHosts is { } hostLimit && hosts.Count > hostLimit)
+        {
+            return DiagnosticResult.Error(
+                $"Scope selection matched {hosts.Count} scopes, exceeding this tool's "
+                + $"maximum fan-out of {hostLimit}; provide a narrower scope list.");
+        }
 
         if (hosts.Count == 1)
         {
@@ -125,11 +190,12 @@ public static class ScopedExecution
             if (host.Status == "degraded")
             {
                 return DiagnosticResult.Error(
-                    $"scope `{host.Scope.Id}` is degraded: {host.StatusMessage ?? "(no message)"}");
+                    BoundDiagnostic(
+                        $"scope `{host.Scope.Id}` is degraded: {host.StatusMessage ?? "(no message)"}"));
             }
             try
             {
-                return await onResolved(host).ConfigureAwait(false);
+                return await onResolved(host, 0, 1).ConfigureAwait(false);
             }
             catch (Exception ex) when (CorruptionGuard.IsCorruptionError(ex) && CorruptionPolicy.Registry is not null)
             {
@@ -143,18 +209,23 @@ public static class ScopedExecution
         }
 
         // Multi-host fan-out: parallel-run, then concatenate Content lists with a per-scope header.
-        // Structured content is dropped in the merge — we don't have a typed merge strategy yet.
-        var perHost = await Task.WhenAll(hosts.Select(async h =>
+        // A schema-aware caller may additionally merge the per-scope structured payloads below.
+        var perHost = await Task.WhenAll(hosts.Select(async (h, index) =>
         {
             await WaitUntilReadyAsync(h, ct, progress).ConfigureAwait(false);
             if (h.Status == "degraded")
             {
-                return (h.Scope.Id, DiagnosticResult.Error($"scope is degraded: {h.StatusMessage ?? "(no message)"}"));
+                return new ScopedCallToolResult(
+                    h.Scope.Id,
+                    h.Status,
+                    h.StatusMessage,
+                    DiagnosticResult.Error(BoundDiagnostic(
+                        $"scope is degraded: {h.StatusMessage ?? "(no message)"}")));
             }
             try
             {
-                var body = await onResolved(h).ConfigureAwait(false);
-                return (h.Scope.Id, body);
+                var body = await onResolved(h, index, hosts.Count).ConfigureAwait(false);
+                return new ScopedCallToolResult(h.Scope.Id, h.Status, h.StatusMessage, body);
             }
             catch (OperationCanceledException) { throw; }
             catch (Exception ex)
@@ -166,27 +237,50 @@ public static class ScopedExecution
                     await CorruptionGuard.VerifyAndMarkAsync(h, CorruptionPolicy.Registry,
                         ex, CorruptionPolicy.Logger, ct).ConfigureAwait(false);
                 }
-                return (h.Scope.Id, DiagnosticResult.Error($"scope query failed: {ex.Message}"));
+                return new ScopedCallToolResult(
+                    h.Scope.Id,
+                    h.Status,
+                    h.StatusMessage,
+                    DiagnosticResult.Error(BoundDiagnostic(
+                        $"scope query failed: {ex.Message}")));
             }
         })).ConfigureAwait(false);
 
         var merged = new List<ContentBlock>();
         var anyError = false;
-        foreach (var (id, body) in perHost)
+        foreach (var scoped in perHost)
         {
-            merged.Add(new TextContentBlock { Text = $"### scope: `{id}`" });
+            merged.Add(new TextContentBlock { Text = $"### scope: `{scoped.ScopeId}`" });
+            var body = scoped.Result;
             if (body.Content is { Count: > 0 } blocks)
             {
                 foreach (var b in blocks) merged.Add(b);
             }
             // OR per-scope IsError flags so a single failed scope marks the merged response as
-            // an error — keeps ToolMetrics' ok/err telemetry honest. StructuredContent merging
-            // is still deferred (sweep-level work), but error propagation is cheap and
-            // cross-cutting, so we land it here.
+            // an error — keeps ToolMetrics' ok/err telemetry honest.
             if (body.IsError == true) anyError = true;
         }
-        return new CallToolResult { Content = merged, IsError = anyError ? true : null };
+        if (mergeResults is not null)
+        {
+            var schemaAwareResult = mergeResults(perHost);
+            if (anyError && schemaAwareResult.IsError != true)
+            {
+                schemaAwareResult.IsError = true;
+            }
+            return schemaAwareResult;
+        }
+
+        return new CallToolResult
+        {
+            Content = merged,
+            IsError = anyError ? true : null,
+        };
     }
+
+    private static string BoundDiagnostic(string value) =>
+        value.Length <= MaxDiagnosticChars
+            ? value
+            : value[..(MaxDiagnosticChars - 1)] + "…";
 
     // Diagnostic short-circuits route through DevBitsLab.Mcp.SourceGraph.Server.Tools.Output.DiagnosticResult.Build
     // so the same wire shape ships from every tool body — keeps the leaf chokepoint's branding
@@ -297,3 +391,12 @@ public static class ScopedExecution
 
 public sealed record MergedHit<T>(T Hit, SortedSet<string> Scopes);
 public sealed record MergedHits<T>(IReadOnlyList<MergedHit<T>> Rows);
+
+/// <summary>
+/// One per-scope outcome supplied to a schema-aware typed fan-out merger.
+/// </summary>
+public sealed record ScopedCallToolResult(
+    string ScopeId,
+    string ScopeStatus,
+    string? ScopeStatusMessage,
+    CallToolResult Result);
