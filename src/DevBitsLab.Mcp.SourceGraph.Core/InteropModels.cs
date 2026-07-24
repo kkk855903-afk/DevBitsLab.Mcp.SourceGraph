@@ -94,6 +94,32 @@ public enum InteropCompatibility
     Error,
 }
 
+/// <summary>
+/// One independently evaluated part of a managed/native record-layout comparison.
+/// </summary>
+public enum AbiCompatibilityAspect
+{
+    Target,
+    RecordKind,
+    RecordSize,
+    RecordAlignment,
+    Pack,
+    FieldCount,
+    FieldOrder,
+    FieldCategory,
+    FieldOffset,
+    FieldSize,
+    FixedArrayLength,
+    BooleanSize,
+    PointerDepth,
+    PointerSize,
+    NestedRecordIdentity,
+    NestedRecordLayout,
+    CollectionLimit,
+    RecursionLimit,
+    Cycle,
+}
+
 public enum InteropFindingSeverity
 {
     Info,
@@ -391,6 +417,36 @@ public sealed record AbiRecordLayout(
     Evidence Evidence);
 
 /// <summary>
+/// Explicit identity proof used to resolve one inline nested record on both sides of an ABI
+/// comparison. The type names are the exact <see cref="AbiTypeRef.CanonicalName"/> values carried
+/// by the containing fields; comparers must not infer this mapping from simple-name similarity.
+/// </summary>
+public sealed record AbiRecordIdentityMapping
+{
+    public AbiRecordIdentityMapping(
+        string managedTypeCanonicalName,
+        string nativeTypeCanonicalName,
+        AbiRecordLayout managedLayout,
+        AbiRecordLayout nativeLayout)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(managedTypeCanonicalName);
+        ArgumentException.ThrowIfNullOrWhiteSpace(nativeTypeCanonicalName);
+        ArgumentNullException.ThrowIfNull(managedLayout);
+        ArgumentNullException.ThrowIfNull(nativeLayout);
+
+        ManagedTypeCanonicalName = managedTypeCanonicalName;
+        NativeTypeCanonicalName = nativeTypeCanonicalName;
+        ManagedLayout = managedLayout;
+        NativeLayout = nativeLayout;
+    }
+
+    public string ManagedTypeCanonicalName { get; }
+    public string NativeTypeCanonicalName { get; }
+    public AbiRecordLayout ManagedLayout { get; }
+    public AbiRecordLayout NativeLayout { get; }
+}
+
+/// <summary>
 /// Provenance-bearing boundary match. <see cref="Reasons"/> explains why a candidate matched,
 /// failed, or remained unknown; consumers must not infer certainty from symbol-name similarity.
 /// </summary>
@@ -415,6 +471,24 @@ public sealed record AbiCompatibilityResult(
     string NativeSymbolCanonicalKey,
     InteropCompatibility Compatibility,
     IReadOnlyList<string> Differences,
+    EvidenceConfidence Confidence,
+    IReadOnlyList<Evidence> Evidence)
+{
+    /// <summary>
+    /// Deterministically ordered, provenance-bearing checks. A result is compatible only when
+    /// every emitted check is compatible; missing facts are represented as warning checks.
+    /// </summary>
+    public IReadOnlyList<AbiCompatibilityCheck> Checks { get; init; } = [];
+}
+
+/// <summary>
+/// One typed compatibility conclusion with the exact facts that support it.
+/// </summary>
+public sealed record AbiCompatibilityCheck(
+    string Path,
+    AbiCompatibilityAspect Aspect,
+    InteropCompatibility Compatibility,
+    string Reason,
     EvidenceConfidence Confidence,
     IReadOnlyList<Evidence> Evidence);
 
