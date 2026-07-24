@@ -35,6 +35,7 @@ public static class WpfTools
     private const int OutputBudgetSafetyMargin = 256;
 
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(TraceBindingResult))]
+    [ToolAnnotation(ReadOnlyHint = true, IdempotentHint = true)]
     [ToolTrigger("\"trace this WPF binding\", \"where does this XAML binding resolve?\", \"why is this binding missing?\"")]
     [Description(
         "Trace a WPF data binding from a XAML element and/or binding path to its canonical target. " +
@@ -55,6 +56,7 @@ public static class WpfTools
             () => TraceAsync(router, element, binding, scope, limit, isCommand: false, ct));
 
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(TraceCommandResult))]
+    [ToolAnnotation(ReadOnlyHint = true, IdempotentHint = true)]
     [ToolTrigger("\"trace this WPF command\", \"where does this Command binding resolve?\", \"why is this command missing?\"")]
     [Description(
         "Trace a WPF Command binding from a XAML element and/or command name to its canonical " +
@@ -75,6 +77,7 @@ public static class WpfTools
             () => TraceAsync(router, element, command, scope, limit, isCommand: true, ct));
 
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(CheckResourcesResult))]
+    [ToolAnnotation(ReadOnlyHint = true, IdempotentHint = true)]
     [ToolTrigger("\"check WPF resources\", \"find missing StaticResource keys\", \"where does this XAML resource resolve?\"")]
     [Description(
         "Audit WPF resource references. Combines resolved `uses-resource` / `applies-style` edges with " +

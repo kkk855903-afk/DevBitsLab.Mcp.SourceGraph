@@ -57,6 +57,14 @@ public sealed class WpfToolCatalogTests
         typeof(WpfTools).GetMethod(nameof(WpfTools.CheckResourcesAsync))!
             .GetCustomAttribute<McpServerToolAttribute>()!.OutputSchemaType
             .Should().Be(typeof(CheckResourcesResult));
+        foreach (var method in methods)
+        {
+            method.GetCustomAttribute<ToolAnnotationAttribute>()
+                .Should().Match<ToolAnnotationAttribute>(annotation =>
+                    annotation.ReadOnlyHint
+                    && annotation.IdempotentHint
+                    && !annotation.DestructiveHint);
+        }
     }
 }
 
