@@ -470,6 +470,8 @@ public sealed class ReleasePackageGateTests
         startInfo.ArgumentList.Add(SdkVersion);
         startInfo.ArgumentList.Add("-ToolRuntimeIdentifiers");
         startInfo.ArgumentList.Add(RuntimeIdentifiers);
+        startInfo.Environment.Remove("GITHUB_SERVER_URL");
+        startInfo.Environment.Remove("GITHUB_REPOSITORY");
         if (sourceLinkRepositoryUrl is not null)
         {
             startInfo.ArgumentList.Add("-SourceLinkRepositoryUrl");
