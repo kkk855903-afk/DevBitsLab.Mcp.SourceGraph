@@ -49,7 +49,32 @@ public sealed record Scope(
     /// on-disk shape so the follow-up doesn't need to retouch the loader.
     /// </summary>
     public ScopeEnrichmentConfig? Enrichment { get; init; }
+
+    /// <summary>
+    /// Optional native-interop indexing configuration. A scope has one explicit ABI target and
+    /// one or more translation units so managed/native matching never depends on host-machine
+    /// defaults.
+    /// </summary>
+    public ScopeInteropConfig? Interop { get; init; }
 }
+
+/// <summary>
+/// Explicit ABI target plus the ordered native translation units indexed for one scope.
+/// Translation-unit order is configuration-significant and is preserved during round trips.
+/// </summary>
+public sealed record ScopeInteropConfig(
+    InteropTarget Target,
+    IReadOnlyList<InteropTranslationUnitConfig> TranslationUnits);
+
+/// <summary>
+/// One native translation unit and the exact compiler arguments used to parse it. Paths are
+/// repository-relative and validated by the scope configuration loader.
+/// </summary>
+public sealed record InteropTranslationUnitConfig(
+    string Path,
+    string Library,
+    IReadOnlyList<string> Arguments,
+    string? BinaryPath);
 
 /// <summary>
 /// Optional per-scope enrichment configuration. Currently carries one nested <see cref="Lsp"/>

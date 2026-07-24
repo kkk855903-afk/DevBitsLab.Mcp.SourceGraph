@@ -8,9 +8,10 @@ namespace DevBitsLab.Mcp.SourceGraph.Server.Scoping;
 /// Used by <c>LiveIndexService</c> to route a single config save into the four delta kinds it
 /// reacts to (add / remove / modify / default-scope) plus a separate flag for plugin changes.
 ///
-/// Equality between two scopes is structural over <c>(Id, ProjectSet, Isolated)</c>. <c>Root</c>
-/// and <c>LastIndexedAt</c> are deliberately ignored: <c>Root</c> is a process-wide constant and
-/// <c>LastIndexedAt</c> is a runtime artefact that's never authored in <c>.sourcegraph.json</c>.
+/// Equality between two scopes is structural over the authored project-set, isolation, and
+/// interop configuration. <c>Root</c> and <c>LastIndexedAt</c> are deliberately ignored:
+/// <c>Root</c> is a process-wide constant and <c>LastIndexedAt</c> is a runtime artefact that's
+/// never authored in <c>.sourcegraph.json</c>.
 /// </summary>
 public static class ScopeDiff
 {
@@ -55,7 +56,8 @@ public static class ScopeDiff
     private static bool ScopesStructurallyEqual(Scope a, Scope b)
     {
         if (a.Isolated != b.Isolated) return false;
-        return ProjectSetsEqual(a.ProjectSet, b.ProjectSet);
+        return ProjectSetsEqual(a.ProjectSet, b.ProjectSet)
+               && InteropConfigsEqual(a.Interop, b.Interop);
     }
 
     private static bool ProjectSetsEqual(ScopeProjectSet a, ScopeProjectSet b)
@@ -69,6 +71,37 @@ public static class ScopeDiff
             (ScopeProjectSet.Paths x, ScopeProjectSet.Paths y) => ListsEqual(x.Globs, y.Globs),
             _ => false,
         };
+    }
+
+    private static bool InteropConfigsEqual(ScopeInteropConfig? a, ScopeInteropConfig? b)
+    {
+        if (a is null || b is null) return a is null && b is null;
+        if (!string.Equals(
+                a.Target.RuntimeIdentifier,
+                b.Target.RuntimeIdentifier,
+                StringComparison.Ordinal)
+            || a.Target.Architecture != b.Target.Architecture
+            || a.Target.CompilerAbi != b.Target.CompilerAbi
+            || a.Target.PointerSizeBytes != b.Target.PointerSizeBytes
+            || a.Target.DefaultPack != b.Target.DefaultPack
+            || a.TranslationUnits.Count != b.TranslationUnits.Count)
+        {
+            return false;
+        }
+
+        for (var i = 0; i < a.TranslationUnits.Count; i++)
+        {
+            var x = a.TranslationUnits[i];
+            var y = b.TranslationUnits[i];
+            if (!string.Equals(x.Path, y.Path, StringComparison.Ordinal)
+                || !string.Equals(x.Library, y.Library, StringComparison.Ordinal)
+                || !string.Equals(x.BinaryPath, y.BinaryPath, StringComparison.Ordinal)
+                || !ListsEqual(x.Arguments, y.Arguments))
+            {
+                return false;
+            }
+        }
+        return true;
     }
 
     private static bool PluginsStructurallyEqual(IReadOnlyList<PluginRef> a, IReadOnlyList<PluginRef> b)

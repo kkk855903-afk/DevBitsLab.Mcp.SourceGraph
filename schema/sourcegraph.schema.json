@@ -64,6 +64,10 @@
           "type": "boolean",
           "default": false,
           "description": "When true, this scope is excluded from `scope = \"*\"` fan-out. Use for vendored or generated code that shouldn't pollute references on production symbols."
+        },
+        "interop": {
+          "$ref": "#/$defs/interop",
+          "description": "Explicit native-interop target and translation units for this scope."
         }
       },
       "oneOf": [
@@ -73,6 +77,89 @@
         { "required": ["include"] }
       ],
       "description": "A scope must declare exactly one of `solutions`, `projects`, `paths`, or `include`."
+    },
+    "interop": {
+      "type": "object",
+      "required": ["target", "translation_units"],
+      "additionalProperties": false,
+      "properties": {
+        "target": { "$ref": "#/$defs/interopTarget" },
+        "translation_units": {
+          "type": "array",
+          "minItems": 1,
+          "description": "Ordered native translation units and the exact compiler arguments used to parse them.",
+          "items": { "$ref": "#/$defs/interopTranslationUnit" }
+        }
+      }
+    },
+    "interopTarget": {
+      "type": "object",
+      "required": [
+        "runtime_identifier",
+        "architecture",
+        "compiler_abi",
+        "pointer_size_bytes",
+        "default_pack"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "runtime_identifier": {
+          "type": "string",
+          "pattern": ".*\\S.*",
+          "description": "Runtime identifier for the ABI target, for example `win-x64`."
+        },
+        "architecture": {
+          "type": "string",
+          "enum": ["x86", "x64", "arm64"]
+        },
+        "compiler_abi": {
+          "type": "string",
+          "enum": ["msvc", "itanium"]
+        },
+        "pointer_size_bytes": {
+          "type": "integer",
+          "enum": [4, 8]
+        },
+        "default_pack": {
+          "type": "integer",
+          "enum": [1, 2, 4, 8, 16, 32, 64, 128]
+        }
+      }
+    },
+    "interopTranslationUnit": {
+      "type": "object",
+      "required": ["path", "library", "arguments"],
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "$ref": "#/$defs/repoRelativePath",
+          "description": "Repository-relative path to the native translation unit."
+        },
+        "library": {
+          "type": "string",
+          "pattern": ".*\\S.*",
+          "description": "Native library identity associated with exports from this translation unit."
+        },
+        "arguments": {
+          "type": "array",
+          "minItems": 1,
+          "description": "Exact compiler arguments used to parse this translation unit.",
+          "items": {
+            "type": "string",
+            "pattern": ".*\\S.*"
+          }
+        },
+        "binary_path": {
+          "$ref": "#/$defs/repoRelativePath",
+          "description": "Optional repository-relative native binary used to verify export identity."
+        }
+      }
+    },
+    "repoRelativePath": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?![A-Za-z]:)(?![\\\\/])(?!.*(?:^|[\\\\/])\\.\\.(?:[\\\\/]|$)).*\\S.*$",
+      "description": "A non-empty repository-relative path without parent-directory (`..`) segments."
     },
     "plugin": {
       "type": "object",

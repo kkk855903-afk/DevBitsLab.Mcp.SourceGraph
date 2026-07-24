@@ -157,6 +157,12 @@ public static class ScopeConfigLoader
                 enrichment = ParseEnrichment(entry.Name, entry.Enrichment);
             }
 
+            ScopeInteropConfig? interop = null;
+            if (entry.Interop is not null)
+            {
+                interop = ParseInterop(entry.Name, entry.Interop);
+            }
+
             scopes.Add(new Scope(
                 Id: entry.Name,
                 Name: entry.Name,
@@ -167,6 +173,7 @@ public static class ScopeConfigLoader
             {
                 Language = entry.Language,
                 Enrichment = enrichment,
+                Interop = interop,
             });
         }
 
@@ -216,6 +223,153 @@ public static class ScopeConfigLoader
         // Trim the command to defend against trailing-newline-from-yaml-paste shapes; args
         // are passed to the process verbatim so we don't trim them.
         return new ScopeEnrichmentConfig(new LspEnrichmentConfig(dto.Lsp.Command.Trim(), args));
+    }
+
+    private static ScopeInteropConfig ParseInterop(string scopeName, ScopeInteropJson dto)
+    {
+        RejectUnknownKeys(scopeName, "interop", dto.Extra);
+        if (dto.Target is null)
+        {
+            throw new ScopeConfigException(
+                $"{FileName} scope `{scopeName}`: `interop.target` is required.");
+        }
+        RejectUnknownKeys(scopeName, "interop.target", dto.Target.Extra);
+
+        var architecture = dto.Target.Architecture switch
+        {
+            "x86" => InteropArchitecture.X86,
+            "x64" => InteropArchitecture.X64,
+            "arm64" => InteropArchitecture.Arm64,
+            _ => throw new ScopeConfigException(
+                $"{FileName} scope `{scopeName}`: `interop.target.architecture` must be one of `x86`, `x64`, or `arm64`."),
+        };
+        var compilerAbi = dto.Target.CompilerAbi switch
+        {
+            "msvc" => InteropCompilerAbi.Msvc,
+            "itanium" => InteropCompilerAbi.Itanium,
+            _ => throw new ScopeConfigException(
+                $"{FileName} scope `{scopeName}`: `interop.target.compiler_abi` must be one of `msvc` or `itanium`."),
+        };
+
+        if (dto.Target.PointerSizeBytes is null)
+        {
+            throw new ScopeConfigException(
+                $"{FileName} scope `{scopeName}`: `interop.target.pointer_size_bytes` is required.");
+        }
+        if (dto.Target.DefaultPack is null)
+        {
+            throw new ScopeConfigException(
+                $"{FileName} scope `{scopeName}`: `interop.target.default_pack` is required.");
+        }
+        var expectedPointerSize = architecture == InteropArchitecture.X86 ? 4 : 8;
+        if (dto.Target.PointerSizeBytes.Value != expectedPointerSize)
+        {
+            throw new ScopeConfigException(
+                $"{FileName} scope `{scopeName}`: `interop.target.pointer_size_bytes` must be "
+                + $"{expectedPointerSize} for architecture `{dto.Target.Architecture}`.");
+        }
+
+        InteropTarget target;
+        try
+        {
+            target = new InteropTarget(
+                dto.Target.RuntimeIdentifier ?? "",
+                architecture,
+                compilerAbi,
+                dto.Target.PointerSizeBytes.Value,
+                dto.Target.DefaultPack.Value);
+        }
+        catch (ArgumentException ex)
+        {
+            throw new ScopeConfigException(
+                $"{FileName} scope `{scopeName}` has an invalid `interop.target`: {ex.Message}",
+                ex);
+        }
+
+        if (dto.TranslationUnits is not { Count: > 0 })
+        {
+            throw new ScopeConfigException(
+                $"{FileName} scope `{scopeName}`: `interop.translation_units` must contain at least one entry.");
+        }
+
+        var translationUnits = new List<InteropTranslationUnitConfig>(dto.TranslationUnits.Count);
+        var translationUnitPaths = new HashSet<string>(
+            OperatingSystem.IsWindows()
+                ? StringComparer.OrdinalIgnoreCase
+                : StringComparer.Ordinal);
+        for (var i = 0; i < dto.TranslationUnits.Count; i++)
+        {
+            var translationUnit = dto.TranslationUnits[i];
+            var prefix = $"scope `{scopeName}` `interop.translation_units[{i}]`";
+            RejectUnknownKeys(scopeName, $"interop.translation_units[{i}]", translationUnit.Extra);
+            ValidateRepoRelativePath(translationUnit.Path, $"{prefix}.path");
+            var normalizedPath = translationUnit.Path!.Replace('\\', '/');
+            if (!translationUnitPaths.Add(normalizedPath))
+            {
+                throw new ScopeConfigException(
+                    $"{FileName} {prefix}.path duplicates translation unit `{normalizedPath}`.");
+            }
+            if (string.IsNullOrWhiteSpace(translationUnit.Library))
+            {
+                throw new ScopeConfigException(
+                    $"{FileName} {prefix}.library must be non-empty.");
+            }
+            if (translationUnit.Arguments is not { Count: > 0 })
+            {
+                throw new ScopeConfigException(
+                    $"{FileName} {prefix}.arguments must contain at least one compiler argument.");
+            }
+            for (var argumentIndex = 0; argumentIndex < translationUnit.Arguments.Count; argumentIndex++)
+            {
+                if (string.IsNullOrWhiteSpace(translationUnit.Arguments[argumentIndex]))
+                {
+                    throw new ScopeConfigException(
+                        $"{FileName} {prefix}.arguments[{argumentIndex}] must be non-empty.");
+                }
+            }
+            if (translationUnit.BinaryPath is not null)
+            {
+                ValidateRepoRelativePath(translationUnit.BinaryPath, $"{prefix}.binary_path");
+            }
+
+            translationUnits.Add(new InteropTranslationUnitConfig(
+                normalizedPath,
+                translationUnit.Library!,
+                translationUnit.Arguments,
+                translationUnit.BinaryPath));
+        }
+
+        return new ScopeInteropConfig(target, translationUnits);
+    }
+
+    private static void RejectUnknownKeys(
+        string scopeName,
+        string block,
+        IReadOnlyDictionary<string, JsonElement>? extra)
+    {
+        if (extra is not { Count: > 0 }) return;
+        throw new ScopeConfigException(
+            $"{FileName} scope `{scopeName}`: unknown key `{extra.Keys.First()}` in `{block}` block.");
+    }
+
+    private static void ValidateRepoRelativePath(string? path, string field)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            throw new ScopeConfigException($"{FileName} {field} must be a non-empty repo-relative path.");
+        }
+        if (!string.Equals(path, path.Trim(), StringComparison.Ordinal))
+        {
+            throw new ScopeConfigException(
+                $"{FileName} {field} must not have leading or trailing whitespace.");
+        }
+        if (Path.IsPathRooted(path)
+            || path.Split(['/', '\\'], StringSplitOptions.RemoveEmptyEntries)
+                .Any(segment => string.Equals(segment, "..", StringComparison.Ordinal)))
+        {
+            throw new ScopeConfigException(
+                $"{FileName} {field} must be repo-relative and must not contain `..` segments.");
+        }
     }
 
     /// <summary>
@@ -305,6 +459,43 @@ public static class ScopeConfigLoader
                         },
                     }
                     : null,
+                Interop = s.Interop is { } interop
+                    ? new ScopeInteropJson
+                    {
+                        Target = new InteropTargetJson
+                        {
+                            RuntimeIdentifier = interop.Target.RuntimeIdentifier,
+                            Architecture = interop.Target.Architecture switch
+                            {
+                                InteropArchitecture.X86 => "x86",
+                                InteropArchitecture.X64 => "x64",
+                                InteropArchitecture.Arm64 => "arm64",
+                                _ => throw new ArgumentOutOfRangeException(
+                                    nameof(interop.Target.Architecture),
+                                    interop.Target.Architecture,
+                                    "Unknown interop architecture."),
+                            },
+                            CompilerAbi = interop.Target.CompilerAbi switch
+                            {
+                                InteropCompilerAbi.Msvc => "msvc",
+                                InteropCompilerAbi.Itanium => "itanium",
+                                _ => throw new ArgumentOutOfRangeException(
+                                    nameof(interop.Target.CompilerAbi),
+                                    interop.Target.CompilerAbi,
+                                    "Unknown interop compiler ABI."),
+                            },
+                            PointerSizeBytes = interop.Target.PointerSizeBytes,
+                            DefaultPack = interop.Target.DefaultPack,
+                        },
+                        TranslationUnits = interop.TranslationUnits.Select(unit => new InteropTranslationUnitJson
+                        {
+                            Path = unit.Path,
+                            Library = unit.Library,
+                            Arguments = unit.Arguments,
+                            BinaryPath = unit.BinaryPath,
+                        }).ToList(),
+                    }
+                    : null,
             }).ToList(),
             DefaultScope = config.DefaultScope,
             Plugins = config.Plugins.Count > 0
@@ -376,6 +567,33 @@ internal sealed record ScopeEntryJson
     [JsonPropertyName("isolated")] public bool? Isolated { get; init; }
     [JsonPropertyName("language")] public string? Language { get; init; }
     [JsonPropertyName("enrichment")] public ScopeEnrichmentJson? Enrichment { get; init; }
+    [JsonPropertyName("interop")] public ScopeInteropJson? Interop { get; init; }
+}
+
+internal sealed record ScopeInteropJson
+{
+    [JsonPropertyName("target")] public InteropTargetJson? Target { get; init; }
+    [JsonPropertyName("translation_units")] public IReadOnlyList<InteropTranslationUnitJson>? TranslationUnits { get; init; }
+    [JsonExtensionData] public Dictionary<string, JsonElement>? Extra { get; init; }
+}
+
+internal sealed record InteropTargetJson
+{
+    [JsonPropertyName("runtime_identifier")] public string? RuntimeIdentifier { get; init; }
+    [JsonPropertyName("architecture")] public string? Architecture { get; init; }
+    [JsonPropertyName("compiler_abi")] public string? CompilerAbi { get; init; }
+    [JsonPropertyName("pointer_size_bytes")] public int? PointerSizeBytes { get; init; }
+    [JsonPropertyName("default_pack")] public int? DefaultPack { get; init; }
+    [JsonExtensionData] public Dictionary<string, JsonElement>? Extra { get; init; }
+}
+
+internal sealed record InteropTranslationUnitJson
+{
+    [JsonPropertyName("path")] public string? Path { get; init; }
+    [JsonPropertyName("library")] public string? Library { get; init; }
+    [JsonPropertyName("arguments")] public IReadOnlyList<string>? Arguments { get; init; }
+    [JsonPropertyName("binary_path")] public string? BinaryPath { get; init; }
+    [JsonExtensionData] public Dictionary<string, JsonElement>? Extra { get; init; }
 }
 
 /// <summary>

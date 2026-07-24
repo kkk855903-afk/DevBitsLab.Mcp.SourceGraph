@@ -24,6 +24,23 @@ public sealed class ScopeDiffTests
             Isolated: false,
             LastIndexedAt: DateTimeOffset.MinValue);
 
+    private static Scope InteropScope(
+        InteropTarget? target = null,
+        IReadOnlyList<InteropTranslationUnitConfig>? translationUnits = null) =>
+        SolutionsScope("foo", "foo.sln") with
+        {
+            Interop = new ScopeInteropConfig(
+                target ?? InteropTarget.WindowsX64Msvc,
+                translationUnits ??
+                [
+                    new InteropTranslationUnitConfig(
+                        "native/interop.cpp",
+                        "medalgo",
+                        ["-std=c++20"],
+                        "artifacts/medalgo.dll"),
+                ]),
+        };
+
     [Fact]
     public void NoChange_returnsEmptyDiff()
     {
@@ -160,6 +177,88 @@ public sealed class ScopeDiffTests
     }
 
     [Fact]
+    public void EquivalentInteropConfiguration_isNotModified()
+    {
+        var oldScope = InteropScope();
+        var equivalent = InteropScope(
+            new InteropTarget("win-x64", InteropArchitecture.X64, InteropCompilerAbi.Msvc, 8, 8),
+            [
+                new InteropTranslationUnitConfig(
+                    "native/interop.cpp",
+                    "medalgo",
+                    ["-std=c++20"],
+                    "artifacts/medalgo.dll"),
+            ]);
+
+        ComputeScopeOnlyDiff(oldScope, equivalent).Modified.Should().BeEmpty();
+    }
+
+    [Fact]
+    public void AnyInteropTargetOrTranslationUnitChange_isModified()
+    {
+        var oldScope = InteropScope();
+        var changedScopes = new[]
+        {
+            InteropScope(new InteropTarget("win-x64-v2", InteropArchitecture.X64, InteropCompilerAbi.Msvc, 8, 8)),
+            InteropScope(new InteropTarget("win-x64", InteropArchitecture.X86, InteropCompilerAbi.Msvc, 8, 8)),
+            InteropScope(new InteropTarget("win-x64", InteropArchitecture.X64, InteropCompilerAbi.Itanium, 8, 8)),
+            InteropScope(new InteropTarget("win-x64", InteropArchitecture.X64, InteropCompilerAbi.Msvc, 4, 8)),
+            InteropScope(new InteropTarget("win-x64", InteropArchitecture.X64, InteropCompilerAbi.Msvc, 8, 16)),
+            InteropScope(translationUnits:
+            [
+                new InteropTranslationUnitConfig(
+                    "native/changed.cpp", "medalgo", ["-std=c++20"], "artifacts/medalgo.dll"),
+            ]),
+            InteropScope(translationUnits:
+            [
+                new InteropTranslationUnitConfig(
+                    "native/interop.cpp", "other", ["-std=c++20"], "artifacts/medalgo.dll"),
+            ]),
+            InteropScope(translationUnits:
+            [
+                new InteropTranslationUnitConfig(
+                    "native/interop.cpp", "medalgo", ["-std=c++23"], "artifacts/medalgo.dll"),
+            ]),
+            InteropScope(translationUnits:
+            [
+                new InteropTranslationUnitConfig(
+                    "native/interop.cpp", "medalgo", ["-std=c++20"], "artifacts/other.dll"),
+            ]),
+            InteropScope(translationUnits:
+            [
+                new InteropTranslationUnitConfig(
+                    "native/interop.cpp", "medalgo", ["-std=c++20"], "artifacts/medalgo.dll"),
+                new InteropTranslationUnitConfig(
+                    "native/extra.cpp", "medalgo", ["-std=c++20"], null),
+            ]),
+        };
+
+        foreach (var changedScope in changedScopes)
+        {
+            ComputeScopeOnlyDiff(oldScope, changedScope).Modified.Should().ContainSingle();
+        }
+    }
+
+    [Fact]
+    public void TranslationUnitAndArgumentOrder_areConfigurationSignificant()
+    {
+        var first = new InteropTranslationUnitConfig(
+            "native/first.cpp", "medalgo", ["-Iinclude", "-std=c++20"], null);
+        var second = new InteropTranslationUnitConfig(
+            "native/second.cpp", "medalgo", ["-std=c++20"], null);
+        var oldScope = InteropScope(translationUnits: [first, second]);
+        var unitsReordered = InteropScope(translationUnits: [second, first]);
+        var argumentsReordered = InteropScope(translationUnits:
+        [
+            first with { Arguments = ["-std=c++20", "-Iinclude"] },
+            second,
+        ]);
+
+        ComputeScopeOnlyDiff(oldScope, unitsReordered).Modified.Should().ContainSingle();
+        ComputeScopeOnlyDiff(oldScope, argumentsReordered).Modified.Should().ContainSingle();
+    }
+
+    [Fact]
     public void Summary_describesDeltas()
     {
         var foo = SolutionsScope("foo", "foo.sln");
@@ -175,4 +274,13 @@ public sealed class ScopeDiffTests
         summary.Should().Contain("-foo");
         summary.Should().Contain("default-scope");
     }
+
+    private static ScopeDiffResult ComputeScopeOnlyDiff(Scope oldScope, Scope newScope) =>
+        ScopeDiff.Compute(
+            currentScopes: [oldScope],
+            newScopes: [newScope],
+            currentDefaultScope: null,
+            newDefaultScope: null,
+            currentPlugins: Array.Empty<PluginRef>(),
+            newPlugins: Array.Empty<PluginRef>());
 }
