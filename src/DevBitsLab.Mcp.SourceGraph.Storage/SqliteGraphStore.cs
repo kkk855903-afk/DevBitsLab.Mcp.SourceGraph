@@ -8,7 +8,7 @@ using Microsoft.Extensions.Logging.Abstractions;
 
 namespace DevBitsLab.Mcp.SourceGraph.Storage;
 
-public sealed class SqliteGraphStore : IGraphStore
+public sealed partial class SqliteGraphStore : IGraphStore
 {
     private readonly SqliteConnection _connection;
     private readonly ILogger<SqliteGraphStore> _logger;

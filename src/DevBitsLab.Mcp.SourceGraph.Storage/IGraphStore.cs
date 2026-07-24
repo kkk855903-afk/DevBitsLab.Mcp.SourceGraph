@@ -43,6 +43,23 @@ public interface IGraphStore : IAsyncDisposable
         throw new NotSupportedException(
             "This graph-store implementation predates atomic producer edge-evidence replacement.");
 
+    /// <summary>
+    /// Atomically replaces a file-owned derived projection consisting of selected annotation
+    /// flavors and edge evidence from one exact producer. Candidate annotations and edge
+    /// endpoints are fully resolved before prior projection rows are changed. Empty fact
+    /// collections are a successful precise cleanup; annotations of other flavors and edge
+    /// evidence from other producers are preserved.
+    /// </summary>
+    Task ReplaceFileDerivedProjectionAsync(
+        string producingFilePath,
+        string producer,
+        IReadOnlyCollection<string> annotationFlavors,
+        IReadOnlyList<FileAnnotationFact> annotations,
+        IReadOnlyList<ProducerEdgeEvidenceFact> edges,
+        CancellationToken ct = default) =>
+        throw new NotSupportedException(
+            "This graph-store implementation predates atomic file-derived projection replacement.");
+
     /// <summary>Delete every symbol declared in <paramref name="fileId"/> whose canonical key is not in
     /// <paramref name="keysToKeep"/>, plus all refs/edges that touch those removed symbols.</summary>
     Task DeleteSymbolsForFileNotInAsync(long fileId, IReadOnlyCollection<string> keysToKeep, CancellationToken ct = default);
