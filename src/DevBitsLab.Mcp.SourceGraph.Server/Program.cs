@@ -6,6 +6,7 @@ using DevBitsLab.Mcp.SourceGraph.Indexing;
 using DevBitsLab.Mcp.SourceGraph.Sdk;
 using DevBitsLab.Mcp.SourceGraph.Server;
 using DevBitsLab.Mcp.SourceGraph.Server.Cli;
+using DevBitsLab.Mcp.SourceGraph.Server.Interop;
 using DevBitsLab.Mcp.SourceGraph.Server.Observability;
 using DevBitsLab.Mcp.SourceGraph.Server.Plugins;
 using DevBitsLab.Mcp.SourceGraph.Server.Scoping;
@@ -15,6 +16,14 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using ModelContextProtocol.Server;
+
+if (NativeWorkerEntrypoint.IsInvocation(args))
+{
+    return await NativeWorkerEntrypoint.RunAsync(
+        Console.OpenStandardInput(),
+        Console.OpenStandardOutput(),
+        Console.Error).ConfigureAwait(false);
+}
 
 CommandLine cli;
 try
