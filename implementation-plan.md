@@ -170,7 +170,7 @@ linker、native snapshot publication、Interop analysis 和 execution query。�
 dotnet restore DevBitsLab.Mcp.SourceGraph.slnx --locked-mode
 dotnet build DevBitsLab.Mcp.SourceGraph.slnx -c Release --no-restore
 dotnet test DevBitsLab.Mcp.SourceGraph.slnx -c Release --no-build
-dotnet list DevBitsLab.Mcp.SourceGraph.slnx package --vulnerable --include-transitive
+dotnet package list --project DevBitsLab.Mcp.SourceGraph.slnx --vulnerable --include-transitive --format json --output-version 1 --no-restore
 dotnet pack src/DevBitsLab.Mcp.SourceGraph.Server/DevBitsLab.Mcp.SourceGraph.Server.csproj -c Release --no-build
 dotnet pack src/DevBitsLab.Mcp.SourceGraph.Sdk/DevBitsLab.Mcp.SourceGraph.Sdk.csproj -c Release --no-build
 ```

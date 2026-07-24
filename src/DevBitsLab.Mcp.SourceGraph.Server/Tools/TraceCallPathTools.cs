@@ -87,7 +87,7 @@ public static class TraceCallPathTools
         [Description("Destination symbol name, FQN, or exact canonical key. May be omitted only with profile=execution and an exact canonical `from`.")]
         string? to = null,
         [Description("Kebab-case edge relation to traverse (default calls)")] string? kind = null,
-        [Description("Optional traversal profile. Use execution for the cross-domain execution relation whitelist; omit for one relation.")]
+        [Description("Optional traversal profile. Use execution for the ordered cross-domain execution state machine; omit for one relation.")]
         string? profile = null,
         [Description("Maximum hops per path, 1-12 (default 8)")] int maxDepth = 8,
         [Description("Maximum returned paths, 1-25 (default 10)")] int maxPaths = 10,
@@ -176,7 +176,7 @@ public static class TraceCallPathTools
         if (executionProfile && !string.IsNullOrWhiteSpace(kind))
         {
             return DiagnosticResult.Error(
-                "trace_call_path does not accept `kind` together with `profile=execution`; the profile uses a fixed relation whitelist.");
+                "trace_call_path does not accept `kind` together with `profile=execution`; the profile uses an ordered relation state machine.");
         }
 
         var edgeKind = executionProfile
