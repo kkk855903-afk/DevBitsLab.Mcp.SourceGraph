@@ -26,11 +26,16 @@ internal static class ManagedInteropExtractor
     public static ManagedImport? TryExtract(
         IMethodSymbol method,
         InteropTarget target,
-        long producingFileId)
+        long producingFileId,
+        string? producingFilePath = null)
     {
         ArgumentNullException.ThrowIfNull(method);
         ArgumentNullException.ThrowIfNull(target);
         ArgumentOutOfRangeException.ThrowIfLessThan(producingFileId, 1);
+        if (producingFilePath is not null)
+        {
+            ArgumentException.ThrowIfNullOrWhiteSpace(producingFilePath);
+        }
 
         var imports = method.GetAttributes()
             .Where(attribute =>
@@ -53,6 +58,9 @@ internal static class ManagedInteropExtractor
             ToSourceLocation(import.ApplicationSyntaxReference?.GetSyntax().GetLocation())
             ?? ToSourceLocation(method.Locations.FirstOrDefault(location => location.IsInSource));
         if (declarationLocation is null) return null;
+        declarationLocation = RebindPath(
+            declarationLocation,
+            producingFilePath);
 
         var characterSet = kind == ManagedImportKind.DllImport
             ? ParseDllImportCharacterSet(import, target)
@@ -66,7 +74,8 @@ internal static class ManagedInteropExtractor
                 parameter,
                 target,
                 characterSet,
-                fallbackLocation))
+                fallbackLocation,
+                producingFilePath))
             .ToArray();
         var returnType = MapType(
             method.ReturnType,
@@ -103,7 +112,8 @@ internal static class ManagedInteropExtractor
         IParameterSymbol parameter,
         InteropTarget target,
         string? characterSet,
-        SourceLocation fallbackLocation)
+        SourceLocation fallbackLocation,
+        string? producingFilePath)
     {
         var attributes = parameter.GetAttributes();
         var type = MapType(
@@ -134,6 +144,7 @@ internal static class ManagedInteropExtractor
         var location =
             ToSourceLocation(parameter.Locations.FirstOrDefault(item => item.IsInSource))
             ?? fallbackLocation;
+        location = RebindPath(location, producingFilePath);
         return new AbiParameter(
             parameter.Ordinal,
             parameter.Name,
@@ -141,6 +152,13 @@ internal static class ManagedInteropExtractor
             direction,
             location);
     }
+
+    private static SourceLocation RebindPath(
+        SourceLocation location,
+        string? producingFilePath) =>
+        producingFilePath is null
+            ? location
+            : location with { FilePath = producingFilePath };
 
     internal static AbiTypeRef MapType(
         ITypeSymbol type,

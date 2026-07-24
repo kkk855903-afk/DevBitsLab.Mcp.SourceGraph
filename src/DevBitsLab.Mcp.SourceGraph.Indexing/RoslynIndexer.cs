@@ -50,13 +50,27 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         OperatingSystem.IsWindows()
             ? StringComparison.OrdinalIgnoreCase
             : StringComparison.Ordinal;
+    private static readonly string[] _analysisEdgeProducer =
+    [
+        InteropFactProducers.Analysis,
+    ];
     private const string ManagedInteropAnnotationName = "ManagedImportV1";
     private const string ManagedInteropAnnotationFullName =
         "MedInterop.ManagedImport.v1";
+    private const string ManagedCallbackUsageAnnotationName =
+        "ManagedCallbackUsageV1";
+    private const string ManagedCallbackUsageAnnotationFullName =
+        "MedInterop.ManagedCallbackUsage.v1";
+    private const string ManagedReturnReleaseAnnotationName =
+        "ManagedReturnReleaseV1";
+    private const string ManagedReturnReleaseAnnotationFullName =
+        "MedInterop.ManagedReturnRelease.v1";
     private const string ManagedAbiRecordAnnotationName = "InteropFact";
     private const string ManagedAbiRecordAnnotationFullName =
         "MedInterop.AbiRecord";
     private const int MaximumManagedAbiRecordsPerFile = 4096;
+    private const int MaximumManagedInteropUsagesPerFile = 4096;
+    private const int MaximumManagedImportFanoutProbeRows = 50_000;
     /// <inheritdoc />
     IReadOnlyCollection<string> ILanguageIndexer.FileExtensions => _fileExtensions;
 
@@ -122,7 +136,8 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         Action<MSBuildWorkspace>? WorkspaceDisposed = null,
         Func<Task>? DisposeAsyncEntered = null,
         Func<SourceGeneratedDocument, string>? GeneratedOwnerIdentity = null,
-        Func<SourceGeneratedDocument, string>? GeneratedDisplayPath = null);
+        Func<SourceGeneratedDocument, string>? GeneratedDisplayPath = null,
+        Action<Document>? BeforePassOneWalk = null);
 
     public RoslynIndexer(
         IGraphStore store,
@@ -553,13 +568,159 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                 _requiresStructuralReload = true;
             }
 
-            return await IndexCoreAsync(
+            IReadOnlySet<string>? generatedPathsForReconcile = null;
+            var generatedReconcileUniverseComplete = false;
+            var hasStaleGeneratedManagedImport = false;
+            if (_interopTarget is not null
+                && await HasStoredGeneratedManagedImportAsync(ct)
+                    .ConfigureAwait(false))
+            {
+                // A generator can stop emitting an import even though the touched physical path
+                // never owned that generated annotation. Discover the complete generated owner
+                // universe before deciding whether import-to-caller fanout is needed.
+                await ProbeProjectCompilationsAsync(
+                        solution.Projects.Where(project =>
+                            !projectsWithReadFailures.Contains(project.Id)),
+                        ct)
+                    .ConfigureAwait(false);
+                _probedFailedProjectIds.UnionWith(
+                    projectsWithReadFailures);
+                var generatedUniverse = await AllCSharpDocumentsAsync(
+                        solution,
+                        ct)
+                    .ConfigureAwait(false);
+                generatedPathsForReconcile =
+                    generatedUniverse.GeneratedPaths;
+                generatedReconcileUniverseComplete =
+                    generatedUniverse.IsComplete;
+                foreach (var failure in generatedUniverse.Failures)
+                {
+                    AddFileFailure(
+                        preIndexFailures,
+                        failure.Path,
+                        failure.Reason);
+                }
+                if (generatedUniverse.IsComplete)
+                {
+                    var currentGeneratedManagedImportPaths =
+                        await GetGeneratedManagedImportPathsAsync(
+                                generatedUniverse.Documents,
+                                ct)
+                            .ConfigureAwait(false);
+                    hasStaleGeneratedManagedImport =
+                        await HasStaleGeneratedManagedImportAsync(
+                                currentGeneratedManagedImportPaths,
+                                ct)
+                            .ConfigureAwait(false);
+                }
+                else
+                {
+                    _requiresStructuralReload = true;
+                }
+            }
+
+            var refreshAllManagedInteropUsages =
+                _interopTarget is not null
+                && (hasStaleGeneratedManagedImport
+                    || await HasStoredManagedImportInPathsAsync(
+                        pathSet,
+                        ct)
+                    .ConfigureAwait(false)
+                    || await DocumentsContainManagedImportAsync(
+                            docs,
+                            ct)
+                        .ConfigureAwait(false));
+            if (refreshAllManagedInteropUsages)
+            {
+                // A declaration change can add, remove, or retarget an import while its callers
+                // remain byte-for-byte unchanged. Re-evaluate every C# usage in the same
+                // successful pass so caller-owned lifetime/ownership facts cannot become
+                // permanent orphans. This fanout is deliberately conservative; it runs only
+                // when the touched inputs currently or previously own a managed import.
+                snapshotPreparation =
+                    await PrepareRegularDocumentSnapshotsAsync(
+                            solution,
+                            selectedPaths: null,
+                            incremental: true,
+                            ct)
+                        .ConfigureAwait(false);
+                solution = snapshotPreparation.Solution;
+                _sanitizedSolution = solution;
+                foreach (var failure in snapshotPreparation.Failures)
+                {
+                    AddFileFailure(
+                        preIndexFailures,
+                        failure.Path,
+                        failure.Reason);
+                }
+                if (snapshotPreparation.FailedProjectIds.Count > 0)
+                {
+                    _requiresStructuralReload = true;
+                }
+
+                await ProbeProjectCompilationsAsync(
+                        solution.Projects.Where(project =>
+                            !snapshotPreparation.FailedProjectIds.Contains(
+                                project.Id)),
+                        ct)
+                    .ConfigureAwait(false);
+                _probedFailedProjectIds.UnionWith(
+                    snapshotPreparation.FailedProjectIds);
+                var allDocuments = await AllCSharpDocumentsAsync(
+                        solution,
+                        ct)
+                    .ConfigureAwait(false);
+                docs = allDocuments.Documents.ToList();
+                generatedPathsForReconcile =
+                    allDocuments.GeneratedPaths;
+                generatedReconcileUniverseComplete =
+                    allDocuments.IsComplete;
+                foreach (var failure in allDocuments.Failures)
+                {
+                    AddFileFailure(
+                        preIndexFailures,
+                        failure.Path,
+                        failure.Reason);
+                }
+                if (!allDocuments.IsComplete)
+                {
+                    _requiresStructuralReload = true;
+                }
+            }
+
+            var result = await IndexCoreAsync(
                 docs,
                 fullReset: false,
                 preIndexFailures,
                 snapshotPreparation.Snapshots,
-                forceInteropProjectionRefresh: false,
+                forceInteropProjectionRefresh:
+                    refreshAllManagedInteropUsages,
                 ct).ConfigureAwait(false);
+            if (generatedPathsForReconcile is not null)
+            {
+                if (generatedReconcileUniverseComplete
+                    && result.FailedProjects.Count == 0
+                    && result.FailedFiles.Count == 0)
+                {
+                    await ReconcileGeneratedFilesAsync(
+                            generatedPathsForReconcile,
+                            ct)
+                        .ConfigureAwait(false);
+                }
+                else
+                {
+                    _requiresStructuralReload = true;
+                }
+            }
+            if (result.FailedProjects.Count > 0
+                || result.FailedFiles.Count > 0)
+            {
+                // Any incomplete incremental result must schedule a complete-universe retry.
+                // Otherwise LiveIndexService's managed interop completeness bit would remain
+                // false forever after a one-shot Pass 1/reconciliation/diagnostic failure.
+                _requiresStructuralReload = true;
+            }
+            return result;
         }
         finally
         {
@@ -634,6 +795,10 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
             await ReconcileGeneratedFilesAsync(
                 discovery.GeneratedPaths,
                 ct).ConfigureAwait(false);
+            result = result with
+            {
+                ReconciledCompleteUniverse = true,
+            };
         }
         else
         {
@@ -656,6 +821,8 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         foreach (var flavor in new[]
                  {
                      InteropAnnotationFlavors.ManagedImport,
+                     InteropAnnotationFlavors.ManagedCallbackUsage,
+                     InteropAnnotationFlavors.ManagedReturnRelease,
                      InteropAnnotationFlavors.AbiRecord,
                  })
         {
@@ -709,6 +876,418 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                     .ConfigureAwait(false);
             }
         }
+    }
+
+    private long? ResolveManagedImportFileId(
+        IMethodSymbol method,
+        IReadOnlyDictionary<SyntaxTree, long>? currentSyntaxTreeOwners = null)
+    {
+        foreach (var location in method.Locations.Where(item => item.IsInSource))
+        {
+            if (location.SourceTree is { } sourceTree
+                && currentSyntaxTreeOwners is not null
+                && currentSyntaxTreeOwners.TryGetValue(
+                    sourceTree,
+                    out var currentOwnerFileId))
+            {
+                return currentOwnerFileId;
+            }
+
+            var path = location.SourceTree?.FilePath;
+            if (string.IsNullOrWhiteSpace(path)) continue;
+            if (_fileIdByPath.TryGetValue(path, out var fileId))
+            {
+                return fileId;
+            }
+
+            try
+            {
+                var fullPath = Path.GetFullPath(path);
+                if (_fileIdByPath.TryGetValue(fullPath, out fileId))
+                {
+                    return fileId;
+                }
+            }
+            catch (Exception ex) when (
+                ex is ArgumentException
+                    or NotSupportedException
+                    or PathTooLongException)
+            {
+                // A malformed source location cannot own a trustworthy persisted fact.
+            }
+        }
+        return null;
+    }
+
+    private async Task<bool> HasStoredManagedImportInPathsAsync(
+        IReadOnlySet<string> paths,
+        CancellationToken ct)
+    {
+        long afterId = 0;
+        var rowsRead = 0;
+        const int pageSize = 1000;
+        while (rowsRead < MaximumManagedImportFanoutProbeRows)
+        {
+            ct.ThrowIfCancellationRequested();
+            var limit = Math.Min(
+                pageSize,
+                MaximumManagedImportFanoutProbeRows - rowsRead);
+            var page = await _store.ListAnnotationsByFlavorAsync(
+                    InteropAnnotationFlavors.ManagedImport,
+                    afterId,
+                    limit,
+                    ct)
+                .ConfigureAwait(false);
+            if (page.Count == 0)
+            {
+                return false;
+            }
+            foreach (var row in page)
+            {
+                rowsRead++;
+                afterId = row.AnnotationId;
+                if (paths.Contains(row.FilePath))
+                {
+                    return true;
+                }
+            }
+            if (page.Count < limit)
+            {
+                return false;
+            }
+        }
+
+        // An over-bound fact universe cannot prove that none of the remaining rows belongs to a
+        // touched file. Fan out conservatively instead of publishing stale caller facts.
+        var probe = await _store.ListAnnotationsByFlavorAsync(
+                InteropAnnotationFlavors.ManagedImport,
+                afterId,
+                limit: 1,
+                ct)
+            .ConfigureAwait(false);
+        return probe.Count > 0;
+    }
+
+    private async Task<bool> HasStoredGeneratedManagedImportAsync(
+        CancellationToken cancellationToken)
+    {
+        var generatedPaths = (await _store.ListGeneratedFilesAsync(
+                    int.MaxValue,
+                    cancellationToken)
+                .ConfigureAwait(false))
+            .Select(file => file.FilePath)
+            .ToHashSet(_pathComparer);
+        if (generatedPaths.Count == 0)
+        {
+            return false;
+        }
+        return await HasStoredManagedImportInPathsAsync(
+                generatedPaths,
+                cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    private async Task<bool> HasStaleGeneratedManagedImportAsync(
+        IReadOnlySet<string> currentGeneratedManagedImportPaths,
+        CancellationToken cancellationToken)
+    {
+        // A generated owner can disappear entirely or keep the same stable path while changing
+        // from an import declaration to ordinary generated code. Both transitions invalidate
+        // unchanged caller-owned usage facts.
+        var generatedPathsWithoutCurrentImport =
+            (await _store.ListGeneratedFilesAsync(
+                    int.MaxValue,
+                    cancellationToken)
+                .ConfigureAwait(false))
+            .Select(file => file.FilePath)
+            .Where(path => !currentGeneratedManagedImportPaths.Contains(path))
+            .ToHashSet(_pathComparer);
+        return generatedPathsWithoutCurrentImport.Count > 0
+            && await HasStoredManagedImportInPathsAsync(
+                    generatedPathsWithoutCurrentImport,
+                    cancellationToken)
+                .ConfigureAwait(false);
+    }
+
+    private async Task<IReadOnlySet<string>> GetGeneratedManagedImportPathsAsync(
+        IReadOnlyList<Document> documents,
+        CancellationToken ct)
+    {
+        var paths = new HashSet<string>(_pathComparer);
+        foreach (var document in documents.OfType<SourceGeneratedDocument>())
+        {
+            ct.ThrowIfCancellationRequested();
+            if (await DocumentContainsManagedImportAsync(document, ct)
+                    .ConfigureAwait(false))
+            {
+                paths.Add(GetGeneratedStoragePath(document));
+            }
+        }
+        return paths;
+    }
+
+    private async Task<bool> DocumentsContainManagedImportAsync(
+        IReadOnlyList<Document> documents,
+        CancellationToken ct)
+    {
+        if (_interopTarget is null)
+        {
+            return false;
+        }
+
+        foreach (var document in documents)
+        {
+            ct.ThrowIfCancellationRequested();
+            if (await DocumentContainsManagedImportAsync(document, ct)
+                    .ConfigureAwait(false))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private async Task<bool> DocumentContainsManagedImportAsync(
+        Document document,
+        CancellationToken ct)
+    {
+        var root = await document.GetSyntaxRootAsync(ct)
+            .ConfigureAwait(false);
+        var model = await document.GetSemanticModelAsync(ct)
+            .ConfigureAwait(false);
+        if (root is null || model is null)
+        {
+            return false;
+        }
+        foreach (var declaration in root.DescendantNodes()
+                     .OfType<MethodDeclarationSyntax>())
+        {
+            ct.ThrowIfCancellationRequested();
+            if (model.GetDeclaredSymbol(
+                    declaration,
+                    ct)
+                is not IMethodSymbol method)
+            {
+                continue;
+            }
+            if (ManagedInteropExtractor.TryExtract(
+                    method,
+                    _interopTarget!,
+                    producingFileId: 1)
+                is not null)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static void MergeManagedUsageProjection(
+        ManagedInteropUsageExtraction extraction,
+        IDictionary<string, FileAnnotationFact> annotationsByIdentity,
+        ref HashSet<string>? firstTargetFrameworkProjection)
+    {
+        var currentProjection =
+            new Dictionary<string, FileAnnotationFact>(
+                StringComparer.Ordinal);
+        foreach (var callback in extraction.CallbackUsages)
+        {
+            var payload =
+                InteropFactPayloadCodec.EncodeManagedCallbackUsage(callback);
+            var fact = new FileAnnotationFact(
+                callback.Usage.CallerSymbolCanonicalKey,
+                ManagedCallbackUsageAnnotationName,
+                ManagedCallbackUsageAnnotationFullName,
+                InteropAnnotationFlavors.ManagedCallbackUsage,
+                payload,
+                AttributeCanonicalKey: null);
+            currentProjection.TryAdd(fact.Flavor + "\0" + payload, fact);
+        }
+        foreach (var release in extraction.ReturnReleases)
+        {
+            var payload =
+                InteropFactPayloadCodec.EncodeManagedReturnRelease(release);
+            var fact = new FileAnnotationFact(
+                release.Release.CallerSymbolCanonicalKey,
+                ManagedReturnReleaseAnnotationName,
+                ManagedReturnReleaseAnnotationFullName,
+                InteropAnnotationFlavors.ManagedReturnRelease,
+                payload,
+                AttributeCanonicalKey: null);
+            currentProjection.TryAdd(fact.Flavor + "\0" + payload, fact);
+        }
+        if (currentProjection.Count > MaximumManagedInteropUsagesPerFile)
+        {
+            throw new InvalidOperationException(
+                "Managed interop usage count exceeds the "
+                + $"{MaximumManagedInteropUsagesPerFile}-item per-file limit.");
+        }
+
+        var currentIdentities = currentProjection.Keys.ToHashSet(
+            StringComparer.Ordinal);
+        if (firstTargetFrameworkProjection is null)
+        {
+            firstTargetFrameworkProjection = currentIdentities;
+            foreach (var pair in currentProjection)
+            {
+                annotationsByIdentity.Add(pair.Key, pair.Value);
+            }
+            return;
+        }
+        if (!firstTargetFrameworkProjection.SetEquals(currentIdentities))
+        {
+            throw new InvalidOperationException(
+                "Managed interop usages have conflicting "
+                + "target-framework projections.");
+        }
+    }
+
+    private async Task<IReadOnlyList<FileAnnotationFact>>
+        ExtractManagedUsageAnnotationsAsync(
+            long fileId,
+            string producingFilePath,
+            IReadOnlyList<Document> documents,
+            Func<IMethodSymbol, long?> importFileIdResolver,
+            CancellationToken cancellationToken)
+    {
+        var annotationsByIdentity =
+            new Dictionary<string, FileAnnotationFact>(
+                StringComparer.Ordinal);
+        HashSet<string>? firstTargetFrameworkProjection = null;
+        foreach (var document in documents)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var tree = await document.GetSyntaxTreeAsync(cancellationToken)
+                .ConfigureAwait(false);
+            var model = await document.GetSemanticModelAsync(
+                    cancellationToken)
+                .ConfigureAwait(false);
+            if (tree is null || model is null)
+            {
+                throw new InvalidOperationException(
+                    "Roslyn returned no syntax tree or semantic model "
+                    + "during managed interop usage refresh.");
+            }
+            var root = await tree.GetRootAsync(cancellationToken)
+                .ConfigureAwait(false);
+            var extraction = ManagedInteropUsageExtractor.Extract(
+                root,
+                model,
+                _interopTarget
+                    ?? throw new InvalidOperationException(
+                        "Managed interop usage refresh has no target."),
+                fileId,
+                producingFilePath,
+                importFileIdResolver,
+                ownerFileId => _storedPathByFileId.TryGetValue(
+                    ownerFileId,
+                    out var ownerPath)
+                    ? ownerPath
+                    : null,
+                cancellationToken);
+            MergeManagedUsageProjection(
+                extraction,
+                annotationsByIdentity,
+                ref firstTargetFrameworkProjection);
+        }
+
+        return annotationsByIdentity
+            .OrderBy(pair => pair.Key, StringComparer.Ordinal)
+            .Select(pair => pair.Value)
+            .ToArray();
+    }
+
+    private async Task<IReadOnlyList<FileFailure>>
+        RefreshUnchangedManagedInteropUsagesAsync(
+            IReadOnlyDictionary<
+                long,
+                (string Path, List<Document> Documents)> refreshes,
+            Func<IMethodSymbol, long?> importFileIdResolver,
+            CancellationToken cancellationToken)
+    {
+        if (refreshes.Count == 0)
+        {
+            return [];
+        }
+
+        var failures = new List<FileFailure>();
+        var projections =
+            new List<FileDerivedProjectionReplacement>(refreshes.Count);
+        foreach (var (fileId, refresh) in refreshes
+                     .OrderBy(pair => pair.Value.Path, _pathComparer)
+                     .ThenBy(pair => pair.Value.Path, StringComparer.Ordinal))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            try
+            {
+                var annotations =
+                    await ExtractManagedUsageAnnotationsAsync(
+                            fileId,
+                            refresh.Path,
+                            refresh.Documents,
+                            importFileIdResolver,
+                            cancellationToken)
+                        .ConfigureAwait(false);
+                var ownedKeys = (await _store.ListSymbolsInFileAsync(
+                            refresh.Path,
+                            cancellationToken)
+                        .ConfigureAwait(false))
+                    .Select(symbol => symbol.CanonicalKey)
+                    .OfType<string>()
+                    .ToHashSet(StringComparer.Ordinal);
+                projections.Add(new FileDerivedProjectionReplacement(
+                    refresh.Path,
+                    ManagedInteropUsageExtractor.Producer,
+                    [
+                        InteropAnnotationFlavors.ManagedCallbackUsage,
+                        InteropAnnotationFlavors.ManagedReturnRelease,
+                    ],
+                    annotations
+                        .Where(annotation =>
+                            ownedKeys.Contains(
+                                annotation.SymbolCanonicalKey))
+                        .ToArray(),
+                    Edges: []));
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                AddFileFailure(
+                    failures,
+                    refresh.Path,
+                    "managed interop usage refresh failed: "
+                    + FailureMessage.Truncate(ex.Message));
+            }
+        }
+
+        if (failures.Count > 0)
+        {
+            return failures;
+        }
+
+        try
+        {
+            await _store.ReplaceFileDerivedProjectionsAsync(
+                    projections,
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            AddFileFailure(
+                failures,
+                projections[0].ProducingFilePath,
+                "managed interop usage publication failed: "
+                + FailureMessage.Truncate(ex.Message));
+        }
+        return failures;
     }
 
     /// <summary>
@@ -1411,6 +1990,16 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         IReadOnlyList<FileFailure> Failures,
         IReadOnlySet<ProjectId> FailedProjectIds);
 
+    private Task ClearSourceFileOutgoingAsync(
+        long fileId,
+        CancellationToken cancellationToken) =>
+        _interopTarget is null
+            ? _store.ClearFileOutgoingAsync(fileId, cancellationToken)
+            : _store.ClearFileOutgoingAsync(
+                fileId,
+                _analysisEdgeProducer,
+                cancellationToken);
+
     /// <summary>
     /// Marks <paramref name="fileId"/> as requiring a durable Pass-2 retry, then best-effort
     /// clears its outgoing refs/edges. The marker is an empty content-hash blob, which can
@@ -1444,7 +2033,10 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
 
         try
         {
-            await _store.ClearFileOutgoingAsync(fileId, CancellationToken.None).ConfigureAwait(false);
+            await ClearSourceFileOutgoingAsync(
+                    fileId,
+                    CancellationToken.None)
+                .ConfigureAwait(false);
         }
         catch (Exception clearEx)
         {
@@ -1590,7 +2182,11 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         // linked-project iteration of the same path before reconciling.
         var changedFileIds = new HashSet<long>();
         var docsByChangedFile = new Dictionary<long, List<Document>>();
+        var unchangedManagedInteropRefreshes =
+            new Dictionary<long, (string Path, List<Document> Documents)>();
         var changedFileMeta = new Dictionary<long, (string Path, byte[] Sha, bool IsGenerated)>();
+        var fileIdBySyntaxTree = new Dictionary<SyntaxTree, long>(
+            ReferenceEqualityComparer.Instance);
         var symbolsIndexed = 0;
 
         var documentGroups = new List<(
@@ -1694,10 +2290,18 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                 _fileIdByPath[displayPath] = fileId;
             }
             _storedPathByFileId[fileId] = path;
+            foreach (var document in groupedDocuments)
+            {
+                var syntaxTree = await document.GetSyntaxTreeAsync(ct)
+                    .ConfigureAwait(false);
+                if (syntaxTree is not null)
+                {
+                    fileIdBySyntaxTree[syntaxTree] = fileId;
+                }
+            }
 
             if (unchanged
                 && !fullReset
-                && !forceInteropProjectionRefresh
                 && _keysByFileId.TryGetValue(fileId, out var keysForFile))
             {
                 // SHA matches and the in-memory symbol map is hydrated. Verify the store's
@@ -1713,6 +2317,11 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                 // branch fires on a process restart even for symbol-less files.
                 if (keysForFile.Count == 0)
                 {
+                    if (forceInteropProjectionRefresh)
+                    {
+                        unchangedManagedInteropRefreshes[fileId] =
+                            (path, groupedDocuments);
+                    }
                     continue;
                 }
                 var hasOutgoingRefs =
@@ -1726,6 +2335,11 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                 }
                 if (hasOutgoingRefs)
                 {
+                    if (forceInteropProjectionRefresh)
+                    {
+                        unchangedManagedInteropRefreshes[fileId] =
+                            (path, groupedDocuments);
+                    }
                     continue;
                 }
                 // Fall through to the changed-file path so pass 2 walks this file.
@@ -1733,7 +2347,8 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
 
             if (changedFileIds.Add(fileId))
             {
-                await _store.ClearFileOutgoingAsync(fileId, ct).ConfigureAwait(false);
+                await ClearSourceFileOutgoingAsync(fileId, ct)
+                    .ConfigureAwait(false);
                 changedFileMeta[fileId] = (path, sha, isGenerated);
             }
             docsByChangedFile[fileId] = groupedDocuments;
@@ -1755,8 +2370,6 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         var pendingInteropByFile =
             new Dictionary<long, List<FileAnnotationFact>>();
         var seenSymbolForAttr = new Dictionary<long, HashSet<string>>();
-        var fileIdBySyntaxTree = new Dictionary<SyntaxTree, long>(
-            ReferenceEqualityComparer.Instance);
         // Test framework detection: keyed by symbol id, value = "xunit"/"nunit"/"mstest".
         // Populated as we walk method symbols in pass 1; flushed in a single batch update once
         // pass-1 completes. Doing it as a separate update lets us avoid clobbering the value
@@ -1778,6 +2391,10 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
             // with a payload conflict fail closed instead of silently winning.
             var abiRecordPayloadByKey =
                 new Dictionary<string, string?>(StringComparer.Ordinal);
+            var managedUsageAnnotationsByIdentity =
+                new Dictionary<string, FileAnnotationFact>(
+                    StringComparer.Ordinal);
+            HashSet<string>? firstManagedUsageProjection = null;
             var attrSeen = new HashSet<string>(StringComparer.Ordinal);
             var path = changedFileMeta.TryGetValue(fileId, out var meta) ? meta.Path : "<unknown>";
 
@@ -1785,6 +2402,7 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
             {
                 foreach (var document in docs)
                 {
+                    _testHooks?.BeforePassOneWalk?.Invoke(document);
                     var tree = await document.GetSyntaxTreeAsync(ct).ConfigureAwait(false);
                     var model = await document.GetSemanticModelAsync(ct).ConfigureAwait(false);
                     if (tree is null || model is null)
@@ -1815,7 +2433,8 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                             var import = ManagedInteropExtractor.TryExtract(
                                 interopMethod,
                                 _interopTarget,
-                                fileId);
+                                fileId,
+                                path);
                             if (import is not null)
                             {
                                 var payload =
@@ -1940,6 +2559,30 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                             }
                         }
                     }
+
+                    if (_interopTarget is not null)
+                    {
+                        var usage = ManagedInteropUsageExtractor.Extract(
+                            root,
+                            model,
+                            _interopTarget,
+                            fileId,
+                            path,
+                            method => ResolveManagedImportFileId(
+                                method,
+                                fileIdBySyntaxTree),
+                            ownerFileId =>
+                                _storedPathByFileId.TryGetValue(
+                                    ownerFileId,
+                                    out var ownerPath)
+                                    ? ownerPath
+                                    : null,
+                            ct);
+                        MergeManagedUsageProjection(
+                            usage,
+                            managedUsageAnnotationsByIdentity,
+                            ref firstManagedUsageProjection);
+                    }
                 }
 
                 // Success: publish per-file state to the shared dictionaries that Pass 1C/1D
@@ -1968,6 +2611,12 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                             InteropAnnotationFlavors.AbiRecord,
                             pair.Value,
                             AttributeCanonicalKey: null)));
+                    interopAnnotations.AddRange(
+                        managedUsageAnnotationsByIdentity
+                            .OrderBy(
+                                pair => pair.Key,
+                                StringComparer.Ordinal)
+                            .Select(pair => pair.Value));
                     pendingInteropByFile[fileId] = interopAnnotations;
                 }
                 seenSymbolForAttr[fileId] = attrSeen;
@@ -2038,6 +2687,13 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                         path,
                         currentlyOwnedKeys,
                         annotations,
+                        _interopTarget is null
+                            ? []
+                            :
+                            [
+                                InteropAnnotationFlavors.Match,
+                                InteropAnnotationFlavors.Finding,
+                            ],
                         ct)
                     .ConfigureAwait(false);
 
@@ -2616,6 +3272,52 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         foreach (var (fid, bucket) in diagnosticsByFile)
         {
             await _store.UpsertDiagnosticsForFileAsync(fid, bucket, ct).ConfigureAwait(false);
+        }
+
+        if (unchangedManagedInteropRefreshes.Count > 0)
+        {
+            if (failedFiles.Count > 0 || _probedFailures.Count > 0)
+            {
+                // Keep every prior caller-owned fact if any other part of the pass is
+                // incomplete. A structural retry will rebuild the import and caller universes
+                // together before analysis publication is allowed again.
+                _requiresStructuralReload = true;
+            }
+            else
+            {
+                try
+                {
+                    var usageRefreshFailures =
+                        await RefreshUnchangedManagedInteropUsagesAsync(
+                                unchangedManagedInteropRefreshes,
+                                method => ResolveManagedImportFileId(
+                                    method,
+                                    fileIdBySyntaxTree),
+                                ct)
+                            .ConfigureAwait(false);
+                    foreach (var failure in usageRefreshFailures)
+                    {
+                        AddFileFailure(
+                            failedFiles,
+                            failure.Path,
+                            failure.Reason);
+                    }
+                    if (usageRefreshFailures.Count > 0)
+                    {
+                        _requiresStructuralReload = true;
+                    }
+                    else
+                    {
+                        filesIndexed +=
+                            unchangedManagedInteropRefreshes.Count;
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    _requiresStructuralReload = true;
+                    throw;
+                }
+            }
         }
 
         sw.Stop();
@@ -3445,6 +4147,13 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
 
 public sealed record IndexResult(int FilesIndexed, int SymbolsIndexed, int ReferencesIndexed, TimeSpan Elapsed)
 {
+    /// <summary>
+    /// True only when this result came from a successful all-document discovery, index, and
+    /// stale generated-owner reconciliation. An incremental entry point may return true when it
+    /// internally performed the required structural full reload.
+    /// </summary>
+    public bool ReconciledCompleteUniverse { get; init; }
+
     /// <summary>
     /// Projects whose Roslyn <c>Compilation</c> could not be obtained during the index pass.
     /// Empty for healthy installs. The pre-flight probe in <see cref="RoslynIndexer"/> populates

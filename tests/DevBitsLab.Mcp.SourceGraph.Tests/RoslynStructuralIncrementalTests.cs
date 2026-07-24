@@ -318,6 +318,7 @@ public sealed class RoslynStructuralIncrementalTests
             var failedRead = await indexer.IndexChangedFilesAsync([existingPath]);
 
             failedRead.FilesIndexed.Should().Be(0);
+            failedRead.ReconciledCompleteUniverse.Should().BeFalse();
             failedRead.FailedFiles.Should().ContainSingle(failure =>
                 string.Equals(
                     failure.Path,
@@ -340,6 +341,8 @@ public sealed class RoslynStructuralIncrementalTests
 
             readRetry.FilesIndexed.Should().BeGreaterThan(1);
             readRetry.FailedFiles.Should().BeEmpty();
+            readRetry.ReconciledCompleteUniverse.Should().BeTrue(
+                "the incremental entry point performed a complete structural retry");
             (await store.GetAllSymbolKeysAsync()).Should().NotContain(symbol =>
                 symbol.CanonicalKey == beforeEdit.CanonicalKey);
             var afterReadRetry = (await store.ListSymbolsInFileAsync(existingPath))
@@ -362,6 +365,7 @@ public sealed class RoslynStructuralIncrementalTests
             var ordinaryEdit = await indexer.IndexChangedFilesAsync([existingPath]);
 
             ordinaryEdit.FilesIndexed.Should().Be(1);
+            ordinaryEdit.ReconciledCompleteUniverse.Should().BeFalse();
             indexer.SanitizedSolution!
                 .GetDocumentIdsWithFilePath(existingPath)
                 .Single()
@@ -588,6 +592,89 @@ public sealed class RoslynStructuralIncrementalTests
             {
                 // Best-effort cleanup: antivirus may transiently hold an evaluated project file.
             }
+        }
+    }
+
+    [Fact]
+    public async Task Failed_incremental_pass_schedules_complete_reconciliation_retry()
+    {
+        var root = Path.Join(
+            Path.GetTempPath(),
+            "sourcegraph-roslyn-incremental-retry-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+
+        try
+        {
+            var solutionPath = await WriteSingleProjectSolutionAsync(
+                root,
+                """
+                <Project Sdk="Microsoft.NET.Sdk">
+                  <PropertyGroup>
+                    <TargetFramework>net10.0</TargetFramework>
+                    <ImplicitUsings>enable</ImplicitUsings>
+                    <Nullable>enable</Nullable>
+                  </PropertyGroup>
+                </Project>
+                """);
+            var sourcePath = Path.Join(root, "App", "Program.cs");
+            await File.WriteAllTextAsync(
+                sourcePath,
+                "public static class BeforeFailure { }");
+
+            var failNextWalk = false;
+            var hooks = new RoslynIndexer.TestHooks(
+                BeforePassOneWalk: document =>
+                {
+                    if (failNextWalk
+                        && string.Equals(
+                            document.FilePath,
+                            sourcePath,
+                            StringComparison.OrdinalIgnoreCase))
+                    {
+                        failNextWalk = false;
+                        throw new InvalidOperationException(
+                            "simulated one-shot Pass 1 failure");
+                    }
+                });
+            await using var store =
+                new SqliteGraphStore(Path.Join(root, "graph.db"));
+            await using var indexer = new RoslynIndexer(
+                store,
+                logger: null,
+                embeddingsSink: null,
+                privacyRoot: root,
+                excludePatterns: Array.Empty<string>(),
+                testHooks: hooks);
+            await indexer.OpenAsync(solutionPath);
+            (await indexer.IndexAllAsync()).FailedFiles.Should().BeEmpty();
+
+            await File.WriteAllTextAsync(
+                sourcePath,
+                "public static class AfterRetry { }");
+            failNextWalk = true;
+
+            var failed = await indexer.IndexChangedFilesAsync([sourcePath]);
+
+            failed.ReconciledCompleteUniverse.Should().BeFalse();
+            failed.FailedFiles.Should().ContainSingle(failure =>
+                failure.Reason.Contains(
+                    "simulated one-shot Pass 1 failure",
+                    StringComparison.Ordinal));
+
+            var retried = await indexer.IndexChangedFilesAsync([sourcePath]);
+
+            retried.ReconciledCompleteUniverse.Should().BeTrue(
+                "the prior incomplete result must force a full-universe retry");
+            retried.FailedProjects.Should().BeEmpty();
+            retried.FailedFiles.Should().BeEmpty();
+            (await store.ListSymbolsInFileAsync(sourcePath))
+                .Should().ContainSingle(symbol => symbol.Name == "AfterRetry");
+            (await store.ListSymbolsInFileAsync(sourcePath))
+                .Should().NotContain(symbol => symbol.Name == "BeforeFailure");
+        }
+        finally
+        {
+            TryDeleteDirectory(root);
         }
     }
 

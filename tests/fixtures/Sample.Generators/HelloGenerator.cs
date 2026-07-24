@@ -115,4 +115,57 @@ public static class SecondGeneratedState
                 });
         }
     }
+
+    /// <summary>
+    /// Emits a generated DllImport only while a consuming syntax tree contains the marker
+    /// GENERATE_INTEROP_IMPORT. Incremental interop tests use the output's disappearance to
+    /// verify stale generated owners trigger caller fanout and cleanup.
+    /// </summary>
+    [Generator(LanguageNames.CSharp)]
+    public sealed class ConditionalInteropImportGenerator : IIncrementalGenerator
+    {
+        public void Initialize(IncrementalGeneratorInitializationContext context)
+        {
+            context.RegisterSourceOutput(
+                context.CompilationProvider,
+                static (productionContext, compilation) =>
+                {
+                    var enabled = compilation.SyntaxTrees.Any(tree =>
+                        tree.GetText().ToString().IndexOf(
+                            "GENERATE_INTEROP_IMPORT",
+                            StringComparison.Ordinal) >= 0);
+                    var keepOwner = compilation.SyntaxTrees.Any(tree =>
+                        tree.GetText().ToString().IndexOf(
+                            "KEEP_GENERATED_INTEROP_OWNER",
+                            StringComparison.Ordinal) >= 0);
+                    if (!enabled && !keepOwner)
+                    {
+                        return;
+                    }
+
+                    const string importSource = @"using System.Runtime.InteropServices;
+
+namespace Generated.Interop;
+
+internal static class NativeMethods
+{
+    [DllImport(""medalgo"", EntryPoint = ""generated_allocate"")]
+    internal static extern System.IntPtr Allocate();
+}
+";
+                    const string ordinarySource = @"namespace Generated.Interop;
+
+internal static class NativeMethods
+{
+    internal static System.IntPtr Allocate() => System.IntPtr.Zero;
+}
+";
+                    productionContext.AddSource(
+                        "ConditionalInteropImport.g.cs",
+                        SourceText.From(
+                            enabled ? importSource : ordinarySource,
+                            Encoding.UTF8));
+                });
+        }
+    }
 }

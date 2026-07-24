@@ -1303,8 +1303,12 @@ public sealed class LiveIndexService : BackgroundService
                                 if (csharpPaths.Length > 0)
                                 {
                                     host.ManagedInteropInputComplete =
-                                        host.ManagedInteropInputComplete
-                                        && csharpSemanticUpdateSucceeded;
+                                        roslynResult?
+                                            .ReconciledCompleteUniverse
+                                            == true
+                                            ? csharpSemanticUpdateSucceeded
+                                            : host.ManagedInteropInputComplete
+                                              && csharpSemanticUpdateSucceeded;
                                 }
                                 if (csharpPaths.Length > 0
                                     && !csharpSemanticUpdateSucceeded)
