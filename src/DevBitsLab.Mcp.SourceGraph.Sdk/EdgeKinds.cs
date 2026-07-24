@@ -42,6 +42,9 @@ public static class EdgeKinds
     /// <summary>A server handler implements a protobuf RPC declaration.</summary>
     public const string ImplementsRpc = "implements-rpc";
 
+    /// <summary>A protobuf RPC dispatches execution to a managed server handler.</summary>
+    public const string RpcDispatchesTo = "rpc-dispatches-to";
+
     /// <summary>A managed P/Invoke declaration maps to a native ABI export.</summary>
     public const string PInvokeMapsTo = "pinvoke-maps-to";
 

@@ -121,6 +121,19 @@ public sealed class GrpcContractLinkerTests : IAsyncLifetime
         managedOverride.Metadata.Should().Contain(
             "match",
             "roslyn-override-to-generated-base");
+        var dispatchEvidence = await _store.ListEdgeEvidenceAsync(
+            _graph.RpcId,
+            _graph.ServerOverrideId,
+            EdgeKinds.RpcDispatchesTo);
+        dispatchEvidence.Should().HaveCount(2);
+        dispatchEvidence.Single(evidence =>
+                evidence.Metadata!["evidence_role"] == "managed-override")
+            .Metadata.Should().Contain(
+                "match",
+                "proto-dispatch-to-managed-override");
+        dispatchEvidence.Single(evidence =>
+                evidence.Metadata!["evidence_role"] == "proto-contract")
+            .Location.FilePath.Should().Be(_protoPath);
 
         await new GrpcContractLinker(_store).RunAsync(
             sourceUniverseComplete: true);
@@ -442,6 +455,11 @@ public sealed class GrpcContractLinkerTests : IAsyncLifetime
                 server.Id,
                 rpc.Id,
                 EdgeKinds.ImplementsRpc))
+            .Should().HaveCount(2);
+        (await store.ListEdgeEvidenceAsync(
+                rpc.Id,
+                server.Id,
+                EdgeKinds.RpcDispatchesTo))
             .Should().HaveCount(2);
     }
 

@@ -134,6 +134,7 @@ public sealed class InteropCanonicalKeysTests
             EdgeKinds.HandlesEvent,
             EdgeKinds.GrpcCalls,
             EdgeKinds.ImplementsRpc,
+            EdgeKinds.RpcDispatchesTo,
             EdgeKinds.PInvokeMapsTo,
             EdgeKinds.StructMapsTo,
         };
@@ -153,6 +154,7 @@ public sealed class InteropCanonicalKeysTests
             "handles-event",
             "grpc-calls",
             "implements-rpc",
+            "rpc-dispatches-to",
             "pinvoke-maps-to",
             "struct-maps-to");
         symbolKinds.Concat(edgeKinds)

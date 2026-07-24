@@ -513,21 +513,24 @@ public sealed class GrpcContractLinker
                     continue;
                 }
 
-                if (facts.Count + roslynEvidence.Length > MaximumCandidates)
+                var derivedEdges = roslynEvidence
+                    .SelectMany(evidence =>
+                        CreateDerivedEdges(
+                            method,
+                            source,
+                            contract,
+                            requestShape,
+                            responseShape,
+                            evidence))
+                    .ToArray();
+                if (facts.Count + derivedEdges.Length > MaximumCandidates)
                 {
                     failures.Add(
                         "grpc-evidence-limit",
                         $"The derived gRPC projection exceeds the {MaximumCandidates}-managed-evidence limit.");
                     return null;
                 }
-                facts.AddRange(roslynEvidence.Select(evidence =>
-                    CreateDerivedEdge(
-                        method,
-                        source,
-                        contract,
-                        requestShape,
-                        responseShape,
-                        evidence)));
+                facts.AddRange(derivedEdges);
             }
         }
 
@@ -970,7 +973,7 @@ public sealed class GrpcContractLinker
             requireOverride: true);
     }
 
-    private static DerivedEdge CreateDerivedEdge(
+    private static IReadOnlyList<DerivedEdge> CreateDerivedEdges(
         GeneratedMethod method,
         SymbolHit source,
         ProtoFactRow contract,
@@ -1012,7 +1015,7 @@ public sealed class GrpcContractLinker
                 upstreamEvidence.Confidence),
             ["upstream_producer"] = upstreamEvidence.Producer,
         };
-        return new DerivedEdge(
+        var auditEdge = new DerivedEdge(
             new ProducerEdgeEvidenceFact(
                 source.CanonicalKey!,
                 contract.Fact.SymbolCanonicalKey,
@@ -1025,6 +1028,38 @@ public sealed class GrpcContractLinker
                     evidenceMetadata)),
             method.Symbol.CanonicalKey!,
             contract);
+        if (method.Role == GeneratedMethodRole.Client)
+        {
+            return [auditEdge];
+        }
+
+        var dispatchMetadata = new SortedDictionary<string, string>(
+            metadata,
+            StringComparer.Ordinal)
+        {
+            ["match"] = "proto-dispatch-to-managed-override",
+        };
+        var dispatchEvidenceMetadata =
+            new SortedDictionary<string, string>(
+                evidenceMetadata,
+                StringComparer.Ordinal)
+            {
+                ["match"] = "proto-dispatch-to-managed-override",
+            };
+        var dispatchEdge = new DerivedEdge(
+            new ProducerEdgeEvidenceFact(
+                contract.Fact.SymbolCanonicalKey,
+                source.CanonicalKey!,
+                EdgeKinds.RpcDispatchesTo,
+                dispatchMetadata,
+                new FileEvidenceFact(
+                    upstreamEvidence.Location,
+                    Core.EvidenceConfidence.Semantic,
+                    Producer,
+                    dispatchEvidenceMetadata)),
+            method.Symbol.CanonicalKey!,
+            contract);
+        return [auditEdge, dispatchEdge];
     }
 
     private static ProducerEdgeEvidenceFact CreateProtoEvidence(
