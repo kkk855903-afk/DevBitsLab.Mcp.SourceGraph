@@ -605,7 +605,7 @@
         "dependencies": {
           "DevBitsLab.Mcp.SourceGraph.Core": "[1.0.0, )",
           "DevBitsLab.Mcp.SourceGraph.Embeddings": "[1.0.0, )",
-          "DevBitsLab.Mcp.SourceGraph.Sdk": "[2.4.0, )",
+          "DevBitsLab.Mcp.SourceGraph.Sdk": "[2.5.0, )",
           "DevBitsLab.Mcp.SourceGraph.Storage": "[1.0.0, )",
           "Google.Protobuf": "[3.35.1, )",
           "Microsoft.Build.Locator": "[1.11.2, )",
@@ -619,14 +619,14 @@
         "dependencies": {
           "ClangSharp": "[21.1.8.4, )",
           "DevBitsLab.Mcp.SourceGraph.Core": "[1.0.0, )",
-          "DevBitsLab.Mcp.SourceGraph.Sdk": "[2.4.0, )",
+          "DevBitsLab.Mcp.SourceGraph.Sdk": "[2.5.0, )",
           "libclang": "[21.1.8, )"
         }
       },
       "devbitslab.mcp.sourcegraph.indexing.treesitter": {
         "type": "Project",
         "dependencies": {
-          "DevBitsLab.Mcp.SourceGraph.Sdk": "[2.4.0, )",
+          "DevBitsLab.Mcp.SourceGraph.Sdk": "[2.5.0, )",
           "Microsoft.Extensions.Logging.Abstractions": "[10.0.10, )",
           "TreeSitter.DotNet": "[1.3.0, )"
         }
@@ -635,7 +635,7 @@
         "type": "Project",
         "dependencies": {
           "DevBitsLab.Mcp.SourceGraph.Indexing.TreeSitter": "[1.0.0, )",
-          "DevBitsLab.Mcp.SourceGraph.Sdk": "[2.4.0, )",
+          "DevBitsLab.Mcp.SourceGraph.Sdk": "[2.5.0, )",
           "Microsoft.Extensions.Logging.Abstractions": "[10.0.10, )"
         }
       },
@@ -643,7 +643,7 @@
         "type": "Project",
         "dependencies": {
           "DevBitsLab.Mcp.SourceGraph.Core": "[1.0.0, )",
-          "DevBitsLab.Mcp.SourceGraph.Sdk": "[2.4.0, )",
+          "DevBitsLab.Mcp.SourceGraph.Sdk": "[2.5.0, )",
           "DevBitsLab.Mcp.SourceGraph.Storage": "[1.0.0, )",
           "Microsoft.CodeAnalysis.CSharp.Workspaces": "[5.3.0, )"
         }
@@ -663,7 +663,7 @@
         "dependencies": {
           "Dapper": "[2.1.72, )",
           "DevBitsLab.Mcp.SourceGraph.Core": "[1.0.0, )",
-          "DevBitsLab.Mcp.SourceGraph.Sdk": "[2.4.0, )",
+          "DevBitsLab.Mcp.SourceGraph.Sdk": "[2.5.0, )",
           "Microsoft.Data.Sqlite": "[10.0.10, )",
           "Microsoft.Extensions.Logging.Abstractions": "[10.0.10, )",
           "sqlite-vec": "[0.1.7-alpha.2.1, )"
@@ -992,6 +992,44 @@
         "dependencies": {
           "libclang.runtime.osx-arm64": "21.1.8"
         }
+      },
+      "Microsoft.ML.OnnxRuntime": {
+        "type": "CentralTransitive",
+        "requested": "[1.25.1, )",
+        "resolved": "1.25.1",
+        "contentHash": "s1olKkbeUrMNb/Oj+lhQswYxyyUiXMo81eqaMe12PbnByvjlgpEtP71FruUpw+rftjtK9KZZ4wVo5HaoUwlXgA==",
+        "dependencies": {
+          "Microsoft.ML.OnnxRuntime.Managed": "1.25.1"
+        }
+      },
+      "sqlite-vec": {
+        "type": "CentralTransitive",
+        "requested": "[0.1.7-alpha.2.1, )",
+        "resolved": "0.1.7-alpha.2.1",
+        "contentHash": "JCN6wMW9cX7e6tO6BZRBEdLT1qq8cRlQ5AdPvl6ZRjTKOJ2JjQXYI+wIAMb4EOXiDbbpt0IIv5rkkbPOMlrkRQ=="
+      },
+      "TreeSitter.DotNet": {
+        "type": "CentralTransitive",
+        "requested": "[1.3.0, )",
+        "resolved": "1.3.0",
+        "contentHash": "VFl5j5UguKI3BvdQ/bbHDrDP1FG7lkEjv9LZCQ01bPe4NuAiXQVnEfuFRWdJ8TA9NmY/D7qqGkj8CuD3ptiDDw=="
+      }
+    },
+    "net10.0/osx-x64": {
+      "SourceGear.sqlite3": {
+        "type": "Transitive",
+        "resolved": "3.53.3",
+        "contentHash": "PaDT7JwQ00HmXZT1xSGSC0c24A5lVpJYHMrXBuJATdpB2t0nf4Kq9HyPaZhxVW0elPq4XI1s5BLh7qLuObmzFA=="
+      },
+      "System.Diagnostics.EventLog": {
+        "type": "Transitive",
+        "resolved": "10.0.10",
+        "contentHash": "OvGz3PrzuAI/Sj7LTcXcCe3FClRI1IyRMZjNONcZtFh+Ww7nAtSh4kh08r8KVe/xxkXJPjR0Y1jF7H+N42d4xQ=="
+      },
+      "System.Security.Cryptography.Pkcs": {
+        "type": "Transitive",
+        "resolved": "10.0.10",
+        "contentHash": "KG8t5RHczdgB3IWvRndpI0nE1DSo7ikDYSDbITxfgRFyIvnYiKzuPjaZOsPnwFQ1aOGUl9sEulJul9wlHLEUoA=="
       },
       "Microsoft.ML.OnnxRuntime": {
         "type": "CentralTransitive",
