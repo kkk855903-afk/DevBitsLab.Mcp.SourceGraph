@@ -3444,6 +3444,8 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                     }
                 }
 
+                EmitScheduledExecutions(root, model, AddEdge, ct);
+
                 // Connect an ICommand property to the source method captured by the command
                 // object's single delegate argument. This is deliberately operation-based:
                 // syntax or name matching would turn overload gaps, dynamic values, and
@@ -4313,6 +4315,163 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                 uniqueMethodReference.Syntax,
                 CoreEvidenceConfidence.Semantic);
         }
+    }
+
+    private void EmitScheduledExecutions(
+        SyntaxNode root,
+        SemanticModel model,
+        Action<long, long, string, SyntaxNode, CoreEvidenceConfidence> addEdge,
+        CancellationToken ct)
+    {
+        foreach (var schedulerSyntax in root
+                     .DescendantNodes()
+                     .OfType<InvocationExpressionSyntax>())
+        {
+            ct.ThrowIfCancellationRequested();
+            if (model.GetOperation(schedulerSyntax, ct) is not
+                IInvocationOperation scheduler)
+            {
+                continue;
+            }
+
+            var relation = SchedulerRelation(scheduler.TargetMethod);
+            if (relation is null)
+            {
+                continue;
+            }
+
+            var source = FindEnclosingNamedMember(
+                model,
+                schedulerSyntax.SpanStart,
+                ct);
+            var sourceKey = source is null
+                ? null
+                : SymbolMapping.CanonicalKey(source);
+            if (sourceKey is null
+                || !_symbolIdByKey.TryGetValue(sourceKey, out var sourceId))
+            {
+                continue;
+            }
+
+            foreach (var argument in schedulerSyntax.ArgumentList.Arguments)
+            {
+                if (UnwrapArgument(argument.Expression) is
+                    AnonymousFunctionExpressionSyntax lambda)
+                {
+                    foreach (var nestedCall in lambda
+                                 .DescendantNodes()
+                                 .OfType<InvocationExpressionSyntax>()
+                                 .Where(call =>
+                                     ReferenceEquals(
+                                         call.Ancestors()
+                                             .OfType<
+                                                 AnonymousFunctionExpressionSyntax>()
+                                             .FirstOrDefault(),
+                                         lambda)))
+                    {
+                        TryEmitTarget(
+                            model.GetSymbolInfo(nestedCall, ct).Symbol
+                            as IMethodSymbol,
+                            nestedCall);
+                    }
+                    continue;
+                }
+
+                TryEmitTarget(
+                    model.GetSymbolInfo(argument.Expression, ct).Symbol
+                    as IMethodSymbol,
+                    argument.Expression);
+            }
+
+            void TryEmitTarget(
+                IMethodSymbol? target,
+                SyntaxNode evidenceNode)
+            {
+                if (target is null)
+                {
+                    return;
+                }
+                var targetKey = SymbolMapping.CanonicalKey(target);
+                if (targetKey is null
+                    || !_symbolIdByKey.TryGetValue(
+                        targetKey,
+                        out var targetId))
+                {
+                    return;
+                }
+                addEdge(
+                    sourceId,
+                    targetId,
+                    relation,
+                    evidenceNode,
+                    CoreEvidenceConfidence.Semantic);
+            }
+        }
+    }
+
+    private static ExpressionSyntax UnwrapArgument(ExpressionSyntax expression)
+    {
+        while (true)
+        {
+            switch (expression)
+            {
+                case ParenthesizedExpressionSyntax parenthesized:
+                    expression = parenthesized.Expression;
+                    continue;
+                case CastExpressionSyntax cast:
+                    expression = cast.Expression;
+                    continue;
+                default:
+                    return expression;
+            }
+        }
+    }
+
+    private static string? SchedulerRelation(IMethodSymbol method)
+    {
+        var containingType = method.ContainingType?.ToDisplayString();
+        if ((containingType == "System.Threading.Tasks.Task"
+             && method.Name == "Run")
+            || (containingType == "System.Threading.Tasks.TaskFactory"
+                && method.Name == "StartNew"))
+        {
+            return EdgeKinds.Schedules;
+        }
+
+        if ((containingType == "System.Windows.Threading.Dispatcher"
+             && method.Name is "Invoke" or "BeginInvoke" or "InvokeAsync")
+            || (containingType == "System.Threading.SynchronizationContext"
+                && method.Name == "Post"))
+        {
+            return EdgeKinds.Dispatches;
+        }
+
+        return null;
+    }
+
+    private static ISymbol? FindEnclosingNamedMember(
+        SemanticModel model,
+        int position,
+        CancellationToken ct)
+    {
+        var symbol = model.GetEnclosingSymbol(position, ct);
+        while (symbol is IMethodSymbol
+               {
+                   MethodKind: MethodKind.AnonymousFunction
+                       or MethodKind.LocalFunction,
+               })
+        {
+            symbol = symbol.ContainingSymbol;
+        }
+        while (symbol is not null
+               and not IMethodSymbol
+               and not IPropertySymbol
+               and not IFieldSymbol
+               and not IEventSymbol)
+        {
+            symbol = symbol.ContainingSymbol;
+        }
+        return symbol;
     }
 
     private static IOperation UnwrapOperation(IOperation operation)

@@ -145,9 +145,20 @@ public sealed class RoslynCommandExecutionTests
             var sourcePath = Path.Join(root, "App", "NegativeCommands.cs");
             await File.WriteAllTextAsync(sourcePath, """
                 using System;
+                using System.Threading.Tasks;
                 using System.Windows.Input;
+                using System.Windows.Threading;
 
-                namespace CommandFixture;
+                namespace System.Windows.Threading
+                {
+                    public sealed class Dispatcher
+                    {
+                        public void BeginInvoke(Action action) { }
+                    }
+                }
+
+                namespace CommandFixture
+                {
 
                 public sealed class NegativeCommands
                 {
@@ -222,6 +233,23 @@ public sealed class RoslynCommandExecutionTests
 
                     private void Handle(object? sender, EventArgs args) { }
                 }
+
+                public sealed class Scheduler
+                {
+                    public void Start()
+                    {
+                        Task.Run(() => RunLoopAsync());
+                    }
+
+                    public void ApplyOnUi(Dispatcher dispatcher)
+                    {
+                        dispatcher.BeginInvoke(() => Apply());
+                    }
+
+                    private static Task RunLoopAsync() => Task.CompletedTask;
+                    private static void Apply() { }
+                }
+                }
                 """);
 
             await using var store =
@@ -272,6 +300,36 @@ public sealed class RoslynCommandExecutionTests
                         evidence.Confidence
                         == DevBitsLab.Mcp.SourceGraph.Core
                             .EvidenceConfidence.Exact
+                        && evidence.Producer == "roslyn");
+            }
+            foreach (var (sourceName, targetName, relation) in new[]
+                     {
+                         ("Start", "RunLoopAsync", EdgeKinds.Schedules),
+                         ("ApplyOnUi", "Apply", EdgeKinds.Dispatches),
+                     })
+            {
+                var source = await SymbolNamedAsync(
+                    store,
+                    sourcePath,
+                    sourceName,
+                    SymbolKinds.Method);
+                var target = await SymbolNamedAsync(
+                    store,
+                    sourcePath,
+                    targetName,
+                    SymbolKinds.Method);
+                (await store.ListCalleesAsync(
+                        source.Id,
+                        edgeKind: relation))
+                    .Should().ContainSingle(symbol => symbol.Id == target.Id);
+                (await store.ListEdgeEvidenceAsync(
+                        source.Id,
+                        target.Id,
+                        relation))
+                    .Should().ContainSingle(evidence =>
+                        evidence.Confidence
+                        == DevBitsLab.Mcp.SourceGraph.Core
+                            .EvidenceConfidence.Semantic
                         && evidence.Producer == "roslyn");
             }
 

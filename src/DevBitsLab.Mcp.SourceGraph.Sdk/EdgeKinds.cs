@@ -42,6 +42,12 @@ public static class EdgeKinds
     /// <summary>A source member raises the target event.</summary>
     public const string RaisesEvent = "raises-event";
 
+    /// <summary>A source member schedules deferred execution of the target member.</summary>
+    public const string Schedules = "schedules";
+
+    /// <summary>A source member dispatches execution of the target member to another context.</summary>
+    public const string Dispatches = "dispatches";
+
     /// <summary>An ICommand property dispatches execution to a source method.</summary>
     public const string CommandExecutes = "command-executes";
 
