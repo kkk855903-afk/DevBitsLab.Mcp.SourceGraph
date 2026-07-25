@@ -1,5 +1,6 @@
 using DevBitsLab.Mcp.SourceGraph.Core;
 using Microsoft.CodeAnalysis;
+using System.Runtime.InteropServices;
 
 namespace DevBitsLab.Mcp.SourceGraph.Indexing;
 
@@ -39,14 +40,24 @@ internal static class SolutionPrivacySanitizer
             solution,
             pathPolicy.IsExcluded,
             document => IsBuildGeneratedDocument(document)
-                ? pathPolicy.IsGeneratedDocumentExcluded(document.FilePath)
-                : pathPolicy.IsExcluded(document.FilePath));
+                ? IsGeneratedCompilerInputExcluded(
+                    document.FilePath,
+                    pathPolicy)
+                : pathPolicy.IsExcluded(document.FilePath),
+            document => IsSecondaryCompilerInputExcluded(
+                document.FilePath,
+                pathPolicy),
+            document => IsSecondaryCompilerInputExcluded(
+                document.FilePath,
+                pathPolicy));
     }
 
     private static Solution Sanitize(
         Solution solution,
         Func<string?, bool> isExcluded,
-        Func<Document, bool>? isDocumentExcluded = null)
+        Func<Document, bool>? isDocumentExcluded = null,
+        Func<TextDocument, bool>? isAdditionalDocumentExcluded = null,
+        Func<TextDocument, bool>? isAnalyzerConfigExcluded = null)
     {
         var sanitized = solution;
         foreach (var project in solution.Projects)
@@ -68,7 +79,9 @@ internal static class SolutionPrivacySanitizer
 
             foreach (var document in project.AdditionalDocuments)
             {
-                if (isExcluded(document.FilePath))
+                if ((isAdditionalDocumentExcluded
+                     ?? (candidate => isExcluded(candidate.FilePath)))(
+                        document))
                 {
                     sanitized = sanitized.RemoveAdditionalDocument(document.Id);
                 }
@@ -76,7 +89,9 @@ internal static class SolutionPrivacySanitizer
 
             foreach (var document in project.AnalyzerConfigDocuments)
             {
-                if (isExcluded(document.FilePath))
+                if ((isAnalyzerConfigExcluded
+                     ?? (candidate => isExcluded(candidate.FilePath)))(
+                        document))
                 {
                     sanitized = sanitized.RemoveAnalyzerConfigDocument(document.Id);
                 }
@@ -105,6 +120,103 @@ internal static class SolutionPrivacySanitizer
         {
             // Roslyn does not expose this provenance publicly. A version mismatch must fail
             // closed rather than admitting an arbitrary obj/bin document into compilation.
+            return false;
+        }
+    }
+
+    private static bool IsGeneratedCompilerInputExcluded(
+        string? path,
+        ScopePathPolicy pathPolicy) =>
+        pathPolicy.IsGeneratedDocumentExcluded(path)
+        && !IsTrustedExternalBuildInput(path);
+
+    private static bool IsSecondaryCompilerInputExcluded(
+        string? path,
+        ScopePathPolicy pathPolicy) =>
+        pathPolicy.IsGeneratedDocumentExcluded(path)
+        && !IsTrustedExternalBuildInput(path);
+
+    private static bool IsTrustedExternalBuildInput(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return false;
+        }
+
+        string fullPath;
+        try
+        {
+            fullPath = Path.GetFullPath(path);
+        }
+        catch (Exception ex) when (
+            ex is ArgumentException
+                or NotSupportedException
+                or PathTooLongException)
+        {
+            return false;
+        }
+
+        var dotnetRoot = TryGetDotNetRoot();
+        if (dotnetRoot is not null
+            && IsContainedBy(fullPath, dotnetRoot))
+        {
+            return true;
+        }
+
+        var packagesRoot = Environment.GetEnvironmentVariable(
+            "NUGET_PACKAGES");
+        if (string.IsNullOrWhiteSpace(packagesRoot))
+        {
+            var profile = Environment.GetFolderPath(
+                Environment.SpecialFolder.UserProfile);
+            if (!string.IsNullOrWhiteSpace(profile))
+            {
+                packagesRoot = Path.Combine(profile, ".nuget", "packages");
+            }
+        }
+        return !string.IsNullOrWhiteSpace(packagesRoot)
+               && IsContainedBy(fullPath, packagesRoot);
+    }
+
+    private static string? TryGetDotNetRoot()
+    {
+        try
+        {
+            var runtimeDirectory = new DirectoryInfo(
+                RuntimeEnvironment.GetRuntimeDirectory());
+            return runtimeDirectory.Parent?.Parent?.Parent?.FullName;
+        }
+        catch (Exception ex) when (
+            ex is ArgumentException
+                or NotSupportedException
+                or System.Security.SecurityException)
+        {
+            return null;
+        }
+    }
+
+    private static bool IsContainedBy(string path, string root)
+    {
+        try
+        {
+            var relative = Path.GetRelativePath(
+                Path.GetFullPath(root),
+                path);
+            return relative == "."
+                   || (!Path.IsPathFullyQualified(relative)
+                       && !relative.Equals("..", StringComparison.Ordinal)
+                       && !relative.StartsWith(
+                           ".." + Path.DirectorySeparatorChar,
+                           StringComparison.Ordinal)
+                       && !relative.StartsWith(
+                           ".." + Path.AltDirectorySeparatorChar,
+                           StringComparison.Ordinal));
+        }
+        catch (Exception ex) when (
+            ex is ArgumentException
+                or NotSupportedException
+                or PathTooLongException)
+        {
             return false;
         }
     }

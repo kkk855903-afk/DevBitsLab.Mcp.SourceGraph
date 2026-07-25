@@ -114,8 +114,28 @@ public sealed class WpfWindowsFixtureContractTests
                 fileName.EndsWith("GlobalUsings.g.cs", StringComparison.Ordinal));
             retainedGeneratedSources.Should().Contain("App.g.cs");
             retainedGeneratedSources.Should().Contain("MainWindow.g.cs");
+            var retainedAnalyzerConfigs = rawProjects
+                .SelectMany(rawProject =>
+                {
+                    var sanitizedProject = sanitized.GetProject(rawProject.Id);
+                    return rawProject.AnalyzerConfigDocuments
+                        .Where(document =>
+                            sanitizedProject?.GetAnalyzerConfigDocument(
+                                document.Id) is not null)
+                        .Select(document => document.FilePath);
+                })
+                .OfType<string>()
+                .ToArray();
+            retainedAnalyzerConfigs.Should().Contain(path =>
+                path.EndsWith(
+                    "GeneratedMSBuildEditorConfig.editorconfig",
+                    StringComparison.Ordinal));
+            retainedAnalyzerConfigs.Should().Contain(path =>
+                path.EndsWith(
+                    ".globalconfig",
+                    StringComparison.Ordinal));
             roslyn.IsProjectSemanticInputComplete(projectPath).Should().BeTrue(
-                "SDK and WPF generated documents remain in the semantic compilation");
+                "SDK, WPF, and analyzer configuration inputs remain in the semantic compilation");
             roslyn.IsProjectXamlPositiveResolutionSafe(projectPath)
                 .Should().BeTrue(
                     "the complete Roslyn compilation is authoritative");

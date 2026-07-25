@@ -11,9 +11,6 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
     <GenerateTargetFrameworkAttribute>false</GenerateTargetFrameworkAttribute>
-    <GenerateMSBuildEditorConfigFile>false</GenerateMSBuildEditorConfigFile>
-    <EnableNETAnalyzers>false</EnableNETAnalyzers>
-    <AnalysisLevel>none</AnalysisLevel>
   </PropertyGroup>
 
 </Project>
