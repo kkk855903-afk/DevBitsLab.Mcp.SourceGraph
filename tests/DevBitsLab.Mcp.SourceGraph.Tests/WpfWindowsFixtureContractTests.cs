@@ -232,6 +232,67 @@ public sealed class WpfWindowsFixtureContractTests
     }
 
     [SkippableFact]
+    public async Task SlnAndSlnxLoadTheSameCompleteWpfProjectUniverse()
+    {
+        Skip.IfNot(
+            OperatingSystem.IsWindows(),
+            "The real WindowsDesktop/WPF solution-format regression runs on Windows.");
+
+        var fixtureRoot = LocateFixture("SampleWpfWindows");
+        var tempRoot = Path.Combine(
+            Path.GetTempPath(),
+            "sourcegraph-wpf-solution-formats-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tempRoot);
+
+        try
+        {
+            var observations = new List<(
+                string[] ProjectNames,
+                int CompilationErrors,
+                int FailedProjects,
+                int FailedFiles)>();
+            foreach (var extension in new[] { ".sln", ".slnx" })
+            {
+                await using var store = new SqliteGraphStore(
+                    Path.Combine(tempRoot, $"graph-{extension[1..]}.db"));
+                await using var roslyn = new RoslynIndexer(store);
+                await roslyn.OpenAsync(
+                    Path.Combine(
+                        fixtureRoot,
+                        "SampleWpfWindows" + extension));
+                var result = await roslyn.IndexAllAsync();
+                observations.Add((
+                    roslyn.SanitizedSolution!.Projects
+                        .Select(project => project.Name)
+                        .OrderBy(name => name, StringComparer.Ordinal)
+                        .ToArray(),
+                    result.CompilationErrorCount,
+                    result.FailedProjects.Count,
+                    result.FailedFiles.Count));
+            }
+
+            observations.Should().HaveCount(2);
+            observations[1].Should().BeEquivalentTo(
+                observations[0],
+                "the modern .slnx path must preserve the same projects and semantic completeness as .sln");
+            observations[0].ProjectNames.Should().ContainSingle()
+                .Which.Should().Be("SampleWpfWindows");
+            observations[0].CompilationErrors.Should().Be(0);
+        }
+        finally
+        {
+            try
+            {
+                Directory.Delete(tempRoot, recursive: true);
+            }
+            catch
+            {
+                // Best-effort cleanup; a failed assertion remains the useful signal.
+            }
+        }
+    }
+
+    [SkippableFact]
     public async Task RealWindowsDesktopCompilationPublishesWpfRiskDiagnostics()
     {
         Skip.IfNot(
