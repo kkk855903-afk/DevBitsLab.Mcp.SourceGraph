@@ -2,6 +2,7 @@ using System.IO;
 using System.Linq;
 using System.Text.Json;
 using DevBitsLab.Mcp.SourceGraph.Core;
+using DevBitsLab.Mcp.SourceGraph.Server;
 using DevBitsLab.Mcp.SourceGraph.Storage;
 using FluentAssertions;
 using Xunit;
@@ -111,6 +112,54 @@ public sealed class ScopesInfoCliTests : IDisposable
         var (_, exitCode) = await CaptureStdoutWithExitAsync(new[] { "scopes", "info", "doesnotexist", "--root", _tempDir });
 
         exitCode.Should().NotBe(0);
+    }
+
+    [Fact]
+    public async Task Synthesized_scope_merges_discovered_solution_and_persisted_runtime_metadata()
+    {
+        var solutionPath = Path.Join(_tempDir, "PostureGuard.slnx");
+        File.WriteAllText(
+            solutionPath,
+            "<Solution><Project Path=\"App/App.csproj\" /></Solution>");
+        var indexedAt = new DateTimeOffset(
+            2026,
+            7,
+            25,
+            1,
+            29,
+            6,
+            TimeSpan.Zero);
+        await using (var registry = new SqliteScopeRegistry(
+                         ScopeLayout.MetaDbPath(_tempDir)))
+        {
+            await registry.EnsureSchemaAsync();
+            await registry.UpsertAsync(new ScopeRow(
+                Id: "default",
+                Name: "default",
+                Root: _tempDir,
+                ProjectSetJson: ScopeProjectSetSerialiser.Serialise(
+                    new ScopeProjectSet.Solutions(
+                        [solutionPath],
+                        Array.Empty<string>())),
+                Isolated: false,
+                LastIndexedAt: indexedAt,
+                Status: "ok",
+                ProjectCount: 2));
+        }
+
+        var output = await CaptureStdoutAsync(
+            ["scopes", "info", "default", "--root", _tempDir, "--json"]);
+        var json = JsonDocument.Parse(output).RootElement;
+
+        json.GetProperty("project_set")
+            .GetProperty("items")[0]
+            .GetString()
+            .Should().Be(solutionPath);
+        json.GetProperty("status").GetString().Should().Be("ok");
+        json.GetProperty("project_count").GetInt32().Should().Be(2);
+        json.GetProperty("last_indexed_at")
+            .GetDateTimeOffset()
+            .Should().Be(indexedAt);
     }
 
     private static async Task<string> CaptureStdoutAsync(string[] args)

@@ -826,7 +826,13 @@ public sealed class LiveIndexService : BackgroundService
             }
             host.LastIndexedAt = DateTimeOffset.UtcNow;
             await _registry.UpsertAsync(
-                ToRow(scope, host.Status, host.StatusMessage, host.FailedProjects, host.FailedFiles),
+                ToRow(
+                    scope,
+                    host.Status,
+                    host.StatusMessage,
+                    host.FailedProjects,
+                    host.FailedFiles,
+                    host.Indexer.SanitizedSolution?.ProjectIds.Count),
                 ct).ConfigureAwait(false);
 
             // Autonomous embeddings prune: cold-index can leave behind embeddings for symbols
@@ -1829,7 +1835,8 @@ public sealed class LiveIndexService : BackgroundService
         string status,
         string? statusMessage,
         IReadOnlyList<ProjectFailure>? failedProjects = null,
-        IReadOnlyList<FileFailure>? failedFiles = null) =>
+        IReadOnlyList<FileFailure>? failedFiles = null,
+        int? projectCount = null) =>
         new(
             Id: scope.Id,
             Name: scope.Name,
@@ -1840,7 +1847,8 @@ public sealed class LiveIndexService : BackgroundService
             Status: status,
             StatusMessage: statusMessage,
             FailedProjects: failedProjects,
-            FailedFiles: failedFiles);
+            FailedFiles: failedFiles,
+            ProjectCount: projectCount);
 }
 
 internal sealed record ColdIndexStatusResolution(

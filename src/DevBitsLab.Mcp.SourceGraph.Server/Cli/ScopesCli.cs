@@ -63,7 +63,9 @@ internal static class ScopesCli
         ScopeConfig config;
         try
         {
-            config = ScopeConfigLoader.Load(root);
+            config = ScopeConfigLoader.Load(
+                root,
+                ScopeConfigLoader.DiscoverSolutionSiblings(root));
         }
         catch (ScopeConfigException ex)
         {
@@ -194,18 +196,31 @@ internal static class ScopesCli
             return 1;
         }
 
+        ScopeRow? runtime = null;
+        var metaDatabasePath = ScopeLayout.MetaDbPath(root);
+        if (File.Exists(metaDatabasePath))
+        {
+            await using var registry =
+                new SqliteScopeRegistry(metaDatabasePath);
+            await registry.EnsureSchemaAsync().ConfigureAwait(false);
+            runtime = await registry.GetAsync(name).ConfigureAwait(false);
+        }
+
         if (cli.Json)
         {
-            EmitInfoJson(scope);
+            EmitInfoJson(scope, runtime);
         }
         else
         {
-            EmitInfoMarkdown(scope, root);
+            EmitInfoMarkdown(scope, root, runtime);
         }
         return 0;
     }
 
-    private static void EmitInfoMarkdown(Scope scope, string repoRoot)
+    private static void EmitInfoMarkdown(
+        Scope scope,
+        string repoRoot,
+        ScopeRow? runtime)
     {
         Console.WriteLine($"## Identity");
         Console.WriteLine($"- id:   {scope.Id}");
@@ -240,6 +255,18 @@ internal static class ScopesCli
         }
 
         Console.WriteLine();
+        Console.WriteLine("## Runtime index");
+        Console.WriteLine($"- status: {runtime?.Status ?? "(not indexed)"}");
+        if (!string.IsNullOrWhiteSpace(runtime?.StatusMessage))
+        {
+            Console.WriteLine($"- status_message: {runtime.StatusMessage}");
+        }
+        Console.WriteLine(
+            $"- loaded_projects: {runtime?.ProjectCount?.ToString() ?? "(unknown)"}");
+        Console.WriteLine(
+            $"- last_indexed_at: {(runtime is null || runtime.LastIndexedAt == DateTimeOffset.MinValue ? "(never)" : runtime.LastIndexedAt.ToString("o"))}");
+
+        Console.WriteLine();
         Console.WriteLine($"## Language");
         Console.WriteLine($"- {scope.Language ?? "(unset)"}");
 
@@ -260,7 +287,7 @@ internal static class ScopesCli
         }
     }
 
-    private static void EmitInfoJson(Scope scope)
+    private static void EmitInfoJson(Scope scope, ScopeRow? runtime)
     {
         var dto = new
         {
@@ -283,7 +310,13 @@ internal static class ScopesCli
                     consumed = false,
                 }
                 : null,
-            last_indexed_at = scope.LastIndexedAt == DateTimeOffset.MinValue
+            status = runtime?.Status,
+            status_message = runtime?.StatusMessage,
+            project_count = runtime?.ProjectCount,
+            last_indexed_at = runtime?.LastIndexedAt is { } runtimeIndexedAt
+                && runtimeIndexedAt != DateTimeOffset.MinValue
+                ? (DateTimeOffset?)runtimeIndexedAt
+                : scope.LastIndexedAt == DateTimeOffset.MinValue
                 ? null
                 : (DateTimeOffset?)scope.LastIndexedAt,
         };

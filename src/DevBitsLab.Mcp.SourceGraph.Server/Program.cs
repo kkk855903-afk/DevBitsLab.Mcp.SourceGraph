@@ -756,6 +756,7 @@ static async Task<int> RunIndexAsync(CommandLine cli)
     var grpc = await new GrpcContractLinker(store).RunAsync(
             result.FailedProjects.Count == 0
             && result.FailedFiles.Count == 0
+            && result.CompilationErrorCount == 0
             && nonCSharpFailedProjects.Count == 0
             && nonCSharpFailedFiles.Count == 0)
         .ConfigureAwait(false);
@@ -793,7 +794,8 @@ static async Task<int> RunIndexAsync(CommandLine cli)
             new UserExecutionTrustPolicy());
         var native = await nativeCoordinator.RunAsync(
                 result.FailedProjects.Count == 0
-                && result.FailedFiles.Count == 0)
+                && result.FailedFiles.Count == 0
+                && result.CompilationErrorCount == 0)
             .ConfigureAwait(false);
         nativeInteropFailed =
             native.State.Status == NativeInteropRuntimeStatus.Partial;
@@ -838,12 +840,46 @@ static async Task<int> RunIndexAsync(CommandLine cli)
     Console.WriteLine($"indexed {result.FilesIndexed} files, {result.SymbolsIndexed} symbols, {result.ReferencesIndexed} refs in {result.Elapsed.TotalSeconds:F2}s");
     Console.WriteLine($"database: {cli.ResolvedDbPath()}");
     if (historyDisabled) Console.WriteLine("history: disabled (--no-history or git unavailable)");
-    return nonCSharpFailedFiles.Count == 0
-        && nonCSharpFailedProjects.Count == 0
-        && !grpcLinkFailed
-        && !nativeInteropFailed
-            ? 0
-            : 1;
+    var indexHasFailures =
+        result.FailedProjects.Count > 0
+        || result.FailedFiles.Count > 0
+        || result.CompilationErrorCount > 0
+        || nonCSharpFailedFiles.Count > 0
+        || nonCSharpFailedProjects.Count > 0
+        || grpcLinkFailed
+        || nativeInteropFailed;
+    var statusMessage = indexHasFailures
+        ? "One-shot index completed with "
+          + $"{result.CompilationErrorCount} compiler error(s), "
+          + $"{result.FailedProjects.Count + nonCSharpFailedProjects.Count} project failure(s), "
+          + $"{result.FailedFiles.Count + nonCSharpFailedFiles.Count} file failure(s)."
+        : null;
+    await using (var registry = new SqliteScopeRegistry(
+                     ScopeLayout.MetaDbPath(repoRootForIndex),
+                     loggerFactory.CreateLogger<SqliteScopeRegistry>()))
+    {
+        await registry.EnsureSchemaAsync().ConfigureAwait(false);
+        await registry.UpsertAsync(new ScopeRow(
+                Id: selectedScope.Id,
+                Name: selectedScope.Name,
+                Root: selectedScope.Root,
+                ProjectSetJson: ScopeProjectSetSerialiser.Serialise(
+                    selectedScope.ProjectSet),
+                Isolated: selectedScope.Isolated,
+                LastIndexedAt: DateTimeOffset.UtcNow,
+                Status: indexHasFailures ? "partial" : "ok",
+                StatusMessage: statusMessage,
+                FailedProjects: result.FailedProjects
+                    .Concat(nonCSharpFailedProjects)
+                    .ToArray(),
+                FailedFiles: result.FailedFiles
+                    .Concat(nonCSharpFailedFiles)
+                    .ToArray(),
+                ProjectCount:
+                    indexer.SanitizedSolution?.ProjectIds.Count))
+            .ConfigureAwait(false);
+    }
+    return indexHasFailures ? 1 : 0;
 }
 
 /// <summary>
