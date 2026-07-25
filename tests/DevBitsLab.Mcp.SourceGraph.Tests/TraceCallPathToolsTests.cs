@@ -769,6 +769,16 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
             .Scopes.Should().ContainSingle().Which;
         scope.Paths.Should().BeEmpty();
         scope.Truncated.Should().BeFalse();
+        scope.Status.Should().Be("ambiguous");
+        scope.PathSearchExecuted.Should().BeFalse();
+        scope.AmbiguousRole.Should().Be(
+            ambiguousSource ? "source" : "destination");
+        scope.Candidates.Should().HaveCount(2);
+        scope.Candidates.Select(candidate => candidate.CanonicalKey).Should()
+            .BeEquivalentTo(
+                "csharp:M:Graph.SharedCandidateFirst",
+                "csharp:M:Graph.SharedCandidateSecond");
+        scope.ExecutionState.Should().BeNull();
         scope.Note.Should()
             .Contain(ambiguousSource
                 ? "Ambiguous source symbol"
@@ -776,7 +786,10 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
             .And.Contain("csharp:M:Graph.SharedCandidateFirst")
             .And.Contain("csharp:M:Graph.SharedCandidateSecond");
         CallToolResultHelpers.ProseText(result).Should()
-            .NotContain("source equals destination")
+            .Contain("ambiguous; path search not executed")
+            .And.NotContain("execution projection:")
+            .And.NotContain("projection gap:")
+            .And.NotContain("source equals destination")
             .And.NotContain("traversal was truncated");
     }
 

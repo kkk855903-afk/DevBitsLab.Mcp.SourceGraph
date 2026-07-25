@@ -26,7 +26,18 @@ public sealed record TraceCallPathScopeResult(
     [property: JsonPropertyName("expanded_nodes")] int ExpandedNodes,
     string? Note,
     [property: JsonPropertyName("execution_state")]
-    TraceCallPathExecutionState? ExecutionState);
+    TraceCallPathExecutionState? ExecutionState)
+{
+    public string Status { get; init; } = "ok";
+
+    [JsonPropertyName("path_search_executed")]
+    public bool PathSearchExecuted { get; init; } = true;
+
+    [JsonPropertyName("ambiguous_role")]
+    public string? AmbiguousRole { get; init; }
+
+    public IReadOnlyList<TraceCallPathSymbol> Candidates { get; init; } = [];
+}
 
 /// <summary>
 /// Completeness disclosure for the cross-domain execution profile. Persisted paths remain

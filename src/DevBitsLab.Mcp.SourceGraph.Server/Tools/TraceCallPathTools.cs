@@ -386,8 +386,6 @@ public static class TraceCallPathTools
         }
         if (sources.Count > 1)
         {
-            executionState = await FinalizeExecutionStateAsync()
-                .ConfigureAwait(false);
             return new TraceCallPathScopeResult(
                 host.Scope.Id,
                 Array.Empty<TraceCallPath>(),
@@ -397,7 +395,13 @@ public static class TraceCallPathTools
                     "source",
                     fromQuery,
                     sources),
-                ExecutionState: executionState);
+                ExecutionState: null)
+            {
+                Status = "ambiguous",
+                PathSearchExecuted = false,
+                AmbiguousRole = "source",
+                Candidates = sources.Select(MapSymbol).ToArray(),
+            };
         }
 
         IReadOnlyList<SymbolHit> targets = discoverTerminal
@@ -424,8 +428,6 @@ public static class TraceCallPathTools
         }
         if (!discoverTerminal && targets.Count > 1)
         {
-            executionState = await FinalizeExecutionStateAsync()
-                .ConfigureAwait(false);
             return new TraceCallPathScopeResult(
                 host.Scope.Id,
                 Array.Empty<TraceCallPath>(),
@@ -435,7 +437,13 @@ public static class TraceCallPathTools
                     "destination",
                     toQuery!,
                     targets),
-                ExecutionState: executionState);
+                ExecutionState: null)
+            {
+                Status = "ambiguous",
+                PathSearchExecuted = false,
+                AmbiguousRole = "destination",
+                Candidates = targets.Select(MapSymbol).ToArray(),
+            };
         }
 
         var targetsById = targets.ToDictionary(target => target.Id);
@@ -1460,6 +1468,11 @@ public static class TraceCallPathTools
     {
         var sb = new StringBuilder();
         var pathCount = result.Scopes.Sum(scope => scope.Paths.Count);
+        var singleAmbiguous = result.Scopes.Count == 1
+            && string.Equals(
+                result.Scopes[0].Status,
+                "ambiguous",
+                StringComparison.Ordinal);
         sb.Append("trace_call_path `")
           .Append(result.FromQuery);
         if (result.ToQuery is null)
@@ -1472,14 +1485,21 @@ public static class TraceCallPathTools
               .Append(result.ToQuery)
               .Append("`: ");
         }
-        sb
-          .Append(pathCount)
-          .Append(" path")
-          .Append(pathCount == 1 ? "" : "s")
-          .Append(result.Profile == ExecutionProfile
-              ? " via execution profile"
-              : $" via `{result.EdgeKind}`")
-          .AppendLine();
+        if (singleAmbiguous)
+        {
+            sb.AppendLine("ambiguous; path search not executed");
+        }
+        else
+        {
+            sb
+              .Append(pathCount)
+              .Append(" path")
+              .Append(pathCount == 1 ? "" : "s")
+              .Append(result.Profile == ExecutionProfile
+                  ? " via execution profile"
+                  : $" via `{result.EdgeKind}`")
+              .AppendLine();
+        }
         if (result.TerminalDefinition is not null)
         {
             sb.Append("terminal definition: ")
@@ -1492,6 +1512,15 @@ public static class TraceCallPathTools
             {
                 sb.AppendLine();
                 sb.Append("### scope: `").Append(scope.ScopeId).AppendLine("`");
+            }
+            if (!singleAmbiguous
+                && string.Equals(
+                    scope.Status,
+                    "ambiguous",
+                    StringComparison.Ordinal))
+            {
+                sb.AppendLine();
+                sb.AppendLine("status: ambiguous; path search not executed");
             }
             if (scope.ExecutionState is not null)
             {
