@@ -52,14 +52,6 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         OperatingSystem.IsWindows()
             ? StringComparison.OrdinalIgnoreCase
             : StringComparison.Ordinal;
-    private static readonly PropertyInfo? _documentStateProperty =
-        typeof(Document).GetProperty(
-            "DocumentState",
-            BindingFlags.Instance | BindingFlags.NonPublic);
-    private static readonly PropertyInfo? _documentStateIsGeneratedProperty =
-        _documentStateProperty?.PropertyType.GetProperty(
-            "IsGenerated",
-            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
     private static readonly string[] _analysisEdgeProducer =
     [
         InteropFactProducers.Analysis,
@@ -439,24 +431,8 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         }
     }
 
-    [SuppressMessage(
-        "ReflectionAnalysis",
-        "IL2075:UnrecognizedReflectionPattern",
-        Justification = "The pinned Roslyn workspace does not publicly expose DocumentInfo.IsGenerated from Document; missing or changed internals fail closed.")]
-    private static bool IsBuildGeneratedDocument(Document document)
-    {
-        try
-        {
-            var state = _documentStateProperty?.GetValue(document);
-            return state is not null
-                   && _documentStateIsGeneratedProperty?.GetValue(state)
-                       is true;
-        }
-        catch
-        {
-            return false;
-        }
-    }
+    private static bool IsBuildGeneratedDocument(Document document) =>
+        SolutionPrivacySanitizer.IsBuildGeneratedDocument(document);
 
     private enum ProjectSemanticInputState
     {
