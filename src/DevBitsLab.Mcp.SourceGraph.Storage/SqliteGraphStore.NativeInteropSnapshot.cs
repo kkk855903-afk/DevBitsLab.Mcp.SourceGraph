@@ -184,6 +184,14 @@ public sealed partial class SqliteGraphStore
                 }
             }
 
+            await DeleteShadowedHeaderSyntaxSymbolsAsync(
+                    symbolsByKey.Values
+                        .Select(symbol => symbol.SymbolId)
+                        .ToArray(),
+                    tx,
+                    ct)
+                .ConfigureAwait(false);
+
             // Remove only call occurrences produced by this projection. Logical edges with
             // independent evidence survive and have their compatibility payload resynchronised.
             await _connection.ExecuteAsync(new CommandDefinition(
@@ -408,6 +416,178 @@ public sealed partial class SqliteGraphStore
         {
             _writeLock.Release();
         }
+    }
+
+    private async Task DeleteShadowedHeaderSyntaxSymbolsAsync(
+        IReadOnlyCollection<long> semanticSymbolIds,
+        Microsoft.Data.Sqlite.SqliteTransaction tx,
+        CancellationToken ct)
+    {
+        if (semanticSymbolIds.Count == 0)
+        {
+            return;
+        }
+
+        await _connection.ExecuteAsync(new CommandDefinition(
+                """
+                CREATE TEMP TABLE IF NOT EXISTS native_snapshot_semantic_ids(
+                    symbol_id INTEGER PRIMARY KEY NOT NULL
+                );
+                CREATE TEMP TABLE IF NOT EXISTS native_snapshot_shadowed_syntax_ids(
+                    symbol_id INTEGER PRIMARY KEY NOT NULL
+                );
+                DELETE FROM native_snapshot_semantic_ids;
+                DELETE FROM native_snapshot_shadowed_syntax_ids;
+                """,
+                transaction: tx,
+                cancellationToken: ct))
+            .ConfigureAwait(false);
+        await _connection.ExecuteAsync(new CommandDefinition(
+                """
+                INSERT OR IGNORE INTO native_snapshot_semantic_ids(symbol_id)
+                VALUES (@SymbolId);
+                """,
+                semanticSymbolIds.Select(symbolId => new { SymbolId = symbolId }),
+                transaction: tx,
+                cancellationToken: ct))
+            .ConfigureAwait(false);
+        await _connection.ExecuteAsync(new CommandDefinition(
+                """
+                INSERT INTO native_snapshot_shadowed_syntax_ids(symbol_id)
+                SELECT syntax.id
+                FROM native_snapshot_semantic_ids selected
+                JOIN symbols semantic
+                  ON semantic.id = selected.symbol_id
+                JOIN files file
+                  ON file.id = semantic.file_id
+                JOIN symbols syntax
+                  ON syntax.file_id = semantic.file_id
+                 AND syntax.id <> semantic.id
+                 AND syntax.name = semantic.name
+                 AND syntax.start_line = semantic.start_line
+                 AND syntax.start_col = semantic.start_col
+                WHERE COALESCE(syntax.modifiers, '')
+                          LIKE '%syntax-only%'
+                  AND (
+                        lower(file.path) LIKE '%.h'
+                        OR lower(file.path) LIKE '%.hh'
+                        OR lower(file.path) LIKE '%.hpp'
+                        OR lower(file.path) LIKE '%.hxx'
+                      )
+                  AND (
+                        syntax.kind_name = semantic.kind_name
+                        OR (
+                            semantic.kind_name = @NativeExportKind
+                            AND syntax.kind_name = @FunctionKind
+                           )
+                      );
+                """,
+                new
+                {
+                    NativeExportKind = SymbolKinds.NativeExport,
+                    FunctionKind = SymbolKinds.Function,
+                },
+                transaction: tx,
+                cancellationToken: ct))
+            .ConfigureAwait(false);
+
+        await _connection.ExecuteAsync(new CommandDefinition(
+                """
+                DELETE FROM refs
+                WHERE symbol_id IN (
+                    SELECT symbol_id
+                    FROM native_snapshot_shadowed_syntax_ids
+                );
+
+                DELETE FROM edge_evidence
+                WHERE src IN (
+                        SELECT symbol_id
+                        FROM native_snapshot_shadowed_syntax_ids
+                      )
+                   OR dst IN (
+                        SELECT symbol_id
+                        FROM native_snapshot_shadowed_syntax_ids
+                      );
+
+                DELETE FROM edges
+                WHERE src IN (
+                        SELECT symbol_id
+                        FROM native_snapshot_shadowed_syntax_ids
+                      )
+                   OR dst IN (
+                        SELECT symbol_id
+                        FROM native_snapshot_shadowed_syntax_ids
+                      );
+
+                UPDATE annotations
+                SET attribute_symbol_id = NULL
+                WHERE attribute_symbol_id IN (
+                    SELECT symbol_id
+                    FROM native_snapshot_shadowed_syntax_ids
+                );
+
+                DELETE FROM annotations
+                WHERE symbol_id IN (
+                    SELECT symbol_id
+                    FROM native_snapshot_shadowed_syntax_ids
+                );
+
+                DELETE FROM diagnostics
+                WHERE symbol_id IN (
+                    SELECT symbol_id
+                    FROM native_snapshot_shadowed_syntax_ids
+                );
+
+                DELETE FROM symbol_history
+                WHERE symbol_id IN (
+                    SELECT symbol_id
+                    FROM native_snapshot_shadowed_syntax_ids
+                );
+
+                DELETE FROM embedding_meta
+                WHERE symbol_id IN (
+                    SELECT symbol_id
+                    FROM native_snapshot_shadowed_syntax_ids
+                );
+
+                UPDATE symbols
+                SET container_id = NULL
+                WHERE container_id IN (
+                    SELECT symbol_id
+                    FROM native_snapshot_shadowed_syntax_ids
+                );
+                """,
+                transaction: tx,
+                cancellationToken: ct))
+            .ConfigureAwait(false);
+        if (_vectorExtensionLoaded)
+        {
+            await _connection.ExecuteAsync(new CommandDefinition(
+                    """
+                    DELETE FROM symbol_embeddings
+                    WHERE symbol_id IN (
+                        SELECT symbol_id
+                        FROM native_snapshot_shadowed_syntax_ids
+                    );
+                    """,
+                    transaction: tx,
+                    cancellationToken: ct))
+                .ConfigureAwait(false);
+        }
+        await _connection.ExecuteAsync(new CommandDefinition(
+                """
+                DELETE FROM symbols
+                WHERE id IN (
+                    SELECT symbol_id
+                    FROM native_snapshot_shadowed_syntax_ids
+                );
+
+                DELETE FROM native_snapshot_semantic_ids;
+                DELETE FROM native_snapshot_shadowed_syntax_ids;
+                """,
+                transaction: tx,
+                cancellationToken: ct))
+            .ConfigureAwait(false);
     }
 
     private static NativeInteropFileFacts[]
