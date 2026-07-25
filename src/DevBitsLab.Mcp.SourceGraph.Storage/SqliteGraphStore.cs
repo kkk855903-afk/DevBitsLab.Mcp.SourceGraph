@@ -2558,11 +2558,30 @@ public sealed partial class SqliteGraphStore : IGraphStore
             JOIN files f ON f.id = r.file_id
             WHERE r.symbol_id = @id
               {(includeGenerated ? "" : "AND f.is_generated = 0")}
+              AND NOT (
+                r.kind = @genericKind
+                AND EXISTS (
+                    SELECT 1
+                    FROM refs specific
+                    WHERE specific.symbol_id = r.symbol_id
+                      AND specific.file_id = r.file_id
+                      AND specific.line = r.line
+                      AND specific.col = r.col
+                      AND specific.kind <> @genericKind
+                )
+              )
             ORDER BY f.path, r.line, r.col
             LIMIT @limit;
             """;
         var rows = await _connection.QueryAsync<RawReferenceHit>(new CommandDefinition(
-            sql, new { id = symbolId, limit }, cancellationToken: ct)).ConfigureAwait(false);
+            sql,
+            new
+            {
+                id = symbolId,
+                genericKind = (int)ReferenceKind.Reference,
+                limit,
+            },
+            cancellationToken: ct)).ConfigureAwait(false);
         return rows.Select(r => r.ToHit()).ToList();
     }
 
