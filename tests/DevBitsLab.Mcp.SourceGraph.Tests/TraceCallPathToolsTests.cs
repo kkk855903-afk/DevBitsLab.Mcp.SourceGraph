@@ -307,8 +307,37 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
         var shallowDto = shallow.StructuredContent!.Value.Deserialize(
             ToolOutputJsonContext.Default.TraceCallPathResult)!;
         shallowDto.Scopes.Single().Paths.Should().BeEmpty();
-        shallowDto.Scopes.Single().Truncated.Should().BeTrue(
+        var shallowScope = shallowDto.Scopes.Single();
+        shallowScope.Truncated.Should().BeTrue(
             "the configured depth cap prevented deeper traversal");
+        shallowScope.Truncation.Should().NotBeNull();
+        shallowScope.Truncation!.TruncatedBy.Should()
+            .Equal("max_depth");
+        shallowScope.Truncation.ExpandedNodes.Should().Be(1);
+        shallowScope.Truncation.MaxNodes.Should().Be(1000);
+        shallowScope.Truncation.DepthReached.Should().Be(1);
+        shallowScope.Truncation.MaxDepth.Should().Be(1);
+        shallowScope.Truncation.ReturnedPaths.Should().Be(0);
+        shallowScope.Truncation.MaxPaths.Should().Be(10);
+        CallToolResultHelpers.ProseText(shallow).Should()
+            .Contain("truncated_by: max_depth")
+            .And.Contain("expanded_nodes: 1/1000")
+            .And.Contain("depth_reached: 1/1")
+            .And.Contain("returned_paths: 0/10");
+
+        var nodeBound = await TraceCallPathTools.TraceCallPathWithProfileAsync(
+            _router!,
+            from: "Graph.TerminalSource",
+            to: "Graph.C",
+            maxNodes: 1);
+        var nodeBoundScope = nodeBound.StructuredContent!.Value.Deserialize(
+            ToolOutputJsonContext.Default.TraceCallPathResult)!
+            .Scopes.Should().ContainSingle().Which;
+        nodeBoundScope.Truncated.Should().BeTrue();
+        nodeBoundScope.Truncation!.TruncatedBy.Should()
+            .Equal("max_nodes");
+        nodeBoundScope.Truncation.ExpandedNodes.Should().Be(1);
+        nodeBoundScope.Truncation.MaxNodes.Should().Be(1);
 
         var invalid = await TraceCallPathTools.TraceCallPathAsync(
             _router!,
@@ -681,6 +710,11 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
         pathBoundScope.Paths.Should().ContainSingle();
         pathBoundScope.Truncated.Should().BeTrue(
             "a second proven terminal remains after the path cap");
+        pathBoundScope.Truncation.Should().NotBeNull();
+        pathBoundScope.Truncation!.TruncatedBy.Should()
+            .Contain("max_paths");
+        pathBoundScope.Truncation.ReturnedPaths.Should().Be(1);
+        pathBoundScope.Truncation.MaxPaths.Should().Be(1);
 
         var depthBound = await TraceCallPathTools.TraceCallPathWithProfileAsync(
             _router!,
@@ -695,6 +729,11 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
         depthBoundScope.Paths.Should().BeEmpty();
         depthBoundScope.Truncated.Should().BeTrue(
             "the native calls frontier remains beyond the depth cap");
+        depthBoundScope.Truncation.Should().NotBeNull();
+        depthBoundScope.Truncation!.TruncatedBy.Should()
+            .Equal("max_depth");
+        depthBoundScope.Truncation.DepthReached.Should().Be(8);
+        depthBoundScope.Truncation.MaxDepth.Should().Be(8);
 
         foreach (var boundedScope in new[]
                  {
@@ -707,6 +746,16 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
                 projection => projection.Name == "query-bounds"
                     && projection.Status == "truncated"
                     && !projection.Authoritative);
+            boundedScope.ExecutionState.Failures.Should().Contain(failure =>
+                failure.StartsWith(
+                    "query-bounds: truncated_by=",
+                    StringComparison.Ordinal)
+                && failure.Contains(
+                    "expanded_nodes=",
+                    StringComparison.Ordinal)
+                && failure.Contains(
+                    "returned_paths=",
+                    StringComparison.Ordinal));
         }
     }
 

@@ -472,6 +472,13 @@ public static class TraceCallPathTools
         var expandedNodes = 0;
         var scheduledStates = queue.Count;
         var truncated = orderedSources.Count > maxNodes;
+        var truncationReasons = new HashSet<string>(
+            StringComparer.Ordinal);
+        if (truncated)
+        {
+            truncationReasons.Add("max_nodes");
+        }
+        var depthReached = 0;
         var observedRelations = new HashSet<string>(
             StringComparer.Ordinal);
         var branchLimit = Math.Min(maxNodes, 1000);
@@ -481,6 +488,7 @@ public static class TraceCallPathTools
         {
             ct.ThrowIfCancellationRequested();
             var state = queue.Dequeue();
+            depthReached = Math.Max(depthReached, state.Hops.Count);
             if (discoverTerminal
                 && state.Stage == ExecutionStage.NativeAlgorithm
                 && !await HasAnyAuditableOutboundAsync(
@@ -492,7 +500,10 @@ public static class TraceCallPathTools
                 AddCompletedPath(state, state.Current);
                 if (paths.Count >= maxPaths)
                 {
-                    truncated |= queue.Count > 0;
+                    if (queue.Count > 0)
+                    {
+                        MarkTruncated("max_paths");
+                    }
                     break;
                 }
                 continue;
@@ -502,26 +513,36 @@ public static class TraceCallPathTools
                 AddCompletedPath(state, reachedTarget);
                 if (paths.Count >= maxPaths)
                 {
-                    truncated |= queue.Count > 0;
+                    if (queue.Count > 0)
+                    {
+                        MarkTruncated("max_paths");
+                    }
                     break;
                 }
                 continue;
             }
             if (state.Hops.Count >= maxDepth)
             {
-                truncated |= await HasUnexploredOutboundAsync(
+                if (await HasUnexploredOutboundAsync(
                     host.Store,
                     state,
-                    ct).ConfigureAwait(false);
+                    ct).ConfigureAwait(false))
+                {
+                    MarkTruncated("max_depth");
+                }
                 continue;
             }
             if (expandedNodes >= maxNodes)
             {
-                truncated |= await HasUnexploredOutboundAsync(
+                var hasUnexploredOutbound =
+                    await HasUnexploredOutboundAsync(
                     host.Store,
                     state,
                     ct).ConfigureAwait(false);
-                truncated |= queue.Count > 0;
+                if (hasUnexploredOutbound || queue.Count > 0)
+                {
+                    MarkTruncated("max_nodes");
+                }
                 break;
             }
 
@@ -544,7 +565,10 @@ public static class TraceCallPathTools
                 .Take(branchLimit + 1)
                 .ToList();
             var branchTruncated = unvisitedEdges.Count > branchLimit;
-            if (branchTruncated) truncated = true;
+            if (branchTruncated)
+            {
+                MarkTruncated("branch_limit");
+            }
             var visibleEdges = unvisitedEdges.Take(branchLimit).ToList();
 
             for (var edgeIndex = 0; edgeIndex < visibleEdges.Count; edgeIndex++)
@@ -583,15 +607,19 @@ public static class TraceCallPathTools
                     nextHops,
                     nextVisited,
                     nextStage);
+                depthReached = Math.Max(depthReached, next.Hops.Count);
 
                 if (targetsById.TryGetValue(callee.Id, out reachedTarget))
                 {
                     AddCompletedPath(next, reachedTarget);
                     if (paths.Count >= maxPaths)
                     {
-                        truncated |= branchTruncated
+                        if (branchTruncated
                             || edgeIndex + 1 < visibleEdges.Count
-                            || queue.Count > 0;
+                            || queue.Count > 0)
+                        {
+                            MarkTruncated("max_paths");
+                        }
                         stop = true;
                         break;
                     }
@@ -600,7 +628,7 @@ public static class TraceCallPathTools
                 {
                     if (scheduledStates >= maxNodes)
                     {
-                        truncated = true;
+                        MarkTruncated("max_nodes");
                         continue;
                     }
                     queue.Enqueue(next);
@@ -609,6 +637,19 @@ public static class TraceCallPathTools
             }
         }
 
+        var truncation = truncated
+            ? new TraceCallPathTruncation(
+                truncationReasons.Order(StringComparer.Ordinal).ToArray(),
+                expandedNodes,
+                maxNodes,
+                depthReached,
+                maxDepth,
+                paths.Count,
+                maxPaths,
+                returnedEvidenceRows,
+                MaximumReturnedEvidenceRows,
+                branchLimit)
+            : null;
         executionState = await FinalizeExecutionStateAsync(
                 paths,
                 observedRelations,
@@ -616,7 +657,9 @@ public static class TraceCallPathTools
             .ConfigureAwait(false);
         if (executionState is not null && truncated)
         {
-            executionState = MarkExecutionTruncated(executionState);
+            executionState = MarkExecutionTruncated(
+                executionState,
+                truncation!);
         }
         var note = paths.Count == 0
             ? executionProfile
@@ -640,7 +683,16 @@ public static class TraceCallPathTools
             truncated,
             expandedNodes,
             note,
-            executionState);
+            executionState)
+        {
+            Truncation = truncation,
+        };
+
+        void MarkTruncated(string reason)
+        {
+            truncated = true;
+            truncationReasons.Add(reason);
+        }
 
         async Task<bool> HasUnexploredOutboundAsync(
             IGraphStore store,
@@ -669,7 +721,7 @@ public static class TraceCallPathTools
             if (returnedEvidenceRows + evidenceRows
                 > MaximumReturnedEvidenceRows)
             {
-                truncated = true;
+                MarkTruncated("evidence_limit");
                 return;
             }
             returnedEvidenceRows += evidenceRows;
@@ -1294,7 +1346,8 @@ public static class TraceCallPathTools
     }
 
     private static TraceCallPathExecutionState MarkExecutionTruncated(
-        TraceCallPathExecutionState current)
+        TraceCallPathExecutionState current,
+        TraceCallPathTruncation truncation)
     {
         var projections = current.Projections
             .Where(projection =>
@@ -1308,11 +1361,11 @@ public static class TraceCallPathTools
                 Applicable: true,
                 Authoritative: false,
                 RetainedLastGood: false,
-                FailureCount: 1))
+                FailureCount: truncation.TruncatedBy.Count))
             .ToArray();
         var failures = current.Failures
             .Append(
-                "query-bounds: traversal stopped at a configured depth, path, node, branch, or evidence bound.")
+                $"query-bounds: {FormatTruncationSummary(truncation)}")
             .Distinct(StringComparer.Ordinal)
             .ToArray();
         IReadOnlyList<string> boundedFailures = failures.Length
@@ -1332,6 +1385,16 @@ public static class TraceCallPathTools
             Failures = boundedFailures,
         };
     }
+
+    private static string FormatTruncationSummary(
+        TraceCallPathTruncation truncation) =>
+        $"truncated_by={string.Join(",", truncation.TruncatedBy)}; "
+        + $"expanded_nodes={truncation.ExpandedNodes}/{truncation.MaxNodes}; "
+        + $"depth_reached={truncation.DepthReached}/{truncation.MaxDepth}; "
+        + $"returned_paths={truncation.ReturnedPaths}/{truncation.MaxPaths}; "
+        + "returned_evidence_rows="
+        + $"{truncation.ReturnedEvidenceRows}/{truncation.MaxEvidenceRows}; "
+        + $"branch_limit={truncation.BranchLimit}.";
 
     private static ExecutionProjectionStamp CaptureProjectionStamp(
         ScopeHost host) =>
@@ -1597,7 +1660,36 @@ public static class TraceCallPathTools
             if (scope.Truncated)
             {
                 sb.AppendLine();
-                sb.AppendLine("note: traversal was truncated by a configured path/node/evidence cap.");
+                if (scope.Truncation is null)
+                {
+                    sb.AppendLine("note: traversal was truncated.");
+                }
+                else
+                {
+                    sb.Append("truncated_by: ")
+                      .AppendLine(string.Join(
+                          ", ",
+                          scope.Truncation.TruncatedBy));
+                    sb.Append("expanded_nodes: ")
+                      .Append(scope.Truncation.ExpandedNodes)
+                      .Append('/')
+                      .AppendLine(scope.Truncation.MaxNodes.ToString());
+                    sb.Append("depth_reached: ")
+                      .Append(scope.Truncation.DepthReached)
+                      .Append('/')
+                      .AppendLine(scope.Truncation.MaxDepth.ToString());
+                    sb.Append("returned_paths: ")
+                      .Append(scope.Truncation.ReturnedPaths)
+                      .Append('/')
+                      .AppendLine(scope.Truncation.MaxPaths.ToString());
+                    sb.Append("returned_evidence_rows: ")
+                      .Append(scope.Truncation.ReturnedEvidenceRows)
+                      .Append('/')
+                      .AppendLine(
+                          scope.Truncation.MaxEvidenceRows.ToString());
+                    sb.Append("branch_limit: ")
+                      .AppendLine(scope.Truncation.BranchLimit.ToString());
+                }
             }
         }
         return sb.ToString().TrimEnd();

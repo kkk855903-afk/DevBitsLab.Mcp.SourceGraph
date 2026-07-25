@@ -37,7 +37,23 @@ public sealed record TraceCallPathScopeResult(
     public string? AmbiguousRole { get; init; }
 
     public IReadOnlyList<TraceCallPathSymbol> Candidates { get; init; } = [];
+
+    public TraceCallPathTruncation? Truncation { get; init; }
 }
+
+public sealed record TraceCallPathTruncation(
+    [property: JsonPropertyName("truncated_by")]
+    IReadOnlyList<string> TruncatedBy,
+    [property: JsonPropertyName("expanded_nodes")] int ExpandedNodes,
+    [property: JsonPropertyName("max_nodes")] int MaxNodes,
+    [property: JsonPropertyName("depth_reached")] int DepthReached,
+    [property: JsonPropertyName("max_depth")] int MaxDepth,
+    [property: JsonPropertyName("returned_paths")] int ReturnedPaths,
+    [property: JsonPropertyName("max_paths")] int MaxPaths,
+    [property: JsonPropertyName("returned_evidence_rows")]
+    int ReturnedEvidenceRows,
+    [property: JsonPropertyName("max_evidence_rows")] int MaxEvidenceRows,
+    [property: JsonPropertyName("branch_limit")] int BranchLimit);
 
 /// <summary>
 /// Completeness disclosure for the cross-domain execution profile. Persisted paths remain
