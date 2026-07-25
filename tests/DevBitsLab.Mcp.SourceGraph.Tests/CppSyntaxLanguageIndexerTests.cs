@@ -129,6 +129,80 @@ public sealed class CppSyntaxLanguageIndexerTests
     }
 
     [Fact]
+    public async Task Indexes_all_multiline_cdecl_export_definitions()
+    {
+        var events = await IndexAsync(
+            """
+            HRESULT __cdecl pg_camera_create(void** camera) { return 0; }
+            void __cdecl pg_camera_destroy(void* camera) {}
+            HRESULT __cdecl pg_camera_start(
+                void* camera,
+                std::uint32_t camera_index,
+                PgCameraFormat* actual_format)
+            {
+                return 0;
+            }
+            void __cdecl pg_camera_stop(void* camera) {}
+            BOOL __cdecl pg_camera_is_running(void* camera) { return 0; }
+            HRESULT __cdecl pg_camera_try_read(
+                void* camera,
+                std::uint8_t* destination,
+                std::uint32_t capacity)
+            {
+                return 0;
+            }
+            std::uint32_t __cdecl pg_camera_get_last_error(
+                void* camera,
+                wchar_t* destination,
+                std::uint32_t capacity)
+            {
+                return 0;
+            }
+            """);
+
+        events.OfType<IndexEvent.SymbolDeclared>()
+            .Where(symbol => symbol.Name.StartsWith(
+                "pg_camera_",
+                StringComparison.Ordinal))
+            .Select(symbol => symbol.Name)
+            .Should().BeEquivalentTo(
+            [
+                "pg_camera_create",
+                "pg_camera_destroy",
+                "pg_camera_start",
+                "pg_camera_stop",
+                "pg_camera_is_running",
+                "pg_camera_try_read",
+                "pg_camera_get_last_error",
+            ]);
+    }
+
+    [Fact]
+    public async Task Distinguishes_destructors_and_deleted_constructors()
+    {
+        var events = await IndexAsync(
+            """
+            class CameraCapture
+            {
+            public:
+                CameraCapture() = default;
+                ~CameraCapture() = default;
+                CameraCapture(const CameraCapture&) = delete;
+            };
+            """);
+
+        var symbols = events.OfType<IndexEvent.SymbolDeclared>().ToArray();
+        symbols.Single(symbol => symbol.Name == "~CameraCapture")
+            .Kind.Should().Be(SymbolKinds.Method);
+        symbols.Single(symbol =>
+                symbol.Name == "CameraCapture"
+                && symbol.Signature!.Contains(
+                    "const CameraCapture&",
+                    StringComparison.Ordinal))
+            .Modifiers.Should().Contain("deleted");
+    }
+
+    [Fact]
     public async Task Does_not_treat_local_object_construction_as_a_function()
     {
         var events = await IndexAsync(

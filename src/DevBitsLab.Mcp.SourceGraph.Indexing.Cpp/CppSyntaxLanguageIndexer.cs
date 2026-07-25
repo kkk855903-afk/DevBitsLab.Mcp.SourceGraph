@@ -281,15 +281,19 @@ public sealed class CppSyntaxLanguageIndexer : ILanguageIndexer, IBoundedSourceL
             $"syntax::{qualifiedName}{parameters}");
 
         var enclosingType = FindEnclosingTypeName(node);
-        var kind = enclosingType is not null
+        var isDestructor = leafName.StartsWith('~');
+        var kind = !isDestructor && enclosingType is not null
             && string.Equals(
-                leafName.TrimStart('~'),
+                leafName,
                 enclosingType,
                 StringComparison.Ordinal)
                 ? SymbolKinds.Constructor
                 : enclosingType is null && !rawName.Contains("::", StringComparison.Ordinal)
                     ? SymbolKinds.Function
                     : SymbolKinds.Method;
+        var modifiers = FindFirstDescendant(node, "delete_method_clause") is null
+            ? "syntax-only"
+            : "syntax-only deleted";
         var (line, column) = TreeSitterAdapter.ToOneBased(node.StartPosition);
         var (endLine, endColumn) = TreeSitterAdapter.ToOneBased(node.EndPosition);
         var symbol = new IndexEvent.SymbolDeclared(
@@ -302,7 +306,7 @@ public sealed class CppSyntaxLanguageIndexer : ILanguageIndexer, IBoundedSourceL
             endLine,
             endColumn,
             signature: CollapseWhitespace(functionDeclarator.Text),
-            modifiers: "syntax-only");
+            modifiers: modifiers);
         return new Declaration(
             NodeIdentity.For(node),
             node.Type,
