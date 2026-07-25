@@ -464,6 +464,8 @@ public static class TraceCallPathTools
         var expandedNodes = 0;
         var scheduledStates = queue.Count;
         var truncated = orderedSources.Count > maxNodes;
+        var observedRelations = new HashSet<string>(
+            StringComparer.Ordinal);
         var branchLimit = Math.Min(maxNodes, 1000);
         var stop = false;
 
@@ -527,6 +529,8 @@ public static class TraceCallPathTools
                     : relations,
                 checked(branchLimit + state.Visited.Count + 1),
                 ct).ConfigureAwait(false);
+            observedRelations.UnionWith(
+                storedEdges.Select(edge => edge.Relation));
             var unvisitedEdges = storedEdges
                 .Where(edge => !state.Visited.Contains(edge.Symbol.Id))
                 .Take(branchLimit + 1)
@@ -597,7 +601,10 @@ public static class TraceCallPathTools
             }
         }
 
-        executionState = await FinalizeExecutionStateAsync(paths)
+        executionState = await FinalizeExecutionStateAsync(
+                paths,
+                observedRelations,
+                queryTraversalComplete: !truncated)
             .ConfigureAwait(false);
         if (executionState is not null && truncated)
         {
@@ -673,7 +680,9 @@ public static class TraceCallPathTools
 
         async Task<TraceCallPathExecutionState?>
             FinalizeExecutionStateAsync(
-                IReadOnlyList<TraceCallPath>? observedPaths = null)
+                IReadOnlyList<TraceCallPath>? observedPaths = null,
+                IReadOnlySet<string>? observedRelations = null,
+                bool queryTraversalComplete = false)
         {
             if (!executionProfile) return null;
 
@@ -697,10 +706,20 @@ public static class TraceCallPathTools
                 initialReadVersion!.Value,
                 finalReadVersion,
                 runtimeChanged);
-            return observedPaths is { Count: > 0 } && !discoverTerminal
-                ? RefineExecutionStateForObservedPaths(
+            if (discoverTerminal)
+            {
+                return reconciled;
+            }
+            if (observedPaths is { Count: > 0 })
+            {
+                return RefineExecutionStateForObservedPaths(
                     reconciled,
-                    observedPaths)
+                    observedPaths);
+            }
+            return queryTraversalComplete && observedRelations is not null
+                ? RefineExecutionStateForObservedRelations(
+                    reconciled,
+                    observedRelations)
                 : reconciled;
         }
     }
@@ -1085,6 +1104,16 @@ public static class TraceCallPathTools
             .SelectMany(path => path.Hops)
             .Select(hop => hop.Relation)
             .ToHashSet(StringComparer.Ordinal);
+        return RefineExecutionStateForObservedRelations(
+            current,
+            relations);
+    }
+
+    private static TraceCallPathExecutionState
+        RefineExecutionStateForObservedRelations(
+            TraceCallPathExecutionState current,
+            IReadOnlySet<string> relations)
+    {
         var scope = current.Projections.First(projection =>
             string.Equals(
                 projection.Name,

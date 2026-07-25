@@ -358,6 +358,58 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task ExecutionNegativePathIgnoresUnreachableNativeProjection()
+    {
+        var result = await TraceCallPathTools.TraceCallPathWithProfileAsync(
+            _router!,
+            from: "csharp:M:Graph.TerminalLeaf",
+            to: "csharp:M:Graph.C",
+            profile: "execution",
+            maxDepth: 8,
+            maxNodes: 100);
+
+        var scope = result.StructuredContent!.Value.Deserialize(
+            ToolOutputJsonContext.Default.TraceCallPathResult)!
+            .Scopes.Should().ContainSingle().Which;
+        scope.Paths.Should().BeEmpty();
+        scope.Truncated.Should().BeFalse();
+        scope.ExecutionState!.Status.Should().Be("complete");
+        scope.ExecutionState.AbsenceAuthoritative.Should().BeTrue();
+        scope.ExecutionState.Projections.Should().Contain(projection =>
+            projection.Name == "native-interop"
+            && !projection.Applicable);
+        scope.ExecutionState.Failures.Should().BeEmpty();
+    }
+
+    [Fact]
+    public async Task ExecutionNegativePathRetainsReachableNativeProjectionGap()
+    {
+        var result = await TraceCallPathTools.TraceCallPathWithProfileAsync(
+            _router!,
+            from: "csharp:M:Graph.Ui",
+            to: "csharp:M:Graph.A",
+            profile: "execution",
+            maxDepth: 12,
+            maxNodes: 1000);
+
+        var scope = result.StructuredContent!.Value.Deserialize(
+            ToolOutputJsonContext.Default.TraceCallPathResult)!
+            .Scopes.Should().ContainSingle().Which;
+        scope.Paths.Should().BeEmpty();
+        scope.Truncated.Should().BeFalse();
+        scope.ExecutionState!.Status.Should().Be("partial");
+        scope.ExecutionState.AbsenceAuthoritative.Should().BeFalse();
+        scope.ExecutionState.Projections.Should().Contain(projection =>
+            projection.Name == "native-interop"
+            && projection.Applicable
+            && !projection.Authoritative);
+        scope.ExecutionState.Failures.Should().Contain(failure =>
+            failure.StartsWith(
+                "native-interop:",
+                StringComparison.Ordinal));
+    }
+
+    [Fact]
     public async Task ExecutionProfile_tracesOnlyWhitelistedRelations_fromExactCanonicalKeys()
     {
         var result = await TraceCallPathTools.TraceCallPathWithProfileAsync(
