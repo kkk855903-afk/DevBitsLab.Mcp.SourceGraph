@@ -13,7 +13,8 @@ namespace DevBitsLab.Mcp.SourceGraph.Server.Plugins;
 /// <item><see cref="BuiltInRoslynLanguageIndexerStub"/> for <c>.cs</c>.</item>
 /// <item><see cref="DevBitsLab.Mcp.SourceGraph.Indexing.Protobuf.ProtobufLanguageIndexer"/> for <c>.proto</c>.</item>
 /// <item><see cref="DevBitsLab.Mcp.SourceGraph.Indexing.Xaml.XamlLanguageIndexer"/> for <c>.xaml</c>.</item>
-/// <item><see cref="DevBitsLab.Mcp.SourceGraph.Indexing.TypeScript.TypeScriptLanguageIndexer"/> for <c>.ts</c> / <c>.tsx</c> / <c>.js</c> / <c>.jsx</c>.</item>
+    /// <item><see cref="DevBitsLab.Mcp.SourceGraph.Indexing.TypeScript.TypeScriptLanguageIndexer"/> for <c>.ts</c> / <c>.tsx</c> / <c>.js</c> / <c>.jsx</c>.</item>
+    /// <item><see cref="DevBitsLab.Mcp.SourceGraph.Indexing.Cpp.CppSyntaxLanguageIndexer"/> for C/C++ source and headers.</item>
 /// </list>
 /// </summary>
 internal static class BuiltInIndexers
@@ -32,6 +33,7 @@ internal static class BuiltInIndexers
             new DevBitsLab.Mcp.SourceGraph.Indexing.Protobuf.ProtobufLanguageIndexer(),
             new DevBitsLab.Mcp.SourceGraph.Indexing.Xaml.XamlLanguageIndexer(),
             new DevBitsLab.Mcp.SourceGraph.Indexing.TypeScript.TypeScriptLanguageIndexer(),
+            new DevBitsLab.Mcp.SourceGraph.Indexing.Cpp.CppSyntaxLanguageIndexer(),
         };
 
         var results = new List<(string, IReadOnlyList<string>)>(indexers.Length);

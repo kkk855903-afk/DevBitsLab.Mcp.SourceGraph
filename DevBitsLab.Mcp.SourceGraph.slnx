@@ -4,6 +4,7 @@
     <Project Path="src/DevBitsLab.Mcp.SourceGraph.Embeddings/DevBitsLab.Mcp.SourceGraph.Embeddings.csproj" />
     <Project Path="src/DevBitsLab.Mcp.SourceGraph.Indexing/DevBitsLab.Mcp.SourceGraph.Indexing.csproj" />
     <Project Path="src/DevBitsLab.Mcp.SourceGraph.Indexing.Clang/DevBitsLab.Mcp.SourceGraph.Indexing.Clang.csproj" />
+    <Project Path="src/DevBitsLab.Mcp.SourceGraph.Indexing.Cpp/DevBitsLab.Mcp.SourceGraph.Indexing.Cpp.csproj" />
     <Project Path="src/DevBitsLab.Mcp.SourceGraph.Indexing.TreeSitter/DevBitsLab.Mcp.SourceGraph.Indexing.TreeSitter.csproj" />
     <Project Path="src/DevBitsLab.Mcp.SourceGraph.Indexing.TypeScript/DevBitsLab.Mcp.SourceGraph.Indexing.TypeScript.csproj" />
     <Project Path="src/DevBitsLab.Mcp.SourceGraph.Indexing.Xaml/DevBitsLab.Mcp.SourceGraph.Indexing.Xaml.csproj" />

@@ -54,6 +54,7 @@
     <ProjectReference Include="..\DevBitsLab.Mcp.SourceGraph.Indexing.Xaml\DevBitsLab.Mcp.SourceGraph.Indexing.Xaml.csproj" />
     <ProjectReference Include="..\DevBitsLab.Mcp.SourceGraph.Indexing.TreeSitter\DevBitsLab.Mcp.SourceGraph.Indexing.TreeSitter.csproj" />
     <ProjectReference Include="..\DevBitsLab.Mcp.SourceGraph.Indexing.TypeScript\DevBitsLab.Mcp.SourceGraph.Indexing.TypeScript.csproj" />
+    <ProjectReference Include="..\DevBitsLab.Mcp.SourceGraph.Indexing.Cpp\DevBitsLab.Mcp.SourceGraph.Indexing.Cpp.csproj" />
     <ProjectReference Include="..\DevBitsLab.Mcp.SourceGraph.Interop\DevBitsLab.Mcp.SourceGraph.Interop.csproj" />
     <ProjectReference Include="..\DevBitsLab.Mcp.SourceGraph.Watcher\DevBitsLab.Mcp.SourceGraph.Watcher.csproj" />
     <ProjectReference Include="..\DevBitsLab.Mcp.SourceGraph.Embeddings\DevBitsLab.Mcp.SourceGraph.Embeddings.csproj" />

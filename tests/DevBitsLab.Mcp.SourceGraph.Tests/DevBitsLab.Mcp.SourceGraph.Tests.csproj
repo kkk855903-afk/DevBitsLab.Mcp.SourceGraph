@@ -30,6 +30,7 @@
     <ProjectReference Include="..\..\src\DevBitsLab.Mcp.SourceGraph.Indexing.Xaml\DevBitsLab.Mcp.SourceGraph.Indexing.Xaml.csproj" />
     <ProjectReference Include="..\..\src\DevBitsLab.Mcp.SourceGraph.Indexing.TreeSitter\DevBitsLab.Mcp.SourceGraph.Indexing.TreeSitter.csproj" />
     <ProjectReference Include="..\..\src\DevBitsLab.Mcp.SourceGraph.Indexing.TypeScript\DevBitsLab.Mcp.SourceGraph.Indexing.TypeScript.csproj" />
+    <ProjectReference Include="..\..\src\DevBitsLab.Mcp.SourceGraph.Indexing.Cpp\DevBitsLab.Mcp.SourceGraph.Indexing.Cpp.csproj" />
     <ProjectReference Include="..\..\src\DevBitsLab.Mcp.SourceGraph.Interop\DevBitsLab.Mcp.SourceGraph.Interop.csproj" />
     <ProjectReference Include="..\..\src\DevBitsLab.Mcp.SourceGraph.Embeddings\DevBitsLab.Mcp.SourceGraph.Embeddings.csproj" />
     <ProjectReference Include="..\..\src\DevBitsLab.Mcp.SourceGraph.Sdk\DevBitsLab.Mcp.SourceGraph.Sdk.csproj" />
