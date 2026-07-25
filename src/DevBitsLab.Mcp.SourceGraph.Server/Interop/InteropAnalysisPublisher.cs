@@ -481,7 +481,9 @@ internal sealed class InteropAnalysisPublisher
                 AttributeCanonicalKey: null));
             matchCounts[importFilePath]++;
 
-            if (match.Status != InteropMatchStatus.Matched)
+            if (match.Status is not (
+                    InteropMatchStatus.Matched
+                    or InteropMatchStatus.SourceMatched))
             {
                 continue;
             }
@@ -498,7 +500,9 @@ internal sealed class InteropAnalysisPublisher
                 StringComparer.Ordinal)
             {
                 ["runtimeIdentifier"] = target.RuntimeIdentifier,
-                ["status"] = "matched",
+                ["status"] = match.Status == InteropMatchStatus.Matched
+                    ? "matched"
+                    : "source_matched",
                 ["confidence"] = ConfidenceToken(match.Confidence),
             };
             edgesByPath[importFilePath].Add(new ProducerEdgeEvidenceFact(
@@ -511,6 +515,11 @@ internal sealed class InteropAnalysisPublisher
                     match.Confidence,
                     Producer,
                     metadata)));
+
+            if (match.Status == InteropMatchStatus.SourceMatched)
+            {
+                continue;
+            }
 
             foreach (var mapping in FindRecordMappings(
                          managed,
