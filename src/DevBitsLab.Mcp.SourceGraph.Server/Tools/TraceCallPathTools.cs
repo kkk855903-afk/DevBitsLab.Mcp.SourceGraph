@@ -366,6 +366,7 @@ public static class TraceCallPathTools
         var executionState = executionProfile
             ? BuildExecutionState(host)
             : null;
+        IReadOnlyList<SymbolHit> targets = [];
         var sources = await ResolveSymbolsAsync(
             host.Store,
             fromQuery,
@@ -406,7 +407,7 @@ public static class TraceCallPathTools
             };
         }
 
-        IReadOnlyList<SymbolHit> targets = discoverTerminal
+        targets = discoverTerminal
             ? []
             : await ResolveSymbolsAsync(
                 host.Store,
@@ -778,12 +779,45 @@ public static class TraceCallPathTools
                     reconciled,
                     observedPaths);
             }
+            var queryRelations = observedRelations is null
+                ? new HashSet<string>(StringComparer.Ordinal)
+                : new HashSet<string>(
+                    observedRelations,
+                    StringComparer.Ordinal);
+            if (sources.Any(IsNativeSymbol)
+                || targets.Any(IsNativeSymbol))
+            {
+                queryRelations.Add(EdgeKinds.NativeImplementation);
+            }
             return queryTraversalComplete && observedRelations is not null
                 ? RefineExecutionStateForObservedRelations(
                     reconciled,
-                    observedRelations)
+                    queryRelations)
                 : reconciled;
         }
+    }
+
+    private static bool IsNativeSymbol(SymbolHit symbol)
+    {
+        if (string.Equals(
+                symbol.Kind,
+                SymbolKinds.NativeExport,
+                StringComparison.Ordinal))
+        {
+            return true;
+        }
+        if (symbol.CanonicalKey?.StartsWith(
+                "cpp:",
+                StringComparison.Ordinal) == true
+            || symbol.CanonicalKey?.StartsWith(
+                "c:",
+                StringComparison.Ordinal) == true)
+        {
+            return true;
+        }
+        return Path.GetExtension(symbol.FilePath).ToLowerInvariant()
+            is ".c" or ".cc" or ".cpp" or ".cxx" or ".c++"
+                or ".h" or ".hh" or ".hpp" or ".hxx";
     }
 
     private static async Task<IReadOnlyList<SymbolHit>> ResolveSymbolsAsync(

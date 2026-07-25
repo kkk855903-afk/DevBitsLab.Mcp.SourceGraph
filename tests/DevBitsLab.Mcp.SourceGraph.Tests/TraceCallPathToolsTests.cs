@@ -91,6 +91,11 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
             store,
             "CppDefinition");
         var cppStop = await SeedSymbolAsync(store, "CppStop");
+        await SeedSymbolAsync(
+            store,
+            "NativeOrphan",
+            canonicalKey: "cpp:F:native/orphan.cpp::syntax::NativeOrphan()",
+            extension: ".cpp");
         var outOfOrderRpc = await SeedSymbolAsync(store, "OutOfOrderRpc");
         var outOfOrderServer = await SeedSymbolAsync(
             store,
@@ -451,6 +456,30 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
             failure.StartsWith(
                 "native-interop:",
                 StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task ExecutionNegativePathRetainsNativeGap_forNativeEndpoint()
+    {
+        var result = await TraceCallPathTools.TraceCallPathWithProfileAsync(
+            _router!,
+            from: "cpp:F:native/orphan.cpp::syntax::NativeOrphan()",
+            to: "csharp:M:Graph.A",
+            profile: "execution",
+            maxDepth: 8,
+            maxNodes: 100);
+
+        var scope = result.StructuredContent!.Value.Deserialize(
+                ToolOutputJsonContext.Default.TraceCallPathResult)!
+            .Scopes.Should().ContainSingle().Which;
+        scope.Paths.Should().BeEmpty();
+        scope.Truncated.Should().BeFalse();
+        scope.ExecutionState!.Status.Should().Be("partial");
+        scope.ExecutionState.AbsenceAuthoritative.Should().BeFalse();
+        scope.ExecutionState.Projections.Should().Contain(projection =>
+            projection.Name == "native-interop"
+            && projection.Applicable
+            && !projection.Authoritative);
     }
 
     [Fact]
@@ -1031,15 +1060,17 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
     private async Task<SeededSymbol> SeedSymbolAsync(
         SqliteGraphStore store,
         string name,
-        string? symbolName = null)
+        string? symbolName = null,
+        string? canonicalKey = null,
+        string extension = ".cs")
     {
-        var path = Path.Join(_tempDir, $"{name}.cs");
+        var path = Path.Join(_tempDir, $"{name}{extension}");
         var fileId = await store.UpsertFileAsync(
             path,
             new byte[] { 1, 2, 3, 4 },
             DateTimeOffset.UtcNow);
         var symbolId = await store.UpsertSymbolAsync(
-            $"csharp:M:Graph.{name}",
+            canonicalKey ?? $"csharp:M:Graph.{name}",
             new Symbol(
                 0,
                 symbolName ?? name,
