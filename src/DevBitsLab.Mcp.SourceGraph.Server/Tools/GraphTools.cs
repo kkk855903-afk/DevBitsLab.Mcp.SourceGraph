@@ -304,7 +304,7 @@ public static class GraphTools
 
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(FindReferencesResult))]
     [ToolTrigger("\"who uses X?\" or \"who calls X?\"")]
-    [Description("Find every place that references a symbol. Resolves the symbol by name/FQN, then lists each occurrence with target symbol id/FQN, relation kind, semantic confidence, and file:line. By default skips refs from source-generated files; pass includeGenerated=true to surface them.")]
+    [Description("Find every place that references a symbol, plus evidence-backed interop links such as managed P/Invoke mappings and native export implementations. Resolves the symbol by name/FQN, then lists each occurrence with target symbol id/FQN, relation kind, semantic confidence, and file:line. By default skips refs from source-generated files; pass includeGenerated=true to surface them.")]
     public static Task<CallToolResult> FindReferencesAsync(
         ScopeRouter router,
         [Description("Symbol name or FQN, same matching rules as find_definition")] string symbol,
@@ -448,6 +448,42 @@ public static class GraphTools
                 if (hits.Count >= limit)
                 {
                     return hits;
+                }
+            }
+        }
+
+        remaining = Math.Max(0, limit - hits.Count);
+        if (remaining > 0)
+        {
+            var implementations = await store.ListAuditableOutboundEdgesAsync(
+                targetSymbolId,
+                remaining,
+                EdgeKinds.NativeImplementation,
+                ct).ConfigureAwait(false);
+            foreach (var implementation in implementations)
+            {
+                if (!includeGenerated && implementation.Symbol.IsGenerated)
+                {
+                    continue;
+                }
+                var evidence = await store.ListEdgeEvidenceAsync(
+                    targetSymbolId,
+                    implementation.Symbol.Id,
+                    implementation.Relation,
+                    ct: ct).ConfigureAwait(false);
+                foreach (var occurrence in evidence)
+                {
+                    hits.Add(new ReferenceDisplayHit(
+                        implementation.Relation,
+                        EvidenceConfidenceLabel(occurrence.Confidence),
+                        occurrence.Location.FilePath,
+                        occurrence.Location.StartLine,
+                        occurrence.Location.StartColumn,
+                        implementation.Symbol.IsGenerated));
+                    if (hits.Count >= limit)
+                    {
+                        return hits;
+                    }
                 }
             }
         }

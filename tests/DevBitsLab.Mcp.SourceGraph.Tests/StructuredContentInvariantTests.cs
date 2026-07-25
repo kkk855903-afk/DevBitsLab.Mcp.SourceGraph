@@ -293,7 +293,7 @@ public sealed class StructuredContentInvariantTests : IAsyncLifetime, IDisposabl
     }
 
     [Fact]
-    public async Task FindReferences_includes_managed_pinvoke_mapping_to_native_export()
+    public async Task FindReferences_includes_managed_pinvoke_and_native_implementation_edges()
     {
         var managedFilePath = Path.Join(_tempDir, "NativeMethods.cs");
         var managedFileId = await _store!.UpsertFileAsync(
@@ -350,6 +350,42 @@ public sealed class StructuredContentInvariantTests : IAsyncLifetime, IDisposabl
                     "interop-analysis"),
             },
         ]);
+        var implementationFilePath = Path.Join(_tempDir, "native", "camera-implementation.cpp");
+        var implementationFileId = await _store.UpsertFileAsync(
+            implementationFilePath,
+            [7, 8, 9],
+            DateTimeOffset.UtcNow);
+        var implementationSymbolId = await _store.UpsertSymbolAsync(
+            "cpp:F:native/camera-implementation.cpp::syntax::pg_camera_start()",
+            new Symbol(
+                Id: 0,
+                Name: "pg_camera_start",
+                Fqn: "pg_camera_start",
+                Kind: SymbolKinds.Function,
+                FileId: implementationFileId,
+                StartLine: 12,
+                StartCol: 1,
+                EndLine: 15,
+                EndCol: 2,
+                Signature: "int pg_camera_start()",
+                ContainerId: null,
+                Modifiers: "syntax-only"));
+        await _store.BulkInsertEdgesAsync(
+        [
+            new Edge(nativeSymbolId, implementationSymbolId, EdgeKinds.NativeImplementation)
+            {
+                Evidence = new Evidence(
+                    implementationFileId,
+                    new SourceLocation(
+                        implementationFilePath,
+                        12,
+                        1,
+                        15,
+                        2),
+                    EvidenceConfidence.Inferred,
+                    "interop-analysis"),
+            },
+        ]);
 
         var result = await GraphTools.FindReferencesAsync(
             _router!,
@@ -359,12 +395,18 @@ public sealed class StructuredContentInvariantTests : IAsyncLifetime, IDisposabl
             ToolOutputJsonContext.Default.FindReferencesResult);
 
         dto.Should().NotBeNull();
-        dto!.References.Should().ContainSingle(reference =>
+        dto!.References.Should().Contain(reference =>
             reference.Relation == EdgeKinds.PInvokeMapsTo
             && reference.FilePath == managedFilePath
             && reference.Confidence == "exact");
+        dto.References.Should().Contain(reference =>
+            reference.Relation == EdgeKinds.NativeImplementation
+            && reference.FilePath == implementationFilePath
+            && reference.Confidence == "inferred");
         CallToolResultHelpers.ProseText(result)
-            .Should().Contain(EdgeKinds.PInvokeMapsTo);
+            .Should().ContainAll(
+                EdgeKinds.PInvokeMapsTo,
+                EdgeKinds.NativeImplementation);
     }
 
     [Fact]
