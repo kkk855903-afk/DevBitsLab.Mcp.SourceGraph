@@ -200,6 +200,28 @@ public sealed class RoslynCommandExecutionTests
                     public bool CanExecute(object? parameter) => true;
                     public void Execute(object? parameter) => first();
                 }
+
+                public sealed class EventOwner
+                {
+                    public event EventHandler? Changed;
+
+                    public void Attach(EventOwner source)
+                    {
+                        source.Changed += Handle;
+                    }
+
+                    public void Detach(EventOwner source)
+                    {
+                        source.Changed -= Handle;
+                    }
+
+                    public void Raise()
+                    {
+                        Changed?.Invoke(this, EventArgs.Empty);
+                    }
+
+                    private void Handle(object? sender, EventArgs args) { }
+                }
                 """);
 
             await using var store =
@@ -220,6 +242,38 @@ public sealed class RoslynCommandExecutionTests
                     && symbol.Kind == SymbolKinds.Event)
                 .Should().HaveCount(3,
                     "field-like event declarations must be indexed as event symbols");
+            var eventSymbol = await SymbolNamedAsync(
+                store,
+                sourcePath,
+                "Changed",
+                SymbolKinds.Event);
+            foreach (var (methodName, relation) in new[]
+                     {
+                         ("Attach", EdgeKinds.SubscribesEvent),
+                         ("Detach", EdgeKinds.UnsubscribesEvent),
+                         ("Raise", EdgeKinds.RaisesEvent),
+                     })
+            {
+                var method = await SymbolNamedAsync(
+                    store,
+                    sourcePath,
+                    methodName,
+                    SymbolKinds.Method);
+                (await store.ListCalleesAsync(
+                        method.Id,
+                        edgeKind: relation))
+                    .Should().ContainSingle(symbol =>
+                        symbol.Id == eventSymbol.Id);
+                (await store.ListEdgeEvidenceAsync(
+                        method.Id,
+                        eventSymbol.Id,
+                        relation))
+                    .Should().ContainSingle(evidence =>
+                        evidence.Confidence
+                        == DevBitsLab.Mcp.SourceGraph.Core
+                            .EvidenceConfidence.Exact
+                        && evidence.Producer == "roslyn");
+            }
 
             foreach (var propertyName in new[]
                      {

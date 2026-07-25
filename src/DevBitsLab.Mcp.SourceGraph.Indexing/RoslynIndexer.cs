@@ -3379,6 +3379,33 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                         }
                     }
 
+                    if (referenced is IEventSymbol)
+                    {
+                        var eventRelation = ClassifyEventRelation(refNode);
+                        if (eventRelation is not null)
+                        {
+                            var enclosing = FindEnclosingMember(
+                                model,
+                                refNode.SpanStart,
+                                ct);
+                            var enclosingKey = enclosing is null
+                                ? null
+                                : SymbolMapping.CanonicalKey(enclosing);
+                            if (enclosingKey is not null
+                                && _symbolIdByKey.TryGetValue(
+                                    enclosingKey,
+                                    out var sourceId))
+                            {
+                                AddEdge(
+                                    sourceId,
+                                    symId,
+                                    eventRelation,
+                                    refNode,
+                                    CoreEvidenceConfidence.Exact);
+                            }
+                        }
+                    }
+
                     // Instantiates edge: every `new T()` becomes an Instantiates(enclosing -> T) edge,
                     // alongside the Calls edge to the constructor that the case above already emitted.
                     // We also emit a UsesType edge so kind=uses_type can answer "every consumer of T",
@@ -4647,6 +4674,57 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         {
             _lock.Release();
         }
+    }
+
+    private static string? ClassifyEventRelation(SyntaxNode reference)
+    {
+        var assignment = reference
+            .AncestorsAndSelf()
+            .OfType<AssignmentExpressionSyntax>()
+            .FirstOrDefault(candidate =>
+                candidate.Left.Span.Contains(reference.Span));
+        if (assignment is not null)
+        {
+            return assignment.Kind() switch
+            {
+                SyntaxKind.AddAssignmentExpression =>
+                    EdgeKinds.SubscribesEvent,
+                SyntaxKind.SubtractAssignmentExpression =>
+                    EdgeKinds.UnsubscribesEvent,
+                _ => null,
+            };
+        }
+
+        var conditionalRaise = reference
+            .AncestorsAndSelf()
+            .OfType<ConditionalAccessExpressionSyntax>()
+            .Any(candidate =>
+                candidate.Expression.Span.Contains(reference.Span)
+                && candidate.WhenNotNull
+                    .DescendantNodesAndSelf()
+                    .OfType<InvocationExpressionSyntax>()
+                    .Any(invocation =>
+                        invocation.Expression switch
+                        {
+                            MemberBindingExpressionSyntax binding =>
+                                binding.Name.Identifier.ValueText == "Invoke",
+                            MemberAccessExpressionSyntax access =>
+                                access.Name.Identifier.ValueText == "Invoke",
+                            _ => false,
+                        }));
+        if (conditionalRaise)
+        {
+            return EdgeKinds.RaisesEvent;
+        }
+
+        var directRaise = reference
+            .AncestorsAndSelf()
+            .OfType<InvocationExpressionSyntax>()
+            .Any(invocation =>
+                invocation.Expression is MemberAccessExpressionSyntax access
+                && access.Expression.Span.Contains(reference.Span)
+                && access.Name.Identifier.ValueText == "Invoke");
+        return directRaise ? EdgeKinds.RaisesEvent : null;
     }
 
     /// <summary>

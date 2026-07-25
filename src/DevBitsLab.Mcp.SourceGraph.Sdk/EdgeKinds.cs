@@ -33,6 +33,15 @@ public static class EdgeKinds
     /// <summary>A declarative UI event is handled by the target symbol.</summary>
     public const string HandlesEvent = "handles-event";
 
+    /// <summary>A source member subscribes a handler to the target event.</summary>
+    public const string SubscribesEvent = "subscribes-event";
+
+    /// <summary>A source member removes a handler from the target event.</summary>
+    public const string UnsubscribesEvent = "unsubscribes-event";
+
+    /// <summary>A source member raises the target event.</summary>
+    public const string RaisesEvent = "raises-event";
+
     /// <summary>An ICommand property dispatches execution to a source method.</summary>
     public const string CommandExecutes = "command-executes";
 
