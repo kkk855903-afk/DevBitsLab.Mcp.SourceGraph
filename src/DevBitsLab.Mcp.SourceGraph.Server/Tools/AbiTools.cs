@@ -33,6 +33,9 @@ public static class AbiTools
 {
     private const int MaximumScopeFanout = 16;
     private const int OutputBudgetSafetyMargin = 256;
+    private const int MaximumProseChecksPerScope = 8;
+    private const int MaximumProseReasonsPerScope = 4;
+    private const int MaximumProseDetailCharacters = 256;
     private static readonly AbiCompatibilityQueryService QueryService = new();
 
     [McpServerTool(
@@ -317,13 +320,66 @@ public static class AbiTools
             .Append(", truncated=")
             .Append(dto.Truncated ? "true" : "false")
             .Append(", omitted=")
-            .Append(dto.OmittedCount)
-            .ToString();
+            .Append(dto.OmittedCount);
+        if (dto.OmittedCount > 0)
+        {
+            prose.Append(" (omitted_checks=")
+                .Append(dto.OmittedCheckCount)
+                .Append(", omitted_reasons=")
+                .Append(dto.OmittedReasonCount)
+                .Append(", omitted_evidence=")
+                .Append(dto.OmittedEvidenceCount)
+                .Append(", omitted_metadata=")
+                .Append(dto.OmittedMetadataCount)
+                .Append(", omitted_characters=")
+                .Append(dto.OmittedCharacterCount)
+                .Append(')');
+        }
+        foreach (var scope in dto.Scopes)
+        {
+            prose.AppendLine()
+                .Append("- scope `")
+                .Append(scope.ScopeId)
+                .Append("`: compatibility=`")
+                .Append(scope.Compatibility)
+                .Append("`, checks=")
+                .Append(scope.Checks.Count)
+                .Append('/')
+                .Append(scope.TotalCheckCount)
+                .Append(", reasons=")
+                .Append(scope.Reasons.Count)
+                .Append('/')
+                .Append(scope.TotalReasonCount);
+            foreach (var check in scope.Checks
+                         .Where(check => !string.Equals(
+                             check.Compatibility,
+                             "compatible",
+                             StringComparison.Ordinal))
+                         .Take(MaximumProseChecksPerScope))
+            {
+                prose.AppendLine()
+                    .Append("  - [")
+                    .Append(check.Compatibility)
+                    .Append("] `")
+                    .Append(ProseDetail(check.Path))
+                    .Append("` ")
+                    .Append(check.Aspect)
+                    .Append(": ")
+                    .Append(ProseDetail(check.Reason));
+            }
+            foreach (var reason in scope.Reasons
+                         .Take(MaximumProseReasonsPerScope))
+            {
+                prose.AppendLine()
+                    .Append("  - reason: ")
+                    .Append(ProseDetail(reason));
+            }
+        }
         return new CallToolResult
         {
             Content =
             [
-                new TextContentBlock { Text = prose },
+                new TextContentBlock { Text = prose.ToString() },
             ],
             StructuredContent = JsonSerializer.SerializeToElement(
                 dto,
@@ -351,8 +407,20 @@ public static class AbiTools
             ? LimitRecord(scope.NativeRecord, limits)
             : null;
         var checks = scope.Checks
+            .Select((check, index) => new
+            {
+                Check = check,
+                Index = index,
+            })
+            .OrderBy(item => string.Equals(
+                item.Check.Compatibility,
+                "compatible",
+                StringComparison.Ordinal)
+                    ? 1
+                    : 0)
+            .ThenBy(item => item.Index)
             .Take(limits.Checks)
-            .Select(check => LimitCheck(check, limits))
+            .Select(item => LimitCheck(item.Check, limits))
             .ToArray();
         var reasons = scope.Reasons
             .Take(limits.Reasons)
@@ -591,6 +659,17 @@ public static class AbiTools
         JsonSerializer.Serialize(
             result,
             McpJsonUtilities.DefaultOptions).Length;
+
+    private static string ProseDetail(string value)
+    {
+        var oneLine = value
+            .Replace('\r', ' ')
+            .Replace('\n', ' ')
+            .Trim();
+        return oneLine.Length <= MaximumProseDetailCharacters
+            ? oneLine
+            : oneLine[..MaximumProseDetailCharacters] + "…";
+    }
 
     private static int EffectiveOutputBudget =>
         OutputBudget.DefaultBudgetChars - OutputBudgetSafetyMargin;

@@ -288,6 +288,71 @@ public sealed class AbiToolsTests : IAsyncLifetime
         dto.Scopes[0].Finding?.Relation.Should().Be("struct-maps-to");
     }
 
+    [Fact]
+    public void Warning_checks_and_omission_breakdown_are_visible_in_prose()
+    {
+        var target = new AbiQueryTarget(
+            "win-x64",
+            "x64",
+            "msvc",
+            PointerSizeBytes: 8,
+            DefaultPack: 8);
+        var scope = new AbiScopeComparisonResult(
+            "default",
+            "ok",
+            "struct-maps-to",
+            "ok",
+            "warning",
+            Partial: false,
+            RetainedLastGood: false,
+            target,
+            Selection("csharp:T:Fixture.CameraFormat", "sequential"),
+            Selection("cpp:T:native/camera.h::PgCameraFormat", "native"),
+            ManagedRecord: null,
+            NativeRecord: null,
+            Checks:
+            [
+                new AbiCompatibilityCheckRow(
+                    "$.pixel_format",
+                    "field_name",
+                    "struct-maps-to",
+                    "warning",
+                    "Managed and native field names differ.",
+                    "exact",
+                    Evidence: [],
+                    EvidenceOmittedCount: 0),
+            ],
+            TotalCheckCount: 9,
+            Reasons:
+            [
+                "Managed and native field names differ.",
+            ],
+            TotalReasonCount: 1,
+            Finding: null,
+            TotalFindingCount: 0,
+            Failures: [],
+            TotalFailureCount: 0,
+            Truncated: true,
+            OmittedCount: 8,
+            OmittedCheckCount: 8,
+            OmittedReasonCount: 0,
+            OmittedEvidenceCount: 0,
+            OmittedMetadataCount: 0,
+            OmittedCharacterCount: 0);
+
+        var result = AbiTools.BuildBoundedResultForTests(
+            "csharp:T:Fixture.CameraFormat",
+            "cpp:T:native/camera.h::PgCameraFormat",
+            mappingCount: 0,
+            [scope]);
+        var prose = CallToolResultHelpers.ProseText(result);
+
+        prose.Should().Contain("$.pixel_format")
+            .And.Contain("Managed and native field names differ.")
+            .And.Contain("omitted_checks=8")
+            .And.Contain("checks=1/9");
+    }
+
     private async Task<ScopeHost> CreateHostAsync(string id)
     {
         var root = Path.Join(_tempDirectory, id);
