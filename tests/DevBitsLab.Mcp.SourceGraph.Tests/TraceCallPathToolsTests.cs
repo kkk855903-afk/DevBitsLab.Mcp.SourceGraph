@@ -369,6 +369,10 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
             EdgeKinds.Schedules,
             EdgeKinds.Dispatches,
             EdgeKinds.InterfaceDispatchesTo,
+            EdgeKinds.HandlesEvent,
+            EdgeKinds.RaisesEvent,
+            EdgeKinds.EventDispatchesTo,
+            EdgeKinds.SubscribesHandler,
             EdgeKinds.GrpcCalls,
             EdgeKinds.RpcDispatchesTo,
             EdgeKinds.PInvokeMapsTo);
@@ -434,11 +438,23 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
             profile: "execution",
             maxDepth: 1);
 
-        var path = result.StructuredContent!.Value.Deserialize(
+        var scope = result.StructuredContent!.Value.Deserialize(
                 ToolOutputJsonContext.Default.TraceCallPathResult)!
-            .Scopes.Should().ContainSingle().Which
-            .Paths.Should().ContainSingle().Which;
+            .Scopes.Should().ContainSingle().Which;
+        var path = scope.Paths.Should().ContainSingle().Which;
         path.Hops.Should().ContainSingle().Which.Relation.Should().Be(relation);
+        scope.ExecutionState!.Status.Should().Be("complete",
+            "unrelated absent gRPC/native projections do not reduce a proven managed path");
+        scope.ExecutionState.Projections.Should().ContainSingle(projection =>
+            projection.Name
+                == (relation == EdgeKinds.Schedules
+                    ? "task-scheduling"
+                    : "ui-dispatch")
+            && projection.Applicable
+            && projection.Authoritative);
+        scope.ExecutionState.Projections.Should().Contain(projection =>
+            projection.Name == "native-interop"
+            && !projection.Applicable);
     }
 
     [Fact]

@@ -567,7 +567,7 @@ public static class TraceCallPathTools
             }
         }
 
-        executionState = await FinalizeExecutionStateAsync()
+        executionState = await FinalizeExecutionStateAsync(paths)
             .ConfigureAwait(false);
         if (executionState is not null && truncated)
         {
@@ -642,7 +642,8 @@ public static class TraceCallPathTools
         }
 
         async Task<TraceCallPathExecutionState?>
-            FinalizeExecutionStateAsync()
+            FinalizeExecutionStateAsync(
+                IReadOnlyList<TraceCallPath>? observedPaths = null)
         {
             if (!executionProfile) return null;
 
@@ -661,11 +662,16 @@ public static class TraceCallPathTools
                 || !ProjectionStampEquals(
                     finalProjectionStampBefore,
                     finalProjectionStampAfter);
-            return ReconcileExecutionState(
+            var reconciled = ReconcileExecutionState(
                 finalState,
                 initialReadVersion!.Value,
                 finalReadVersion,
                 runtimeChanged);
+            return observedPaths is { Count: > 0 } && !discoverTerminal
+                ? RefineExecutionStateForObservedPaths(
+                    reconciled,
+                    observedPaths)
+                : reconciled;
         }
     }
 
@@ -988,6 +994,112 @@ public static class TraceCallPathTools
             retainedLastGood,
             projections,
             boundedFailures);
+    }
+
+    private static TraceCallPathExecutionState
+        RefineExecutionStateForObservedPaths(
+            TraceCallPathExecutionState current,
+            IReadOnlyList<TraceCallPath> paths)
+    {
+        var relations = paths
+            .SelectMany(path => path.Hops)
+            .Select(hop => hop.Relation)
+            .ToHashSet(StringComparer.Ordinal);
+        var scope = current.Projections.First(projection =>
+            string.Equals(
+                projection.Name,
+                "scope",
+                StringComparison.Ordinal));
+        var projections = current.Projections
+            .Select(projection => projection.Name switch
+            {
+                "grpc" => projection with
+                {
+                    Applicable =
+                        relations.Contains(EdgeKinds.GrpcCalls)
+                        || relations.Contains(EdgeKinds.RpcDispatchesTo),
+                },
+                "native-interop" => projection with
+                {
+                    Applicable =
+                        relations.Contains(EdgeKinds.PInvokeMapsTo),
+                },
+                _ => projection,
+            })
+            .ToList();
+
+        AddRelationProjection(
+            "managed-calls",
+            relations.Contains(EdgeKinds.Calls));
+        AddRelationProjection(
+            "task-scheduling",
+            relations.Contains(EdgeKinds.Schedules));
+        AddRelationProjection(
+            "ui-dispatch",
+            relations.Contains(EdgeKinds.Dispatches));
+        AddRelationProjection(
+            "interface-dispatch",
+            relations.Contains(EdgeKinds.InterfaceDispatchesTo));
+        AddRelationProjection(
+            "event-flow",
+            relations.Overlaps(
+            [
+                EdgeKinds.RaisesEvent,
+                EdgeKinds.EventDispatchesTo,
+                EdgeKinds.SubscribesHandler,
+            ]));
+        AddRelationProjection(
+            "xaml-event-flow",
+            relations.Contains(EdgeKinds.HandlesEvent));
+        AddRelationProjection(
+            "command-flow",
+            relations.Overlaps(
+            [
+                "binds-path",
+                EdgeKinds.CommandExecutes,
+            ]));
+
+        var applicableNames = projections
+            .Where(projection => projection.Applicable)
+            .Select(projection => projection.Name)
+            .ToHashSet(StringComparer.Ordinal);
+        var failures = current.Failures
+            .Where(failure =>
+            {
+                var separator = failure.IndexOf(':');
+                var projection = separator < 0
+                    ? failure
+                    : failure[..separator];
+                return applicableNames.Contains(projection);
+            })
+            .ToArray();
+        var partial = projections.Any(projection =>
+            projection.Applicable && !projection.Authoritative);
+        return current with
+        {
+            Status = partial ? "partial" : "complete",
+            Partial = partial,
+            AbsenceAuthoritative = !partial,
+            RetainedLastGood = projections.Any(projection =>
+                projection.Applicable && projection.RetainedLastGood),
+            Projections = projections,
+            Failures = failures,
+        };
+
+        void AddRelationProjection(string name, bool applicable)
+        {
+            if (!applicable)
+            {
+                return;
+            }
+            projections.Add(new TraceCallPathProjectionState(
+                name,
+                scope.Authoritative ? "complete" : scope.Status,
+                Applicable: true,
+                Authoritative: scope.Authoritative,
+                RetainedLastGood: false,
+                FailureCount: scope.Authoritative ? 0 : scope.FailureCount));
+        }
     }
 
     internal static TraceCallPathExecutionState ReconcileExecutionState(
