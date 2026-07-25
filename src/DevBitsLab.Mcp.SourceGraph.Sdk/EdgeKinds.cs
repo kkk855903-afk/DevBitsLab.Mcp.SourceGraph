@@ -45,6 +45,15 @@ public static class EdgeKinds
     /// <summary>A source member raises the target event.</summary>
     public const string RaisesEvent = "raises-event";
 
+    /// <summary>An event dispatches execution to a semantically resolved subscriber target.</summary>
+    public const string EventDispatchesTo = "event-dispatches-to";
+
+    /// <summary>
+    /// A source member subscribes a resolved handler when the framework event itself is external
+    /// to the indexed symbol universe.
+    /// </summary>
+    public const string SubscribesHandler = "subscribes-handler";
+
     /// <summary>A source member schedules deferred execution of the target member.</summary>
     public const string Schedules = "schedules";
 

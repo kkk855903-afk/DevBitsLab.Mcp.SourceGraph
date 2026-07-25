@@ -221,6 +221,20 @@ public sealed class RoslynCommandExecutionTests
                         source.Changed += Handle;
                     }
 
+                    public void AttachDispatched(
+                        EventOwner source,
+                        Dispatcher dispatcher)
+                    {
+                        source.Changed += (_, _) =>
+                            dispatcher.BeginInvoke(() => ApplyEventFrame());
+                    }
+
+                    public void AttachExternal()
+                    {
+                        AppDomain.CurrentDomain.UnhandledException +=
+                            HandleUnhandled;
+                    }
+
                     public void Detach(EventOwner source)
                     {
                         source.Changed -= Handle;
@@ -232,6 +246,10 @@ public sealed class RoslynCommandExecutionTests
                     }
 
                     private void Handle(object? sender, EventArgs args) { }
+                    private static void ApplyEventFrame() { }
+                    private static void HandleUnhandled(
+                        object sender,
+                        UnhandledExceptionEventArgs args) { }
                 }
 
                 public sealed class Scheduler
@@ -302,6 +320,29 @@ public sealed class RoslynCommandExecutionTests
                             .EvidenceConfidence.Exact
                         && evidence.Producer == "roslyn");
             }
+            (await store.ListCalleesAsync(
+                    eventSymbol.Id,
+                    edgeKind: EdgeKinds.EventDispatchesTo))
+                .Select(symbol => symbol.Name)
+                .Should().BeEquivalentTo(["Handle", "ApplyEventFrame"]);
+
+            var attachExternal = await SymbolNamedAsync(
+                store,
+                sourcePath,
+                "AttachExternal",
+                SymbolKinds.Method);
+            var externalHandler = await SymbolNamedAsync(
+                store,
+                sourcePath,
+                "HandleUnhandled",
+                SymbolKinds.Method);
+            (await store.ListCalleesAsync(
+                    attachExternal.Id,
+                    edgeKind: EdgeKinds.SubscribesHandler))
+                .Should().ContainSingle(symbol =>
+                    symbol.Id == externalHandler.Id,
+                    "metadata-only framework events must retain a handler execution edge");
+
             foreach (var (sourceName, targetName, relation) in new[]
                      {
                          ("Start", "RunLoopAsync", EdgeKinds.Schedules),

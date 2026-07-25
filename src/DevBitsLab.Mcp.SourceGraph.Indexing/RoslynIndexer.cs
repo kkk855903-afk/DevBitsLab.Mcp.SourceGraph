@@ -3518,6 +3518,13 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
 
                 EmitScheduledExecutions(root, model, AddEdge, ct);
 
+                // Connect an event directly to the source members executed by its subscription
+                // handler. Lambdas are intentionally projected without inventing unstable
+                // anonymous symbol identities: nested dispatcher callbacks still resolve to
+                // their concrete target method. For metadata-only framework events, retain the
+                // useful subscription-to-handler relation from the enclosing source member.
+                EmitEventExecutions(root, model, AddEdge, ct);
+
                 // Connect an ICommand property to the source method captured by the command
                 // object's single delegate argument. This is deliberately operation-based:
                 // syntax or name matching would turn overload gaps, dynamic values, and
@@ -4504,6 +4511,103 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                     sourceId,
                     targetId,
                     relation,
+                    evidenceNode,
+                    CoreEvidenceConfidence.Semantic);
+            }
+        }
+    }
+
+    private void EmitEventExecutions(
+        SyntaxNode root,
+        SemanticModel model,
+        Action<long, long, string, SyntaxNode, CoreEvidenceConfidence> addEdge,
+        CancellationToken ct)
+    {
+        foreach (var assignment in root
+                     .DescendantNodes()
+                     .OfType<AssignmentExpressionSyntax>()
+                     .Where(candidate =>
+                         candidate.IsKind(SyntaxKind.AddAssignmentExpression)))
+        {
+            ct.ThrowIfCancellationRequested();
+            if (model.GetSymbolInfo(assignment.Left, ct).Symbol is not
+                IEventSymbol subscribedEvent)
+            {
+                continue;
+            }
+
+            var enclosing = FindEnclosingNamedMember(
+                model,
+                assignment.SpanStart,
+                ct);
+            var enclosingKey = enclosing is null
+                ? null
+                : SymbolMapping.CanonicalKey(enclosing);
+            if (enclosingKey is null
+                || !_symbolIdByKey.TryGetValue(enclosingKey, out var sourceId))
+            {
+                continue;
+            }
+
+            var eventKey = SymbolMapping.CanonicalKey(subscribedEvent);
+            var eventId = 0L;
+            var hasIndexedEvent = eventKey is not null
+                && _symbolIdByKey.TryGetValue(eventKey, out eventId);
+            var emittedTargets = new HashSet<long>();
+
+            TryEmitTarget(
+                model.GetSymbolInfo(
+                    UnwrapArgument(assignment.Right),
+                    ct).Symbol as IMethodSymbol,
+                assignment.Right);
+
+            foreach (var invocation in assignment.Right
+                         .DescendantNodesAndSelf()
+                         .OfType<InvocationExpressionSyntax>())
+            {
+                TryEmitTarget(
+                    model.GetSymbolInfo(invocation, ct).Symbol
+                    as IMethodSymbol,
+                    invocation);
+                foreach (var argument in invocation.ArgumentList.Arguments)
+                {
+                    TryEmitTarget(
+                        model.GetSymbolInfo(
+                            UnwrapArgument(argument.Expression),
+                            ct).Symbol as IMethodSymbol,
+                        argument.Expression);
+                }
+            }
+
+            void TryEmitTarget(
+                IMethodSymbol? target,
+                SyntaxNode evidenceNode)
+            {
+                if (target is null)
+                {
+                    return;
+                }
+                if (SchedulerRelation(target) is not null)
+                {
+                    // The event projection collapses the anonymous subscription handler to
+                    // concrete application targets; the scheduler boundary already has its own
+                    // dispatches/schedules edge and must not become an apparent handler target.
+                    return;
+                }
+                var targetKey = SymbolMapping.CanonicalKey(target);
+                if (targetKey is null
+                    || !_symbolIdByKey.TryGetValue(targetKey, out var targetId)
+                    || !emittedTargets.Add(targetId))
+                {
+                    return;
+                }
+
+                addEdge(
+                    hasIndexedEvent ? eventId : sourceId,
+                    targetId,
+                    hasIndexedEvent
+                        ? EdgeKinds.EventDispatchesTo
+                        : EdgeKinds.SubscribesHandler,
                     evidenceNode,
                     CoreEvidenceConfidence.Semantic);
             }
