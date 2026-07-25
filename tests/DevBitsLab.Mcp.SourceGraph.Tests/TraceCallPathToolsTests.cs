@@ -67,6 +67,9 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
             "InterfaceImplementation");
         var xamlButton = await SeedSymbolAsync(store, "XamlButton");
         var clickHandler = await SeedSymbolAsync(store, "ClickHandler");
+        var xamlBindingTarget = await SeedSymbolAsync(
+            store,
+            "XamlBindingTarget");
         var eventLoop = await SeedSymbolAsync(store, "EventLoop");
         var frameReady = await SeedSymbolAsync(store, "FrameReady");
         var eventApplyFrame = await SeedSymbolAsync(
@@ -128,10 +131,11 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
             Edge(uiDispatch, applyFrame, 47, CoreEvidenceConfidence.Semantic, "dispatcher-lambda", EdgeKinds.Dispatches),
             Edge(interfaceCaller, interfaceMember, 48, CoreEvidenceConfidence.Exact, "interface-call"),
             Edge(interfaceMember, interfaceImplementation, 49, CoreEvidenceConfidence.Semantic, "interface-dispatch", EdgeKinds.InterfaceDispatchesTo),
-            Edge(xamlButton, clickHandler, 50, CoreEvidenceConfidence.Semantic, "xaml-handler", EdgeKinds.HandlesEvent),
-            Edge(eventLoop, frameReady, 51, CoreEvidenceConfidence.Exact, "event-raise", EdgeKinds.RaisesEvent),
-            Edge(frameReady, eventApplyFrame, 52, CoreEvidenceConfidence.Semantic, "event-dispatch", EdgeKinds.EventDispatchesTo),
-            Edge(frameworkSubscription, frameworkHandler, 53, CoreEvidenceConfidence.Semantic, "external-handler", EdgeKinds.SubscribesHandler),
+            Edge(xamlButton, xamlBindingTarget, 50, CoreEvidenceConfidence.Semantic, "xaml-binding", "binds-path"),
+            Edge(xamlButton, clickHandler, 51, CoreEvidenceConfidence.Semantic, "xaml-handler", EdgeKinds.HandlesEvent),
+            Edge(eventLoop, frameReady, 52, CoreEvidenceConfidence.Exact, "event-raise", EdgeKinds.RaisesEvent),
+            Edge(frameReady, eventApplyFrame, 53, CoreEvidenceConfidence.Semantic, "event-dispatch", EdgeKinds.EventDispatchesTo),
+            Edge(frameworkSubscription, frameworkHandler, 54, CoreEvidenceConfidence.Semantic, "external-handler", EdgeKinds.SubscribesHandler),
             Edge(ui, native, 29, CoreEvidenceConfidence.Exact, "excluded-shortcut", EdgeKinds.Tests),
             Edge(ui, outOfOrderRpc, 30, CoreEvidenceConfidence.Semantic, "out-of-order-grpc", EdgeKinds.GrpcCalls),
             Edge(outOfOrderRpc, outOfOrderServer, 31, CoreEvidenceConfidence.Semantic, "out-of-order-dispatch", EdgeKinds.RpcDispatchesTo),
@@ -500,6 +504,11 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
         scope.Paths.Should().ContainSingle();
         scope.Paths[0].Hops.Should().ContainSingle(hop =>
             hop.Relation == relation);
+        if (relation == EdgeKinds.HandlesEvent)
+        {
+            scope.Truncated.Should().BeFalse(
+                "a binding on the same XAML element must not hide its event execution branch");
+        }
     }
 
     [Fact]

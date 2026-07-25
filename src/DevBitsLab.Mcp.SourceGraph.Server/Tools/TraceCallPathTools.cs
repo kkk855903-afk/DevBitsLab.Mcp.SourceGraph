@@ -728,7 +728,8 @@ public static class TraceCallPathTools
         ExecutionStage stage) =>
         stage switch
         {
-            ExecutionStage.AwaitBinding => ["binds-path"],
+            ExecutionStage.AwaitBinding =>
+                ["binds-path", EdgeKinds.HandlesEvent],
             ExecutionStage.AwaitCommand => [EdgeKinds.CommandExecutes],
             ExecutionStage.AwaitManagedCall =>
                 [
@@ -773,6 +774,8 @@ public static class TraceCallPathTools
         {
             (ExecutionStage.AwaitBinding, "binds-path") =>
                 ExecutionStage.AwaitCommand,
+            (ExecutionStage.AwaitBinding, EdgeKinds.HandlesEvent) =>
+                ExecutionStage.ManagedClient,
             (ExecutionStage.AwaitCommand, EdgeKinds.CommandExecutes) =>
                 ExecutionStage.AwaitManagedCall,
             (ExecutionStage.AwaitManagedCall, EdgeKinds.Calls) =>
