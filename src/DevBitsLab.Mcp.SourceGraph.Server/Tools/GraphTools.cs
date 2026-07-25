@@ -2381,16 +2381,17 @@ public static class GraphTools
 
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(FindDiagnosticsResult))]
     [ToolTrigger("\"what does this codebase warn about?\" or \"is X being warned on?\"")]
-    [Description("Find Roslyn diagnostics (analyzer warnings, compiler errors, etc.) captured during indexing. Filter by severity (default 'warning' = severity >= 2), diagnostic code (e.g. 'CS0618'), and/or symbol.")]
+    [Description("Find Roslyn diagnostics captured during indexing. Results include a code-frequency summary and detect the common cascading pattern where SDK global usings/framework inputs are missing. Filter by severity/code/symbol or set rootCauseOnly to suppress individual cascade rows.")]
     public static Task<CallToolResult> FindDiagnosticsAsync(
         ScopeRouter router,
         [Description("Severity floor: hidden | info | warning (default) | error | all. Numeric values 0-3 also accepted.")] string? severity = "warning",
         [Description("Optional diagnostic code filter, e.g. 'CS0618' for [Obsolete] usage")] string? code = null,
         [Description("Optional symbol name/FQN to scope the lookup to a single symbol's diagnostics")] string? symbol = null,
         [Description("Maximum rows to return (default 100)")] int limit = 100,
+        [Description("When true, return only an inferred workspace root-cause summary if a high-confidence cascading compiler-error pattern is detected.")] bool rootCauseOnly = false,
         [Description(ScopeDescription)] string? scope = null,
         CancellationToken ct = default) =>
-        ToolMetrics.TrackAsync("find_diagnostics", new { severity, code, symbol, limit, scope }, () =>
+        ToolMetrics.TrackAsync("find_diagnostics", new { severity, code, symbol, limit, rootCauseOnly, scope }, () =>
             ScopedExecution.RunAsync(router, scope, async host =>
             {
                 var sw = System.Diagnostics.Stopwatch.StartNew();
@@ -2412,12 +2413,36 @@ public static class GraphTools
                 }
 
                 var rows = await host.Store.FindDiagnosticsAsync(sev, code, symbolId, limit, ct).ConfigureAwait(false);
+                var rootCause = InferWorkspaceRootCause(rows);
                 var sb = new StringBuilder();
                 var sevLabel = sev is null ? "all" : $">= {SeverityLabel(sev.Value)}";
                 var codeClause = string.IsNullOrEmpty(code) ? "" : $", code={code}";
                 var symClause = symbolFqn is null ? "" : $", symbol={symbolFqn}";
                 sb.AppendLine($"Diagnostics (severity {sevLabel}{codeClause}{symClause}): {rows.Count}");
-                if (rows.Count >= 2)
+                if (rows.Count > 0)
+                {
+                    sb.AppendLine();
+                    sb.AppendLine("By code: "
+                        + string.Join(
+                            ", ",
+                            rows.GroupBy(row => row.Code)
+                                .OrderByDescending(group => group.Count())
+                                .ThenBy(group => group.Key, StringComparer.Ordinal)
+                                .Select(group =>
+                                    $"{group.Key}={group.Count()}")));
+                }
+                if (rootCause is not null)
+                {
+                    sb.AppendLine();
+                    sb.AppendLine($"**Likely workspace root cause:** {rootCause}");
+                }
+                if (rootCauseOnly && rootCause is null)
+                {
+                    sb.AppendLine();
+                    sb.AppendLine(
+                        "_No high-confidence cascading workspace root cause was detected; use rootCauseOnly=false to inspect individual diagnostics._");
+                }
+                else if (!rootCauseOnly && rows.Count >= 2)
                 {
                     var tableRows = new List<IReadOnlyList<string>>(rows.Count);
                     foreach (var d in rows)
@@ -2447,7 +2472,7 @@ public static class GraphTools
                         },
                         tableRows);
                 }
-                else if (rows.Count == 1)
+                else if (!rootCauseOnly && rows.Count == 1)
                 {
                     foreach (var d in rows)
                     {
@@ -2465,7 +2490,10 @@ public static class GraphTools
                     code: code,
                     symbolFqn: symbolFqn,
                     symbolId: symbolId,
-                    rows: rows,
+                    rootCause: rootCause,
+                    rows: rootCauseOnly
+                        ? Array.Empty<DiagnosticHit>()
+                        : rows,
                     scopeId: host.Scope.Id,
                     elapsedMs: sw.ElapsedMilliseconds);
             }, ct));
@@ -2476,6 +2504,7 @@ public static class GraphTools
         string? code,
         string? symbolFqn,
         long? symbolId,
+        string? rootCause,
         IReadOnlyList<DiagnosticHit> rows,
         string scopeId,
         long elapsedMs)
@@ -2512,6 +2541,7 @@ public static class GraphTools
             Code: string.IsNullOrEmpty(code) ? null : code,
             Symbol: symbolFqn,
             SymbolId: symbolId,
+            RootCause: rootCause,
             Diagnostics: structuredRows);
         return new CallToolResult
         {
@@ -2536,6 +2566,56 @@ public static class GraphTools
                 "roslyn-compiler",
             _ => "roslyn-analyzer",
         };
+
+    internal static string? InferWorkspaceRootCause(
+        IReadOnlyList<DiagnosticHit> diagnostics)
+    {
+        var errors = diagnostics
+            .Where(diagnostic => diagnostic.Severity == 3)
+            .ToArray();
+        if (errors.Length < 10)
+        {
+            return null;
+        }
+
+        var cascadingCodes = new HashSet<string>(
+            ["CS0103", "CS0246", "CS1061", "CS0066"],
+            StringComparer.Ordinal);
+        var cascadingCount = errors.Count(error =>
+            cascadingCodes.Contains(error.Code));
+        if (cascadingCount < errors.Length * 0.7)
+        {
+            return null;
+        }
+
+        var frameworkTypeHints = new[]
+        {
+            "Task",
+            "TimeSpan",
+            "DateTimeOffset",
+            "List",
+            "IEnumerable",
+            "EventHandler",
+            "CancellationToken",
+            "Math",
+        };
+        var missingFrameworkTypes = frameworkTypeHints
+            .Where(type => errors.Any(error =>
+                error.Message.Contains(
+                    type,
+                    StringComparison.Ordinal)))
+            .ToArray();
+        if (missingFrameworkTypes.Length < 3)
+        {
+            return null;
+        }
+
+        return "Multiple framework/BCL types are simultaneously unresolved "
+            + $"({string.Join(", ", missingFrameworkTypes)}). "
+            + "The project compilation likely omitted SDK-generated global usings, "
+            + "target-framework references, or analyzer configuration; later name/member "
+            + "errors are probably cascading.";
+    }
 
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(ListGeneratedFilesResult))]
     [ToolTrigger("\"what's source-generated in this codebase?\"")]

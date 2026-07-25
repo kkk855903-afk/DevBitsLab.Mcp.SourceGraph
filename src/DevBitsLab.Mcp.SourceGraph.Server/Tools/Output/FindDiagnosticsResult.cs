@@ -14,6 +14,7 @@ public sealed record FindDiagnosticsResult(
     string? Code,
     string? Symbol,
     [property: JsonPropertyName("symbol_id")] long? SymbolId,
+    [property: JsonPropertyName("root_cause")] string? RootCause,
     IReadOnlyList<FindDiagnosticsRow> Diagnostics);
 
 /// <summary>
