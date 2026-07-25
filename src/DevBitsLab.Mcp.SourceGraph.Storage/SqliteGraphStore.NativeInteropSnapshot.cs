@@ -93,6 +93,8 @@ public sealed partial class SqliteGraphStore
                                 symbol.canonical_key GLOB 'c:*'
                                 OR symbol.canonical_key GLOB 'cpp:*'
                               )
+                          AND COALESCE(symbol.modifiers, '')
+                              NOT LIKE '%syntax-only%'
                           AND (
                                 symbol.kind_name IN @ProjectionKinds
                                 OR EXISTS (

@@ -391,6 +391,47 @@ public sealed class NativeInteropSnapshotPublisherTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task Syntax_only_symbols_are_not_native_stale_candidates()
+    {
+        var implementationPath = PathFor("native/api.cpp");
+        var fileId = await _store!.UpsertFileAsync(
+            implementationPath,
+            Hash(20),
+            DateTimeOffset.UtcNow);
+        var syntaxKey = "cpp:F:native/api.cpp::syntax::run()";
+        await _store.UpsertSymbolAsync(
+            syntaxKey,
+            new Symbol(
+                0,
+                "run",
+                "run",
+                SymbolKinds.Function,
+                fileId,
+                2,
+                1,
+                2,
+                20,
+                "int run()",
+                null,
+                "syntax-only"));
+        var headerPath = PathFor("native/api.h");
+        var export = Export(
+            "c:E:native/api.h::run",
+            "native.dll",
+            binaryVerified: false,
+            headerPath);
+
+        var result = await Publisher().PublishAsync(Snapshot(
+            hashes: [ContentHash(headerPath, Hash(21))],
+            sourceExports: [export]));
+
+        result.IsComplete.Should().BeTrue();
+        result.StaleCanonicalKeys.Should().NotContain(syntaxKey);
+        (await _store.GetSymbolByCanonicalKeyAsync(syntaxKey))
+            .Should().NotBeNull();
+    }
+
+    [Fact]
     public async Task Incomplete_candidate_retains_the_last_complete_snapshot()
     {
         var path = PathFor("native/api.h");
