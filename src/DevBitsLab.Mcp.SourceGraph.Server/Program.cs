@@ -40,6 +40,12 @@ catch (ArgumentException ex)
     return 2;
 }
 
+if (cli.ShowVersion)
+{
+    Console.WriteLine(VersionInfo.Render());
+    return 0;
+}
+
 if (cli.ShowHelp)
 {
     Console.WriteLine(cli.SelectedHelpText);
