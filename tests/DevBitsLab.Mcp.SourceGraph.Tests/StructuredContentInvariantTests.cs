@@ -407,6 +407,17 @@ public sealed class StructuredContentInvariantTests : IAsyncLifetime, IDisposabl
             .Should().ContainAll(
                 EdgeKinds.PInvokeMapsTo,
                 EdgeKinds.NativeImplementation);
+
+        var canonicalResult = await GraphTools.FindReferencesAsync(
+            _router!,
+            "c:E:native/camera.cpp::pg_camera_start");
+        var canonicalDto = JsonSerializer.Deserialize(
+            canonicalResult.StructuredContent!.Value.GetRawText(),
+            ToolOutputJsonContext.Default.FindReferencesResult);
+        canonicalDto.Should().NotBeNull();
+        canonicalDto!.TargetSymbolId.Should().Be(nativeSymbolId);
+        canonicalDto.References.Should().Contain(reference =>
+            reference.Relation == EdgeKinds.NativeImplementation);
     }
 
     [Fact]

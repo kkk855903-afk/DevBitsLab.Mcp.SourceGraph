@@ -304,10 +304,10 @@ public static class GraphTools
 
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(FindReferencesResult))]
     [ToolTrigger("\"who uses X?\" or \"who calls X?\"")]
-    [Description("Find every place that references a symbol, plus evidence-backed interop links such as managed P/Invoke mappings and native export implementations. Resolves the symbol by name/FQN, then lists each occurrence with target symbol id/FQN, relation kind, semantic confidence, and file:line. By default skips refs from source-generated files; pass includeGenerated=true to surface them.")]
+    [Description("Find every place that references a symbol, plus evidence-backed interop links such as managed P/Invoke mappings and native export implementations. Resolves the symbol by exact canonical key, name, or FQN, then lists each occurrence with target symbol id/FQN, relation kind, semantic confidence, and file:line. By default skips refs from source-generated files; pass includeGenerated=true to surface them.")]
     public static Task<CallToolResult> FindReferencesAsync(
         ScopeRouter router,
-        [Description("Symbol name or FQN, same matching rules as find_definition")] string symbol,
+        [Description("Exact canonical key, symbol name, or FQN")] string symbol,
         [Description("Maximum number of references to return (default 50)")] int limit = 50,
         [Description("Include references from source-generated files (default false)")] bool includeGenerated = false,
         [Description(ScopeDescription)] string? scope = null,
@@ -316,7 +316,23 @@ public static class GraphTools
             ScopedExecution.RunAsync(router, scope, async host =>
             {
                 var sw = System.Diagnostics.Stopwatch.StartNew();
-                var hits = await host.Store.FindSymbolsAsync(symbol, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
+                var selection = symbol.Trim();
+                IReadOnlyList<SymbolHit> hits;
+                if (CanonicalKeyValidator.IsValid(selection))
+                {
+                    var exact = await host.Store.GetSymbolByCanonicalKeyAsync(
+                        selection,
+                        ct).ConfigureAwait(false);
+                    hits = exact is null ? [] : [exact];
+                }
+                else
+                {
+                    hits = await host.Store.FindSymbolsAsync(
+                        selection,
+                        filePathHint: null,
+                        limit: 5,
+                        ct).ConfigureAwait(false);
+                }
                 if (hits.Count == 0)
                 {
                     // No symbol resolved — short-circuit through DiagnosticResult.Build instead of
