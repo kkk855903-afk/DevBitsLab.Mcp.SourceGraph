@@ -384,6 +384,21 @@ public static class TraceCallPathTools
                     executionState),
                 ExecutionState: executionState);
         }
+        if (sources.Count > 1)
+        {
+            executionState = await FinalizeExecutionStateAsync()
+                .ConfigureAwait(false);
+            return new TraceCallPathScopeResult(
+                host.Scope.Id,
+                Array.Empty<TraceCallPath>(),
+                Truncated: false,
+                ExpandedNodes: 0,
+                Note: AmbiguousSelectionNote(
+                    "source",
+                    fromQuery,
+                    sources),
+                ExecutionState: executionState);
+        }
 
         IReadOnlyList<SymbolHit> targets = discoverTerminal
             ? []
@@ -405,6 +420,21 @@ public static class TraceCallPathTools
                 Note: AddAbsenceDisclosure(
                     missingTargetNote,
                     executionState),
+                ExecutionState: executionState);
+        }
+        if (!discoverTerminal && targets.Count > 1)
+        {
+            executionState = await FinalizeExecutionStateAsync()
+                .ConfigureAwait(false);
+            return new TraceCallPathScopeResult(
+                host.Scope.Id,
+                Array.Empty<TraceCallPath>(),
+                Truncated: false,
+                ExpandedNodes: 0,
+                Note: AmbiguousSelectionNote(
+                    "destination",
+                    toQuery!,
+                    targets),
                 ExecutionState: executionState);
         }
 
@@ -689,11 +719,58 @@ public static class TraceCallPathTools
             return exact is null ? [] : [exact];
         }
 
-        return await store.FindSymbolsAsync(
+        var matches = await store.FindSymbolsAsync(
             selection,
             limit: 10,
             ct: ct).ConfigureAwait(false);
+        return HighestRankedMatches(selection, matches);
     }
+
+    private static IReadOnlyList<SymbolHit> HighestRankedMatches(
+        string query,
+        IReadOnlyList<SymbolHit> matches)
+    {
+        var exactNames = matches
+            .Where(hit => string.Equals(
+                hit.Name,
+                query,
+                StringComparison.Ordinal))
+            .ToArray();
+        if (exactNames.Length > 0) return exactNames;
+
+        var exactFqns = matches
+            .Where(hit => string.Equals(
+                hit.Fqn,
+                query,
+                StringComparison.Ordinal))
+            .ToArray();
+        if (exactFqns.Length > 0) return exactFqns;
+
+        var suffixFqns = matches
+            .Where(hit => hit.Fqn.EndsWith(
+                query,
+                StringComparison.Ordinal))
+            .ToArray();
+        if (suffixFqns.Length > 0) return suffixFqns;
+
+        var namePrefixes = matches
+            .Where(hit => hit.Name.StartsWith(
+                query,
+                StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+        return namePrefixes.Length > 0 ? namePrefixes : matches;
+    }
+
+    private static string AmbiguousSelectionNote(
+        string role,
+        string query,
+        IReadOnlyList<SymbolHit> candidates) =>
+        $"Ambiguous {role} symbol '{query}' matched {candidates.Count} candidates. "
+        + "Use one exact canonical key: "
+        + string.Join(
+            "; ",
+            candidates.Select(candidate =>
+                $"`{candidate.CanonicalKey ?? "<no-canonical-key>"}` ({candidate.Fqn})"));
 
     private static Task<IReadOnlyList<EdgeTraversalHit>> ListOutboundEdgesAsync(
         IGraphStore store,
@@ -1394,6 +1471,11 @@ public static class TraceCallPathTools
                 sb.AppendLine();
                 sb.Append("Path ").Append(pathIndex + 1)
                   .Append(" [").Append(path.Confidence).AppendLine("]");
+                sb.Append("selection: from `")
+                  .Append(path.From.CanonicalKey ?? "<no-canonical-key>")
+                  .Append("`; to `")
+                  .Append(path.To.CanonicalKey ?? "<no-canonical-key>")
+                  .AppendLine("`");
                 if (path.Hops.Count == 0)
                 {
                     sb.Append("- `").Append(path.From.Fqn).AppendLine("` (source equals destination)");

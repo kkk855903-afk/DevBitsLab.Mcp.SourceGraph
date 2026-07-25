@@ -107,6 +107,14 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
         var backwardImport = await SeedSymbolAsync(store, "BackwardImport");
         var backwardExport = await SeedSymbolAsync(store, "BackwardExport");
         var backwardNative = await SeedSymbolAsync(store, "BackwardNative");
+        await SeedSymbolAsync(
+            store,
+            "SharedCandidateFirst",
+            symbolName: "SharedCandidate");
+        await SeedSymbolAsync(
+            store,
+            "SharedCandidateSecond",
+            symbolName: "SharedCandidate");
 
         await store.BulkInsertEdgesAsync(new[]
         {
@@ -263,6 +271,8 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
         scope.Paths.Select(path => path.Hops.Select(hop => hop.To.Fqn))
             .Should().Contain(sequence => sequence.SequenceEqual(throughB))
             .And.Contain(sequence => sequence.SequenceEqual(throughD));
+        CallToolResultHelpers.ProseText(result).Should().Contain(
+            "selection: from `csharp:M:Graph.A`; to `csharp:M:Graph.C`");
 
         var semanticPath = scope.Paths.Single(path =>
             path.Hops[0].To.Fqn == "Graph.B");
@@ -671,6 +681,39 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
     }
 
     [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task FuzzySelectionWithMultipleTopCandidatesIsAmbiguous(
+        bool ambiguousSource)
+    {
+        var result = await TraceCallPathTools.TraceCallPathWithProfileAsync(
+            _router!,
+            from: ambiguousSource
+                ? "SharedCandidate"
+                : "csharp:M:Graph.A",
+            to: ambiguousSource
+                ? "csharp:M:Graph.C"
+                : "SharedCandidate",
+            profile: "execution");
+
+        result.IsError.Should().NotBe(true);
+        var scope = result.StructuredContent!.Value.Deserialize(
+            ToolOutputJsonContext.Default.TraceCallPathResult)!
+            .Scopes.Should().ContainSingle().Which;
+        scope.Paths.Should().BeEmpty();
+        scope.Truncated.Should().BeFalse();
+        scope.Note.Should()
+            .Contain(ambiguousSource
+                ? "Ambiguous source symbol"
+                : "Ambiguous destination symbol")
+            .And.Contain("csharp:M:Graph.SharedCandidateFirst")
+            .And.Contain("csharp:M:Graph.SharedCandidateSecond");
+        CallToolResultHelpers.ProseText(result).Should()
+            .NotContain("source equals destination")
+            .And.NotContain("traversal was truncated");
+    }
+
+    [Theory]
     [InlineData("csharp:")]
     [InlineData(@"csharp:M:Graph\Ui")]
     public async Task MalformedCanonicalIntent_isRejectedInsteadOfFuzzyMatched(
@@ -815,7 +858,8 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
 
     private async Task<SeededSymbol> SeedSymbolAsync(
         SqliteGraphStore store,
-        string name)
+        string name,
+        string? symbolName = null)
     {
         var path = Path.Join(_tempDir, $"{name}.cs");
         var fileId = await store.UpsertFileAsync(
@@ -826,7 +870,7 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
             $"csharp:M:Graph.{name}",
             new Symbol(
                 0,
-                name,
+                symbolName ?? name,
                 $"Graph.{name}",
                 SymbolKinds.Method,
                 fileId,
