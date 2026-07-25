@@ -289,7 +289,9 @@ public sealed class StructuredContentInvariantTests : IAsyncLifetime, IDisposabl
             reference.SymbolId == dto.TargetSymbolId
             && reference.TargetFqn == dto.TargetFqn
             && reference.Relation == reference.Kind
-            && reference.Confidence == "semantic");
+            && reference.Confidence == "semantic"
+            && reference.Source == null
+            && reference.Target == null);
     }
 
     [Fact]
@@ -431,8 +433,24 @@ public sealed class StructuredContentInvariantTests : IAsyncLifetime, IDisposabl
             reference.Relation == EdgeKinds.NativeImplementation
             && reference.FilePath == implementationFilePath
             && reference.Confidence == "inferred");
+        var implementationReference = implementationDto.References.Single();
+        implementationReference.Source.Should().NotBeNull();
+        implementationReference.Source!.SymbolId.Should().Be(nativeSymbolId);
+        implementationReference.Source.CanonicalKey.Should().Be(
+            "c:E:native/camera.cpp::pg_camera_start");
+        implementationReference.Source.FilePath.Should().Be(nativeFilePath);
+        implementationReference.Source.Line.Should().Be(4);
+        implementationReference.Target.Should().NotBeNull();
+        implementationReference.Target!.SymbolId.Should().Be(implementationSymbolId);
+        implementationReference.Target.CanonicalKey.Should().Be(
+            "cpp:F:native/camera-implementation.cpp::syntax::pg_camera_start()");
+        implementationReference.Target.FilePath.Should().Be(implementationFilePath);
+        implementationReference.Target.Line.Should().Be(12);
         CallToolResultHelpers.ProseText(implementationResult)
             .Should().Contain(EdgeKinds.NativeImplementation)
+            .And.Contain("-[native-implementation]->")
+            .And.Contain(nativeFilePath)
+            .And.Contain(implementationFilePath)
             .And.NotContain("no other references");
     }
 

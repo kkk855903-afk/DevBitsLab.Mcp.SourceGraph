@@ -345,7 +345,7 @@ public static class GraphTools
                 var top = hits[0];
                 var refs = await FindReferenceDisplayHitsAsync(
                     host.Store,
-                    top.Id,
+                    top,
                     includeGenerated,
                     limit,
                     ct).ConfigureAwait(false);
@@ -369,26 +369,42 @@ public static class GraphTools
                 sb.AppendLine($"{refs.Count} references:");
                 if (refs.Count >= 2)
                 {
+                    var includesSemanticRelations = refs.Any(r => r.Source is not null && r.Target is not null);
                     var rows = new List<IReadOnlyList<string>>(refs.Count);
                     foreach (var r in refs)
                     {
                         rows.Add(new[]
                         {
-                            r.Relation,
+                            includesSemanticRelations ? ReferenceRelationLabel(r) : r.Relation,
                             r.Confidence,
                             Format.Location(r.FilePath, r.Line, r.Col) + GeneratedSuffix(r.IsGenerated),
                         });
                     }
-                    Format.AppendTable(sb, new[] { "Relation", "Confidence", "Location" }, rows);
+                    Format.AppendTable(
+                        sb,
+                        includesSemanticRelations
+                            ? new[] { "Reference", "Confidence", "Evidence" }
+                            : new[] { "Relation", "Confidence", "Location" },
+                        rows);
                 }
                 else
                 {
                     foreach (var r in refs)
                     {
-                        sb.AppendLine(
-                            $"- {r.Relation} at " +
-                            $"{Format.Location(r.FilePath, r.Line, r.Col)}{GeneratedSuffix(r.IsGenerated)} " +
-                            $"[{r.Confidence}]");
+                        if (r.Source is null || r.Target is null)
+                        {
+                            sb.AppendLine(
+                                $"- {r.Relation} at " +
+                                $"{Format.Location(r.FilePath, r.Line, r.Col)}{GeneratedSuffix(r.IsGenerated)} " +
+                                $"[{r.Confidence}]");
+                        }
+                        else
+                        {
+                            sb.AppendLine($"- {ReferenceRelationLabel(r)} " +
+                                          $"[{r.Confidence}; evidence: " +
+                                          $"{Format.Location(r.FilePath, r.Line, r.Col)}" +
+                                          $"{GeneratedSuffix(r.IsGenerated)}]");
+                        }
                     }
                 }
                 return BuildFindReferencesResult(
@@ -403,13 +419,13 @@ public static class GraphTools
     private static async Task<IReadOnlyList<ReferenceDisplayHit>>
         FindReferenceDisplayHitsAsync(
             IGraphStore store,
-            long targetSymbolId,
+            SymbolHit target,
             bool includeGenerated,
             int limit,
             CancellationToken ct)
     {
         var direct = await store.FindReferencesAsync(
-            targetSymbolId,
+            target.Id,
             includeGenerated,
             limit,
             ct).ConfigureAwait(false);
@@ -420,7 +436,9 @@ public static class GraphTools
                 reference.FilePath,
                 reference.Line,
                 reference.Col,
-                reference.IsGenerated))
+                reference.IsGenerated,
+                Source: null,
+                Target: null))
             .ToList();
         var remaining = Math.Max(0, limit - hits.Count);
         if (remaining == 0)
@@ -441,7 +459,7 @@ public static class GraphTools
             }
 
             var mappings = await store.ListAuditableInboundEdgesAsync(
-                targetSymbolId,
+                target.Id,
                 remaining,
                 incomingKind,
                 ct).ConfigureAwait(false);
@@ -453,7 +471,7 @@ public static class GraphTools
                 }
                 var evidence = await store.ListEdgeEvidenceAsync(
                     mapping.Symbol.Id,
-                    targetSymbolId,
+                    target.Id,
                     mapping.Relation,
                     ct: ct).ConfigureAwait(false);
                 foreach (var occurrence in evidence)
@@ -464,7 +482,9 @@ public static class GraphTools
                         occurrence.Location.FilePath,
                         occurrence.Location.StartLine,
                         occurrence.Location.StartColumn,
-                        mapping.Symbol.IsGenerated));
+                        mapping.Symbol.IsGenerated,
+                        Source: ReferenceEndpoint(mapping.Symbol),
+                        Target: ReferenceEndpoint(target)));
                     if (hits.Count >= limit)
                     {
                         return hits;
@@ -477,7 +497,7 @@ public static class GraphTools
         if (remaining > 0)
         {
             var implementations = await store.ListAuditableOutboundEdgesAsync(
-                targetSymbolId,
+                target.Id,
                 remaining,
                 EdgeKinds.NativeImplementation,
                 ct).ConfigureAwait(false);
@@ -488,7 +508,7 @@ public static class GraphTools
                     continue;
                 }
                 var evidence = await store.ListEdgeEvidenceAsync(
-                    targetSymbolId,
+                    target.Id,
                     implementation.Symbol.Id,
                     implementation.Relation,
                     ct: ct).ConfigureAwait(false);
@@ -500,7 +520,9 @@ public static class GraphTools
                         occurrence.Location.FilePath,
                         occurrence.Location.StartLine,
                         occurrence.Location.StartColumn,
-                        implementation.Symbol.IsGenerated));
+                        implementation.Symbol.IsGenerated,
+                        Source: ReferenceEndpoint(target),
+                        Target: ReferenceEndpoint(implementation.Symbol)));
                     if (hits.Count >= limit)
                     {
                         return hits;
@@ -513,9 +535,32 @@ public static class GraphTools
                 hit.Relation,
                 hit.FilePath,
                 hit.Line,
-                hit.Col))
+                hit.Col,
+                hit.Source?.SymbolId,
+                hit.Target?.SymbolId))
             .ToList();
     }
+
+    private static string ReferenceRelationLabel(ReferenceDisplayHit hit) =>
+        hit.Source is null || hit.Target is null
+            ? $"{hit.Relation} at {Format.Location(hit.FilePath, hit.Line, hit.Col)}" +
+              GeneratedSuffix(hit.IsGenerated)
+            : $"**{hit.Source.Fqn}** at " +
+              $"{Format.Location(hit.Source.FilePath, hit.Source.Line, hit.Source.Column)} " +
+              $"-[{hit.Relation}]-> **{hit.Target.Fqn}** at " +
+              Format.Location(hit.Target.FilePath, hit.Target.Line, hit.Target.Column);
+
+    private static TraceCallPathSymbol ReferenceEndpoint(SymbolHit symbol) =>
+        new(
+            SymbolId: symbol.Id,
+            CanonicalKey: symbol.CanonicalKey,
+            Fqn: symbol.Fqn,
+            Kind: symbol.Kind,
+            FilePath: symbol.FilePath,
+            Line: symbol.StartLine,
+            Column: symbol.StartCol,
+            EndLine: symbol.EndLine,
+            EndColumn: symbol.EndCol);
 
     private static string EvidenceConfidenceLabel(
         DevBitsLab.Mcp.SourceGraph.Core.EvidenceConfidence confidence) =>
@@ -583,7 +628,9 @@ public static class GraphTools
                 FilePath: r.FilePath,
                 Line: r.Line,
                 Column: r.Col,
-                IsGenerated: r.IsGenerated))
+                IsGenerated: r.IsGenerated,
+                Source: r.Source,
+                Target: r.Target))
             .ToList();
         var dto = new FindReferencesResult(
             TargetFqn: target.Fqn,
@@ -2745,7 +2792,9 @@ public static class GraphTools
         string FilePath,
         int Line,
         int Col,
-        bool IsGenerated);
+        bool IsGenerated,
+        TraceCallPathSymbol? Source,
+        TraceCallPathSymbol? Target);
 
     private static string DiagnosticRelation(DiagnosticHit diagnostic) =>
         diagnostic.SymbolId is null
