@@ -428,34 +428,47 @@ public static class GraphTools
             return hits;
         }
 
-        var mappings = await store.ListAuditableInboundEdgesAsync(
-            targetSymbolId,
-            remaining,
-            EdgeKinds.PInvokeMapsTo,
-            ct).ConfigureAwait(false);
-        foreach (var mapping in mappings)
+        foreach (var incomingKind in new[]
+                 {
+                     EdgeKinds.PInvokeMapsTo,
+                     EdgeKinds.NativeImplementation,
+                 })
         {
-            if (!includeGenerated && mapping.Symbol.IsGenerated)
+            remaining = Math.Max(0, limit - hits.Count);
+            if (remaining == 0)
             {
-                continue;
+                break;
             }
-            var evidence = await store.ListEdgeEvidenceAsync(
-                mapping.Symbol.Id,
+
+            var mappings = await store.ListAuditableInboundEdgesAsync(
                 targetSymbolId,
-                mapping.Relation,
-                ct: ct).ConfigureAwait(false);
-            foreach (var occurrence in evidence)
+                remaining,
+                incomingKind,
+                ct).ConfigureAwait(false);
+            foreach (var mapping in mappings)
             {
-                hits.Add(new ReferenceDisplayHit(
-                    mapping.Relation,
-                    EvidenceConfidenceLabel(occurrence.Confidence),
-                    occurrence.Location.FilePath,
-                    occurrence.Location.StartLine,
-                    occurrence.Location.StartColumn,
-                    mapping.Symbol.IsGenerated));
-                if (hits.Count >= limit)
+                if (!includeGenerated && mapping.Symbol.IsGenerated)
                 {
-                    return hits;
+                    continue;
+                }
+                var evidence = await store.ListEdgeEvidenceAsync(
+                    mapping.Symbol.Id,
+                    targetSymbolId,
+                    mapping.Relation,
+                    ct: ct).ConfigureAwait(false);
+                foreach (var occurrence in evidence)
+                {
+                    hits.Add(new ReferenceDisplayHit(
+                        mapping.Relation,
+                        EvidenceConfidenceLabel(occurrence.Confidence),
+                        occurrence.Location.FilePath,
+                        occurrence.Location.StartLine,
+                        occurrence.Location.StartColumn,
+                        mapping.Symbol.IsGenerated));
+                    if (hits.Count >= limit)
+                    {
+                        return hits;
+                    }
                 }
             }
         }

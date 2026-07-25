@@ -418,6 +418,22 @@ public sealed class StructuredContentInvariantTests : IAsyncLifetime, IDisposabl
         canonicalDto!.TargetSymbolId.Should().Be(nativeSymbolId);
         canonicalDto.References.Should().Contain(reference =>
             reference.Relation == EdgeKinds.NativeImplementation);
+
+        var implementationResult = await GraphTools.FindReferencesAsync(
+            _router!,
+            "cpp:F:native/camera-implementation.cpp::syntax::pg_camera_start()");
+        var implementationDto = JsonSerializer.Deserialize(
+            implementationResult.StructuredContent!.Value.GetRawText(),
+            ToolOutputJsonContext.Default.FindReferencesResult);
+        implementationDto.Should().NotBeNull();
+        implementationDto!.TargetSymbolId.Should().Be(implementationSymbolId);
+        implementationDto.References.Should().ContainSingle(reference =>
+            reference.Relation == EdgeKinds.NativeImplementation
+            && reference.FilePath == implementationFilePath
+            && reference.Confidence == "inferred");
+        CallToolResultHelpers.ProseText(implementationResult)
+            .Should().Contain(EdgeKinds.NativeImplementation)
+            .And.NotContain("no other references");
     }
 
     [Fact]
