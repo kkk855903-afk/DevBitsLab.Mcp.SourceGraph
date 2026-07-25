@@ -83,6 +83,35 @@ public sealed class CppSyntaxLanguageIndexerTests
     }
 
     [Fact]
+    public async Task Resolves_method_call_through_static_cast_receiver()
+    {
+        const string source = """
+            class CameraCapture
+            {
+            public:
+                int Start(int index) { return index; }
+            };
+
+            int pg_camera_start(void* camera, int index)
+            {
+                return static_cast<CameraCapture*>(camera)->Start(index);
+            }
+            """;
+        var events = await IndexAsync(source);
+
+        var symbols = events.OfType<IndexEvent.SymbolDeclared>().ToArray();
+        var wrapper = symbols.Single(symbol =>
+            symbol.Name == "pg_camera_start");
+        var start = symbols.Single(symbol =>
+            symbol.Name == "Start"
+            && symbol.Fqn == "CameraCapture::Start");
+        events.OfType<IndexEvent.EdgeEmitted>().Should().ContainSingle(edge =>
+            edge.SourceCanonicalKey == wrapper.CanonicalKey
+            && edge.TargetCanonicalKey == start.CanonicalKey
+            && edge.EdgeKindName == EdgeKinds.Calls);
+    }
+
+    [Fact]
     public async Task Anonymous_namespace_does_not_capture_a_descendant_type_as_its_name()
     {
         var events = await IndexAsync(

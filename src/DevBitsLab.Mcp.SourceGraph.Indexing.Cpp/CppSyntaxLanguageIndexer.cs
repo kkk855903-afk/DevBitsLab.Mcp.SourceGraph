@@ -558,11 +558,6 @@ public sealed class CppSyntaxLanguageIndexer : ILanguageIndexer, IBoundedSourceL
     private static string FunctionLeafName(string text)
     {
         var value = CollapseWhitespace(text);
-        var paren = value.IndexOf('(');
-        if (paren >= 0)
-        {
-            value = value[..paren];
-        }
         var separators = new[] { "->", ".", "::" };
         foreach (var separator in separators)
         {
@@ -571,6 +566,11 @@ public sealed class CppSyntaxLanguageIndexer : ILanguageIndexer, IBoundedSourceL
             {
                 value = value[(index + separator.Length)..];
             }
+        }
+        var paren = value.IndexOf('(');
+        if (paren >= 0)
+        {
+            value = value[..paren];
         }
         var template = value.IndexOf('<');
         if (template > 0)
