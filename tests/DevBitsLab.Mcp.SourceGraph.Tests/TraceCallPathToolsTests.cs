@@ -56,6 +56,10 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
         var nativeAlternative = await SeedSymbolAsync(
             store,
             "NativeAlternative");
+        var scheduledStart = await SeedSymbolAsync(store, "ScheduledStart");
+        var scheduledLoop = await SeedSymbolAsync(store, "ScheduledLoop");
+        var uiDispatch = await SeedSymbolAsync(store, "UiDispatch");
+        var applyFrame = await SeedSymbolAsync(store, "ApplyFrame");
         var outOfOrderRpc = await SeedSymbolAsync(store, "OutOfOrderRpc");
         var outOfOrderServer = await SeedSymbolAsync(
             store,
@@ -102,6 +106,8 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
             Edge(import, export, 27, CoreEvidenceConfidence.Exact, "pinvoke", EdgeKinds.PInvokeMapsTo),
             Edge(export, native, 28, CoreEvidenceConfidence.Exact, "native-call"),
             Edge(export, nativeAlternative, 29, CoreEvidenceConfidence.Exact, "native-alternative"),
+            Edge(scheduledStart, scheduledLoop, 46, CoreEvidenceConfidence.Semantic, "scheduled-lambda", EdgeKinds.Schedules),
+            Edge(uiDispatch, applyFrame, 47, CoreEvidenceConfidence.Semantic, "dispatcher-lambda", EdgeKinds.Dispatches),
             Edge(ui, native, 29, CoreEvidenceConfidence.Exact, "excluded-shortcut", EdgeKinds.Tests),
             Edge(ui, outOfOrderRpc, 30, CoreEvidenceConfidence.Semantic, "out-of-order-grpc", EdgeKinds.GrpcCalls),
             Edge(outOfOrderRpc, outOfOrderServer, 31, CoreEvidenceConfidence.Semantic, "out-of-order-dispatch", EdgeKinds.RpcDispatchesTo),
@@ -336,6 +342,8 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
             "binds-path",
             EdgeKinds.CommandExecutes,
             EdgeKinds.Calls,
+            EdgeKinds.Schedules,
+            EdgeKinds.Dispatches,
             EdgeKinds.GrpcCalls,
             EdgeKinds.RpcDispatchesTo,
             EdgeKinds.PInvokeMapsTo);
@@ -378,6 +386,34 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
             projection => projection.Name == "query-bounds"
                 && projection.Status == "truncated"
                 && !projection.Authoritative);
+    }
+
+    [Theory]
+    [InlineData(
+        "csharp:M:Graph.ScheduledStart",
+        "csharp:M:Graph.ScheduledLoop",
+        "schedules")]
+    [InlineData(
+        "csharp:M:Graph.UiDispatch",
+        "csharp:M:Graph.ApplyFrame",
+        "dispatches")]
+    public async Task ExecutionProfile_canStartAtManagedSchedulingMethods(
+        string from,
+        string to,
+        string relation)
+    {
+        var result = await TraceCallPathTools.TraceCallPathWithProfileAsync(
+            _router!,
+            from,
+            to,
+            profile: "execution",
+            maxDepth: 1);
+
+        var path = result.StructuredContent!.Value.Deserialize(
+                ToolOutputJsonContext.Default.TraceCallPathResult)!
+            .Scopes.Should().ContainSingle().Which
+            .Paths.Should().ContainSingle().Which;
+        path.Hops.Should().ContainSingle().Which.Relation.Should().Be(relation);
     }
 
     [Theory]
