@@ -12,7 +12,7 @@ internal static class SemanticPipelineFingerprint
     private const int CSharpIndexerVersion = 2;
     private const int XamlIndexerVersion = 2;
     private const int CppSyntaxIndexerVersion = 2;
-    private const int ExecutionProjectionVersion = 4;
+    private const int ExecutionProjectionVersion = 5;
     private const int DiagnosticPipelineVersion = 2;
 
     public static string Current =>

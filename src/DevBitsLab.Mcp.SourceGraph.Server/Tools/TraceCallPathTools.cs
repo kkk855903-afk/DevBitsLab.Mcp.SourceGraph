@@ -33,7 +33,8 @@ public static class TraceCallPathTools
     private const string ExecutionTerminalDefinition =
         "A terminal algorithm is reached only by binds-path, command-executes, one or more "
         + "managed calls, grpc-calls, rpc-dispatches-to, one or more server calls, "
-        + "pinvoke-maps-to, and one or more native calls, in that order; its final node has "
+        + "pinvoke-maps-to, an optional native-implementation hop, and one or more native "
+        + "calls, in that order; its final node has "
         + "no auditable outbound calls edge.";
     private static readonly string[] ExecutionRelations =
     [
@@ -50,6 +51,7 @@ public static class TraceCallPathTools
         EdgeKinds.GrpcCalls,
         EdgeKinds.RpcDispatchesTo,
         EdgeKinds.PInvokeMapsTo,
+        EdgeKinds.NativeImplementation,
     ];
 
     /// <summary>
@@ -909,13 +911,16 @@ public static class TraceCallPathTools
                     EdgeKinds.EventDispatchesTo,
                     EdgeKinds.SubscribesHandler,
                     EdgeKinds.GrpcCalls,
+                    EdgeKinds.PInvokeMapsTo,
+                    EdgeKinds.NativeImplementation,
                 ],
             ExecutionStage.AwaitRpcDispatch =>
                 [EdgeKinds.RpcDispatchesTo],
             ExecutionStage.AwaitServerCall => [EdgeKinds.Calls],
             ExecutionStage.ManagedServer =>
                 [EdgeKinds.Calls, EdgeKinds.PInvokeMapsTo],
-            ExecutionStage.AwaitNativeCall => [EdgeKinds.Calls],
+            ExecutionStage.AwaitNativeCall =>
+                [EdgeKinds.NativeImplementation, EdgeKinds.Calls],
             ExecutionStage.NativeAlgorithm => [EdgeKinds.Calls],
             _ => throw new InvalidOperationException(
                 $"Execution relation requested for invalid stage `{stage}`."),
@@ -968,6 +973,10 @@ public static class TraceCallPathTools
                 ExecutionStage.ManagedClient,
             (ExecutionStage.ManagedClient, EdgeKinds.GrpcCalls) =>
                 ExecutionStage.AwaitRpcDispatch,
+            (ExecutionStage.ManagedClient, EdgeKinds.PInvokeMapsTo) =>
+                ExecutionStage.AwaitNativeCall,
+            (ExecutionStage.ManagedClient, EdgeKinds.NativeImplementation) =>
+                ExecutionStage.AwaitNativeCall,
             (ExecutionStage.AwaitRpcDispatch, EdgeKinds.RpcDispatchesTo) =>
                 ExecutionStage.AwaitServerCall,
             (ExecutionStage.AwaitServerCall, EdgeKinds.Calls) =>
@@ -975,6 +984,8 @@ public static class TraceCallPathTools
             (ExecutionStage.ManagedServer, EdgeKinds.Calls) =>
                 ExecutionStage.ManagedServer,
             (ExecutionStage.ManagedServer, EdgeKinds.PInvokeMapsTo) =>
+                ExecutionStage.AwaitNativeCall,
+            (ExecutionStage.AwaitNativeCall, EdgeKinds.NativeImplementation) =>
                 ExecutionStage.AwaitNativeCall,
             (ExecutionStage.AwaitNativeCall, EdgeKinds.Calls) =>
                 ExecutionStage.NativeAlgorithm,
@@ -1191,7 +1202,8 @@ public static class TraceCallPathTools
                 "native-interop" => projection with
                 {
                     Applicable =
-                        relations.Contains(EdgeKinds.PInvokeMapsTo),
+                        relations.Contains(EdgeKinds.PInvokeMapsTo)
+                        || relations.Contains(EdgeKinds.NativeImplementation),
                 },
                 _ => projection,
             })

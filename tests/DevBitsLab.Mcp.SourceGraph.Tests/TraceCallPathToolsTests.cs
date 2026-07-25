@@ -81,6 +81,16 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
         var frameworkHandler = await SeedSymbolAsync(
             store,
             "FrameworkHandler");
+        var nativeBridgeImport = await SeedSymbolAsync(
+            store,
+            "NativeBridgeImport");
+        var nativeBridgeExport = await SeedSymbolAsync(
+            store,
+            "NativeBridgeExport");
+        var cppDefinition = await SeedSymbolAsync(
+            store,
+            "CppDefinition");
+        var cppStop = await SeedSymbolAsync(store, "CppStop");
         var outOfOrderRpc = await SeedSymbolAsync(store, "OutOfOrderRpc");
         var outOfOrderServer = await SeedSymbolAsync(
             store,
@@ -144,6 +154,11 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
             Edge(eventLoop, frameReady, 52, CoreEvidenceConfidence.Exact, "event-raise", EdgeKinds.RaisesEvent),
             Edge(frameReady, eventApplyFrame, 53, CoreEvidenceConfidence.Semantic, "event-dispatch", EdgeKinds.EventDispatchesTo),
             Edge(frameworkSubscription, frameworkHandler, 54, CoreEvidenceConfidence.Semantic, "external-handler", EdgeKinds.SubscribesHandler),
+            Edge(clickHandler, interfaceMember, 55, CoreEvidenceConfidence.Exact, "click-interface-call"),
+            Edge(interfaceImplementation, nativeBridgeImport, 56, CoreEvidenceConfidence.Exact, "implementation-import-call"),
+            Edge(nativeBridgeImport, nativeBridgeExport, 57, CoreEvidenceConfidence.Exact, "pinvoke-bridge", EdgeKinds.PInvokeMapsTo),
+            Edge(nativeBridgeExport, cppDefinition, 58, CoreEvidenceConfidence.Inferred, "cpp-implementation", EdgeKinds.NativeImplementation),
+            Edge(cppDefinition, cppStop, 59, CoreEvidenceConfidence.Inferred, "cpp-stop-call"),
             Edge(ui, native, 29, CoreEvidenceConfidence.Exact, "excluded-shortcut", EdgeKinds.Tests),
             Edge(ui, outOfOrderRpc, 30, CoreEvidenceConfidence.Semantic, "out-of-order-grpc", EdgeKinds.GrpcCalls),
             Edge(outOfOrderRpc, outOfOrderServer, 31, CoreEvidenceConfidence.Semantic, "out-of-order-dispatch", EdgeKinds.RpcDispatchesTo),
@@ -470,7 +485,8 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
             EdgeKinds.SubscribesHandler,
             EdgeKinds.GrpcCalls,
             EdgeKinds.RpcDispatchesTo,
-            EdgeKinds.PInvokeMapsTo);
+            EdgeKinds.PInvokeMapsTo,
+            EdgeKinds.NativeImplementation);
         var scope = dto.Scopes.Should().ContainSingle().Which;
         scope.ExecutionState.Should().NotBeNull();
         scope.ExecutionState!.Status.Should().Be("partial");
@@ -569,6 +585,33 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
         path.Hops.Select(hop => hop.Relation).Should().Equal(
             EdgeKinds.Calls,
             EdgeKinds.InterfaceDispatchesTo);
+    }
+
+    [Fact]
+    public async Task ExecutionProfile_connectsXaml_interface_and_cpp_implementation()
+    {
+        var result = await TraceCallPathTools.TraceCallPathWithProfileAsync(
+            _router!,
+            from: "csharp:M:Graph.XamlButton",
+            to: "csharp:M:Graph.CppStop",
+            profile: "execution",
+            maxDepth: 8,
+            maxPaths: 10,
+            maxNodes: 100);
+
+        result.IsError.Should().NotBe(true);
+        var scope = result.StructuredContent!.Value.Deserialize(
+                ToolOutputJsonContext.Default.TraceCallPathResult)!
+            .Scopes.Should().ContainSingle().Which;
+        var path = scope.Paths.Should().ContainSingle().Which;
+        path.Hops.Select(hop => hop.Relation).Should().Equal(
+            EdgeKinds.HandlesEvent,
+            EdgeKinds.Calls,
+            EdgeKinds.InterfaceDispatchesTo,
+            EdgeKinds.Calls,
+            EdgeKinds.PInvokeMapsTo,
+            EdgeKinds.NativeImplementation,
+            EdgeKinds.Calls);
     }
 
     [Theory]
