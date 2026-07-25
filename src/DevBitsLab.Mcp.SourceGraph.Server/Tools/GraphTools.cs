@@ -4,6 +4,7 @@ using System.Text;
 using System.Text.Json;
 using DevBitsLab.Mcp.SourceGraph.Core;
 using DevBitsLab.Mcp.SourceGraph.Embeddings;
+using DevBitsLab.Mcp.SourceGraph.Indexing;
 using DevBitsLab.Mcp.SourceGraph.Sdk;
 using DevBitsLab.Mcp.SourceGraph.Sdk.Validation;
 using DevBitsLab.Mcp.SourceGraph.Server.Observability;
@@ -2538,7 +2539,7 @@ public static class GraphTools
 
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(ListGeneratedFilesResult))]
     [ToolTrigger("\"what's source-generated in this codebase?\"")]
-    [Description("List every source-generated file (Roslyn IIncrementalGenerator output: regex source-gen, MVVM Toolkit, ASP.NET routing, JSON source-gen, etc.) tracked by the index. Each row shows the path and the count of symbols emitted from that file.")]
+    [Description("List generated inputs in two groups: searchable Roslyn source-generator output with emitted-symbol counts, and SDK/WPF build-generated compiler inputs (for example GlobalUsings.g.cs and MainWindow.g.cs) that support semantics without becoming ordinary search noise.")]
     public static Task<CallToolResult> ListGeneratedFilesAsync(
         ScopeRouter router,
         [Description("Maximum rows (default 100)")] int limit = 100,
@@ -2549,27 +2550,48 @@ public static class GraphTools
             {
                 var sw = System.Diagnostics.Stopwatch.StartNew();
                 var rows = await host.Store.ListGeneratedFilesAsync(limit, ct).ConfigureAwait(false);
+                var compilerInputs = host.Indexer
+                    .ListBuildGeneratedCompilerInputs();
                 var sb = new StringBuilder();
-                sb.AppendLine($"Generated files: {rows.Count}");
+                sb.AppendLine($"Source-generator files: {rows.Count}");
                 if (rows.Count == 0)
                 {
                     sb.AppendLine("_(no source-generated documents in this solution)_");
-                    return BuildListGeneratedFilesResult(
-                        prose: sb.ToString(),
-                        rows: Array.Empty<GeneratedFileRow>(),
-                        scopeId: host.Scope.Id,
-                        elapsedMs: sw.ElapsedMilliseconds);
                 }
-                sb.AppendLine();
-                sb.AppendLine("| Symbols | Path |");
-                sb.AppendLine("|--------:|------|");
-                foreach (var r in rows)
+                else
                 {
-                    sb.AppendLine($"| {r.SymbolCount} | `{r.FilePath}` |");
+                    sb.AppendLine();
+                    sb.AppendLine("| Symbols | Path |");
+                    sb.AppendLine("|--------:|------|");
+                    foreach (var r in rows)
+                    {
+                        sb.AppendLine($"| {r.SymbolCount} | `{r.FilePath}` |");
+                    }
+                }
+
+                sb.AppendLine();
+                sb.AppendLine(
+                    $"Semantic-only compiler inputs: {compilerInputs.Count}");
+                if (compilerInputs.Count == 0)
+                {
+                    sb.AppendLine(
+                        "_(no SDK/WPF build-generated documents were retained)_");
+                }
+                else
+                {
+                    sb.AppendLine();
+                    sb.AppendLine("| Category | Path |");
+                    sb.AppendLine("|----------|------|");
+                    foreach (var input in compilerInputs)
+                    {
+                        sb.AppendLine(
+                            $"| {input.Category} | `{input.FilePath}` |");
+                    }
                 }
                 return BuildListGeneratedFilesResult(
                     prose: sb.ToString(),
                     rows: rows,
+                    compilerInputs: compilerInputs,
                     scopeId: host.Scope.Id,
                     elapsedMs: sw.ElapsedMilliseconds);
             }, ct));
@@ -2577,6 +2599,7 @@ public static class GraphTools
     private static CallToolResult BuildListGeneratedFilesResult(
         string prose,
         IReadOnlyList<GeneratedFileRow> rows,
+        IReadOnlyList<BuildGeneratedCompilerInput> compilerInputs,
         string scopeId,
         long elapsedMs)
     {
@@ -2607,7 +2630,14 @@ public static class GraphTools
                 FilePath: r.FilePath,
                 SymbolCount: r.SymbolCount))
             .ToList();
-        var dto = new ListGeneratedFilesResult(Files: structuredRows);
+        var structuredCompilerInputs = compilerInputs
+            .Select(input => new ListGeneratedCompilerInputRow(
+                FilePath: input.FilePath,
+                Category: input.Category))
+            .ToList();
+        var dto = new ListGeneratedFilesResult(
+            Files: structuredRows,
+            CompilerInputs: structuredCompilerInputs);
         return new CallToolResult
         {
             Content = content,

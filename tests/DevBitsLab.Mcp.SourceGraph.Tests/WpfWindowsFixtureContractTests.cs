@@ -217,6 +217,18 @@ public sealed class WpfWindowsFixtureContractTests
                     || file.FilePath.EndsWith("App.g.cs", StringComparison.Ordinal)
                     || file.FilePath.EndsWith("MainWindow.g.cs", StringComparison.Ordinal),
                     "build-generated compiler inputs are semantic support, not ordinary search noise");
+            var semanticCompilerInputs =
+                roslyn.ListBuildGeneratedCompilerInputs();
+            semanticCompilerInputs.Should().Contain(input =>
+                input.Category == "sdk-generated"
+                && input.FilePath.EndsWith(
+                    "GlobalUsings.g.cs",
+                    StringComparison.Ordinal));
+            semanticCompilerInputs.Should().Contain(input =>
+                input.Category == "wpf-generated"
+                && input.FilePath.EndsWith(
+                    "MainWindow.g.cs",
+                    StringComparison.Ordinal));
         }
         finally
         {

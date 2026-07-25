@@ -204,6 +204,55 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
     public Solution? SanitizedSolution => _sanitizedSolution;
 
     /// <summary>
+    /// Lists SDK/WPF build-generated documents retained only as compiler inputs. These documents
+    /// intentionally stay out of the ordinary generated-file search index, but exposing their
+    /// presence lets diagnostics distinguish "no source-generator output" from "the workspace
+    /// failed to load GlobalUsings.g.cs / WPF .g.cs inputs".
+    /// </summary>
+    public IReadOnlyList<BuildGeneratedCompilerInput>
+        ListBuildGeneratedCompilerInputs()
+    {
+        var solution = _sanitizedSolution;
+        if (solution is null)
+        {
+            return Array.Empty<BuildGeneratedCompilerInput>();
+        }
+
+        return solution.Projects
+            .SelectMany(project => project.Documents)
+            .Where(SolutionPrivacySanitizer.IsBuildGeneratedDocument)
+            .Select(document =>
+            {
+                var path = document.FilePath ?? document.Name;
+                var fileName = Path.GetFileName(path);
+                var category =
+                    fileName.EndsWith(
+                        "GlobalUsings.g.cs",
+                        StringComparison.OrdinalIgnoreCase)
+                    || fileName.Contains(
+                        "AssemblyInfo",
+                        StringComparison.OrdinalIgnoreCase)
+                    || fileName.Contains(
+                        "AssemblyAttributes",
+                        StringComparison.OrdinalIgnoreCase)
+                        ? "sdk-generated"
+                        : fileName.EndsWith(
+                                ".g.cs",
+                                StringComparison.OrdinalIgnoreCase)
+                            || fileName.EndsWith(
+                                ".g.i.cs",
+                                StringComparison.OrdinalIgnoreCase)
+                            ? "wpf-generated"
+                            : "build-generated";
+                return new BuildGeneratedCompilerInput(path, category);
+            })
+            .Distinct()
+            .OrderBy(input => input.Category, StringComparer.Ordinal)
+            .ThenBy(input => input.FilePath, _pathComparer)
+            .ToArray();
+    }
+
+    /// <summary>
     /// Returns whether every Roslyn input for all target-framework iterations of
     /// <paramref name="projectFilePath"/> survived the scope privacy sanitizer. XAML semantic
     /// analysis uses this as a fail-closed completeness signal: a clean compilation assembled
@@ -5055,3 +5104,11 @@ public sealed record IndexResult(int FilesIndexed, int SymbolsIndexed, int Refer
     /// </summary>
     public IReadOnlyList<FileFailure> FailedFiles { get; init; } = Array.Empty<FileFailure>();
 }
+
+/// <summary>
+/// One SDK/WPF build-generated document retained in the semantic Compilation but deliberately
+/// omitted from the normal generated-file symbol index.
+/// </summary>
+public sealed record BuildGeneratedCompilerInput(
+    string FilePath,
+    string Category);
