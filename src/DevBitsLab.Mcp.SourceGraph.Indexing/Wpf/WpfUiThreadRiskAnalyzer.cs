@@ -25,9 +25,11 @@ internal static class WpfUiThreadRiskAnalyzer
         DiagnosticSeverity.Warning,
         isEnabledByDefault: true,
         description:
-            "A member whose receiver statically derives from DispatcherObject is accessed inside "
-            + "a callback directly scheduled by Task.Run, ThreadPool, or an immediately started "
-            + "Thread. Marshal the access through Dispatcher.Invoke, BeginInvoke, or InvokeAsync.");
+            "A proven DispatcherObject member is accessed inside a callback directly scheduled "
+            + "by Task.Run, ThreadPool, or an immediately started Thread. Ordinary source "
+            + "members do not inherit UI affinity merely because their containing class derives "
+            + "from DispatcherObject. Marshal real control access through Dispatcher.Invoke, "
+            + "BeginInvoke, or InvokeAsync.");
 #pragma warning restore RS2008
 
     public static ImmutableArray<Diagnostic> Analyze(
@@ -293,6 +295,16 @@ internal static class WpfUiThreadRiskAnalyzer
             {
                 return;
             }
+            if (IsContainingTypeInstance(receiver)
+                && !IsFrameworkDispatcherMember(member))
+            {
+                // A Window/UserControl is a DispatcherObject, but its ordinary fields, helper
+                // methods, and pure state are not automatically thread-affine. Real control
+                // access remains visible through its own typed receiver (for example
+                // `_statusText.Text`), while inherited WPF framework members are metadata
+                // declarations and remain proven UI access.
+                return;
+            }
 
             var entryStart = entryLocation.GetLineSpan().StartLinePosition;
             var diagnostic = Diagnostic.Create(
@@ -306,6 +318,28 @@ internal static class WpfUiThreadRiskAnalyzer
                 entryStart.Character + 1);
             reportDiagnostic(diagnostic);
         }
+
+        private static bool IsContainingTypeInstance(IOperation receiver)
+        {
+            while (receiver is IConversionOperation conversion)
+            {
+                receiver = conversion.Operand;
+            }
+            while (receiver is IParenthesizedOperation parenthesized)
+            {
+                receiver = parenthesized.Operand;
+            }
+            return receiver is IInstanceReferenceOperation
+            {
+                ReferenceKind:
+                    InstanceReferenceKind.ContainingTypeInstance,
+            };
+        }
+
+        private bool IsFrameworkDispatcherMember(ISymbol member) =>
+            member.ContainingType is { } containingType
+            && DerivesFrom(containingType, symbols.DispatcherObject)
+            && member.Locations.All(location => !location.IsInSource);
     }
 
     private static bool DerivesFrom(
