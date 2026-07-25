@@ -177,6 +177,113 @@ public sealed class XamlBindingOutcomeTests
     }
 
     [Fact]
+    public async Task CodeBehindDataContextResolvesFieldTypeWithEvidence()
+    {
+        const string csharp = """
+            namespace System.Windows
+            {
+                public class Window
+                {
+                    public object? DataContext { get; set; }
+                }
+            }
+
+            namespace Test
+            {
+                public sealed class Vm
+                {
+                    public string Existing { get; } = "";
+                }
+
+                public sealed class View : System.Windows.Window
+                {
+                    private readonly Vm _viewModel = new();
+
+                    public View()
+                    {
+                        DataContext = _viewModel;
+                    }
+                }
+            }
+            """;
+        var xaml = $$"""
+            <Window xmlns="{{PresentationNamespace}}"
+                    xmlns:x="{{XamlNamespace}}"
+                    x:Class="Test.View">
+                <TextBlock x:Name="Resolved" Text="{Binding Existing}" />
+            </Window>
+            """;
+
+        var events = await IndexAsync(csharp, xaml);
+
+        var edge = events.OfType<IndexEvent.EdgeEmitted>()
+            .Should().ContainSingle(item =>
+                item.SourceCanonicalKey.EndsWith(
+                    "#Resolved",
+                    StringComparison.Ordinal)
+                && item.EdgeKindName == "binds-path")
+            .Subject;
+        edge.TargetCanonicalKey.Should().Be("csharp:P:Test.Vm.Existing");
+        edge.Metadata.Should().Contain(
+            "context-source",
+            "code-behind-data-context");
+    }
+
+    [Fact]
+    public async Task MultipleCodeBehindDataContextTypesAreAmbiguous()
+    {
+        const string csharp = """
+            namespace System.Windows
+            {
+                public class Window
+                {
+                    public object? DataContext { get; set; }
+                }
+            }
+
+            namespace Test
+            {
+                public sealed class FirstVm { public string Value => ""; }
+                public sealed class SecondVm { public string Value => ""; }
+
+                public sealed class View : System.Windows.Window
+                {
+                    public View(bool first)
+                    {
+                        if (first)
+                            DataContext = new FirstVm();
+                        else
+                            DataContext = new SecondVm();
+                    }
+                }
+            }
+            """;
+        var xaml = $$"""
+            <Window xmlns="{{PresentationNamespace}}"
+                    xmlns:x="{{XamlNamespace}}"
+                    x:Class="Test.View">
+                <TextBlock x:Name="AmbiguousContext" Text="{Binding Value}" />
+            </Window>
+            """;
+
+        var events = await IndexAsync(csharp, xaml);
+
+        var annotation = AnnotationFor(
+            events,
+            "AmbiguousContext",
+            "xaml-binding-outcome");
+        annotation.FullName.Should().Be("ambiguous");
+        using var json = JsonDocument.Parse(annotation.ArgsJson!);
+        json.RootElement.GetProperty("reason").GetString().Should()
+            .Be("multiple-code-behind-data-context-types");
+        events.OfType<IndexEvent.EdgeEmitted>().Should().NotContain(edge =>
+            edge.SourceCanonicalKey.EndsWith(
+                "#AmbiguousContext",
+                StringComparison.Ordinal)
+            && edge.EdgeKindName == "binds-path");
+    }
+
+    [Fact]
     public async Task CommandResolutionDistinguishesResolvedMissingAndUnsupported()
     {
         const string csharp = """
