@@ -583,6 +583,7 @@ public sealed class LiveIndexService : BackgroundService
         var nativeInteropPartial = false;
         var grpcLinkPartial = false;
         var projectDiscoveryFailed = false;
+        var compilationErrorCount = 0;
 
         try
         {
@@ -636,9 +637,11 @@ public sealed class LiveIndexService : BackgroundService
                 // the end of this method.
                 host.FailedProjects = initial.FailedProjects;
                 host.FailedFiles = initial.FailedFiles;
+                compilationErrorCount = initial.CompilationErrorCount;
                 host.ManagedInteropInputComplete =
                     initial.FailedProjects.Count == 0
-                    && initial.FailedFiles.Count == 0;
+                    && initial.FailedFiles.Count == 0
+                    && initial.CompilationErrorCount == 0;
             }
             else
             {
@@ -784,7 +787,8 @@ public sealed class LiveIndexService : BackgroundService
                 retainedCounts,
                 failedProjectCount,
                 failedFileCount,
-                projectDiscoveryFailed);
+                projectDiscoveryFailed,
+                compilationErrorCount);
             if ((grpcLinkPartial || nativeInteropPartial)
                 && status.Status != "degraded")
             {
@@ -1084,9 +1088,12 @@ public sealed class LiveIndexService : BackgroundService
         RowCountsRow retainedCounts,
         int failedProjectCount,
         int failedFileCount,
-        bool projectDiscoveryFailed)
+        bool projectDiscoveryFailed,
+        int compilationErrorCount = 0)
     {
-        var hasFailures = failedProjectCount > 0 || failedFileCount > 0;
+        var hasFailures = failedProjectCount > 0
+            || failedFileCount > 0
+            || compilationErrorCount > 0;
         if (!hasFailures)
         {
             return new ColdIndexStatusResolution("ok", null, UsesRetainedGraph: false);
@@ -1107,7 +1114,11 @@ public sealed class LiveIndexService : BackgroundService
                 : "Indexed with failures";
             return new ColdIndexStatusResolution(
                 "partial",
-                BuildFailureSummary(prefix, failedProjectCount, failedFileCount),
+                BuildFailureSummary(
+                    prefix,
+                    failedProjectCount,
+                    failedFileCount,
+                    compilationErrorCount),
                 usesRetainedGraph);
         }
 
@@ -1119,7 +1130,8 @@ public sealed class LiveIndexService : BackgroundService
             BuildFailureSummary(
                 degradedPrefix,
                 failedProjectCount,
-                failedFileCount),
+                failedFileCount,
+                compilationErrorCount),
             UsesRetainedGraph: false);
     }
 
@@ -1743,13 +1755,31 @@ public sealed class LiveIndexService : BackgroundService
     /// non-empty. Avoids the "0 project(s)" wart that a naive interpolation produces when only
     /// file-level failures occurred.
     /// </summary>
-    private static string BuildFailureSummary(string prefix, int projectCount, int fileCount)
+    private static string BuildFailureSummary(
+        string prefix,
+        int projectCount,
+        int fileCount,
+        int compilationErrorCount = 0)
     {
-        if (projectCount == 0 && fileCount == 0) return prefix + ".";
-        var parts = new List<string>(2);
+        if (projectCount == 0
+            && fileCount == 0
+            && compilationErrorCount == 0)
+        {
+            return prefix + ".";
+        }
+        var parts = new List<string>(3);
         if (projectCount > 0) parts.Add($"{projectCount} project(s)");
         if (fileCount > 0) parts.Add($"{fileCount} file(s)");
-        return $"{prefix}: {string.Join(", ", parts)} failed.";
+        if (compilationErrorCount == 0)
+        {
+            return $"{prefix}: {string.Join(", ", parts)} failed.";
+        }
+
+        var compilationSummary =
+            $"{compilationErrorCount} compiler error(s)";
+        return parts.Count == 0
+            ? $"{prefix}: {compilationSummary}."
+            : $"{prefix}: {string.Join(", ", parts)} failed; {compilationSummary}.";
     }
 
     private static string GrpcLinkFailureSummary(

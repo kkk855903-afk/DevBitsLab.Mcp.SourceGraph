@@ -2478,6 +2478,7 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         // state visible so a later integrity/structural retry can repair it.
         var walkedFileIds = new HashSet<long>();
         var failedFiles = new List<FileFailure>();
+        var compilationErrorCount = 0;
         if (initialFailures is not null)
         {
             foreach (var failure in initialFailures)
@@ -3795,8 +3796,10 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
             }
 
             var project = _sanitizedSolution!.GetProject(pid);
-            var compilationContainsErrors = diags.Any(diagnostic =>
+            var projectCompilationErrorCount = diags.Count(diagnostic =>
                 diagnostic.Severity == DiagnosticSeverity.Error);
+            compilationErrorCount += projectCompilationErrorCount;
+            var compilationContainsErrors = projectCompilationErrorCount > 0;
             var semanticInputComplete =
                 project?.FilePath is { Length: > 0 } projectFilePath
                 && IsProjectSemanticInputComplete(
@@ -4021,6 +4024,7 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         {
             FailedProjects = _probedFailures,
             FailedFiles = failedFiles,
+            CompilationErrorCount = compilationErrorCount,
         };
     }
 
@@ -5023,6 +5027,13 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
 
 public sealed record IndexResult(int FilesIndexed, int SymbolsIndexed, int ReferencesIndexed, TimeSpan Elapsed)
 {
+    /// <summary>
+    /// Number of Roslyn error diagnostics observed in the projects touched by this pass.
+    /// A non-zero value means symbol/reference output can still be useful, but semantic
+    /// projections are not authoritative and the owning scope must not report itself as healthy.
+    /// </summary>
+    public int CompilationErrorCount { get; init; }
+
     /// <summary>
     /// True only when this result came from a successful all-document discovery, index, and
     /// stale generated-owner reconciliation. An incremental entry point may return true when it
