@@ -3326,14 +3326,20 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                     ISymbol? referenced = null;
                     ReferenceKind kind = ReferenceKind.Reference;
                     SyntaxNode? refNode = null; // node whose position we record
+                    var referenceConfidence =
+                        CoreEvidenceConfidence.Exact;
 
                     switch (node)
                     {
                         case IdentifierNameSyntax id when id.Parent is not (NamespaceDeclarationSyntax or BaseTypeDeclarationSyntax or MethodDeclarationSyntax or PropertyDeclarationSyntax or VariableDeclaratorSyntax or ParameterSyntax or TypeParameterSyntax):
-                            referenced = id.Parent is InvocationExpressionSyntax invocationId
+                            var identifierInfo =
+                                id.Parent is InvocationExpressionSyntax invocationId
                                 && invocationId.Expression == id
-                                    ? model.GetSymbolInfo(invocationId, ct).Symbol
-                                    : model.GetSymbolInfo(id, ct).Symbol;
+                                    ? model.GetSymbolInfo(invocationId, ct)
+                                    : model.GetSymbolInfo(id, ct);
+                            referenced = ResolveReferenceCandidate(
+                                identifierInfo,
+                                out referenceConfidence);
                             refNode = id;
                             kind = id.Parent is InvocationExpressionSyntax inv
                                 && inv.Expression == id
@@ -3342,10 +3348,14 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                             break;
 
                         case GenericNameSyntax gn:
-                            referenced = gn.Parent is InvocationExpressionSyntax invocationGeneric
+                            var genericInfo =
+                                gn.Parent is InvocationExpressionSyntax invocationGeneric
                                 && invocationGeneric.Expression == gn
-                                    ? model.GetSymbolInfo(invocationGeneric, ct).Symbol
-                                    : model.GetSymbolInfo(gn, ct).Symbol;
+                                    ? model.GetSymbolInfo(invocationGeneric, ct)
+                                    : model.GetSymbolInfo(gn, ct);
+                            referenced = ResolveReferenceCandidate(
+                                genericInfo,
+                                out referenceConfidence);
                             refNode = gn;
                             kind = gn.Parent is InvocationExpressionSyntax invGn
                                 && invGn.Expression == gn
@@ -3354,10 +3364,14 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                             break;
 
                         case MemberAccessExpressionSyntax mae:
-                            referenced = mae.Parent is InvocationExpressionSyntax invocationMember
+                            var memberInfo =
+                                mae.Parent is InvocationExpressionSyntax invocationMember
                                 && invocationMember.Expression == mae
-                                    ? model.GetSymbolInfo(invocationMember, ct).Symbol
-                                    : model.GetSymbolInfo(mae.Name, ct).Symbol;
+                                    ? model.GetSymbolInfo(invocationMember, ct)
+                                    : model.GetSymbolInfo(mae.Name, ct);
+                            referenced = ResolveReferenceCandidate(
+                                memberInfo,
+                                out referenceConfidence);
                             refNode = mae.Name;
                             kind = mae.Parent is InvocationExpressionSyntax invMa && invMa.Expression == mae
                                 ? ReferenceKind.Call
@@ -3365,22 +3379,30 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                             break;
 
                         case ObjectCreationExpressionSyntax oce:
-                            referenced = model.GetSymbolInfo(oce, ct).Symbol;
+                            referenced = ResolveReferenceCandidate(
+                                model.GetSymbolInfo(oce, ct),
+                                out referenceConfidence);
                             refNode = oce;
                             kind = ReferenceKind.Call;
                             break;
 
                         case ImplicitObjectCreationExpressionSyntax ioce:
-                            referenced = model.GetSymbolInfo(ioce, ct).Symbol;
+                            referenced = ResolveReferenceCandidate(
+                                model.GetSymbolInfo(ioce, ct),
+                                out referenceConfidence);
                             refNode = ioce;
                             kind = ReferenceKind.Call;
                             break;
 
                         case MemberBindingExpressionSyntax mbe:
-                            referenced = mbe.Parent is InvocationExpressionSyntax invocationBinding
+                            var bindingInfo =
+                                mbe.Parent is InvocationExpressionSyntax invocationBinding
                                 && invocationBinding.Expression == mbe
-                                    ? model.GetSymbolInfo(invocationBinding, ct).Symbol
-                                    : model.GetSymbolInfo(mbe.Name, ct).Symbol;
+                                    ? model.GetSymbolInfo(invocationBinding, ct)
+                                    : model.GetSymbolInfo(mbe.Name, ct);
+                            referenced = ResolveReferenceCandidate(
+                                bindingInfo,
+                                out referenceConfidence);
                             refNode = mbe.Name;
                             kind = mbe.Parent is InvocationExpressionSyntax invMb
                                 && invMb.Expression == mbe
@@ -3424,7 +3446,7 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                                     symId,
                                     EdgeKinds.Calls,
                                     refNode,
-                                    CoreEvidenceConfidence.Exact);
+                                    referenceConfidence);
                             }
                         }
                     }
@@ -3451,7 +3473,7 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                                     symId,
                                     eventRelation,
                                     refNode,
-                                    CoreEvidenceConfidence.Exact);
+                                    referenceConfidence);
                             }
                         }
                     }
@@ -4158,6 +4180,32 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
             _logger.LogInformation("Hydrated {Symbols} csharp symbol(s) and {Files} file(s) from graph store", hydrated, fileRows.Count);
         }
         _mapsHydrated = true;
+    }
+
+    /// <summary>
+    /// Prefer Roslyn's bound symbol. When binding fails but Roslyn still reports exactly one
+    /// candidate (most commonly an overload-resolution failure caused by an unresolved argument
+    /// type), retain that candidate with semantic rather than exact confidence. Multiple
+    /// candidates remain unprojected so a broken compilation cannot create guessed call edges.
+    /// </summary>
+    private static ISymbol? ResolveReferenceCandidate(
+        SymbolInfo symbolInfo,
+        out CoreEvidenceConfidence confidence)
+    {
+        if (symbolInfo.Symbol is not null)
+        {
+            confidence = CoreEvidenceConfidence.Exact;
+            return symbolInfo.Symbol;
+        }
+
+        if (symbolInfo.CandidateSymbols.Length == 1)
+        {
+            confidence = CoreEvidenceConfidence.Semantic;
+            return symbolInfo.CandidateSymbols[0];
+        }
+
+        confidence = CoreEvidenceConfidence.Inferred;
+        return null;
     }
 
     private static ISymbol? FindEnclosingMember(SemanticModel model, int position, CancellationToken ct)

@@ -360,6 +360,88 @@ public sealed class RoslynCommandExecutionTests
         }
     }
 
+    [Fact]
+    public async Task Calls_retains_one_Roslyn_candidate_but_rejects_ambiguous_candidates()
+    {
+        var root = CreateTemporaryRoot();
+        try
+        {
+            var solutionPath = await WriteProjectAsync(root);
+            var sourcePath = Path.Join(root, "App", "PartialCalls.cs");
+            await File.WriteAllTextAsync(sourcePath, """
+                namespace CommandFixture;
+
+                public sealed class PartialCalls
+                {
+                    public void UniqueCandidate()
+                    {
+                        TakesInt("wrong argument type");
+                    }
+
+                    public void AmbiguousCandidate()
+                    {
+                        Overloaded(true);
+                    }
+
+                    private static void TakesInt(int value) { }
+                    private static void Overloaded(int value) { }
+                    private static void Overloaded(string value) { }
+                }
+                """);
+
+            await using var store =
+                new SqliteGraphStore(Path.Join(root, "graph.db"));
+            await using var indexer = new RoslynIndexer(
+                store,
+                logger: null,
+                embeddingsSink: null,
+                privacyRoot: root);
+            await indexer.OpenAsync(solutionPath);
+
+            var result = await indexer.IndexAllAsync();
+
+            result.CompilationErrorCount.Should().BeGreaterThan(0);
+            var caller = await SymbolNamedAsync(
+                store,
+                sourcePath,
+                "UniqueCandidate",
+                SymbolKinds.Method);
+            var target = await SymbolNamedAsync(
+                store,
+                sourcePath,
+                "TakesInt",
+                SymbolKinds.Method);
+            (await store.ListCalleesAsync(
+                    caller.Id,
+                    edgeKind: EdgeKinds.Calls))
+                .Should().ContainSingle(symbol => symbol.Id == target.Id);
+            (await store.ListEdgeEvidenceAsync(
+                    caller.Id,
+                    target.Id,
+                    EdgeKinds.Calls))
+                .Should().ContainSingle(evidence =>
+                    evidence.Confidence
+                    == DevBitsLab.Mcp.SourceGraph.Core
+                        .EvidenceConfidence.Semantic);
+
+            var ambiguousCaller = await SymbolNamedAsync(
+                store,
+                sourcePath,
+                "AmbiguousCandidate",
+                SymbolKinds.Method);
+            (await store.ListCalleesAsync(
+                    ambiguousCaller.Id,
+                    edgeKind: EdgeKinds.Calls))
+                .Should().NotContain(symbol =>
+                    symbol.Name == "Overloaded",
+                    "multiple candidates must remain explicit ambiguity rather than guessed calls");
+        }
+        finally
+        {
+            TryDeleteDirectory(root);
+        }
+    }
+
     private static readonly string RelayCommandSource = """
         using System;
         using System.Windows.Input;
