@@ -15,6 +15,9 @@ public static class EdgeKinds
     public const string UsesType = "uses-type";
     public const string OverridesMember = "overrides-member";
     public const string ImplementsMember = "implements-member";
+
+    /// <summary>An interface member may dispatch execution to an implementing member.</summary>
+    public const string InterfaceDispatchesTo = "interface-dispatches-to";
     public const string Instantiates = "instantiates";
     public const string Throws = "throws";
 

@@ -4683,6 +4683,12 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                     EdgeKinds.ImplementsMember,
                     evidenceNode,
                     CoreEvidenceConfidence.Semantic);
+                addEdge(
+                    dstId,
+                    srcId,
+                    EdgeKinds.InterfaceDispatchesTo,
+                    evidenceNode,
+                    CoreEvidenceConfidence.Semantic);
             }
         }
     }

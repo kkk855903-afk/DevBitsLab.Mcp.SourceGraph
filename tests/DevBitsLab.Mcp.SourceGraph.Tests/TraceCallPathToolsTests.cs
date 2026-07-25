@@ -60,6 +60,11 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
         var scheduledLoop = await SeedSymbolAsync(store, "ScheduledLoop");
         var uiDispatch = await SeedSymbolAsync(store, "UiDispatch");
         var applyFrame = await SeedSymbolAsync(store, "ApplyFrame");
+        var interfaceCaller = await SeedSymbolAsync(store, "InterfaceCaller");
+        var interfaceMember = await SeedSymbolAsync(store, "InterfaceMember");
+        var interfaceImplementation = await SeedSymbolAsync(
+            store,
+            "InterfaceImplementation");
         var outOfOrderRpc = await SeedSymbolAsync(store, "OutOfOrderRpc");
         var outOfOrderServer = await SeedSymbolAsync(
             store,
@@ -108,6 +113,8 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
             Edge(export, nativeAlternative, 29, CoreEvidenceConfidence.Exact, "native-alternative"),
             Edge(scheduledStart, scheduledLoop, 46, CoreEvidenceConfidence.Semantic, "scheduled-lambda", EdgeKinds.Schedules),
             Edge(uiDispatch, applyFrame, 47, CoreEvidenceConfidence.Semantic, "dispatcher-lambda", EdgeKinds.Dispatches),
+            Edge(interfaceCaller, interfaceMember, 48, CoreEvidenceConfidence.Exact, "interface-call"),
+            Edge(interfaceMember, interfaceImplementation, 49, CoreEvidenceConfidence.Semantic, "interface-dispatch", EdgeKinds.InterfaceDispatchesTo),
             Edge(ui, native, 29, CoreEvidenceConfidence.Exact, "excluded-shortcut", EdgeKinds.Tests),
             Edge(ui, outOfOrderRpc, 30, CoreEvidenceConfidence.Semantic, "out-of-order-grpc", EdgeKinds.GrpcCalls),
             Edge(outOfOrderRpc, outOfOrderServer, 31, CoreEvidenceConfidence.Semantic, "out-of-order-dispatch", EdgeKinds.RpcDispatchesTo),
@@ -344,6 +351,7 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
             EdgeKinds.Calls,
             EdgeKinds.Schedules,
             EdgeKinds.Dispatches,
+            EdgeKinds.InterfaceDispatchesTo,
             EdgeKinds.GrpcCalls,
             EdgeKinds.RpcDispatchesTo,
             EdgeKinds.PInvokeMapsTo);
@@ -414,6 +422,25 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
             .Scopes.Should().ContainSingle().Which
             .Paths.Should().ContainSingle().Which;
         path.Hops.Should().ContainSingle().Which.Relation.Should().Be(relation);
+    }
+
+    [Fact]
+    public async Task ExecutionProfile_crossesInterfaceDispatch()
+    {
+        var result = await TraceCallPathTools.TraceCallPathWithProfileAsync(
+            _router!,
+            from: "csharp:M:Graph.InterfaceCaller",
+            to: "csharp:M:Graph.InterfaceImplementation",
+            profile: "execution",
+            maxDepth: 2);
+
+        var path = result.StructuredContent!.Value.Deserialize(
+                ToolOutputJsonContext.Default.TraceCallPathResult)!
+            .Scopes.Should().ContainSingle().Which
+            .Paths.Should().ContainSingle().Which;
+        path.Hops.Select(hop => hop.Relation).Should().Equal(
+            EdgeKinds.Calls,
+            EdgeKinds.InterfaceDispatchesTo);
     }
 
     [Theory]

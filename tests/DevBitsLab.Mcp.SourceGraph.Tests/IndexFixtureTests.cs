@@ -113,6 +113,30 @@ public sealed class IndexFixtureTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task InterfaceMemberDispatchesToImplementingMember()
+    {
+        var interfaceMethod = (await _store!.FindSymbolsAsync("IGreeter.Greet"))
+            .Should().ContainSingle(hit =>
+                hit.Fqn.Contains("IGreeter.Greet", StringComparison.Ordinal))
+            .Which;
+        var implementation = (await _store.ListCalleesAsync(
+                interfaceMethod.Id,
+                edgeKind: EdgeKinds.InterfaceDispatchesTo))
+            .Should().ContainSingle(hit =>
+                hit.Fqn.Contains("Greeter.Greet", StringComparison.Ordinal)
+                && !hit.Fqn.Contains("IGreeter.Greet", StringComparison.Ordinal))
+            .Which;
+
+        (await _store.ListEdgeEvidenceAsync(
+                interfaceMethod.Id,
+                implementation.Id,
+                EdgeKinds.InterfaceDispatchesTo))
+            .Should().ContainSingle(evidence =>
+                evidence.Confidence == CoreEvidenceConfidence.Semantic
+                && evidence.Producer == "roslyn");
+    }
+
+    [Fact]
     public async Task RepeatedRoslynCalls_preserveExactCallSiteEvidence()
     {
         var caller = (await _store!.FindSymbolsAsync("AddManyNumbers"))
