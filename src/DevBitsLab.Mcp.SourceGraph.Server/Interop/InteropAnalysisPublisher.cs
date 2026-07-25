@@ -128,6 +128,11 @@ internal sealed class InteropAnalysisPublisher
             IReadOnlyList<ManagedFileProjection> projections;
             try
             {
+                var nativeImplementations =
+                    await FindNativeImplementationsAsync(
+                            native.Facts,
+                            cancellationToken)
+                        .ConfigureAwait(false);
                 projections = BuildProjections(
                     target,
                     managed.Facts,
@@ -136,7 +141,8 @@ internal sealed class InteropAnalysisPublisher
                     native.Facts,
                     abiRecords.Facts,
                     previousMatches.Facts,
-                    previousFindings.Facts);
+                    previousFindings.Facts,
+                    nativeImplementations);
             }
             catch (OperationCanceledException)
             {
@@ -353,7 +359,8 @@ internal sealed class InteropAnalysisPublisher
         IReadOnlyList<StoredInteropFact<NativeExport>> nativeFacts,
         IReadOnlyList<StoredInteropFact<AbiRecordLayout>> abiRecordFacts,
         IReadOnlyList<StoredInteropFact<InteropMatchProjection>> previousMatches,
-        IReadOnlyList<StoredInteropFact<InteropFindingProjection>> previousFindings)
+        IReadOnlyList<StoredInteropFact<InteropFindingProjection>> previousFindings,
+        IReadOnlyList<NativeImplementationLink> nativeImplementations)
     {
         var nativeExports = nativeFacts
             .Select(item => item.Fact)
@@ -410,9 +417,36 @@ internal sealed class InteropAnalysisPublisher
 
         foreach (var path in managedFacts.Select(item => item.Row.FilePath)
                      .Concat(previousMatches.Select(item => item.Row.FilePath))
-                     .Concat(previousFindings.Select(item => item.Row.FilePath)))
+                     .Concat(previousFindings.Select(item => item.Row.FilePath))
+                     .Concat(nativeImplementations.Select(item => item.OwnerPath)))
         {
             EnsureFile(path);
+        }
+
+        foreach (var implementation in nativeImplementations)
+        {
+            var metadata = new Dictionary<string, string>(
+                StringComparer.Ordinal)
+            {
+                ["confidence"] = "inferred",
+                ["source"] = "syntax-only",
+            };
+            edgesByPath[implementation.OwnerPath].Add(
+                new ProducerEdgeEvidenceFact(
+                    implementation.ExportCanonicalKey,
+                    implementation.Implementation.CanonicalKey!,
+                    EdgeKinds.NativeImplementation,
+                    metadata,
+                    new FileEvidenceFact(
+                        new SourceLocation(
+                            implementation.Implementation.FilePath,
+                            implementation.Implementation.StartLine,
+                            implementation.Implementation.StartCol,
+                            implementation.Implementation.EndLine,
+                            implementation.Implementation.EndCol),
+                        EvidenceConfidence.Inferred,
+                        Producer,
+                        metadata)));
         }
 
         foreach (var stored in managedFacts
@@ -592,6 +626,59 @@ internal sealed class InteropAnalysisPublisher
                 findingCounts[filePath]))
             .ToArray();
     }
+
+    private async Task<IReadOnlyList<NativeImplementationLink>>
+        FindNativeImplementationsAsync(
+            IReadOnlyList<StoredInteropFact<NativeExport>> nativeFacts,
+            CancellationToken cancellationToken)
+    {
+        const int maximumCandidatesPerExport = 100;
+        var links = new List<NativeImplementationLink>(nativeFacts.Count);
+        foreach (var stored in nativeFacts)
+        {
+            var candidates = await _store.FindSymbolsAsync(
+                    stored.Fact.ExportName,
+                    filePathHint: null,
+                    maximumCandidatesPerExport,
+                    cancellationToken)
+                .ConfigureAwait(false);
+            var implementations = candidates
+                .Where(candidate =>
+                    string.Equals(
+                        candidate.Name,
+                        stored.Fact.ExportName,
+                        StringComparison.Ordinal)
+                    && string.Equals(
+                        candidate.Kind,
+                        DevBitsLab.Mcp.SourceGraph.Sdk.SymbolKinds.Function,
+                        StringComparison.Ordinal)
+                    && HasModifier(candidate.Modifiers, "syntax-only")
+                    && IsImplementationSource(candidate.FilePath)
+                    && candidate.CanonicalKey is not null)
+                .DistinctBy(candidate => candidate.CanonicalKey)
+                .ToArray();
+            if (implementations.Length == 1
+                && candidates.Count < maximumCandidatesPerExport)
+            {
+                links.Add(new NativeImplementationLink(
+                    stored.Fact.SymbolCanonicalKey,
+                    implementations[0].FilePath,
+                    implementations[0]));
+            }
+        }
+        return links;
+    }
+
+    private static bool HasModifier(string? modifiers, string expected) =>
+        modifiers?.Split(
+                ' ',
+                StringSplitOptions.RemoveEmptyEntries
+                    | StringSplitOptions.TrimEntries)
+            .Contains(expected, StringComparer.Ordinal) == true;
+
+    private static bool IsImplementationSource(string path) =>
+        Path.GetExtension(path).ToLowerInvariant()
+            is ".c" or ".cc" or ".cpp" or ".cxx" or ".c++";
 
     private static List<InteropAnalysisPublicationFailure> LoadFailures(
         StoredInteropFactSnapshot<ManagedImport> managed,
@@ -1032,6 +1119,11 @@ internal sealed class InteropAnalysisPublisher
         IReadOnlyList<ProducerEdgeEvidenceFact> Edges,
         int MatchCount,
         int FindingCount);
+
+    private sealed record NativeImplementationLink(
+        string ExportCanonicalKey,
+        string OwnerPath,
+        SymbolHit Implementation);
 
     private sealed record ProvenRecordMapping(
         AbiRecordLayout Managed,
