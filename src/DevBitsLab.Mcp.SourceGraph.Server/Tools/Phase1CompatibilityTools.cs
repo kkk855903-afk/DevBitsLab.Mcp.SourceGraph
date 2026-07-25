@@ -125,8 +125,9 @@ public static class Phase1CompatibilityTools
             maxDepth,
             maxPaths,
             maxNodes,
-            scope,
-            ct);
+            scope: scope,
+            detail: "detail",
+            ct: ct);
 
     [McpServerTool(
         Name = "trace_call",
@@ -153,6 +154,8 @@ public static class Phase1CompatibilityTools
         [Description("Maximum returned paths, 1-25 (default 10)")] int maxPaths = 10,
         [Description("Maximum expanded graph nodes per scope, 1-5000 (default 1000)")] int maxNodes = 1000,
         [Description(ScopeDescription)] string? scope = null,
+        [Description("Output detail: summary | detail; terminal discovery defaults to summary")]
+        string? detail = null,
         CancellationToken ct = default) =>
         TraceCallPathTools.TraceCallPathWithProfileAsync(
             router,
@@ -164,20 +167,31 @@ public static class Phase1CompatibilityTools
             maxPaths,
             maxNodes,
             scope,
+            detail,
             ct);
 
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(ImpactOfChangeResult))]
     [ToolAnnotation(ReadOnlyHint = true, IdempotentHint = true)]
     [ToolTrigger("\"analyze the impact of changing X\"")]
-    [Description("Compute bounded evidence-backed upstream impact. Compatibility name for impact_of_change; every row includes its BFS predecessor and a source-to-target path whose hops carry real occurrence evidence.")]
+    [Description("Compute bounded evidence-backed upstream impact. Compatibility name for impact_of_change; summary output is compact, while detail output includes every evidence path.")]
     public static Task<CallToolResult> ImpactAnalysisAsync(
         ScopeRouter router,
         [Description("Symbol name or FQN")] string symbol,
         [Description("Maximum traversal depth (default 4)")] int maxDepth = 4,
         [Description("Maximum results (default 100)")] int limit = 100,
         [Description("Edge kind to walk (default calls); pass all to walk every indexed edge kind")] string? kind = null,
+        [Description("Output detail: summary (default) | detail")] string detail = "summary",
         [Description(ScopeDescription)] string? scope = null,
         IProgress<ProgressNotificationValue>? progress = null,
         CancellationToken ct = default) =>
-        GraphTools.ImpactOfChangeAsync(router, symbol, maxDepth, limit, kind, scope, progress, ct);
+        GraphTools.ImpactOfChangeAsync(
+            router,
+            symbol,
+            maxDepth,
+            limit,
+            kind,
+            detail,
+            scope,
+            progress,
+            ct);
 }

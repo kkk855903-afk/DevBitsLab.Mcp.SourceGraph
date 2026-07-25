@@ -13,6 +13,7 @@ public sealed record ImpactOfChangeResult(
     [property: JsonPropertyName("target_symbol_id")] long TargetSymbolId,
     [property: JsonPropertyName("target_canonical_key")] string? TargetCanonicalKey,
     [property: JsonPropertyName("edge_kind")] string EdgeKind,
+    string Detail,
     [property: JsonPropertyName("max_depth")] int MaxDepth,
     bool Truncated,
     [property: JsonPropertyName("expanded_nodes")] int ExpandedNodes,
@@ -21,8 +22,9 @@ public sealed record ImpactOfChangeResult(
 /// <summary>
 /// One upstream caller — <see cref="Depth"/> is the BFS distance from the root (1 = direct
 /// caller, 2 = caller-of-caller, etc.). <see cref="Predecessor"/> is the next symbol toward the
-/// changed target in the breadth-first predecessor tree. <see cref="Path"/> is ordered from this
-/// upstream symbol to the changed target and every hop contains real occurrence evidence.
+/// changed target in the breadth-first predecessor tree. For <c>detail</c> output,
+/// <see cref="Path"/> is ordered from this upstream symbol to the changed target and every hop
+/// contains real occurrence evidence; compact <c>summary</c> output leaves it empty.
 /// </summary>
 public sealed record ImpactOfChangeRow(
     int Depth,

@@ -10,6 +10,7 @@ public sealed record TraceCallPathResult(
     [property: JsonPropertyName("from_query")] string FromQuery,
     [property: JsonPropertyName("to_query")] string? ToQuery,
     string Profile,
+    string Detail,
     [property: JsonPropertyName("destination_mode")] string DestinationMode,
     [property: JsonPropertyName("terminal_definition")] string? TerminalDefinition,
     [property: JsonPropertyName("edge_kind")] string? EdgeKind,
@@ -84,7 +85,11 @@ public sealed record TraceCallPath(
     TraceCallPathSymbol From,
     TraceCallPathSymbol To,
     string Confidence,
-    IReadOnlyList<TraceCallPathHop> Hops);
+    IReadOnlyList<TraceCallPathHop> Hops)
+{
+    [JsonPropertyName("hop_count")]
+    public int HopCount { get; init; } = Hops.Count;
+}
 
 public sealed record TraceCallPathHop(
     TraceCallPathSymbol From,

@@ -122,6 +122,17 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
         var backwardImport = await SeedSymbolAsync(store, "BackwardImport");
         var backwardExport = await SeedSymbolAsync(store, "BackwardExport");
         var backwardNative = await SeedSymbolAsync(store, "BackwardNative");
+        var dedupImport = await SeedSymbolAsync(store, "DedupImport");
+        var dedupDirectExport = await SeedSymbolAsync(
+            store,
+            "DedupDirectExport");
+        var dedupBridgeExport = await SeedSymbolAsync(
+            store,
+            "DedupBridgeExport");
+        var dedupCppDefinition = await SeedSymbolAsync(
+            store,
+            "DedupCppDefinition");
+        var dedupTerminal = await SeedSymbolAsync(store, "DedupTerminal");
         await SeedSymbolAsync(
             store,
             "SharedCandidateFirst",
@@ -181,6 +192,11 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
             Edge(backwardServer, backwardImport, 43, CoreEvidenceConfidence.Exact, "backward-call"),
             Edge(backwardImport, backwardExport, 44, CoreEvidenceConfidence.Exact, "backward-pinvoke", EdgeKinds.PInvokeMapsTo),
             Edge(backwardExport, backwardNative, 45, CoreEvidenceConfidence.Exact, "backward-native"),
+            Edge(dedupImport, dedupDirectExport, 60, CoreEvidenceConfidence.Inferred, "dedup-direct-pinvoke", EdgeKinds.PInvokeMapsTo),
+            Edge(dedupDirectExport, dedupTerminal, 61, CoreEvidenceConfidence.Inferred, "dedup-direct-native"),
+            Edge(dedupImport, dedupBridgeExport, 62, CoreEvidenceConfidence.Inferred, "dedup-bridge-pinvoke", EdgeKinds.PInvokeMapsTo),
+            Edge(dedupBridgeExport, dedupCppDefinition, 63, CoreEvidenceConfidence.Inferred, "dedup-implementation", EdgeKinds.NativeImplementation),
+            Edge(dedupCppDefinition, dedupTerminal, 64, CoreEvidenceConfidence.Inferred, "dedup-implementation-call"),
         });
 
         // This raw legacy edge sorts before ZDirectTarget but has no occurrence evidence. An
@@ -492,7 +508,8 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
             profile: "execution",
             maxDepth: 9,
             maxPaths: 10,
-            maxNodes: 100);
+            maxNodes: 100,
+            detail: "detail");
 
         result.IsError.Should().NotBe(true);
         var dto = result.StructuredContent!.Value.Deserialize(
@@ -745,7 +762,8 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
             profile: "execution",
             maxDepth: 9,
             maxPaths: 10,
-            maxNodes: 100);
+            maxNodes: 100,
+            detail: "detail");
 
         result.IsError.Should().NotBe(true);
         var dto = result.StructuredContent!.Value.Deserialize(
@@ -764,6 +782,31 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
         scope.Truncated.Should().BeFalse();
         CallToolResultHelpers.ProseText(result).Should().Contain(
             "terminal definition:");
+    }
+
+    [Fact]
+    public async Task ExecutionTerminalDiscovery_keeps_one_shortest_path_per_terminal()
+    {
+        var result = await TraceCallPathTools.TraceCallPathWithProfileAsync(
+            _router!,
+            from: "csharp:M:Graph.DedupImport",
+            profile: "execution",
+            maxDepth: 4,
+            maxPaths: 10,
+            maxNodes: 100);
+
+        var paths = result.StructuredContent!.Value.Deserialize(
+                ToolOutputJsonContext.Default.TraceCallPathResult)!
+            .Scopes.Should().ContainSingle().Which
+            .Paths;
+        paths.Should().ContainSingle();
+        paths[0].To.Fqn.Should().Be("Graph.DedupTerminal");
+        paths[0].Hops.Should().BeEmpty();
+        paths[0].HopCount.Should().Be(2,
+            "breadth-first discovery keeps the shortest proven route");
+        CallToolResultHelpers.ProseText(result)
+            .Should().Contain("detail: summary")
+            .And.Contain("evidence omitted in summary");
     }
 
     [Fact]

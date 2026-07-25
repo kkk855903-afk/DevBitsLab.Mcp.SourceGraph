@@ -78,8 +78,9 @@ public static class TraceCallPathTools
             maxDepth,
             maxPaths,
             maxNodes,
-            scope,
-            ct);
+            scope: scope,
+            detail: "detail",
+            ct: ct);
 
     [McpServerTool(
         Name = "trace_call_path",
@@ -89,7 +90,7 @@ public static class TraceCallPathTools
         OutputSchemaType = typeof(TraceCallPathResult))]
     [ToolAnnotation(ReadOnlyHint = true, IdempotentHint = true)]
     [ToolTrigger("\"show how execution can flow from A to B\"")]
-    [Description("Trace bounded directed paths between indexed symbols. Defaults to calls edges and requires `to`. Set profile=execution to follow the ordered evidence-backed UI → command → managed call → gRPC dispatch → P/Invoke state machine. Execution mode may omit `to` when `from` is an exact canonical key; it then returns only proven terminal native algorithms. Exact canonical-key inputs never use fuzzy matching. Every hop includes occurrence evidence, and execution results disclose whether current absence claims are authoritative.")]
+    [Description("Trace bounded directed paths between indexed symbols. Defaults to calls edges and requires `to`. Set profile=execution to follow the ordered evidence-backed UI → command → managed call → gRPC dispatch → P/Invoke state machine. Execution mode may omit `to` when `from` is an exact canonical key; terminal discovery defaults to compact summary output with one shortest path per terminal, while explicit-target queries default to full detail. Exact canonical-key inputs never use fuzzy matching. Execution results disclose whether current absence claims are authoritative.")]
     public static Task<CallToolResult> TraceCallPathWithProfileAsync(
         ScopeRouter router,
         [Description("Starting symbol name, FQN, or exact canonical key")] string from,
@@ -102,10 +103,23 @@ public static class TraceCallPathTools
         [Description("Maximum returned paths, 1-25 (default 10)")] int maxPaths = 10,
         [Description("Maximum expanded graph nodes per scope, 1-5000 (default 1000)")] int maxNodes = 1000,
         [Description("Optional scope id, '*', or comma-separated scope ids")] string? scope = null,
+        [Description("Output detail: summary | detail. Defaults to summary for terminal discovery and detail for an explicit target.")]
+        string? detail = null,
         CancellationToken ct = default) =>
         ToolMetrics.TrackAsync(
             "trace_call_path",
-            new { from, to, kind, profile, maxDepth, maxPaths, maxNodes, scope },
+            new
+            {
+                from,
+                to,
+                kind,
+                profile,
+                maxDepth,
+                maxPaths,
+                maxNodes,
+                scope,
+                detail,
+            },
             () => TraceCallPathImplAsync(
                 router,
                 from,
@@ -116,6 +130,7 @@ public static class TraceCallPathTools
                 maxPaths,
                 maxNodes,
                 scope,
+                detail,
                 ct));
 
     private static async Task<CallToolResult> TraceCallPathImplAsync(
@@ -128,6 +143,7 @@ public static class TraceCallPathTools
         int maxPaths,
         int maxNodes,
         object? scope,
+        string? detail,
         CancellationToken ct)
     {
         if (string.IsNullOrWhiteSpace(from))
@@ -164,6 +180,14 @@ public static class TraceCallPathTools
         var executionProfile = normalizedProfile == ExecutionProfile;
         var discoverTerminal = executionProfile
             && string.IsNullOrWhiteSpace(to);
+        var detailLevel = string.IsNullOrWhiteSpace(detail)
+            ? discoverTerminal ? "summary" : "detail"
+            : detail.Trim().ToLowerInvariant();
+        if (detailLevel is not ("summary" or "detail"))
+        {
+            return DiagnosticResult.Error(
+                "trace_call_path `detail` must be `summary` or `detail`.");
+        }
         if (!discoverTerminal && string.IsNullOrWhiteSpace(to))
         {
             return DiagnosticResult.Error(
@@ -279,10 +303,16 @@ public static class TraceCallPathTools
         })).ConfigureAwait(false);
         sw.Stop();
 
+        var outputScopes = detailLevel == "summary"
+            ? perScope
+                .Select(CompactScope)
+                .ToArray()
+            : perScope;
         var dto = new TraceCallPathResult(
             from,
             discoverTerminal ? null : to,
             normalizedProfile,
+            detailLevel,
             discoverTerminal ? "execution-terminal" : "explicit-target",
             discoverTerminal ? ExecutionTerminalDefinition : null,
             edgeKind,
@@ -290,8 +320,8 @@ public static class TraceCallPathTools
             maxDepth,
             maxPaths,
             maxNodes,
-            perScope);
-        var pathCount = perScope.Sum(result => result.Paths.Count);
+            outputScopes);
+        var pathCount = outputScopes.Sum(result => result.Paths.Count);
         var content = new List<ContentBlock>
         {
             new TextContentBlock
@@ -300,7 +330,7 @@ public static class TraceCallPathTools
             },
         };
         var linkedSymbols = new HashSet<(string ScopeId, long SymbolId)>();
-        foreach (var scopeResult in perScope)
+        foreach (var scopeResult in outputScopes)
         {
             foreach (var path in scopeResult.Paths)
             {
@@ -326,6 +356,22 @@ public static class TraceCallPathTools
                 dto,
                 ToolOutputJsonContext.Default.TraceCallPathResult),
         };
+
+        TraceCallPathScopeResult CompactScope(
+            TraceCallPathScopeResult scopeResult) =>
+            scopeResult with
+            {
+                Paths = scopeResult.Paths
+                    .Select(path => path with
+                    {
+                        Hops = Array.Empty<TraceCallPathHop>(),
+                        HopCount = path.Hops.Count,
+                    })
+                    .ToArray(),
+                Note = AppendNote(
+                    scopeResult.Note,
+                    "Summary output omits repeated hop evidence; rerun with detail=detail and an exact terminal canonical key for the full path."),
+            };
 
         void AddSymbolLink(string scopeId, TraceCallPathSymbol symbol)
         {
@@ -715,6 +761,11 @@ public static class TraceCallPathTools
 
         void AddCompletedPath(PathState state, SymbolHit target)
         {
+            if (discoverTerminal
+                && paths.Any(path => path.To.SymbolId == target.Id))
+            {
+                return;
+            }
             var key = state.Hops.Count == 0
                 ? $"same:{state.Current.Id}"
                 : string.Join(">", state.Hops.Select(hop =>
@@ -1614,6 +1665,7 @@ public static class TraceCallPathTools
             sb.Append("terminal definition: ")
               .AppendLine(result.TerminalDefinition);
         }
+        sb.Append("detail: ").AppendLine(result.Detail);
 
         foreach (var scope in result.Scopes)
         {
@@ -1669,7 +1721,22 @@ public static class TraceCallPathTools
                   .AppendLine("`");
                 if (path.Hops.Count == 0)
                 {
-                    sb.Append("- `").Append(path.From.Fqn).AppendLine("` (source equals destination)");
+                    if (path.HopCount > 0)
+                    {
+                        sb.Append("- `")
+                          .Append(path.From.Fqn)
+                          .Append("` → `")
+                          .Append(path.To.Fqn)
+                          .Append("` (")
+                          .Append(path.HopCount)
+                          .AppendLine(" hops; evidence omitted in summary)");
+                    }
+                    else
+                    {
+                        sb.Append("- `")
+                          .Append(path.From.Fqn)
+                          .AppendLine("` (source equals destination)");
+                    }
                     continue;
                 }
                 for (var hopIndex = 0; hopIndex < path.Hops.Count; hopIndex++)

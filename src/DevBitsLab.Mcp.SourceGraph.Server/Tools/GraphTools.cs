@@ -2002,17 +2002,18 @@ public static class GraphTools
 
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(ImpactOfChangeResult))]
     [ToolTrigger("\"what would change if I edit X?\" — transitive callers")]
-    [Description("Compute bounded evidence-backed upstream impact with breadth-first, cycle-safe traversal. Every row includes its canonical identity, BFS predecessor, path confidence, and a source-to-target path whose hops carry real occurrence evidence. maxDepth is 1-12 and limit is 1-1000; truncation is explicit.")]
+    [Description("Compute bounded evidence-backed upstream impact with breadth-first, cycle-safe traversal. summary output (default) returns canonical identities, BFS predecessors, and path confidence without repeating full path prefixes; detail output includes each source-to-target evidence path. maxDepth is 1-12 and limit is 1-1000; truncation is explicit.")]
     public static Task<CallToolResult> ImpactOfChangeAsync(
         ScopeRouter router,
         [Description("Symbol name or FQN")] string symbol,
         [Description("Maximum traversal depth (default 4)")] int maxDepth = 4,
         [Description("Maximum results (default 100)")] int limit = 100,
         [Description("Edge kind to walk (kebab-case): calls (default) | uses-type | overrides-member | implements-member | instantiates | throws | tests | code-behind | binds-to | binds-path | binds-element | handles-event | uses-resource | instantiates-type | merges | applies-style | all. Plugin-defined kinds are accepted.")] string? kind = null,
+        [Description("Output detail: summary (default; rows and predecessors) | detail (include every evidence path)")] string detail = "summary",
         [Description(ScopeDescription)] string? scope = null,
         IProgress<ProgressNotificationValue>? progress = null,
         CancellationToken ct = default) =>
-        ToolMetrics.TrackAsync("impact_of_change", new { symbol, maxDepth, limit, kind, scope }, () =>
+        ToolMetrics.TrackAsync("impact_of_change", new { symbol, maxDepth, limit, kind, detail, scope }, () =>
             ScopedExecution.RunAsync(router, scope, async host =>
             {
                 var sw = System.Diagnostics.Stopwatch.StartNew();
@@ -2023,6 +2024,12 @@ public static class GraphTools
                 if (limit is < 1 or > 1000)
                 {
                     return DiagnosticResult.Error("impact_of_change `limit` must be between 1 and 1000.");
+                }
+                var detailLevel = detail.Trim().ToLowerInvariant();
+                if (detailLevel is not ("summary" or "detail"))
+                {
+                    return DiagnosticResult.Error(
+                        "impact_of_change `detail` must be `summary` or `detail`.");
                 }
                 var (edgeKind, label, isAll) = NormaliseEdgeKindParam(kind);
                 if (!isAll && edgeKind is not null)
@@ -2053,6 +2060,7 @@ public static class GraphTools
                         target: top,
                         rows: Array.Empty<AuditableImpact>(),
                         edgeKindLabel: label,
+                        detailLevel: detailLevel,
                         maxDepth: maxDepth,
                         truncated: traversal.Truncated,
                         expandedNodes: traversal.ExpandedNodes,
@@ -2085,7 +2093,16 @@ public static class GraphTools
                         sb.AppendLine($"- d{r.Depth}: **{r.Symbol.Fqn}** ({KindLabel(r.Symbol.Kind)}) at {Format.Location(r.Symbol.FilePath, r.Symbol.StartLine, r.Symbol.StartCol)}");
                     }
                 }
-                EvidenceTraversal.AppendImpactPaths(sb, rows);
+                if (detailLevel == "detail")
+                {
+                    EvidenceTraversal.AppendImpactPaths(sb, rows);
+                }
+                else
+                {
+                    sb.AppendLine();
+                    sb.AppendLine(
+                        "detail: summary (pass detail=detail to include full evidence paths)");
+                }
                 if (traversal.Truncated)
                 {
                     sb.AppendLine();
@@ -2096,6 +2113,7 @@ public static class GraphTools
                     target: top,
                     rows: rows,
                     edgeKindLabel: label,
+                    detailLevel: detailLevel,
                     maxDepth: maxDepth,
                     truncated: traversal.Truncated,
                     expandedNodes: traversal.ExpandedNodes,
@@ -2108,6 +2126,7 @@ public static class GraphTools
         SymbolHit target,
         IReadOnlyList<AuditableImpact> rows,
         string edgeKindLabel,
+        string detailLevel,
         int maxDepth,
         bool truncated,
         int expandedNodes,
@@ -2135,6 +2154,7 @@ public static class GraphTools
             scopeId,
             elapsedMs,
             ("edge_kind", edgeKindLabel),
+            ("detail", detailLevel),
             ("max_depth", maxDepth.ToString()),
             ("upstream", rows.Count.ToString())));
 
@@ -2150,7 +2170,9 @@ public static class GraphTools
                 Column: r.Symbol.StartCol,
                 Predecessor: TraceCallPathTools.MapSymbol(r.Predecessor),
                 Confidence: r.Confidence,
-                Path: r.Path))
+                Path: detailLevel == "detail"
+                    ? r.Path
+                    : Array.Empty<TraceCallPathHop>()))
             .ToList();
         var dto = new ImpactOfChangeResult(
             TargetFqn: target.Fqn,
@@ -2158,6 +2180,7 @@ public static class GraphTools
             TargetSymbolId: target.Id,
             TargetCanonicalKey: target.CanonicalKey,
             EdgeKind: edgeKindLabel,
+            Detail: detailLevel,
             MaxDepth: maxDepth,
             Truncated: truncated,
             ExpandedNodes: expandedNodes,

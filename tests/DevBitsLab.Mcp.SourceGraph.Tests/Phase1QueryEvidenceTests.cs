@@ -154,7 +154,8 @@ public sealed class Phase1QueryEvidenceTests : IAsyncLifetime
             "Graph.C",
             maxDepth: 4,
             limit: 10,
-            kind: EdgeKinds.Calls);
+            kind: EdgeKinds.Calls,
+            detail: "detail");
         var dto = Deserialize<ImpactOfChangeResult>(
             result,
             ToolOutputJsonContext.Default.ImpactOfChangeResult);
@@ -183,6 +184,27 @@ public sealed class Phase1QueryEvidenceTests : IAsyncLifetime
             .Should().Equal("Graph.B", "Graph.C");
         a.Confidence.Should().Be("semantic", "the path uses its weakest hop confidence");
         a.Path.Should().AllSatisfy(AssertHopIsAuditable);
+    }
+
+    [Fact]
+    public async Task Impact_summary_omits_repeated_paths_until_detail_is_requested()
+    {
+        var result = await Phase1CompatibilityTools.ImpactAnalysisAsync(
+            _router!,
+            "Graph.C",
+            maxDepth: 4,
+            limit: 10,
+            kind: EdgeKinds.Calls);
+        var dto = Deserialize<ImpactOfChangeResult>(
+            result,
+            ToolOutputJsonContext.Default.ImpactOfChangeResult);
+
+        dto.Detail.Should().Be("summary");
+        dto.Upstream.Should().NotBeEmpty()
+            .And.OnlyContain(row => row.Path.Count == 0);
+        CallToolResultHelpers.ProseText(result)
+            .Should().Contain("detail: summary")
+            .And.NotContain("Auditable predecessor paths:");
     }
 
     [Fact]
