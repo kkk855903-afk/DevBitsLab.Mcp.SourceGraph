@@ -4574,11 +4574,16 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                 case ConstructorDeclarationSyntax:
                 case PropertyDeclarationSyntax:
                 case EventDeclarationSyntax:
-                case EventFieldDeclarationSyntax:
                 case EnumMemberDeclarationSyntax:
                 case OperatorDeclarationSyntax:
                 case ConversionOperatorDeclarationSyntax:
                     yield return node;
+                    break;
+                case EventFieldDeclarationSyntax eventField:
+                    foreach (var variable in eventField.Declaration.Variables)
+                    {
+                        yield return variable;
+                    }
                     break;
                 case FieldDeclarationSyntax fd:
                     foreach (var v in fd.Declaration.Variables) yield return v;

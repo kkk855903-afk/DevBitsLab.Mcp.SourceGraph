@@ -211,7 +211,15 @@ public sealed class RoslynCommandExecutionTests
                 privacyRoot: root);
             await indexer.OpenAsync(solutionPath);
 
-            await indexer.IndexAllAsync();
+            var result = await indexer.IndexAllAsync();
+
+            result.FailedFiles.Should().BeEmpty();
+            (await store.ListSymbolsInFileAsync(sourcePath))
+                .Where(symbol =>
+                    symbol.Name == "CanExecuteChanged"
+                    && symbol.Kind == SymbolKinds.Event)
+                .Should().HaveCount(3,
+                    "field-like event declarations must be indexed as event symbols");
 
             foreach (var propertyName in new[]
                      {
