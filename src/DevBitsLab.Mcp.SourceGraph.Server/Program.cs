@@ -702,7 +702,8 @@ static async Task<int> RunIndexAsync(CommandLine cli)
             langRegistry,
             projectFactoryRegistry,
             loggerFactory.CreateLogger<LanguageIndexerDispatcher>(),
-            analyzerPipeline);
+            analyzerPipeline,
+            sink);
         var projectMapResult = await dispatcher.DiscoverProjectMapAsync(
             repoRootForIndex,
             selectedScope.ProjectSet,

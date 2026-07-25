@@ -1,6 +1,9 @@
 using System.Text;
+using DevBitsLab.Mcp.SourceGraph.Embeddings;
 using DevBitsLab.Mcp.SourceGraph.Indexing.Cpp;
 using DevBitsLab.Mcp.SourceGraph.Sdk;
+using DevBitsLab.Mcp.SourceGraph.Server.Plugins;
+using DevBitsLab.Mcp.SourceGraph.Storage;
 using FluentAssertions;
 using Xunit;
 
@@ -250,6 +253,71 @@ public sealed class CppSyntaxLanguageIndexerTests
             [".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".inl"]);
     }
 
+    [Fact]
+    public async Task Dispatcher_enqueues_cpp_body_for_semantic_search()
+    {
+        var root = Path.Join(
+            Path.GetTempPath(),
+            "sourcegraph-cpp-embedding-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        var sourcePath = Path.Join(root, "camera.cpp");
+        await File.WriteAllTextAsync(
+            sourcePath,
+            """
+            class CameraCapture
+            {
+            public:
+                void StoreSample(unsigned char* bgra)
+                {
+                    cv::cvtColor(bgra, destination, cv::COLOR_BGRA2BGR);
+                }
+            };
+            """);
+        SqliteGraphStore? store = null;
+        try
+        {
+            store = new SqliteGraphStore(Path.Join(root, "graph.db"));
+            await store.EnsureSchemaAsync();
+            var registry = new LanguageIndexerRegistry();
+            registry.Register(new CppSyntaxLanguageIndexer());
+            var sink = new CapturingEmbeddingsSink();
+            var dispatcher = new LanguageIndexerDispatcher(
+                registry,
+                new LanguageProjectFactoryRegistry(),
+                embeddingsSink: sink);
+
+            var result = await dispatcher.DispatchAllForTestAsync(
+                store,
+                "test",
+                root,
+                new Dictionary<string, ILanguageProject>());
+
+            result.FailedFiles.Should().BeEmpty();
+            var request = sink.Requests.Should().ContainSingle(item =>
+                    item.Text.Contains(
+                        "CameraCapture::StoreSample",
+                        StringComparison.Ordinal))
+                .Subject;
+            request.Text.Should().Contain("COLOR_BGRA2BGR");
+            request.ContentHash.Should().HaveCount(32);
+        }
+        finally
+        {
+            if (store is not null)
+            {
+                await store.DisposeAsync();
+            }
+            try
+            {
+                Directory.Delete(root, recursive: true);
+            }
+            catch (Exception ex) when (
+                ex is IOException or UnauthorizedAccessException)
+            {
+            }
+        }
+    }
+
     private static async Task<IReadOnlyList<IndexEvent>> IndexAsync(
         string source)
     {
@@ -260,5 +328,12 @@ public sealed class CppSyntaxLanguageIndexerTests
             "test",
             "/repo");
         return await indexer.IndexAsync(ctx, CancellationToken.None);
+    }
+
+    private sealed class CapturingEmbeddingsSink : IEmbeddingsRequestSink
+    {
+        public bool IsEnabled => true;
+        public List<EmbedRequest> Requests { get; } = [];
+        public void Enqueue(EmbedRequest request) => Requests.Add(request);
     }
 }
