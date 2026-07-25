@@ -129,6 +129,45 @@ public sealed class CppSyntaxLanguageIndexerTests
     }
 
     [Fact]
+    public async Task Does_not_treat_local_object_construction_as_a_function()
+    {
+        var events = await IndexAsync(
+            """
+            class CameraCapture
+            {
+            public:
+                void Start()
+                {
+                    std::scoped_lock lock(mutex_);
+                    Sample sample(42);
+                }
+            };
+            """);
+
+        events.OfType<IndexEvent.SymbolDeclared>()
+            .Should().NotContain(symbol =>
+                symbol.Name == "lock" || symbol.Name == "sample");
+    }
+
+    [Fact]
+    public async Task Type_signatures_do_not_include_the_entire_definition_body()
+    {
+        var events = await IndexAsync(
+            """
+            class CameraCapture final
+            {
+            public:
+                void Start() {}
+                void Stop() {}
+            };
+            """);
+
+        var cameraCapture = events.OfType<IndexEvent.SymbolDeclared>()
+            .Single(symbol => symbol.Name == "CameraCapture");
+        cameraCapture.Signature.Should().Be("class CameraCapture");
+    }
+
+    [Fact]
     public void Claims_common_c_and_cpp_source_and_header_extensions()
     {
         var indexer = new CppSyntaxLanguageIndexer();

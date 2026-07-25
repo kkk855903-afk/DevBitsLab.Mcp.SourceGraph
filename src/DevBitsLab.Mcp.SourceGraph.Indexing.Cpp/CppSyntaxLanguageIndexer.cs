@@ -222,7 +222,7 @@ public sealed class CppSyntaxLanguageIndexer : ILanguageIndexer, IBoundedSourceL
             column,
             endLine,
             endColumn,
-            signature: CollapseWhitespace(node.Text),
+            signature: TypeSignature(node.Type, name),
             modifiers: "syntax-only");
         return new Declaration(
             NodeIdentity.For(node),
@@ -236,6 +236,11 @@ public sealed class CppSyntaxLanguageIndexer : ILanguageIndexer, IBoundedSourceL
         TsNode node,
         IndexContext ctx)
     {
+        if (node.Type == "declaration" && IsInsideCompoundStatement(node))
+        {
+            return null;
+        }
+
         var functionDeclarator = node.Type == "function_definition"
             ? FindFunctionDeclarator(NamedField(node, "declarator") ?? node)
             : FindFunctionDeclarator(node);
@@ -576,6 +581,37 @@ public sealed class CppSyntaxLanguageIndexer : ILanguageIndexer, IBoundedSourceL
             .Replace(" :: ", "::", StringComparison.Ordinal)
             .Replace(":: ", "::", StringComparison.Ordinal)
             .Replace(" ::", "::", StringComparison.Ordinal);
+
+    private static bool IsInsideCompoundStatement(TsNode node)
+    {
+        var current = node.Parent;
+        for (var hops = 0;
+             hops < MaximumAncestorHops && current is not null;
+             hops++, current = current.Parent)
+        {
+            if (current.Type == "compound_statement")
+            {
+                return true;
+            }
+            if (current.Type is "translation_unit" or "namespace_definition")
+            {
+                return false;
+            }
+        }
+        return false;
+    }
+
+    private static string TypeSignature(string nodeType, string name) =>
+        nodeType switch
+        {
+            "class_specifier" => $"class {name}",
+            "struct_specifier" => $"struct {name}",
+            "union_specifier" => $"union {name}",
+            "enum_specifier" => $"enum {name}",
+            "alias_declaration" => $"using {name}",
+            "type_definition" => $"typedef {name}",
+            _ => name,
+        };
 
     private static string CollapseWhitespace(string? value)
     {
