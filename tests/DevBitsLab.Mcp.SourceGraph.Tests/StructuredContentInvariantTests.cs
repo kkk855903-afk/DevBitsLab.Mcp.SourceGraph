@@ -18,6 +18,8 @@ using FluentAssertions;
 using ModelContextProtocol.Protocol;
 using ModelContextProtocol.Server;
 using Xunit;
+using EdgeKinds = DevBitsLab.Mcp.SourceGraph.Sdk.EdgeKinds;
+using SymbolKinds = DevBitsLab.Mcp.SourceGraph.Sdk.SymbolKinds;
 
 namespace DevBitsLab.Mcp.SourceGraph.Tests;
 
@@ -288,6 +290,81 @@ public sealed class StructuredContentInvariantTests : IAsyncLifetime, IDisposabl
             && reference.TargetFqn == dto.TargetFqn
             && reference.Relation == reference.Kind
             && reference.Confidence == "semantic");
+    }
+
+    [Fact]
+    public async Task FindReferences_includes_managed_pinvoke_mapping_to_native_export()
+    {
+        var managedFilePath = Path.Join(_tempDir, "NativeMethods.cs");
+        var managedFileId = await _store!.UpsertFileAsync(
+            managedFilePath,
+            [1, 2, 3],
+            DateTimeOffset.UtcNow);
+        var managedSymbolId = await _store.UpsertSymbolAsync(
+            "csharp:M:NativeMethods.Start",
+            new Symbol(
+                Id: 0,
+                Name: "Start",
+                Fqn: "NativeMethods.Start",
+                Kind: SymbolKinds.Method,
+                FileId: managedFileId,
+                StartLine: 8,
+                StartCol: 5,
+                EndLine: 8,
+                EndCol: 31,
+                Signature: "static extern int Start()",
+                ContainerId: null));
+        var nativeFilePath = Path.Join(_tempDir, "native", "camera.cpp");
+        Directory.CreateDirectory(Path.GetDirectoryName(nativeFilePath)!);
+        var nativeFileId = await _store.UpsertFileAsync(
+            nativeFilePath,
+            [4, 5, 6],
+            DateTimeOffset.UtcNow);
+        var nativeSymbolId = await _store.UpsertSymbolAsync(
+            "c:E:native/camera.cpp::pg_camera_start",
+            new Symbol(
+                Id: 0,
+                Name: "pg_camera_start",
+                Fqn: "pg_camera_start",
+                Kind: SymbolKinds.Function,
+                FileId: nativeFileId,
+                StartLine: 4,
+                StartCol: 1,
+                EndLine: 4,
+                EndCol: 24,
+                Signature: "int pg_camera_start()",
+                ContainerId: null));
+        await _store.BulkInsertEdgesAsync(
+        [
+            new Edge(managedSymbolId, nativeSymbolId, EdgeKinds.PInvokeMapsTo)
+            {
+                Evidence = new Evidence(
+                    managedFileId,
+                    new SourceLocation(
+                        managedFilePath,
+                        8,
+                        5,
+                        8,
+                        31),
+                    EvidenceConfidence.Exact,
+                    "interop-analysis"),
+            },
+        ]);
+
+        var result = await GraphTools.FindReferencesAsync(
+            _router!,
+            "pg_camera_start");
+        var dto = JsonSerializer.Deserialize(
+            result.StructuredContent!.Value.GetRawText(),
+            ToolOutputJsonContext.Default.FindReferencesResult);
+
+        dto.Should().NotBeNull();
+        dto!.References.Should().ContainSingle(reference =>
+            reference.Relation == EdgeKinds.PInvokeMapsTo
+            && reference.FilePath == managedFilePath
+            && reference.Confidence == "exact");
+        CallToolResultHelpers.ProseText(result)
+            .Should().Contain(EdgeKinds.PInvokeMapsTo);
     }
 
     [Fact]

@@ -335,7 +335,12 @@ public static class GraphTools
                     sb.AppendLine();
                 }
                 var top = hits[0];
-                var refs = await host.Store.FindReferencesAsync(top.Id, includeGenerated, limit, ct).ConfigureAwait(false);
+                var refs = await FindReferenceDisplayHitsAsync(
+                    host.Store,
+                    top.Id,
+                    includeGenerated,
+                    limit,
+                    ct).ConfigureAwait(false);
                 sb.AppendLine($"References to **{top.Fqn}** ({KindLabel(top.Kind)}){GeneratedSuffix(top.IsGenerated)}:");
                 sb.AppendLine($"- definition: {Format.Location(top.FilePath, top.StartLine, top.StartCol)}");
                 if (refs.Count == 0)
@@ -346,7 +351,7 @@ public static class GraphTools
                     return BuildFindReferencesResult(
                         prose: sb.ToString(),
                         target: top,
-                        refs: Array.Empty<ReferenceHit>(),
+                        refs: Array.Empty<ReferenceDisplayHit>(),
                         scopeId: host.Scope.Id,
                         elapsedMs: sw.ElapsedMilliseconds);
                 }
@@ -361,8 +366,8 @@ public static class GraphTools
                     {
                         rows.Add(new[]
                         {
-                            RefKindLabel(r.Kind),
-                            "semantic",
+                            r.Relation,
+                            r.Confidence,
                             Format.Location(r.FilePath, r.Line, r.Col) + GeneratedSuffix(r.IsGenerated),
                         });
                     }
@@ -373,9 +378,9 @@ public static class GraphTools
                     foreach (var r in refs)
                     {
                         sb.AppendLine(
-                            $"- {RefKindLabel(r.Kind)} at " +
+                            $"- {r.Relation} at " +
                             $"{Format.Location(r.FilePath, r.Line, r.Col)}{GeneratedSuffix(r.IsGenerated)} " +
-                            "[semantic]");
+                            $"[{r.Confidence}]");
                     }
                 }
                 return BuildFindReferencesResult(
@@ -386,6 +391,83 @@ public static class GraphTools
                     elapsedMs: sw.ElapsedMilliseconds,
                     omittedSize: refsOmitted);
             }, ct));
+
+    private static async Task<IReadOnlyList<ReferenceDisplayHit>>
+        FindReferenceDisplayHitsAsync(
+            IGraphStore store,
+            long targetSymbolId,
+            bool includeGenerated,
+            int limit,
+            CancellationToken ct)
+    {
+        var direct = await store.FindReferencesAsync(
+            targetSymbolId,
+            includeGenerated,
+            limit,
+            ct).ConfigureAwait(false);
+        var hits = direct
+            .Select(reference => new ReferenceDisplayHit(
+                RefKindLabel(reference.Kind),
+                "semantic",
+                reference.FilePath,
+                reference.Line,
+                reference.Col,
+                reference.IsGenerated))
+            .ToList();
+        var remaining = Math.Max(0, limit - hits.Count);
+        if (remaining == 0)
+        {
+            return hits;
+        }
+
+        var mappings = await store.ListAuditableInboundEdgesAsync(
+            targetSymbolId,
+            remaining,
+            EdgeKinds.PInvokeMapsTo,
+            ct).ConfigureAwait(false);
+        foreach (var mapping in mappings)
+        {
+            if (!includeGenerated && mapping.Symbol.IsGenerated)
+            {
+                continue;
+            }
+            var evidence = await store.ListEdgeEvidenceAsync(
+                mapping.Symbol.Id,
+                targetSymbolId,
+                mapping.Relation,
+                ct: ct).ConfigureAwait(false);
+            foreach (var occurrence in evidence)
+            {
+                hits.Add(new ReferenceDisplayHit(
+                    mapping.Relation,
+                    EvidenceConfidenceLabel(occurrence.Confidence),
+                    occurrence.Location.FilePath,
+                    occurrence.Location.StartLine,
+                    occurrence.Location.StartColumn,
+                    mapping.Symbol.IsGenerated));
+                if (hits.Count >= limit)
+                {
+                    return hits;
+                }
+            }
+        }
+        return hits
+            .DistinctBy(hit => (
+                hit.Relation,
+                hit.FilePath,
+                hit.Line,
+                hit.Col))
+            .ToList();
+    }
+
+    private static string EvidenceConfidenceLabel(
+        DevBitsLab.Mcp.SourceGraph.Core.EvidenceConfidence confidence) =>
+        confidence switch
+        {
+            DevBitsLab.Mcp.SourceGraph.Core.EvidenceConfidence.Exact => "exact",
+            DevBitsLab.Mcp.SourceGraph.Core.EvidenceConfidence.Semantic => "semantic",
+            _ => "inferred",
+        };
 
     /// <summary>
     /// Compose the multi-content <see cref="CallToolResult"/> for <c>find_references</c>: leading
@@ -399,7 +481,7 @@ public static class GraphTools
     private static CallToolResult BuildFindReferencesResult(
         string prose,
         SymbolHit target,
-        IReadOnlyList<ReferenceHit> refs,
+        IReadOnlyList<ReferenceDisplayHit> refs,
         string scopeId,
         long elapsedMs,
         int omittedSize = 0)
@@ -423,7 +505,7 @@ public static class GraphTools
             {
                 Uri = GraphResourceUris.Symbol(target.Id),
                 Name = target.Fqn,
-                Title = $"{RefKindLabel(r.Kind)} at {Format.Location(r.FilePath, r.Line, r.Col)}",
+                Title = $"{r.Relation} at {Format.Location(r.FilePath, r.Line, r.Col)}",
                 Description = $"{KindLabel(target.Kind)} — {Format.Location(target.FilePath, target.StartLine, target.StartCol)}",
                 MimeType = "text/markdown",
             });
@@ -438,9 +520,9 @@ public static class GraphTools
             .Select(r => new FindReferenceHit(
                 SymbolId: target.Id,
                 TargetFqn: target.Fqn,
-                Kind: RefKindLabel(r.Kind),
-                Relation: RefKindLabel(r.Kind),
-                Confidence: "semantic",
+                Kind: r.Relation,
+                Relation: r.Relation,
+                Confidence: r.Confidence,
                 FilePath: r.FilePath,
                 Line: r.Line,
                 Column: r.Col,
@@ -2551,6 +2633,14 @@ public static class GraphTools
                 ToolOutputJsonContext.Default.FindDiagnosticsResult),
         };
     }
+
+    private sealed record ReferenceDisplayHit(
+        string Relation,
+        string Confidence,
+        string FilePath,
+        int Line,
+        int Col,
+        bool IsGenerated);
 
     private static string DiagnosticRelation(DiagnosticHit diagnostic) =>
         diagnostic.SymbolId is null
