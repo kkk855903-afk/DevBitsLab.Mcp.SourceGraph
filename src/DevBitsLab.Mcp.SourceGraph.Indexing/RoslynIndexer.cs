@@ -1849,6 +1849,9 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
     private MSBuildWorkspace CreateWorkspace()
     {
         var workspace = MSBuildWorkspace.Create();
+        // A solution may legitimately contain VC++ projects. Roslyn owns only managed-language
+        // projects; the native interop pipeline handles configured C/C++ translation units.
+        workspace.SkipUnrecognizedProjects = true;
         var diagnostics = new ConcurrentQueue<WorkspaceDiagnostic>();
         _workspaceDiagnostics[workspace] = diagnostics;
         workspace.RegisterWorkspaceFailedHandler(e =>
@@ -1856,7 +1859,18 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
             diagnostics.Enqueue(e.Diagnostic);
             if (e.Diagnostic.Kind == WorkspaceDiagnosticKind.Failure)
             {
-                _logger.LogWarning("Workspace failure: {Message}", e.Diagnostic.Message);
+                if (IsUnsupportedNativeProjectDiagnostic(e.Diagnostic))
+                {
+                    _logger.LogInformation(
+                        "Workspace skipped non-Roslyn native project: {Message}",
+                        e.Diagnostic.Message);
+                }
+                else
+                {
+                    _logger.LogWarning(
+                        "Workspace failure: {Message}",
+                        e.Diagnostic.Message);
+                }
             }
             else
             {
@@ -1925,7 +1939,8 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
     {
         var failureDiagnostics = diagnostics
             .Where(diagnostic =>
-                diagnostic.Kind == WorkspaceDiagnosticKind.Failure)
+                diagnostic.Kind == WorkspaceDiagnosticKind.Failure
+                && !IsUnsupportedNativeProjectDiagnostic(diagnostic))
             .ToList();
         if (failureDiagnostics.Count == 0)
         {
@@ -1937,6 +1952,33 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                 " | ",
                 failureDiagnostics.Select(diagnostic =>
                     FailureMessage.Truncate(diagnostic.Message))));
+    }
+
+    private static bool IsUnsupportedNativeProjectDiagnostic(
+        WorkspaceDiagnostic diagnostic)
+    {
+        if (diagnostic.Kind != WorkspaceDiagnosticKind.Failure)
+        {
+            return false;
+        }
+
+        // WorkspaceDiagnostic exposes only localized prose, not the failed project path or an
+        // error code. Project extensions and MSVC target names remain invariant across locales.
+        return diagnostic.Message.Contains(
+                ".vcxproj",
+                StringComparison.OrdinalIgnoreCase)
+            || diagnostic.Message.Contains(
+                ".vcproj",
+                StringComparison.OrdinalIgnoreCase)
+            || diagnostic.Message.Contains(
+                ".vcxitems",
+                StringComparison.OrdinalIgnoreCase)
+            || diagnostic.Message.Contains(
+                "VCTargetsPath",
+                StringComparison.OrdinalIgnoreCase)
+            || diagnostic.Message.Contains(
+                "Microsoft.Cpp.",
+                StringComparison.OrdinalIgnoreCase);
     }
 
     private bool IsCSharpStructureChange(Solution solution, string path)
