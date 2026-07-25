@@ -57,6 +57,11 @@ public static class Schema
             version INTEGER PRIMARY KEY
         );
 
+        CREATE TABLE IF NOT EXISTS index_metadata (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS files (
             id INTEGER PRIMARY KEY,
             path TEXT UNIQUE NOT NULL,

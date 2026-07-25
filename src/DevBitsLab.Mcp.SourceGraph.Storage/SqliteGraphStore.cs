@@ -130,6 +130,83 @@ public sealed partial class SqliteGraphStore : IGraphStore
         }
     }
 
+    public async Task<bool> EnsureSemanticPipelineAsync(
+        string fingerprint,
+        CancellationToken ct = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(fingerprint);
+        if (fingerprint.Length > 2048)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(fingerprint),
+                "Semantic pipeline fingerprint must not exceed 2048 characters.");
+        }
+
+        const string metadataKey = "semantic-pipeline-fingerprint";
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            var current = await _connection.ExecuteScalarAsync<string?>(
+                new CommandDefinition(
+                    "SELECT value FROM index_metadata WHERE key = @key;",
+                    new { key = metadataKey },
+                    cancellationToken: ct)).ConfigureAwait(false);
+            if (string.Equals(current, fingerprint, StringComparison.Ordinal))
+            {
+                return false;
+            }
+
+            _logger.LogInformation(
+                "Semantic pipeline fingerprint changed; invalidating the complete derived graph");
+            using var tx = _connection.BeginTransaction();
+            await _connection.ExecuteAsync(
+                new CommandDefinition(
+                    Schema.DropAll,
+                    transaction: tx,
+                    cancellationToken: ct)).ConfigureAwait(false);
+            await _connection.ExecuteAsync(
+                new CommandDefinition(
+                    Schema.V1,
+                    transaction: tx,
+                    cancellationToken: ct)).ConfigureAwait(false);
+            await _connection.ExecuteAsync(
+                new CommandDefinition(
+                    Schema.V2,
+                    transaction: tx,
+                    cancellationToken: ct)).ConfigureAwait(false);
+            if (_vectorExtensionLoaded && _embeddingDimension > 0)
+            {
+                await _connection.ExecuteAsync(
+                    new CommandDefinition(
+                        Schema.V7Embeddings(_embeddingDimension),
+                        transaction: tx,
+                        cancellationToken: ct)).ConfigureAwait(false);
+            }
+            await _connection.ExecuteAsync(
+                new CommandDefinition(
+                    "INSERT OR REPLACE INTO schema_version(version) VALUES (@version);",
+                    new { version = Schema.Version },
+                    transaction: tx,
+                    cancellationToken: ct)).ConfigureAwait(false);
+            await _connection.ExecuteAsync(
+                new CommandDefinition(
+                    """
+                    INSERT INTO index_metadata(key, value)
+                    VALUES (@key, @value)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+                    """,
+                    new { key = metadataKey, value = fingerprint },
+                    transaction: tx,
+                    cancellationToken: ct)).ConfigureAwait(false);
+            tx.Commit();
+            return true;
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
     public Task<GraphReadVersion> GetReadVersionAsync(
         CancellationToken ct = default)
     {

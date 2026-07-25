@@ -568,6 +568,13 @@ static async Task<int> RunIndexAsync(CommandLine cli)
     var modelInfo = new EmbeddingModelInfo(cli.Model ?? DefaultEmbeddingModel.ModelId, DefaultEmbeddingModel.Dimension);
     store.TryLoadVectorExtension(modelInfo.Dimension);
     await store.EnsureSchemaAsync().ConfigureAwait(false);
+    if (await store.EnsureSemanticPipelineAsync(
+            SemanticPipelineFingerprint.Current).ConfigureAwait(false))
+    {
+        await Console.Error.WriteLineAsync(
+            "[sourcegraph-mcp] semantic pipeline changed; rebuilding the complete scope index")
+            .ConfigureAwait(false);
+    }
 
     // For one-shot index runs we register the embedding pipeline only when the user opts in.
     IEmbeddingsRequestSink sink = new NoOpEmbeddingsRequestSink();

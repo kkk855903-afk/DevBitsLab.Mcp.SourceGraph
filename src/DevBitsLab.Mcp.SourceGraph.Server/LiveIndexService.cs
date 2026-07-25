@@ -444,6 +444,16 @@ public sealed class LiveIndexService : BackgroundService
             store = new SqliteGraphStore(dbPath, _loggerFactory.CreateLogger<SqliteGraphStore>());
             store.TryLoadVectorExtension(_modelInfo.Dimension);
             await store.EnsureSchemaAsync(ct).ConfigureAwait(false);
+            var pipelineReset = await store.EnsureSemanticPipelineAsync(
+                    SemanticPipelineFingerprint.Current,
+                    ct)
+                .ConfigureAwait(false);
+            if (pipelineReset)
+            {
+                _logger.LogInformation(
+                    "Scope `{Id}` requires a cold rebuild because its semantic pipeline changed",
+                    scope.Id);
+            }
             var embeddingsStore = store.CreateEmbeddingsStore(_modelInfo.Dimension, _loggerFactory.CreateLogger<SqliteEmbeddingsStore>());
 
             // Per-scope embeddings drain. The ONNX generator is shared (singleton) but every
