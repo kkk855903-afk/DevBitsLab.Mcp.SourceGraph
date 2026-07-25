@@ -877,18 +877,11 @@ public static class TraceCallPathTools
         CancellationToken ct)
     {
         var selection = query.Trim();
-        if (CanonicalKeyValidator.IsValid(selection))
-        {
-            var exact = await store.GetSymbolByCanonicalKeyAsync(
-                selection,
-                ct).ConfigureAwait(false);
-            return exact is null ? [] : [exact];
-        }
-
-        var matches = await store.FindSymbolsAsync(
+        var matches = await SymbolQueryResolver.ResolveAsync(
+            store,
             selection,
             limit: 10,
-            ct: ct).ConfigureAwait(false);
+            ct).ConfigureAwait(false);
         return HighestRankedMatches(selection, matches);
     }
 

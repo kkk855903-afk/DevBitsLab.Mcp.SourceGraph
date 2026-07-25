@@ -70,7 +70,7 @@ public static class Phase1CompatibilityTools
     [Description("Find each indexed reference occurrence for a symbol. Compatibility name for find_references; returns the same file, line, column, and reference-kind evidence.")]
     public static Task<CallToolResult> FindReferenceAsync(
         ScopeRouter router,
-        [Description("Symbol name or FQN, same matching rules as find_definition")] string symbol,
+        [Description("Exact canonical key, symbol name, or FQN; same matching rules as find_definition")] string symbol,
         [Description("Maximum number of references to return (default 50)")] int limit = 50,
         [Description("Include references from source-generated files (default false)")] bool includeGenerated = false,
         [Description(ScopeDescription)] string? scope = null,
@@ -83,7 +83,7 @@ public static class Phase1CompatibilityTools
     [Description("Find evidence-backed inbound relations to a target. Compatibility name for list_callers; each row includes canonical source/target identities, the actual relation and confidence, plus stored occurrence file/range evidence.")]
     public static Task<CallToolResult> FindCallersAsync(
         ScopeRouter router,
-        [Description("Target symbol name or FQN")] string symbol,
+        [Description("Target exact canonical key, symbol name, or FQN")] string symbol,
         [Description("Maximum number of results to return (default 50)")] int limit = 50,
         [Description("Edge kind to walk (default calls); pass all to walk every indexed edge kind")] string? kind = null,
         [Description(ScopeDescription)] string? scope = null,
@@ -96,7 +96,7 @@ public static class Phase1CompatibilityTools
     [Description("Find evidence-backed outbound relations from a source. Compatibility name for list_callees; each row includes canonical source/target identities, the actual relation and confidence, plus stored occurrence file/range evidence.")]
     public static Task<CallToolResult> FindCalleesAsync(
         ScopeRouter router,
-        [Description("Source symbol name or FQN")] string symbol,
+        [Description("Source exact canonical key, symbol name, or FQN")] string symbol,
         [Description("Maximum number of results to return (default 50)")] int limit = 50,
         [Description("Edge kind to walk (default calls); pass all to walk every indexed edge kind")] string? kind = null,
         [Description(ScopeDescription)] string? scope = null,
@@ -176,7 +176,7 @@ public static class Phase1CompatibilityTools
     [Description("Compute bounded evidence-backed upstream impact. Compatibility name for impact_of_change; summary output is compact, while detail output includes every evidence path.")]
     public static Task<CallToolResult> ImpactAnalysisAsync(
         ScopeRouter router,
-        [Description("Symbol name or FQN")] string symbol,
+        [Description("Exact canonical key, symbol name, or FQN")] string symbol,
         [Description("Maximum traversal depth (default 4)")] int maxDepth = 4,
         [Description("Maximum results (default 100)")] int limit = 100,
         [Description("Edge kind to walk (default calls); pass all to walk every indexed edge kind")] string? kind = null,

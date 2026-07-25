@@ -36,6 +36,27 @@ public sealed class Phase1QueryEvidenceTests : IAsyncLifetime
         var b = await SeedSymbolAsync(store, "B");
         var c = await SeedSymbolAsync(store, "C");
         var d = await SeedSymbolAsync(store, "D");
+        var nativeExport = await SeedSymbolAsync(
+            store,
+            "pg_camera_start",
+            canonicalKey: "c:E:native/camera.h::pg_camera_start",
+            fqn: "camera.dll!pg_camera_start",
+            kind: SymbolKinds.NativeExport,
+            extension: ".h");
+        var nativeWrapper = await SeedSymbolAsync(
+            store,
+            "pg_camera_start",
+            canonicalKey: "cpp:F:native/camera.cpp::syntax::pg_camera_start(void*)",
+            fqn: "pg_camera_start",
+            kind: SymbolKinds.Function,
+            extension: ".cpp");
+        var nativeAlgorithm = await SeedSymbolAsync(
+            store,
+            "Start",
+            canonicalKey: "cpp:F:native/camera.cpp::syntax::CameraCapture::Start()",
+            fqn: "CameraCapture::Start",
+            kind: SymbolKinds.Method,
+            extension: ".cpp");
 
         await store.BulkInsertEdgesAsync(new[]
         {
@@ -44,6 +65,20 @@ public sealed class Phase1QueryEvidenceTests : IAsyncLifetime
             Edge(b, c, EdgeKinds.UsesType, 21, CoreEvidenceConfidence.Exact, "b-uses-c"),
             Edge(c, a, EdgeKinds.Calls, 30, CoreEvidenceConfidence.Exact, "cycle"),
             Edge(a, c, EdgeKinds.UsesType, 40, CoreEvidenceConfidence.Exact, "a-uses-c"),
+            Edge(
+                nativeExport,
+                nativeWrapper,
+                EdgeKinds.NativeImplementation,
+                50,
+                CoreEvidenceConfidence.Inferred,
+                "header-to-wrapper"),
+            Edge(
+                nativeWrapper,
+                nativeAlgorithm,
+                EdgeKinds.Calls,
+                60,
+                CoreEvidenceConfidence.Inferred,
+                "wrapper-to-algorithm"),
         });
 
         // Deliberately malformed legacy row. Evidence-first tools must skip it instead of
@@ -144,6 +179,69 @@ public sealed class Phase1QueryEvidenceTests : IAsyncLifetime
         duplicateTargetResult.Content
             .OfType<ModelContextProtocol.Protocol.ResourceLinkBlock>()
             .Should().HaveCount(2, "resource links are per relation row, not per target id");
+    }
+
+    [Fact]
+    public async Task CuratedSymbolTools_share_exact_cpp_canonical_resolution()
+    {
+        const string wrapperKey =
+            "cpp:F:native/camera.cpp::syntax::pg_camera_start(void*)";
+        var expected = await _host!.Store.GetSymbolByCanonicalKeyAsync(
+            wrapperKey);
+        expected.Should().NotBeNull();
+
+        var definition = Deserialize<FindDefinitionResult>(
+            await GraphTools.FindDefinitionAsync(_router!, wrapperKey),
+            ToolOutputJsonContext.Default.FindDefinitionResult);
+        definition.Hits.Should().ContainSingle()
+            .Which.SymbolId.Should().Be(expected!.Id);
+
+        var references = Deserialize<FindReferencesResult>(
+            await GraphTools.FindReferencesAsync(_router!, wrapperKey),
+            ToolOutputJsonContext.Default.FindReferencesResult);
+        references.TargetSymbolId.Should().Be(expected.Id);
+
+        var callers = Deserialize<ListCallersResult>(
+            await Phase1CompatibilityTools.FindCallersAsync(
+                _router!,
+                wrapperKey,
+                kind: "all"),
+            ToolOutputJsonContext.Default.ListCallersResult);
+        callers.TargetCanonicalKey.Should().Be(wrapperKey);
+        callers.Callers.Should().ContainSingle()
+            .Which.Relation.Should().Be(EdgeKinds.NativeImplementation);
+
+        var callees = Deserialize<ListCalleesResult>(
+            await Phase1CompatibilityTools.FindCalleesAsync(
+                _router!,
+                wrapperKey,
+                kind: "all"),
+            ToolOutputJsonContext.Default.ListCalleesResult);
+        callees.TargetCanonicalKey.Should().Be(wrapperKey);
+        callees.Callees.Should().ContainSingle()
+            .Which.Fqn.Should().Be("CameraCapture::Start");
+
+        var neighborhood = Deserialize<NeighborhoodResult>(
+            await GraphTools.NeighborhoodAsync(
+                _router!,
+                wrapperKey,
+                kind: "all"),
+            ToolOutputJsonContext.Default.NeighborhoodResult);
+        neighborhood.Fqn.Should().Be("pg_camera_start");
+        neighborhood.Inbound.Should().ContainSingle()
+            .Which.Fqn.Should().Be("camera.dll!pg_camera_start");
+        neighborhood.Outbound.Should().ContainSingle()
+            .Which.Fqn.Should().Be("CameraCapture::Start");
+
+        var impact = Deserialize<ImpactOfChangeResult>(
+            await Phase1CompatibilityTools.ImpactAnalysisAsync(
+                _router!,
+                wrapperKey,
+                kind: "all"),
+            ToolOutputJsonContext.Default.ImpactOfChangeResult);
+        impact.TargetCanonicalKey.Should().Be(wrapperKey);
+        impact.Upstream.Should().ContainSingle()
+            .Which.Fqn.Should().Be("camera.dll!pg_camera_start");
     }
 
     [Fact]
@@ -249,20 +347,24 @@ public sealed class Phase1QueryEvidenceTests : IAsyncLifetime
 
     private async Task<SeededSymbol> SeedSymbolAsync(
         SqliteGraphStore store,
-        string name)
+        string name,
+        string? canonicalKey = null,
+        string? fqn = null,
+        string? kind = null,
+        string extension = ".cs")
     {
-        var path = Path.Join(_tempDir, $"{name}.cs");
+        var path = Path.Join(_tempDir, $"{name}{extension}");
         var fileId = await store.UpsertFileAsync(
             path,
             [1, 2, 3, 4],
             DateTimeOffset.UtcNow);
         var symbolId = await store.UpsertSymbolAsync(
-            $"csharp:M:Graph.{name}",
+            canonicalKey ?? $"csharp:M:Graph.{name}",
             new Symbol(
                 0,
                 name,
-                $"Graph.{name}",
-                SymbolKinds.Method,
+                fqn ?? $"Graph.{name}",
+                kind ?? SymbolKinds.Method,
                 fileId,
                 1,
                 1,

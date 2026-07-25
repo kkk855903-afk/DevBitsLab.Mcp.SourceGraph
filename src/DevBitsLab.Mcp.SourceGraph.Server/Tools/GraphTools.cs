@@ -6,7 +6,6 @@ using DevBitsLab.Mcp.SourceGraph.Core;
 using DevBitsLab.Mcp.SourceGraph.Embeddings;
 using DevBitsLab.Mcp.SourceGraph.Indexing;
 using DevBitsLab.Mcp.SourceGraph.Sdk;
-using DevBitsLab.Mcp.SourceGraph.Sdk.Validation;
 using DevBitsLab.Mcp.SourceGraph.Server.Observability;
 using DevBitsLab.Mcp.SourceGraph.Server.Resources;
 using DevBitsLab.Mcp.SourceGraph.Server.Scoping;
@@ -35,10 +34,10 @@ public static class GraphTools
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(FindDefinitionResult))]
     [ToolAnnotation(ReadOnlyHint = true, IdempotentHint = true)]
     [ToolTrigger("\"where is X defined?\"")]
-    [Description("Find the definition of a symbol by name or fully-qualified name. Returns symbol id, exact declaration range, defines relation, confidence, kind, signature, accessibility, modifiers, and one-line XML summary for each match.")]
+    [Description("Find the definition of a symbol by exact canonical key, name, or fully-qualified name. Returns symbol id, exact declaration range, defines relation, confidence, kind, signature, accessibility, modifiers, and one-line XML summary for each match.")]
     public static Task<CallToolResult> FindDefinitionAsync(
         ScopeRouter router,
-        [Description("Symbol name (e.g. 'Calculator', 'Divide') or FQN suffix (e.g. 'Calculator.Add', 'Sample.Domain.Calculator')")] string symbol,
+        [Description("Exact canonical key, symbol name (e.g. 'Calculator', 'Divide'), or FQN suffix (e.g. 'Calculator.Add', 'Sample.Domain.Calculator')")] string symbol,
         [Description("Optional substring to narrow the search to specific file paths")] string? fileHint = null,
         [Description(ScopeDescription)] string? scope = null,
         IProgress<ModelContextProtocol.ProgressNotificationValue>? progress = null,
@@ -47,7 +46,12 @@ public static class GraphTools
             ScopedExecution.RunAsync(router, scope, async host =>
             {
                 var sw = System.Diagnostics.Stopwatch.StartNew();
-                var hits = await host.Store.FindSymbolsAsync(symbol, fileHint, limit: 25, ct).ConfigureAwait(false);
+                var hits = await SymbolQueryResolver.ResolveAsync(
+                    host.Store,
+                    symbol,
+                    limit: 25,
+                    ct,
+                    fileHint).ConfigureAwait(false);
                 if (hits.Count == 0)
                 {
                     return BuildFindDefinitionResult(
@@ -316,23 +320,11 @@ public static class GraphTools
             ScopedExecution.RunAsync(router, scope, async host =>
             {
                 var sw = System.Diagnostics.Stopwatch.StartNew();
-                var selection = symbol.Trim();
-                IReadOnlyList<SymbolHit> hits;
-                if (CanonicalKeyValidator.IsValid(selection))
-                {
-                    var exact = await host.Store.GetSymbolByCanonicalKeyAsync(
-                        selection,
-                        ct).ConfigureAwait(false);
-                    hits = exact is null ? [] : [exact];
-                }
-                else
-                {
-                    hits = await host.Store.FindSymbolsAsync(
-                        selection,
-                        filePathHint: null,
-                        limit: 5,
-                        ct).ConfigureAwait(false);
-                }
+                var hits = await SymbolQueryResolver.ResolveAsync(
+                    host.Store,
+                    symbol,
+                    limit: 5,
+                    ct).ConfigureAwait(false);
                 if (hits.Count == 0)
                 {
                     // No symbol resolved — short-circuit through DiagnosticResult.Build instead of
@@ -712,7 +704,7 @@ public static class GraphTools
     [Description("List evidence-backed inbound edges into a target symbol. Every row includes canonical source/target identities, actual relation, confidence, and stored occurrence file/range evidence; malformed edges without evidence are skipped. Default kind=calls; kind=all preserves each actual edge kind. Plugin-defined kebab-case kinds are accepted.")]
     public static Task<CallToolResult> ListCallersAsync(
         ScopeRouter router,
-        [Description("Target symbol name or FQN")] string symbol,
+        [Description("Target exact canonical key, symbol name, or FQN")] string symbol,
         [Description("Maximum number of results to return (default 50)")] int limit = 50,
         [Description("Edge kind to walk (kebab-case): calls (default) | uses-type | overrides-member | implements-member | instantiates | throws | tests | code-behind | binds-to | binds-path | binds-element | handles-event | uses-resource | instantiates-type | merges | applies-style | all. Plugin-defined kinds are accepted.")] string? kind = null,
         [Description(ScopeDescription)] string? scope = null,
@@ -732,7 +724,11 @@ public static class GraphTools
                     if (unknownNote is not null) return DiagnosticResult.Error(unknownNote);
                 }
 
-                var hits = await host.Store.FindSymbolsAsync(symbol, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
+                var hits = await SymbolQueryResolver.ResolveAsync(
+                    host.Store,
+                    symbol,
+                    limit: 5,
+                    ct).ConfigureAwait(false);
                 if (hits.Count == 0) return DiagnosticResult.Build($"No matches for '{symbol}'.");
                 var top = hits[0];
                 var traversal = await EvidenceTraversal.LoadInboundAsync(
@@ -881,7 +877,7 @@ public static class GraphTools
     [Description("List evidence-backed outbound edges from a source symbol. Every row includes canonical source/target identities, actual relation, confidence, and stored occurrence file/range evidence; malformed edges without evidence are skipped. Default kind=calls; kind=all preserves each actual edge kind. Plugin-defined kebab-case kinds are accepted.")]
     public static Task<CallToolResult> ListCalleesAsync(
         ScopeRouter router,
-        [Description("Source symbol name or FQN")] string symbol,
+        [Description("Source exact canonical key, symbol name, or FQN")] string symbol,
         [Description("Maximum number of results to return (default 50)")] int limit = 50,
         [Description("Edge kind to walk (kebab-case): calls (default) | uses-type | overrides-member | implements-member | instantiates | throws | tests | code-behind | binds-to | binds-path | binds-element | handles-event | uses-resource | instantiates-type | merges | applies-style | all. Plugin-defined kinds are accepted.")] string? kind = null,
         [Description(ScopeDescription)] string? scope = null,
@@ -901,7 +897,11 @@ public static class GraphTools
                     if (unknownNote is not null) return DiagnosticResult.Error(unknownNote);
                 }
 
-                var hits = await host.Store.FindSymbolsAsync(symbol, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
+                var hits = await SymbolQueryResolver.ResolveAsync(
+                    host.Store,
+                    symbol,
+                    limit: 5,
+                    ct).ConfigureAwait(false);
                 if (hits.Count == 0) return DiagnosticResult.Build($"No matches for '{symbol}'.");
                 var top = hits[0];
                 var traversal = await EvidenceTraversal.LoadOutboundAsync(
@@ -1046,7 +1046,7 @@ public static class GraphTools
     [Description("Find every concrete member that implements an interface member (uses implements-member edges).")]
     public static Task<CallToolResult> FindImplementationsAsync(
         ScopeRouter router,
-        [Description("Interface member name or FQN, e.g. 'IGreeter.Greet'")] string symbol,
+        [Description("Interface member exact canonical key, name, or FQN, e.g. 'IGreeter.Greet'")] string symbol,
         [Description("Include abstract base members in the result (default false)")] bool includeAbstract = false,
         [Description("Maximum results (default 50)")] int limit = 50,
         [Description(ScopeDescription)] string? scope = null,
@@ -1055,7 +1055,11 @@ public static class GraphTools
             ScopedExecution.RunAsync(router, scope, async host =>
             {
                 var sw = System.Diagnostics.Stopwatch.StartNew();
-                var hits = await host.Store.FindSymbolsAsync(symbol, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
+                var hits = await SymbolQueryResolver.ResolveAsync(
+                    host.Store,
+                    symbol,
+                    limit: 5,
+                    ct).ConfigureAwait(false);
                 if (hits.Count == 0) return DiagnosticResult.Build($"No matches for '{symbol}'.");
                 var top = hits[0];
                 var impls = await host.Store.ListImplementationsAsync(top.Id, limit, ct).ConfigureAwait(false);
@@ -1285,21 +1289,18 @@ public static class GraphTools
 
     /// <summary>
     /// Resolve a free-form symbol identifier (canonical key, name, or FQN suffix) to a canonical
-    /// key. Inputs that pass <see cref="CanonicalKeyValidator.IsValid"/> are passed through
-    /// verbatim so the storage WHERE clause matches by key — single source of truth for the
-    /// scheme list (delegating to the SDK keeps this in lockstep when new languages get
-    /// promoted into <see cref="CanonicalKeyValidator.EnforcedSchemes"/>). Other inputs go
-    /// through the same name-lookup path <c>find_definition</c> uses; the top hit's canonical
-    /// key wins. Returns <c>null</c> for null/empty input or when the lookup produces no hits.
+    /// key through <see cref="SymbolQueryResolver"/>. Exact canonical keys use direct storage
+    /// lookup; other inputs use the same name/FQN matching path as the curated symbol tools.
+    /// Returns <c>null</c> for null/empty input or when the lookup produces no hits.
     /// </summary>
     private static async Task<string?> ResolveCanonicalKeyAsync(IGraphStore store, string? identifier, CancellationToken ct)
     {
         if (string.IsNullOrWhiteSpace(identifier)) return null;
-        // CanonicalKeyValidator rejects inputs whose scheme isn't an enforced one — XAML
-        // placeholder FQNs like `binding-target:Views/Main.xaml#Text@12:24` fail (the leading
-        // token isn't a valid scheme), so they correctly fall through to FindSymbolsAsync.
-        if (CanonicalKeyValidator.IsValid(identifier)) return identifier;
-        var hits = await store.FindSymbolsAsync(identifier, filePathHint: null, limit: 1, ct).ConfigureAwait(false);
+        var hits = await SymbolQueryResolver.ResolveAsync(
+            store,
+            identifier,
+            limit: 1,
+            ct).ConfigureAwait(false);
         return hits.Count == 0 ? null : hits[0].CanonicalKey;
     }
 
@@ -1680,7 +1681,7 @@ public static class GraphTools
     [Description("Get the immediate graph neighborhood of a symbol: callers, callees, and inheritance/implements edges. Default kind=calls; pass kind=uses-type, overrides-member, implements-member, instantiates, throws, tests, all, any XAML edge kind (code-behind, binds-to, binds-path, binds-element, handles-event, uses-resource, instantiates-type, merges, applies-style) on a scope that loaded the XAML indexer, or any plugin-defined kebab-case kind to inspect other edge layers.")]
     public static Task<CallToolResult> NeighborhoodAsync(
         ScopeRouter router,
-        [Description("Symbol name or FQN")] string symbol,
+        [Description("Exact canonical key, symbol name, or FQN")] string symbol,
         [Description("Max items per category (default 20)")] int perCategory = 20,
         [Description("Edge kind to walk (kebab-case): calls (default) | uses-type | overrides-member | implements-member | instantiates | throws | tests | code-behind | binds-to | binds-path | binds-element | handles-event | uses-resource | instantiates-type | merges | applies-style | all. Plugin-defined kinds are accepted.")] string? kind = null,
         [Description(ScopeDescription)] string? scope = null,
@@ -1696,7 +1697,11 @@ public static class GraphTools
                     if (unknownNote is not null) return DiagnosticResult.Error(unknownNote);
                 }
 
-                var hits = await host.Store.FindSymbolsAsync(symbol, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
+                var hits = await SymbolQueryResolver.ResolveAsync(
+                    host.Store,
+                    symbol,
+                    limit: 5,
+                    ct).ConfigureAwait(false);
                 if (hits.Count == 0) return DiagnosticResult.Build($"No matches for '{symbol}'.");
                 var top = hits[0];
                 var callers = await host.Store.ListCallersAsync(top.Id, perCategory, edgeKind, ct).ConfigureAwait(false);
@@ -2005,7 +2010,7 @@ public static class GraphTools
     [Description("Compute bounded evidence-backed upstream impact with breadth-first, cycle-safe traversal. summary output (default) returns canonical identities, BFS predecessors, and path confidence without repeating full path prefixes; detail output includes each source-to-target evidence path. maxDepth is 1-12 and limit is 1-1000; truncation is explicit.")]
     public static Task<CallToolResult> ImpactOfChangeAsync(
         ScopeRouter router,
-        [Description("Symbol name or FQN")] string symbol,
+        [Description("Exact canonical key, symbol name, or FQN")] string symbol,
         [Description("Maximum traversal depth (default 4)")] int maxDepth = 4,
         [Description("Maximum results (default 100)")] int limit = 100,
         [Description("Edge kind to walk (kebab-case): calls (default) | uses-type | overrides-member | implements-member | instantiates | throws | tests | code-behind | binds-to | binds-path | binds-element | handles-event | uses-resource | instantiates-type | merges | applies-style | all. Plugin-defined kinds are accepted.")] string? kind = null,
@@ -2038,7 +2043,11 @@ public static class GraphTools
                     if (unknownNote is not null) return DiagnosticResult.Error(unknownNote);
                 }
 
-                var hits = await host.Store.FindSymbolsAsync(symbol, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
+                var hits = await SymbolQueryResolver.ResolveAsync(
+                    host.Store,
+                    symbol,
+                    limit: 5,
+                    ct).ConfigureAwait(false);
                 if (hits.Count == 0) return DiagnosticResult.Build($"No matches for '{symbol}'.");
                 var top = hits[0];
                 progress?.Report(Format.Progress(0.0, "querying"));
@@ -2199,7 +2208,7 @@ public static class GraphTools
     [Description("List the direct members of a container (class, struct, interface, namespace) by FQN, optionally filtered by accessibility. Walks the populated container_id chain — replaces 'list_symbols_in_file then filter'.")]
     public static Task<CallToolResult> ListMembersAsync(
         ScopeRouter router,
-        [Description("Container FQN (e.g. 'Sample.Domain.Calculator', 'Sample.Domain'). Resolved with the same matching rules as find_definition; the top match is used.")] string container,
+        [Description("Container exact canonical key or FQN (e.g. 'Sample.Domain.Calculator', 'Sample.Domain'). Resolved with the same matching rules as find_definition; the top match is used.")] string container,
         [Description("Reserved for a future change that follows inherits/implements edges; currently ignored.")] bool includeInherited = false,
         [Description("Optional accessibility filter: public|internal|private|protected|protected internal|private protected.")] string? accessibility = null,
         [Description("Maximum members to return (default 100)")] int limit = 100,
@@ -2209,7 +2218,11 @@ public static class GraphTools
             ScopedExecution.RunAsync(router, scope, async host =>
             {
                 var sw = System.Diagnostics.Stopwatch.StartNew();
-                var hits = await host.Store.FindSymbolsAsync(container, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
+                var hits = await SymbolQueryResolver.ResolveAsync(
+                    host.Store,
+                    container,
+                    limit: 5,
+                    ct).ConfigureAwait(false);
                 if (hits.Count == 0) return DiagnosticResult.Build($"No matches for container '{container}'.");
                 var top = hits[0];
 
@@ -2543,7 +2556,7 @@ public static class GraphTools
         ScopeRouter router,
         [Description("Severity floor: hidden | info | warning (default) | error | all. Numeric values 0-3 also accepted.")] string? severity = "warning",
         [Description("Optional diagnostic code filter, e.g. 'CS0618' for [Obsolete] usage")] string? code = null,
-        [Description("Optional symbol name/FQN to scope the lookup to a single symbol's diagnostics")] string? symbol = null,
+        [Description("Optional exact canonical key, symbol name, or FQN to scope the lookup to a single symbol's diagnostics")] string? symbol = null,
         [Description("Maximum rows to return (default 100)")] int limit = 100,
         [Description("When true, return only an inferred workspace root-cause summary if a high-confidence cascading compiler-error pattern is detected.")] bool rootCauseOnly = false,
         [Description(ScopeDescription)] string? scope = null,
@@ -2563,7 +2576,11 @@ public static class GraphTools
                 string? symbolFqn = null;
                 if (!string.IsNullOrWhiteSpace(symbol))
                 {
-                    var hits = await host.Store.FindSymbolsAsync(symbol, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
+                    var hits = await SymbolQueryResolver.ResolveAsync(
+                        host.Store,
+                        symbol,
+                        limit: 5,
+                        ct).ConfigureAwait(false);
                     if (hits.Count == 0) return DiagnosticResult.Build($"No matches for '{symbol}'.");
                     symbolId = hits[0].Id;
                     symbolFqn = hits[0].Fqn;
