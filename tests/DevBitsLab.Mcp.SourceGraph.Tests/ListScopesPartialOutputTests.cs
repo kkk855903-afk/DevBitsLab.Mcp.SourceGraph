@@ -189,6 +189,46 @@ public sealed class ListScopesPartialOutputTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task Project_count_uses_projects_loaded_from_solution_instead_of_solution_file_count()
+    {
+        var firstProjectDirectory = Path.Combine(_tmpDir, "First");
+        var secondProjectDirectory = Path.Combine(_tmpDir, "Second");
+        Directory.CreateDirectory(firstProjectDirectory);
+        Directory.CreateDirectory(secondProjectDirectory);
+        await File.WriteAllTextAsync(
+            Path.Combine(firstProjectDirectory, "First.csproj"),
+            "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup></Project>");
+        await File.WriteAllTextAsync(
+            Path.Combine(secondProjectDirectory, "Second.csproj"),
+            "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup></Project>");
+        await File.WriteAllTextAsync(
+            Path.Combine(firstProjectDirectory, "First.cs"),
+            "namespace First; public sealed class One;");
+        await File.WriteAllTextAsync(
+            Path.Combine(secondProjectDirectory, "Second.cs"),
+            "namespace Second; public sealed class Two;");
+        var solutionPath = Path.Combine(_tmpDir, "Synthetic.slnx");
+        await File.WriteAllTextAsync(
+            solutionPath,
+            """
+            <Solution>
+              <Project Path="First/First.csproj" />
+              <Project Path="Second/Second.csproj" />
+            </Solution>
+            """);
+
+        await _indexer!.OpenAsync(solutionPath);
+        var router = new ScopeRouter();
+        router.Register(BuildHost(id: "multi-project", status: "ok", statusMessage: null));
+
+        var (prose, structured) = await RenderViaTool(router);
+
+        prose.Should().Contain("| 2 |");
+        structured.Scopes.Should().ContainSingle()
+            .Which.ProjectCount.Should().Be(2);
+    }
+
+    [Fact]
     public async Task Failure_sublist_sanitises_backticks_and_newlines_in_names_and_reasons()
     {
         // Failure detail lives inside a markdown bullet list with inline-code spans wrapping
