@@ -3064,6 +3064,12 @@ public sealed partial class SqliteGraphStore : IGraphStore
 
     public async Task<IReadOnlyList<SymbolHit>> ListSymbolsInFileAsync(string filePath, CancellationToken ct = default)
     {
+        ArgumentException.ThrowIfNullOrWhiteSpace(filePath);
+        var normalizedPath = filePath.Replace('\\', '/');
+        while (normalizedPath.StartsWith("./", StringComparison.Ordinal))
+        {
+            normalizedPath = normalizedPath[2..];
+        }
         const string sql = """
             SELECT s.id, s.name, s.fqn, s.kind_name AS Kind, f.path AS FilePath, s.start_line AS StartLine, s.start_col AS StartCol,
                    s.end_line AS EndLine, s.end_col AS EndCol, s.signature,
@@ -3072,11 +3078,12 @@ public sealed partial class SqliteGraphStore : IGraphStore
                    s.canonical_key AS CanonicalKey
             FROM symbols s
             JOIN files f ON f.id = s.file_id
-            WHERE f.path = @path OR f.path LIKE '%' || @path
+            WHERE REPLACE(f.path, '\', '/') = @path
+               OR REPLACE(f.path, '\', '/') LIKE '%/' || @path
             ORDER BY s.start_line, s.start_col;
             """;
         var rows = await _connection.QueryAsync<RawSymbolHit>(new CommandDefinition(
-            sql, new { path = filePath }, cancellationToken: ct)).ConfigureAwait(false);
+            sql, new { path = normalizedPath }, cancellationToken: ct)).ConfigureAwait(false);
         return rows.Select(r => r.ToHit()).ToList();
     }
 
