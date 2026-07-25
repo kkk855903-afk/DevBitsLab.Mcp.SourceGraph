@@ -339,8 +339,23 @@ public static class GraphTools
                 var sb = new StringBuilder();
                 if (hits.Count > 1)
                 {
-                    sb.AppendLine($"Multiple symbols match '{symbol}'; reporting references for the top match. Other matches: {string.Join(", ", hits.Skip(1).Select(h => h.Fqn))}");
-                    sb.AppendLine();
+                    sb.AppendLine(
+                        $"status: ambiguous; reference search not executed for '{symbol}'.");
+                    sb.AppendLine(
+                        "Use one exact canonical key so references from different semantic symbols are not silently mixed or omitted:");
+                    foreach (var candidate in hits)
+                    {
+                        sb.Append("- `")
+                            .Append(candidate.CanonicalKey ?? "<no-canonical-key>")
+                            .Append("` — **")
+                            .Append(candidate.Fqn)
+                            .Append("** at ")
+                            .AppendLine(Format.Location(
+                                candidate.FilePath,
+                                candidate.StartLine,
+                                candidate.StartCol));
+                    }
+                    return DiagnosticResult.Build(sb.ToString());
                 }
                 var top = hits[0];
                 var refs = await FindReferenceDisplayHitsAsync(
@@ -376,7 +391,7 @@ public static class GraphTools
                         rows.Add(new[]
                         {
                             includesSemanticRelations ? ReferenceRelationLabel(r) : r.Relation,
-                            r.Confidence,
+                            ReferenceConfidenceLabel(r),
                             Format.Location(r.FilePath, r.Line, r.Col) + GeneratedSuffix(r.IsGenerated),
                         });
                     }
@@ -396,12 +411,12 @@ public static class GraphTools
                             sb.AppendLine(
                                 $"- {r.Relation} at " +
                                 $"{Format.Location(r.FilePath, r.Line, r.Col)}{GeneratedSuffix(r.IsGenerated)} " +
-                                $"[{r.Confidence}]");
+                                $"[{ReferenceConfidenceLabel(r)}]");
                         }
                         else
                         {
                             sb.AppendLine($"- {ReferenceRelationLabel(r)} " +
-                                          $"[{r.Confidence}; evidence: " +
+                                          $"[{ReferenceConfidenceLabel(r)}; evidence: " +
                                           $"{Format.Location(r.FilePath, r.Line, r.Col)}" +
                                           $"{GeneratedSuffix(r.IsGenerated)}]");
                         }
@@ -432,7 +447,10 @@ public static class GraphTools
         var hits = direct
             .Select(reference => new ReferenceDisplayHit(
                 RefKindLabel(reference.Kind),
-                "semantic",
+                reference.Confidence is null
+                    ? "semantic"
+                    : EvidenceConfidenceLabel(reference.Confidence.Value),
+                reference.Producer,
                 reference.FilePath,
                 reference.Line,
                 reference.Col,
@@ -479,6 +497,7 @@ public static class GraphTools
                     hits.Add(new ReferenceDisplayHit(
                         mapping.Relation,
                         EvidenceConfidenceLabel(occurrence.Confidence),
+                        occurrence.Producer,
                         occurrence.Location.FilePath,
                         occurrence.Location.StartLine,
                         occurrence.Location.StartColumn,
@@ -517,6 +536,7 @@ public static class GraphTools
                     hits.Add(new ReferenceDisplayHit(
                         implementation.Relation,
                         EvidenceConfidenceLabel(occurrence.Confidence),
+                        occurrence.Producer,
                         occurrence.Location.FilePath,
                         occurrence.Location.StartLine,
                         occurrence.Location.StartColumn,
@@ -533,6 +553,7 @@ public static class GraphTools
         return hits
             .DistinctBy(hit => (
                 hit.Relation,
+                hit.Producer,
                 hit.FilePath,
                 hit.Line,
                 hit.Col,
@@ -549,6 +570,11 @@ public static class GraphTools
               $"{Format.Location(hit.Source.FilePath, hit.Source.Line, hit.Source.Column)} " +
               $"-[{hit.Relation}]-> **{hit.Target.Fqn}** at " +
               Format.Location(hit.Target.FilePath, hit.Target.Line, hit.Target.Column);
+
+    private static string ReferenceConfidenceLabel(ReferenceDisplayHit hit) =>
+        string.IsNullOrWhiteSpace(hit.Producer)
+            ? hit.Confidence
+            : $"{hit.Confidence}, {hit.Producer}";
 
     private static TraceCallPathSymbol ReferenceEndpoint(SymbolHit symbol) =>
         new(
@@ -629,6 +655,7 @@ public static class GraphTools
                 Line: r.Line,
                 Column: r.Col,
                 IsGenerated: r.IsGenerated,
+                Producer: r.Producer,
                 Source: r.Source,
                 Target: r.Target))
             .ToList();
@@ -2789,6 +2816,7 @@ public static class GraphTools
     private sealed record ReferenceDisplayHit(
         string Relation,
         string Confidence,
+        string? Producer,
         string FilePath,
         int Line,
         int Col,

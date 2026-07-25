@@ -146,7 +146,13 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
         {
             Edge(a, b, 5, CoreEvidenceConfidence.Exact, "a-to-b"),
             Edge(b, c, 8, CoreEvidenceConfidence.Semantic, "b-to-c"),
-            Edge(a, d, 6, CoreEvidenceConfidence.Exact, "a-to-d"),
+            Edge(
+                a,
+                d,
+                6,
+                CoreEvidenceConfidence.Exact,
+                "a-to-d",
+                condition: "flag is true"),
             Edge(d, c, 9, CoreEvidenceConfidence.Exact, "d-to-c"),
             Edge(c, a, 12, CoreEvidenceConfidence.Exact, "cycle"),
             Edge(starveSource, directTarget, 15, CoreEvidenceConfidence.Exact, "auditable-direct"),
@@ -248,7 +254,8 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
             int line,
             CoreEvidenceConfidence confidence,
             string marker,
-            string kind = EdgeKinds.Calls) =>
+            string kind = EdgeKinds.Calls,
+            string? condition = null) =>
             new(source.SymbolId, target.SymbolId, kind)
             {
                 Evidence = new CoreEvidence(
@@ -256,7 +263,18 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
                     new CoreSourceLocation(source.FilePath, line, 5, line, 12),
                     confidence,
                     "fixture",
-                    new Dictionary<string, string> { ["marker"] = marker }),
+                    condition is null
+                        ? new Dictionary<string, string>
+                        {
+                            ["marker"] = marker,
+                        }
+                        : new Dictionary<string, string>
+                        {
+                            ["marker"] = marker,
+                            ["control_flow"] = "conditional",
+                            ["branch"] = "if",
+                            ["condition"] = condition,
+                        }),
             };
     }
 
@@ -327,7 +345,11 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
         var exactPath = scope.Paths.Single(path =>
             path.Hops[0].To.Fqn == "Graph.D");
         exactPath.Confidence.Should().Be("exact");
-        CallToolResultHelpers.ProseText(result).Should().Contain("2 paths");
+        CallToolResultHelpers.ProseText(result)
+            .Should().Contain("2 paths")
+            .And.Contain("[exact; conditional]")
+            .And.Contain("condition (if): `flag is true`")
+            .And.Contain("not guaranteed normal flow");
         result.Content.OfType<ResourceLinkBlock>().Should().HaveCount(4)
             .And.OnlyHaveUniqueItems(link => link.Uri);
     }

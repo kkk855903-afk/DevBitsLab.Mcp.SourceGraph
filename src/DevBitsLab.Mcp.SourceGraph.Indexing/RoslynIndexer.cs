@@ -3329,7 +3329,22 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                     long dst,
                     string kind,
                     SyntaxNode evidenceNode,
-                    CoreEvidenceConfidence confidence)
+                    CoreEvidenceConfidence confidence) =>
+                    AddEdgeWithMetadata(
+                        src,
+                        dst,
+                        kind,
+                        evidenceNode,
+                        confidence,
+                        evidenceMetadata: null);
+
+                void AddEdgeWithMetadata(
+                    long src,
+                    long dst,
+                    string kind,
+                    SyntaxNode evidenceNode,
+                    CoreEvidenceConfidence confidence,
+                    IReadOnlyDictionary<string, string>? evidenceMetadata)
                 {
                     if (src == dst) return;
                     var lineSpan = evidenceNode.GetLocation().GetLineSpan();
@@ -3358,7 +3373,8 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                                     endLine,
                                     endColumn),
                                 confidence,
-                                "roslyn"),
+                                "roslyn",
+                                evidenceMetadata),
                         });
                     }
                 }
@@ -3483,12 +3499,13 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                             var encKey = SymbolMapping.CanonicalKey(enclosing);
                             if (encKey is not null && _symbolIdByKey.TryGetValue(encKey, out var srcId))
                             {
-                                AddEdge(
+                                AddEdgeWithMetadata(
                                     srcId,
                                     symId,
                                     EdgeKinds.Calls,
                                     refNode,
-                                    referenceConfidence);
+                                    referenceConfidence,
+                                    ConditionalControlFlowMetadata(refNode));
                             }
                         }
                     }
@@ -4255,6 +4272,62 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
 
         confidence = CoreEvidenceConfidence.Inferred;
         return null;
+    }
+
+    private static IReadOnlyDictionary<string, string>?
+        ConditionalControlFlowMetadata(SyntaxNode node)
+    {
+        foreach (var ancestor in node.Ancestors())
+        {
+            switch (ancestor)
+            {
+                case IfStatementSyntax ifStatement
+                    when ifStatement.Statement.Span.Contains(node.Span):
+                    return ConditionalMetadata(
+                        "if",
+                        ifStatement.Condition);
+                case IfStatementSyntax ifStatement
+                    when ifStatement.Else?.Statement.Span.Contains(node.Span) == true:
+                    return ConditionalMetadata(
+                        "else",
+                        ifStatement.Condition);
+                case ConditionalExpressionSyntax conditional
+                    when conditional.WhenTrue.Span.Contains(node.Span):
+                    return ConditionalMetadata(
+                        "when_true",
+                        conditional.Condition);
+                case ConditionalExpressionSyntax conditional
+                    when conditional.WhenFalse.Span.Contains(node.Span):
+                    return ConditionalMetadata(
+                        "when_false",
+                        conditional.Condition);
+                case AnonymousFunctionExpressionSyntax:
+                case MemberDeclarationSyntax:
+                    return null;
+            }
+        }
+
+        return null;
+    }
+
+    private static IReadOnlyDictionary<string, string> ConditionalMetadata(
+        string branch,
+        ExpressionSyntax condition)
+    {
+        var text = condition.ToString()
+            .Replace('\r', ' ')
+            .Replace('\n', ' ')
+            .Trim();
+        if (text.Length > 512)
+        {
+            text = text[..512] + "…";
+        }
+        return new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["control_flow"] = "conditional",
+            ["branch"] = branch,
+            ["condition"] = text,
+        };
     }
 
     private static ISymbol? FindEnclosingMember(SemanticModel model, int position, CancellationToken ct)

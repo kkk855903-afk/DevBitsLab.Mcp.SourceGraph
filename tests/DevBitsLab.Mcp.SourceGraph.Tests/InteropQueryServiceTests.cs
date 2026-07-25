@@ -126,6 +126,35 @@ public sealed class InteropQueryServiceTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task Boundary_name_coalesces_one_to_one_managed_and_native_candidates()
+    {
+        var managed = await SeedManagedAsync(
+            "managed/NativeMethods.cs",
+            "csharp:M:Fixture.NativeMethods.run",
+            "run");
+        var native = await SeedNativeAsync(
+            "native/export.h",
+            "c:E:native/export.h::run",
+            "run");
+        await SeedMatchAsync(managed, native, InteropMatchStatus.Matched);
+
+        var query = await Service().QueryAsync(
+            "scope-a",
+            _store!,
+            CompleteState(),
+            "run",
+            InteropQuerySelectionMode.ManagedOrNativeBoundary,
+            includeFindings: true);
+
+        query.Result.Status.Should().Be("ok");
+        query.Result.SelectionStatus.Should().Be("selected");
+        query.Result.SelectionCandidates.Should().HaveCount(2);
+        query.Result.Matches.Should().ContainSingle(match =>
+            match.ManagedSymbol == managed.Key
+            && match.NativeSymbol == native.Key);
+    }
+
+    [Fact]
     public async Task Complete_scope_with_zero_candidates_reports_not_found()
     {
         var query = await Service().QueryAsync(

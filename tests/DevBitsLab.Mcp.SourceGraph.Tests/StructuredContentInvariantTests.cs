@@ -289,9 +289,51 @@ public sealed class StructuredContentInvariantTests : IAsyncLifetime, IDisposabl
             reference.SymbolId == dto.TargetSymbolId
             && reference.TargetFqn == dto.TargetFqn
             && reference.Relation == reference.Kind
-            && reference.Confidence == "semantic"
+            && (
+                (reference.Confidence == "semantic"
+                 && reference.Producer == null)
+                || (reference.Confidence == "exact"
+                    && reference.Producer == "roslyn"))
             && reference.Source == null
             && reference.Target == null);
+    }
+
+    [Fact]
+    public async Task FindReferences_ambiguous_short_name_does_not_search_only_top_match()
+    {
+        var filePath = Path.Join(_tempDir, "Ambiguous.cs");
+        var fileId = await _store!.UpsertFileAsync(
+            filePath,
+            [1, 2, 3],
+            DateTimeOffset.UtcNow);
+        foreach (var owner in new[] { "Primary", "Contract" })
+        {
+            await _store.UpsertSymbolAsync(
+                $"csharp:M:Sample.{owner}.Analyze",
+                new Symbol(
+                    Id: 0,
+                    Name: "Analyze",
+                    Fqn: $"Sample.{owner}.Analyze",
+                    Kind: SymbolKinds.Method,
+                    FileId: fileId,
+                    StartLine: owner == "Primary" ? 4 : 8,
+                    StartCol: 5,
+                    EndLine: owner == "Primary" ? 4 : 8,
+                    EndCol: 20,
+                    Signature: "void Analyze()",
+                    ContainerId: null));
+        }
+
+        var result = await GraphTools.FindReferencesAsync(
+            _router!,
+            "Analyze");
+
+        result.StructuredContent.Should().BeNull();
+        CallToolResultHelpers.ProseText(result)
+            .Should().Contain("status: ambiguous")
+            .And.Contain("reference search not executed")
+            .And.Contain("csharp:M:Sample.Primary.Analyze")
+            .And.Contain("csharp:M:Sample.Contract.Analyze");
     }
 
     [Fact]
@@ -391,7 +433,7 @@ public sealed class StructuredContentInvariantTests : IAsyncLifetime, IDisposabl
 
         var result = await GraphTools.FindReferencesAsync(
             _router!,
-            "pg_camera_start");
+            "c:E:native/camera.cpp::pg_camera_start");
         var dto = JsonSerializer.Deserialize(
             result.StructuredContent!.Value.GetRawText(),
             ToolOutputJsonContext.Default.FindReferencesResult);

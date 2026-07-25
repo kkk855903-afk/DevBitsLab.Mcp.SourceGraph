@@ -124,6 +124,12 @@ internal sealed class InteropQueryService
                 native.Facts,
                 cancellationToken)
             .ConfigureAwait(false);
+        if (selectionMode == InteropQuerySelectionMode.ManagedOrNativeBoundary)
+        {
+            selection = CoalesceOneToOneBoundarySelection(
+                selection,
+                matches.Facts);
+        }
         if (selection.Failure is not null)
         {
             failures.Add(selection.Failure);
@@ -433,6 +439,56 @@ internal sealed class InteropQueryService
         return failure is null
             ? new MatchSelection([match], [managed], [])
             : MatchSelection.Invalid([managed], failure);
+    }
+
+    private static SelectionOutcome CoalesceOneToOneBoundarySelection(
+        SelectionOutcome selection,
+        IReadOnlyList<StoredInteropFact<InteropMatchProjection>> matches)
+    {
+        if (selection.Status != SelectionStatus.Ambiguous
+            || selection.Failure is not null
+            || selection.Candidates.Count != 2)
+        {
+            return selection;
+        }
+
+        var managedCandidates = selection.Candidates.Where(candidate =>
+            string.Equals(
+                candidate.SymbolType,
+                ManagedSymbolType,
+                StringComparison.Ordinal)).ToArray();
+        var nativeCandidates = selection.Candidates.Where(candidate =>
+            string.Equals(
+                candidate.SymbolType,
+                NativeSymbolType,
+                StringComparison.Ordinal)).ToArray();
+        if (managedCandidates.Length != 1 || nativeCandidates.Length != 1)
+        {
+            return selection;
+        }
+        var managed = managedCandidates[0];
+        var native = nativeCandidates[0];
+
+        var nativeMatches = matches
+            .Where(match => string.Equals(
+                match.Fact.NativeSymbolCanonicalKey,
+                native.CanonicalKey,
+                StringComparison.Ordinal))
+            .ToArray();
+        if (nativeMatches.Length != 1
+            || !string.Equals(
+                nativeMatches[0].Fact.ManagedSymbolCanonicalKey,
+                managed.CanonicalKey,
+                StringComparison.Ordinal))
+        {
+            return selection;
+        }
+
+        return selection with
+        {
+            Status = SelectionStatus.Selected,
+            Selected = managed,
+        };
     }
 
     private static MatchSelection SelectNativeMatches(

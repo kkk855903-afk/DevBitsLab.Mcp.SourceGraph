@@ -275,7 +275,8 @@ public sealed class AbiToolsTests : IAsyncLifetime
         firstJson.Should().Be(secondJson);
         var dto = Read(first);
         dto.Truncated.Should().BeTrue();
-        dto.Partial.Should().BeTrue();
+        dto.Partial.Should().BeFalse(
+            "response compaction must not make a completed compatibility analysis partial");
         dto.OmittedCount.Should().BeGreaterThan(0);
         dto.OmittedCheckCount.Should().BeGreaterThan(0);
         dto.TotalCheckCount.Should().Be(2000);

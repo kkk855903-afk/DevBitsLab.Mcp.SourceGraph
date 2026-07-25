@@ -171,6 +171,35 @@ public sealed class IndexFixtureTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task ConditionalRoslynCall_preserves_branch_condition_metadata()
+    {
+        var caller = (await _store!.FindSymbolsAsync("Calculator.Divide"))
+            .Should().ContainSingle(hit =>
+                hit.Fqn.Contains(
+                    "Sample.Domain.Calculator.Divide",
+                    StringComparison.Ordinal))
+            .Which;
+        var target = (await _store.ListCalleesAsync(
+                caller.Id,
+                edgeKind: EdgeKinds.Calls))
+            .Should().ContainSingle(hit =>
+                hit.Fqn.Contains(
+                    "DivisionByZero",
+                    StringComparison.Ordinal))
+            .Which;
+
+        var evidence = (await _store.ListEdgeEvidenceAsync(
+                caller.Id,
+                target.Id,
+                EdgeKinds.Calls))
+            .Should().ContainSingle().Subject;
+
+        evidence.Metadata.Should().Contain("control_flow", "conditional");
+        evidence.Metadata.Should().Contain("branch", "if");
+        evidence.Metadata.Should().Contain("condition", "b == 0");
+    }
+
+    [Fact]
     public async Task RoslynTypeRelations_preserveExactBaseTypeEvidence()
     {
         await AssertTypeRelationEvidenceAsync(

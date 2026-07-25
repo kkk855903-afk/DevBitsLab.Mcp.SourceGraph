@@ -32,5 +32,6 @@ public sealed record FindReferenceHit(
     int Line,
     int Column,
     [property: JsonPropertyName("is_generated")] bool IsGenerated,
+    string? Producer,
     TraceCallPathSymbol? Source,
     TraceCallPathSymbol? Target);

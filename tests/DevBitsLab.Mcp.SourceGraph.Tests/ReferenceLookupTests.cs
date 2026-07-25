@@ -67,6 +67,61 @@ public sealed class ReferenceLookupTests : IAsyncLifetime
                 [ReferenceKind.Read, ReferenceKind.Write]);
     }
 
+    [Fact]
+    public async Task Call_reference_uses_matching_edge_evidence_confidence()
+    {
+        var (fileId, targetSymbolId) = await AddSymbolAsync();
+        var sourceSymbolId = await _store!.UpsertSymbolAsync(
+            "cpp:F:CameraService.cpp::syntax::Run()",
+            new Symbol(
+                Id: 0,
+                Name: "Run",
+                Fqn: "CameraService::Run",
+                Kind: DevBitsLab.Mcp.SourceGraph.Sdk.SymbolKinds.Function,
+                FileId: fileId,
+                StartLine: 8,
+                StartCol: 1,
+                EndLine: 14,
+                EndCol: 2,
+                Signature: "void Run()",
+                ContainerId: null));
+        await _store.BulkInsertReferencesAsync(
+        [
+            new SymbolReference(
+                0,
+                targetSymbolId,
+                fileId,
+                12,
+                9,
+                ReferenceKind.Call),
+        ]);
+        await _store.BulkInsertEdgesAsync(
+        [
+            new Edge(
+                sourceSymbolId,
+                targetSymbolId,
+                DevBitsLab.Mcp.SourceGraph.Sdk.EdgeKinds.Calls)
+            {
+                Evidence = new Evidence(
+                    fileId,
+                    new SourceLocation(
+                        @"D:\repo\CameraService.cs",
+                        12,
+                        9,
+                        12,
+                        14),
+                    EvidenceConfidence.Inferred,
+                    "tree-sitter-cpp"),
+            },
+        ]);
+
+        var reference = (await _store.FindReferencesAsync(targetSymbolId))
+            .Should().ContainSingle().Subject;
+
+        reference.Confidence.Should().Be(EvidenceConfidence.Inferred);
+        reference.Producer.Should().Be("tree-sitter-cpp");
+    }
+
     private async Task<(long FileId, long SymbolId)> AddSymbolAsync()
     {
         var fileId = await _store!.UpsertFileAsync(

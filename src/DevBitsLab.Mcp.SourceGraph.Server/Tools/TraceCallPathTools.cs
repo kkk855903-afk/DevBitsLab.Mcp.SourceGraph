@@ -90,7 +90,7 @@ public static class TraceCallPathTools
         OutputSchemaType = typeof(TraceCallPathResult))]
     [ToolAnnotation(ReadOnlyHint = true, IdempotentHint = true)]
     [ToolTrigger("\"show how execution can flow from A to B\"")]
-    [Description("Trace bounded directed paths between indexed symbols. Defaults to calls edges and requires `to`. Set profile=execution to follow the ordered evidence-backed UI → command → managed call → gRPC dispatch → P/Invoke state machine. Execution mode may omit `to` when `from` is an exact canonical key; terminal discovery defaults to compact summary output with one shortest path per terminal, while explicit-target queries default to full detail. Exact canonical-key inputs never use fuzzy matching. Execution results disclose whether current absence claims are authoritative.")]
+    [Description("Trace bounded directed possible paths between indexed symbols; a returned path is not proof that every hop executes on every run. Defaults to calls edges and requires `to`. Set profile=execution to follow the ordered evidence-backed UI → command → managed call → gRPC dispatch → P/Invoke state machine. Detail output labels indexed conditional call sites with their branch condition. Execution mode may omit `to` when `from` is an exact canonical key; terminal discovery defaults to compact summary output with one shortest path per terminal, while explicit-target queries default to full detail. Exact canonical-key inputs never use fuzzy matching. Execution results disclose whether current absence claims are authoritative.")]
     public static Task<CallToolResult> TraceCallPathWithProfileAsync(
         ScopeRouter router,
         [Description("Starting symbol name, FQN, or exact canonical key")] string from,
@@ -1735,6 +1735,14 @@ public static class TraceCallPathTools
                 for (var hopIndex = 0; hopIndex < path.Hops.Count; hopIndex++)
                 {
                     var hop = path.Hops[hopIndex];
+                    var isConditional = hop.Evidence.Any(evidence =>
+                        evidence.Metadata?.TryGetValue(
+                            "control_flow",
+                            out var controlFlow) == true
+                        && string.Equals(
+                            controlFlow,
+                            "conditional",
+                            StringComparison.Ordinal));
                     sb.Append(hopIndex + 1).Append(". `")
                       .Append(hop.From.Fqn)
                       .Append("` -[")
@@ -1743,6 +1751,7 @@ public static class TraceCallPathTools
                       .Append(hop.To.Fqn)
                       .Append("` [")
                       .Append(hop.Confidence)
+                      .Append(isConditional ? "; conditional" : "")
                       .AppendLine("]");
                     foreach (var evidence in hop.Evidence)
                     {
@@ -1760,6 +1769,22 @@ public static class TraceCallPathTools
                           .Append(", ")
                           .Append(evidence.Producer)
                           .AppendLine("]");
+                        if (evidence.Metadata?.TryGetValue(
+                                "condition",
+                                out var condition) == true)
+                        {
+                            evidence.Metadata.TryGetValue(
+                                "branch",
+                                out var branch);
+                            sb.Append("     condition")
+                              .Append(string.IsNullOrWhiteSpace(branch)
+                                  ? ""
+                                  : $" ({branch})")
+                              .Append(": `")
+                              .Append(condition.Replace('`', '\''))
+                              .AppendLine(
+                                  "` — this hop is conditional, not guaranteed normal flow.");
+                        }
                     }
                 }
             }

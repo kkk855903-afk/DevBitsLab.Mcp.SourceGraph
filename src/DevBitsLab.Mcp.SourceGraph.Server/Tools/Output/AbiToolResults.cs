@@ -3,7 +3,11 @@ using DevBitsLab.Mcp.SourceGraph.Server.Interop;
 
 namespace DevBitsLab.Mcp.SourceGraph.Server.Tools.Output;
 
-/// <summary>Typed, multi-scope object-root output for <c>compare_struct</c>.</summary>
+/// <summary>
+/// Typed, multi-scope object-root output for <c>compare_struct</c>.
+/// <see cref="Partial"/> means the compatibility analysis itself was incomplete.
+/// <see cref="Truncated"/> independently means response details were omitted for presentation.
+/// </summary>
 public sealed record CompareStructResult(
     string Managed,
     string Native,

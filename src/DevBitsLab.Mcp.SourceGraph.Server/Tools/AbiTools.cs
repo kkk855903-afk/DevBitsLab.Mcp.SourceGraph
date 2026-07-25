@@ -51,7 +51,9 @@ public static class AbiTools
         + "current scope target. Exact canonical keys are preferred; non-canonical probes must "
         + "select exactly one record on each side. Nested records are compared only through the "
         + "explicit `nested_mappings` input and are never guessed by name. Returns typed checks, "
-        + "reasons, exact source evidence, and an Interop002 finding for non-compatible results.")]
+        + "reasons, exact source evidence, and an Interop002 finding for non-compatible results. "
+        + "`partial` describes analysis completeness; `truncated` only describes response "
+        + "presentation omissions.")]
     public static Task<CallToolResult> CompareStructAsync(
         ScopeRouter router,
         [Description(
@@ -315,9 +317,9 @@ public static class AbiTools
             .Append("`, relation=`struct-maps-to")
             .Append("`, scopes=")
             .Append(dto.Scopes.Count)
-            .Append(", partial=")
+            .Append(", analysis_partial=")
             .Append(dto.Partial ? "true" : "false")
-            .Append(", truncated=")
+            .Append(", response_truncated=")
             .Append(dto.Truncated ? "true" : "false")
             .Append(", omitted=")
             .Append(dto.OmittedCount);
@@ -484,7 +486,7 @@ public static class AbiTools
 
         return scope with
         {
-            Partial = scope.Partial || omitted > 0,
+            Partial = scope.Partial,
             Target = limits.IncludeTarget ? scope.Target : null,
             ManagedSelection = managedSelection,
             NativeSelection = nativeSelection,

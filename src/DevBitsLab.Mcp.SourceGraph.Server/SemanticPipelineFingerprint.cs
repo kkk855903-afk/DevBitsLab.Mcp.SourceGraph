@@ -9,7 +9,7 @@ namespace DevBitsLab.Mcp.SourceGraph.Server;
 /// </summary>
 internal static class SemanticPipelineFingerprint
 {
-    private const int CSharpIndexerVersion = 2;
+    private const int CSharpIndexerVersion = 3;
     private const int XamlIndexerVersion = 2;
     private const int CppSyntaxIndexerVersion = 4;
     private const int NativeInteropProjectionVersion = 2;

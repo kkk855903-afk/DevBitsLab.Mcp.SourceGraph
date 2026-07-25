@@ -2553,7 +2553,35 @@ public sealed partial class SqliteGraphStore : IGraphStore
         // tests) keep their pre-v7 behaviour.
         var sql = $"""
             SELECT r.id, r.symbol_id AS SymbolId, f.path AS FilePath, r.line, r.col, r.kind,
-                   f.is_generated AS IsGenerated
+                   f.is_generated AS IsGenerated,
+                   (
+                       SELECT ee.confidence
+                       FROM edge_evidence ee
+                       WHERE ee.dst = r.symbol_id
+                         AND ee.producing_file_id = r.file_id
+                         AND ee.start_line = r.line
+                         AND ee.start_col = r.col
+                         AND (
+                             r.kind <> @callKind
+                             OR ee.kind_name = @callsKind
+                         )
+                       ORDER BY ee.confidence DESC, ee.producer
+                       LIMIT 1
+                   ) AS EvidenceConfidence,
+                   (
+                       SELECT ee.producer
+                       FROM edge_evidence ee
+                       WHERE ee.dst = r.symbol_id
+                         AND ee.producing_file_id = r.file_id
+                         AND ee.start_line = r.line
+                         AND ee.start_col = r.col
+                         AND (
+                             r.kind <> @callKind
+                             OR ee.kind_name = @callsKind
+                         )
+                       ORDER BY ee.confidence DESC, ee.producer
+                       LIMIT 1
+                   ) AS EvidenceProducer
             FROM refs r
             JOIN files f ON f.id = r.file_id
             WHERE r.symbol_id = @id
@@ -2579,6 +2607,8 @@ public sealed partial class SqliteGraphStore : IGraphStore
             {
                 id = symbolId,
                 genericKind = (int)ReferenceKind.Reference,
+                callKind = (int)ReferenceKind.Call,
+                callsKind = DevBitsLab.Mcp.SourceGraph.Sdk.EdgeKinds.Calls,
                 limit,
             },
             cancellationToken: ct)).ConfigureAwait(false);
@@ -3277,9 +3307,29 @@ public sealed partial class SqliteGraphStore : IGraphStore
             PayloadJson: PayloadJson);
     }
 
-    private sealed record RawReferenceHit(long Id, long SymbolId, string FilePath, long Line, long Col, long Kind, long IsGenerated)
+    private sealed record RawReferenceHit(
+        long Id,
+        long SymbolId,
+        string FilePath,
+        long Line,
+        long Col,
+        long Kind,
+        long IsGenerated,
+        long? EvidenceConfidence,
+        string? EvidenceProducer)
     {
-        public ReferenceHit ToHit() => new(Id, SymbolId, FilePath, (int)Line, (int)Col, (Core.ReferenceKind)Kind, IsGenerated != 0);
+        public ReferenceHit ToHit() => new(
+            Id,
+            SymbolId,
+            FilePath,
+            (int)Line,
+            (int)Col,
+            (Core.ReferenceKind)Kind,
+            IsGenerated != 0,
+            EvidenceConfidence is null
+                ? null
+                : (Core.EvidenceConfidence)EvidenceConfidence.Value,
+            EvidenceProducer);
     }
 
     public async Task<IReadOnlyList<SymbolKeyRow>> GetAllSymbolKeysAsync(CancellationToken ct = default)
