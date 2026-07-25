@@ -43,6 +43,10 @@ public static class TraceCallPathTools
         EdgeKinds.Schedules,
         EdgeKinds.Dispatches,
         EdgeKinds.InterfaceDispatchesTo,
+        EdgeKinds.HandlesEvent,
+        EdgeKinds.RaisesEvent,
+        EdgeKinds.EventDispatchesTo,
+        EdgeKinds.SubscribesHandler,
         EdgeKinds.GrpcCalls,
         EdgeKinds.RpcDispatchesTo,
         EdgeKinds.PInvokeMapsTo,
@@ -726,6 +730,10 @@ public static class TraceCallPathTools
                     EdgeKinds.Schedules,
                     EdgeKinds.Dispatches,
                     EdgeKinds.InterfaceDispatchesTo,
+                    EdgeKinds.HandlesEvent,
+                    EdgeKinds.RaisesEvent,
+                    EdgeKinds.EventDispatchesTo,
+                    EdgeKinds.SubscribesHandler,
                 ],
             ExecutionStage.ManagedClient =>
                 [
@@ -733,6 +741,10 @@ public static class TraceCallPathTools
                     EdgeKinds.Schedules,
                     EdgeKinds.Dispatches,
                     EdgeKinds.InterfaceDispatchesTo,
+                    EdgeKinds.HandlesEvent,
+                    EdgeKinds.RaisesEvent,
+                    EdgeKinds.EventDispatchesTo,
+                    EdgeKinds.SubscribesHandler,
                     EdgeKinds.GrpcCalls,
                 ],
             ExecutionStage.AwaitRpcDispatch =>
@@ -765,6 +777,14 @@ public static class TraceCallPathTools
                 ExecutionStage.ManagedClient,
             (ExecutionStage.AwaitManagedCall, EdgeKinds.InterfaceDispatchesTo) =>
                 ExecutionStage.ManagedClient,
+            (ExecutionStage.AwaitManagedCall, EdgeKinds.HandlesEvent) =>
+                ExecutionStage.ManagedClient,
+            (ExecutionStage.AwaitManagedCall, EdgeKinds.RaisesEvent) =>
+                ExecutionStage.ManagedClient,
+            (ExecutionStage.AwaitManagedCall, EdgeKinds.EventDispatchesTo) =>
+                ExecutionStage.ManagedClient,
+            (ExecutionStage.AwaitManagedCall, EdgeKinds.SubscribesHandler) =>
+                ExecutionStage.ManagedClient,
             (ExecutionStage.ManagedClient, EdgeKinds.Calls) =>
                 ExecutionStage.ManagedClient,
             (ExecutionStage.ManagedClient, EdgeKinds.Schedules) =>
@@ -772,6 +792,14 @@ public static class TraceCallPathTools
             (ExecutionStage.ManagedClient, EdgeKinds.Dispatches) =>
                 ExecutionStage.ManagedClient,
             (ExecutionStage.ManagedClient, EdgeKinds.InterfaceDispatchesTo) =>
+                ExecutionStage.ManagedClient,
+            (ExecutionStage.ManagedClient, EdgeKinds.HandlesEvent) =>
+                ExecutionStage.ManagedClient,
+            (ExecutionStage.ManagedClient, EdgeKinds.RaisesEvent) =>
+                ExecutionStage.ManagedClient,
+            (ExecutionStage.ManagedClient, EdgeKinds.EventDispatchesTo) =>
+                ExecutionStage.ManagedClient,
+            (ExecutionStage.ManagedClient, EdgeKinds.SubscribesHandler) =>
                 ExecutionStage.ManagedClient,
             (ExecutionStage.ManagedClient, EdgeKinds.GrpcCalls) =>
                 ExecutionStage.AwaitRpcDispatch,
