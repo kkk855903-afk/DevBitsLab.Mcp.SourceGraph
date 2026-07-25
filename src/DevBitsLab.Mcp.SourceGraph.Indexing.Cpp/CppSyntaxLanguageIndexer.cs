@@ -240,6 +240,15 @@ public sealed class CppSyntaxLanguageIndexer : ILanguageIndexer, IBoundedSourceL
         {
             return null;
         }
+        if (node.Type is "declaration" or "field_declaration"
+            && node.NamedChildren.Any(child =>
+                child.Type is (
+                    "class_specifier"
+                    or "struct_specifier"
+                    or "union_specifier")))
+        {
+            return null;
+        }
 
         var functionDeclarator = node.Type == "function_definition"
             ? FindFunctionDeclarator(NamedField(node, "declarator") ?? node)

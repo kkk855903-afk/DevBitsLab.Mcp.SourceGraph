@@ -235,6 +235,40 @@ public sealed class CppSyntaxLanguageIndexerTests
     }
 
     [Fact]
+    public async Task Nested_class_declaration_does_not_emit_an_outer_method()
+    {
+        var events = await IndexAsync(
+            """
+            class CameraCapture
+            {
+            private:
+                class CallbackGuard
+                {
+                public:
+                    explicit CallbackGuard(CameraCapture& owner) noexcept {}
+                    ~CallbackGuard() {}
+                    CallbackGuard(const CallbackGuard&) = delete;
+                    CallbackGuard& operator=(const CallbackGuard&) = delete;
+                };
+            };
+            """);
+
+        var symbols = events.OfType<IndexEvent.SymbolDeclared>().ToArray();
+        symbols.Should().ContainSingle(symbol =>
+            symbol.Fqn == "CameraCapture::CallbackGuard"
+            && symbol.Kind == SymbolKinds.Class);
+        symbols.Should().NotContain(symbol =>
+            symbol.Fqn == "CameraCapture::CallbackGuard"
+            && symbol.Kind == SymbolKinds.Method);
+        symbols.Should().Contain(symbol =>
+            symbol.Fqn == "CameraCapture::CallbackGuard::CallbackGuard"
+            && symbol.Kind == SymbolKinds.Constructor);
+        symbols.Should().Contain(symbol =>
+            symbol.Fqn == "CameraCapture::CallbackGuard::~CallbackGuard"
+            && symbol.Kind == SymbolKinds.Method);
+    }
+
+    [Fact]
     public async Task Does_not_treat_local_object_construction_as_a_function()
     {
         var events = await IndexAsync(
