@@ -519,6 +519,21 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
             scope.Truncated.Should().BeFalse(
                 "a binding on the same XAML element must not hide its event execution branch");
         }
+        else
+        {
+            scope.ExecutionState!.Status.Should().Be("partial");
+            scope.ExecutionState.AbsenceAuthoritative.Should().BeFalse();
+            scope.ExecutionState.Projections.Should().ContainSingle(projection =>
+                projection.Name == "event-flow"
+                && projection.Status == "partial-external-trigger"
+                && !projection.Authoritative);
+            scope.ExecutionState.Failures.Should().ContainSingle(failure =>
+                failure.Contains(
+                    "partial because framework-owned event trigger is external",
+                    StringComparison.Ordinal));
+            CallToolResultHelpers.ProseText(result).Should().Contain(
+                "projection gap: event-flow: partial because framework-owned event trigger is external");
+        }
     }
 
     [Fact]

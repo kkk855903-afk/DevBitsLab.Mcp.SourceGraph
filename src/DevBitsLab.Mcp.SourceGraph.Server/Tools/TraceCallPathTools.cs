@@ -1120,14 +1120,32 @@ public static class TraceCallPathTools
         AddRelationProjection(
             "interface-dispatch",
             relations.Contains(EdgeKinds.InterfaceDispatchesTo));
-        AddRelationProjection(
-            "event-flow",
-            relations.Overlaps(
-            [
-                EdgeKinds.RaisesEvent,
-                EdgeKinds.EventDispatchesTo,
-                EdgeKinds.SubscribesHandler,
-            ]));
+        var usesExternalFrameworkTrigger =
+            relations.Contains(EdgeKinds.SubscribesHandler);
+        var relationFailures = new List<string>();
+        if (usesExternalFrameworkTrigger)
+        {
+            projections.Add(new TraceCallPathProjectionState(
+                "event-flow",
+                "partial-external-trigger",
+                Applicable: true,
+                Authoritative: false,
+                RetainedLastGood: false,
+                FailureCount: 1));
+            relationFailures.Add(
+                "event-flow: partial because framework-owned event trigger is external "
+                + "and its occurrence cannot be proven statically.");
+        }
+        else
+        {
+            AddRelationProjection(
+                "event-flow",
+                relations.Overlaps(
+                [
+                    EdgeKinds.RaisesEvent,
+                    EdgeKinds.EventDispatchesTo,
+                ]));
+        }
         AddRelationProjection(
             "xaml-event-flow",
             relations.Contains(EdgeKinds.HandlesEvent));
@@ -1152,6 +1170,7 @@ public static class TraceCallPathTools
                     : failure[..separator];
                 return applicableNames.Contains(projection);
             })
+            .Concat(relationFailures)
             .ToArray();
         var partial = projections.Any(projection =>
             projection.Applicable && !projection.Authoritative);
@@ -1458,6 +1477,11 @@ public static class TraceCallPathTools
                 {
                     sb.AppendLine(
                         "note: at least one relation projection is retained from the last complete index.");
+                }
+                foreach (var failure in scope.ExecutionState.Failures)
+                {
+                    sb.Append("projection gap: ")
+                      .AppendLine(failure);
                 }
             }
             if (!string.IsNullOrEmpty(scope.Note))
