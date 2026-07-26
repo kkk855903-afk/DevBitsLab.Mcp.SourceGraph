@@ -24,7 +24,7 @@ public sealed class SqliteScopeRegistry : IScopeRegistry
     // the first cold index after the upgrade. If a future schema change touches a column
     // whose value is NOT trivially recoverable from config + index, the migration strategy
     // will need to switch to ALTER TABLE rather than DROP.
-    private const int SchemaVersion = 2;
+    private const int SchemaVersion = 3;
 
     private readonly SqliteConnection _connection;
     private readonly ILogger<SqliteScopeRegistry> _logger;
@@ -63,7 +63,15 @@ public sealed class SqliteScopeRegistry : IScopeRegistry
                 "CREATE TABLE IF NOT EXISTS meta_schema_version (version INTEGER PRIMARY KEY);");
             var current = _connection.ExecuteScalar<int?>(
                 "SELECT MAX(version) FROM meta_schema_version;");
-            if (current is not null && current < SchemaVersion)
+            if (current == 2)
+            {
+                _logger.LogInformation(
+                    "Scope registry schema v2 -> v3; preserving rows while adding project_count");
+                _connection.Execute(
+                    "ALTER TABLE scopes ADD COLUMN project_count INTEGER;");
+                _connection.Execute("DELETE FROM meta_schema_version;");
+            }
+            else if (current is not null && current < SchemaVersion)
             {
                 _logger.LogInformation("Scope registry schema v{Old} -> v{New}; rebuilding", current, SchemaVersion);
                 _connection.Execute("DROP TABLE IF EXISTS scopes;");
@@ -82,7 +90,8 @@ public sealed class SqliteScopeRegistry : IScopeRegistry
                     status TEXT NOT NULL DEFAULT 'ok',
                     status_message TEXT,
                     failed_projects_json TEXT NOT NULL DEFAULT '[]',
-                    failed_files_json TEXT NOT NULL DEFAULT '[]'
+                    failed_files_json TEXT NOT NULL DEFAULT '[]',
+                    project_count INTEGER
                 );
                 """, transaction: tx);
             _connection.Execute(
@@ -110,7 +119,8 @@ public sealed class SqliteScopeRegistry : IScopeRegistry
                    status              AS Status,
                    status_message      AS StatusMessage,
                    failed_projects_json AS FailedProjectsJson,
-                   failed_files_json   AS FailedFilesJson
+                   failed_files_json   AS FailedFilesJson,
+                   project_count       AS ProjectCount
             FROM scopes
             ORDER BY id;
             """,
@@ -131,7 +141,8 @@ public sealed class SqliteScopeRegistry : IScopeRegistry
                    status              AS Status,
                    status_message      AS StatusMessage,
                    failed_projects_json AS FailedProjectsJson,
-                   failed_files_json   AS FailedFilesJson
+                   failed_files_json   AS FailedFilesJson,
+                   project_count       AS ProjectCount
             FROM scopes WHERE id = @id;
             """, new { id }, cancellationToken: ct)).ConfigureAwait(false);
         return row?.ToRow();
@@ -144,8 +155,8 @@ public sealed class SqliteScopeRegistry : IScopeRegistry
         {
             await _connection.ExecuteAsync(new CommandDefinition(
                 """
-                INSERT INTO scopes(id, name, root, project_set_json, isolated, last_indexed_at, status, status_message, failed_projects_json, failed_files_json)
-                VALUES (@Id, @Name, @Root, @ProjectSetJson, @IsolatedInt, @LastIndexedAtMs, @Status, @StatusMessage, @FailedProjectsJson, @FailedFilesJson)
+                INSERT INTO scopes(id, name, root, project_set_json, isolated, last_indexed_at, status, status_message, failed_projects_json, failed_files_json, project_count)
+                VALUES (@Id, @Name, @Root, @ProjectSetJson, @IsolatedInt, @LastIndexedAtMs, @Status, @StatusMessage, @FailedProjectsJson, @FailedFilesJson, @ProjectCount)
                 ON CONFLICT(id) DO UPDATE SET
                     name                 = excluded.name,
                     root                 = excluded.root,
@@ -155,7 +166,8 @@ public sealed class SqliteScopeRegistry : IScopeRegistry
                     status               = excluded.status,
                     status_message       = excluded.status_message,
                     failed_projects_json = excluded.failed_projects_json,
-                    failed_files_json    = excluded.failed_files_json;
+                    failed_files_json    = excluded.failed_files_json,
+                    project_count        = COALESCE(excluded.project_count, scopes.project_count);
                 """,
                 new
                 {
@@ -169,6 +181,7 @@ public sealed class SqliteScopeRegistry : IScopeRegistry
                     row.StatusMessage,
                     FailedProjectsJson = SerializeProjectFailures(row.FailedProjects),
                     FailedFilesJson = SerializeFileFailures(row.FailedFiles),
+                    row.ProjectCount,
                 },
                 cancellationToken: ct)).ConfigureAwait(false);
         }
@@ -246,12 +259,13 @@ public sealed class SqliteScopeRegistry : IScopeRegistry
 
     private sealed record RawScopeRow(string Id, string Name, string Root, string ProjectSetJson,
         long IsolatedInt, long LastIndexedAtMs, string Status, string? StatusMessage,
-        string? FailedProjectsJson, string? FailedFilesJson)
+        string? FailedProjectsJson, string? FailedFilesJson, long? ProjectCount)
     {
         public ScopeRow ToRow() => new(
             Id, Name, Root, ProjectSetJson, IsolatedInt != 0,
             DateTimeOffset.FromUnixTimeMilliseconds(LastIndexedAtMs), Status, StatusMessage,
             DeserializeProjectFailures(FailedProjectsJson),
-            DeserializeFileFailures(FailedFilesJson));
+            DeserializeFileFailures(FailedFilesJson),
+            ProjectCount is null ? null : checked((int)ProjectCount.Value));
     }
 }

@@ -391,6 +391,108 @@ public sealed class NativeInteropSnapshotPublisherTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task Syntax_only_symbols_are_not_native_stale_candidates()
+    {
+        var implementationPath = PathFor("native/api.cpp");
+        var fileId = await _store!.UpsertFileAsync(
+            implementationPath,
+            Hash(20),
+            DateTimeOffset.UtcNow);
+        var syntaxKey = "cpp:F:native/api.cpp::syntax::run()";
+        await _store.UpsertSymbolAsync(
+            syntaxKey,
+            new Symbol(
+                0,
+                "run",
+                "run",
+                SymbolKinds.Function,
+                fileId,
+                2,
+                1,
+                2,
+                20,
+                "int run()",
+                null,
+                "syntax-only"));
+        var headerPath = PathFor("native/api.h");
+        var export = Export(
+            "c:E:native/api.h::run",
+            "native.dll",
+            binaryVerified: false,
+            headerPath);
+
+        var result = await Publisher().PublishAsync(Snapshot(
+            hashes: [ContentHash(headerPath, Hash(21))],
+            sourceExports: [export]));
+
+        result.IsComplete.Should().BeTrue();
+        result.StaleCanonicalKeys.Should().NotContain(syntaxKey);
+        (await _store.GetSymbolByCanonicalKeyAsync(syntaxKey))
+            .Should().NotBeNull();
+    }
+
+    [Fact]
+    public async Task Native_header_semantics_replace_matching_syntax_only_symbols()
+    {
+        var headerPath = PathFor("native/api.h");
+        var fileId = await _store!.UpsertFileAsync(
+            headerPath,
+            Hash(22),
+            DateTimeOffset.UtcNow);
+        var shadowedKey = "cpp:F:native/api.h::syntax::run()";
+        await _store.UpsertSymbolAsync(
+            shadowedKey,
+            new Symbol(
+                0,
+                "run",
+                "run",
+                SymbolKinds.Function,
+                fileId,
+                1,
+                1,
+                1,
+                8,
+                "void run()",
+                null,
+                "syntax-only"));
+        var unrelatedKey = "cpp:F:native/api.h::syntax::helper()";
+        await _store.UpsertSymbolAsync(
+            unrelatedKey,
+            new Symbol(
+                0,
+                "helper",
+                "helper",
+                SymbolKinds.Function,
+                fileId,
+                2,
+                1,
+                2,
+                11,
+                "void helper()",
+                null,
+                "syntax-only"));
+        var export = Export(
+            "c:E:native/api.h::run",
+            "native.dll",
+            binaryVerified: false,
+            headerPath);
+
+        var result = await Publisher().PublishAsync(Snapshot(
+            hashes: [ContentHash(headerPath, Hash(23))],
+            sourceExports: [export]));
+
+        result.IsComplete.Should().BeTrue();
+        (await _store.GetSymbolByCanonicalKeyAsync(shadowedKey))
+            .Should().BeNull();
+        (await _store.GetSymbolByCanonicalKeyAsync(unrelatedKey))
+            .Should().NotBeNull(
+                "syntax-only declarations without a matching Clang semantic remain useful");
+        (await _store.GetSymbolByCanonicalKeyAsync(
+                export.SymbolCanonicalKey))
+            .Should().NotBeNull();
+    }
+
+    [Fact]
     public async Task Incomplete_candidate_retains_the_last_complete_snapshot()
     {
         var path = PathFor("native/api.h");

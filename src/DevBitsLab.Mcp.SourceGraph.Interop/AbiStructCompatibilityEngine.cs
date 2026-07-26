@@ -215,12 +215,10 @@ public sealed class AbiStructCompatibilityEngine
                 native.AlignmentBytes,
                 recordEvidence,
                 context);
-            CompareKnownDimension(
+            CompareEffectivePack(
+                managed,
+                native,
                 path,
-                AbiCompatibilityAspect.Pack,
-                "effective pack",
-                managed.Pack,
-                native.Pack,
                 recordEvidence,
                 context);
 
@@ -789,6 +787,46 @@ public sealed class AbiStructCompatibilityEngine
                 : $"{label} mismatch: managed={managed}, native={native}.",
             evidence);
     }
+
+    private static void CompareEffectivePack(
+        AbiRecordLayout managed,
+        AbiRecordLayout native,
+        string path,
+        IReadOnlyList<Evidence> evidence,
+        ComparisonContext context)
+    {
+        var managedPack = managed.Pack ?? PositiveDefaultPack(managed.Target);
+        var nativePack = native.Pack ?? PositiveDefaultPack(native.Target);
+        if (managedPack is null || nativePack is null)
+        {
+            context.Add(
+                path,
+                AbiCompatibilityAspect.Pack,
+                InteropCompatibility.Warning,
+                "effective pack is unknown on one or both sides, including the configured target default.",
+                evidence,
+                isUnknown: true);
+            return;
+        }
+
+        var managedSource = managed.Pack is null ? "target default" : "record";
+        var nativeSource = native.Pack is null ? "target default" : "record";
+        context.Add(
+            path,
+            AbiCompatibilityAspect.Pack,
+            managedPack == nativePack
+                ? InteropCompatibility.Compatible
+                : InteropCompatibility.Error,
+            managedPack == nativePack
+                ? $"Both layouts use effective pack {managedPack} "
+                  + $"(managed: {managedSource}; native: {nativeSource})."
+                : $"effective pack mismatch: managed={managedPack} ({managedSource}), "
+                  + $"native={nativePack} ({nativeSource}).",
+            evidence);
+    }
+
+    private static int? PositiveDefaultPack(InteropTarget target) =>
+        target.DefaultPack > 0 ? target.DefaultPack : null;
 
     private static IReadOnlyList<Evidence> EvidenceFor(params Evidence[] evidence) =>
         OrderEvidence(evidence);

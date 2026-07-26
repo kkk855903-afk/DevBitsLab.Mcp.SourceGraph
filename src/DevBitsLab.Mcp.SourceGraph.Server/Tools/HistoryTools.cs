@@ -33,7 +33,7 @@ public static class HistoryTools
     [Description("List the test methods that exercise a production symbol. Walks inbound `Tests` edges and returns each test's location, framework, and class.")]
     public static Task<CallToolResult> ListTestsForAsync(
         ScopeRouter router,
-        [Description("Production symbol name or FQN (e.g. 'Calculator.Add', 'Sample.Domain.Calculator.Multiply').")] string symbol,
+        [Description("Production symbol exact canonical key, name, or FQN (e.g. 'Calculator.Add', 'Sample.Domain.Calculator.Multiply').")] string symbol,
         [Description("Reserved for a future change that walks transitive callers; currently ignored.")] bool includeIndirect = false,
         [Description("Maximum results (default 50).")] int limit = 50,
         [Description(ScopeDescription)] string? scope = null,
@@ -42,7 +42,11 @@ public static class HistoryTools
             ScopedExecution.RunAsync(router, scope, async host =>
             {
                 var sw = System.Diagnostics.Stopwatch.StartNew();
-                var hits = await host.Store.FindSymbolsAsync(symbol, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
+                var hits = await SymbolQueryResolver.ResolveAsync(
+                    host.Store,
+                    symbol,
+                    limit: 5,
+                    ct).ConfigureAwait(false);
                 if (hits.Count == 0) return DiagnosticResult.Build($"No matches for '{symbol}'.");
                 var top = hits[0];
                 var tests = await host.Store.ListTestsForAsync(top.Id, limit, ct).ConfigureAwait(false);
@@ -153,7 +157,7 @@ public static class HistoryTools
     public static Task<CallToolResult> WhoAuthoredAsync(
         ScopeRouter router,
         HistoryOptions options,
-        [Description("Symbol name or FQN.")] string symbol,
+        [Description("Exact canonical key, symbol name, or FQN.")] string symbol,
         [Description(ScopeDescription)] string? scope = null,
         CancellationToken ct = default) =>
         ToolMetrics.TrackAsync("who_authored", new { symbol, scope }, () =>
@@ -164,7 +168,11 @@ public static class HistoryTools
                 {
                     return DiagnosticResult.Error("git history unavailable on this server (--no-history)");
                 }
-                var hits = await host.Store.FindSymbolsAsync(symbol, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
+                var hits = await SymbolQueryResolver.ResolveAsync(
+                    host.Store,
+                    symbol,
+                    limit: 5,
+                    ct).ConfigureAwait(false);
                 var top = hits.FirstOrDefault(hit => IsAllowedHistoryPath(host, hit.FilePath));
                 if (top is null) return DiagnosticResult.Build($"No matches for '{symbol}'.");
                 var history = await host.Store.GetSymbolHistoryAsync(top.Id, ct).ConfigureAwait(false);

@@ -588,8 +588,16 @@ public static class InteropTools
             else if (scope.SelectionCandidates.Count > 0)
             {
                 builder.Append("- Selection: ")
-                    .Append(scope.SelectionStatus)
-                    .Append(" — ")
+                    .Append(scope.SelectionStatus);
+                if (string.Equals(
+                        scope.SelectionStatus,
+                        "ambiguous",
+                        StringComparison.Ordinal))
+                {
+                    builder.Append(
+                        "; boundary analysis not executed. Rerun with one exact canonical key");
+                }
+                builder.Append(" — ")
                     .AppendJoin(
                         ", ",
                         scope.SelectionCandidates

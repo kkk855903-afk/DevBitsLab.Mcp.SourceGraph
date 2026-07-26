@@ -10,6 +10,7 @@ public sealed record TraceCallPathResult(
     [property: JsonPropertyName("from_query")] string FromQuery,
     [property: JsonPropertyName("to_query")] string? ToQuery,
     string Profile,
+    string Detail,
     [property: JsonPropertyName("destination_mode")] string DestinationMode,
     [property: JsonPropertyName("terminal_definition")] string? TerminalDefinition,
     [property: JsonPropertyName("edge_kind")] string? EdgeKind,
@@ -26,7 +27,44 @@ public sealed record TraceCallPathScopeResult(
     [property: JsonPropertyName("expanded_nodes")] int ExpandedNodes,
     string? Note,
     [property: JsonPropertyName("execution_state")]
-    TraceCallPathExecutionState? ExecutionState);
+    TraceCallPathExecutionState? ExecutionState)
+{
+    public string Status { get; init; } = "ok";
+
+    [JsonPropertyName("path_search_executed")]
+    public bool PathSearchExecuted { get; init; } = true;
+
+    [JsonPropertyName("ambiguous_role")]
+    public string? AmbiguousRole { get; init; }
+
+    public IReadOnlyList<TraceCallPathSymbol> Candidates { get; init; } = [];
+
+    public TraceCallPathTruncation? Truncation { get; init; }
+
+    [JsonPropertyName("last_resolved")]
+    public TraceCallPathSymbol? LastResolved { get; init; }
+
+    [JsonPropertyName("candidate_next_steps")]
+    public IReadOnlyList<TraceCallPathSymbol> CandidateNextSteps
+    {
+        get;
+        init;
+    } = [];
+}
+
+public sealed record TraceCallPathTruncation(
+    [property: JsonPropertyName("truncated_by")]
+    IReadOnlyList<string> TruncatedBy,
+    [property: JsonPropertyName("expanded_nodes")] int ExpandedNodes,
+    [property: JsonPropertyName("max_nodes")] int MaxNodes,
+    [property: JsonPropertyName("depth_reached")] int DepthReached,
+    [property: JsonPropertyName("max_depth")] int MaxDepth,
+    [property: JsonPropertyName("returned_paths")] int ReturnedPaths,
+    [property: JsonPropertyName("max_paths")] int MaxPaths,
+    [property: JsonPropertyName("returned_evidence_rows")]
+    int ReturnedEvidenceRows,
+    [property: JsonPropertyName("max_evidence_rows")] int MaxEvidenceRows,
+    [property: JsonPropertyName("branch_limit")] int BranchLimit);
 
 /// <summary>
 /// Completeness disclosure for the cross-domain execution profile. Persisted paths remain
@@ -57,7 +95,11 @@ public sealed record TraceCallPath(
     TraceCallPathSymbol From,
     TraceCallPathSymbol To,
     string Confidence,
-    IReadOnlyList<TraceCallPathHop> Hops);
+    IReadOnlyList<TraceCallPathHop> Hops)
+{
+    [JsonPropertyName("hop_count")]
+    public int HopCount { get; init; } = Hops.Count;
+}
 
 public sealed record TraceCallPathHop(
     TraceCallPathSymbol From,

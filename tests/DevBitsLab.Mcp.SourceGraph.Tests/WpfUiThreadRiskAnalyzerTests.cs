@@ -227,6 +227,46 @@ public sealed class WpfUiThreadRiskAnalyzerTests
             "Task.Run(() => provenUi.VerifyAccess());");
     }
 
+    [Fact]
+    public void DispatcherObjectContainingTypeDoesNotTaintOrdinaryMembers()
+    {
+        const string source = """
+            using System.Threading;
+            using System.Threading.Tasks;
+            using System.Windows.Threading;
+
+            namespace Fixture;
+
+            public sealed class View : DispatcherObject
+            {
+                public string Text { get; set; } = "";
+            }
+
+            public sealed class WindowLike : DispatcherObject
+            {
+                private readonly CancellationTokenSource _cancellation = new();
+                private readonly View _view = new();
+
+                public void Start()
+                {
+                    Task.Run(() => CameraLoopAsync(_cancellation.Token));
+                    Task.Run(() => _view.Text = "unsafe");
+                }
+
+                private Task CameraLoopAsync(CancellationToken token) =>
+                    Task.CompletedTask;
+            }
+            """;
+
+        var diagnostics = Analyze(source);
+
+        diagnostics.Should().ContainSingle(
+            "only the access through the actual DispatcherObject field is UI-bound");
+        LineText(diagnostics[0]).Should().Be(
+            "Task.Run(() => _view.Text = \"unsafe\");");
+        diagnostics[0].GetMessage().Should().Contain("Fixture.View.Text");
+    }
+
     private static IReadOnlyList<Diagnostic> Analyze(string source)
     {
         var trees = new[]

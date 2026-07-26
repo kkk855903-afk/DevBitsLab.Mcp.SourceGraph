@@ -13,6 +13,7 @@ internal sealed class CommandLine
     public string? DatabasePath { get; private init; }
     public string? RepoRoot { get; private init; }
     public bool ShowHelp { get; private init; }
+    public bool ShowVersion { get; private init; }
     public CliHelpLanguage HelpLanguage { get; private init; } = CliHelpLanguage.English;
     /// <summary>Override the default embedding model identity (Hugging Face-style id).</summary>
     public string? Model { get; private init; }
@@ -126,6 +127,19 @@ internal sealed class CommandLine
                     helpIndex: 0,
                     language: CliHelpLanguage.English,
                     alreadySpecified: false),
+                NoModelDownload = forceNoModelDownload || !allowModelDownload,
+            };
+        }
+        if (args[0] is "-v" or "--version")
+        {
+            if (args.Length != 1)
+            {
+                throw new ArgumentException(
+                    "--version does not accept additional arguments.");
+            }
+            return new CommandLine
+            {
+                ShowVersion = true,
                 NoModelDownload = forceNoModelDownload || !allowModelDownload,
             };
         }
@@ -457,6 +471,9 @@ internal sealed class CommandLine
           sourcegraph-mcp --help [--lang <en|zh>]
               Print this help in English (`en`) or Simplified Chinese (`zh`).
 
+          sourcegraph-mcp --version
+              Print the effective package/assembly version plus the .NET runtime and OS.
+
           sourcegraph-mcp serve [--solution <path>] [--db <path>] [--root <repo>] [--model <id>] [--no-embeddings] [--allow-model-download|--no-model-download] [--no-history] [--codex-compat]
               Run the MCP stdio server. With --solution given, registers an implicit single-scope
               `default` mapped to that solution. Otherwise reads `.sourcegraph.json` from --root
@@ -599,6 +616,9 @@ internal sealed class CommandLine
         用法:
           sourcegraph-mcp --help [--lang <en|zh>]
               使用英文 (`en`) 或简体中文 (`zh`) 显示本帮助。
+
+          sourcegraph-mcp --version
+              输出当前实际运行的包/程序集版本，以及 .NET 运行时和操作系统信息。
 
           sourcegraph-mcp serve [--solution <path>] [--db <path>] [--root <repo>] [--model <id>] [--no-embeddings] [--allow-model-download|--no-model-download] [--no-history] [--codex-compat]
               运行 MCP stdio 服务器。指定 --solution 时，将创建映射到该解决方案的隐式

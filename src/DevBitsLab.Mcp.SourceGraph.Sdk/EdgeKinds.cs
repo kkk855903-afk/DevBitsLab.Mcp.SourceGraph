@@ -15,6 +15,9 @@ public static class EdgeKinds
     public const string UsesType = "uses-type";
     public const string OverridesMember = "overrides-member";
     public const string ImplementsMember = "implements-member";
+
+    /// <summary>An interface member may dispatch execution to an implementing member.</summary>
+    public const string InterfaceDispatchesTo = "interface-dispatches-to";
     public const string Instantiates = "instantiates";
     public const string Throws = "throws";
 
@@ -33,6 +36,30 @@ public static class EdgeKinds
     /// <summary>A declarative UI event is handled by the target symbol.</summary>
     public const string HandlesEvent = "handles-event";
 
+    /// <summary>A source member subscribes a handler to the target event.</summary>
+    public const string SubscribesEvent = "subscribes-event";
+
+    /// <summary>A source member removes a handler from the target event.</summary>
+    public const string UnsubscribesEvent = "unsubscribes-event";
+
+    /// <summary>A source member raises the target event.</summary>
+    public const string RaisesEvent = "raises-event";
+
+    /// <summary>An event dispatches execution to a semantically resolved subscriber target.</summary>
+    public const string EventDispatchesTo = "event-dispatches-to";
+
+    /// <summary>
+    /// A source member subscribes a resolved handler when the framework event itself is external
+    /// to the indexed symbol universe.
+    /// </summary>
+    public const string SubscribesHandler = "subscribes-handler";
+
+    /// <summary>A source member schedules deferred execution of the target member.</summary>
+    public const string Schedules = "schedules";
+
+    /// <summary>A source member dispatches execution of the target member to another context.</summary>
+    public const string Dispatches = "dispatches";
+
     /// <summary>An ICommand property dispatches execution to a source method.</summary>
     public const string CommandExecutes = "command-executes";
 
@@ -47,6 +74,12 @@ public static class EdgeKinds
 
     /// <summary>A managed P/Invoke declaration maps to a native ABI export.</summary>
     public const string PInvokeMapsTo = "pinvoke-maps-to";
+
+    /// <summary>
+    /// A native ABI export declaration is implemented by a compiler-independent C/C++ syntax
+    /// definition in an implementation file.
+    /// </summary>
+    public const string NativeImplementation = "native-implementation";
 
     /// <summary>A managed interop struct maps to a native struct declaration.</summary>
     public const string StructMapsTo = "struct-maps-to";

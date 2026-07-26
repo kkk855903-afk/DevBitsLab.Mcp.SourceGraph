@@ -59,7 +59,7 @@ public static class ScopeTools
         foreach (var host in hosts)
         {
             var scope = host.Scope;
-            var projectCount = ProjectCount(scope.ProjectSet);
+            var projectCount = ProjectCount(host);
             var lastIndexed = host.LastIndexedAt == DateTimeOffset.MinValue
                 ? "_never_"
                 : host.LastIndexedAt.ToString("yyyy-MM-dd HH:mm:ss UTC");
@@ -136,13 +136,14 @@ public static class ScopeTools
                 Id: host.Scope.Id,
                 Name: host.Scope.Name,
                 Root: host.Scope.Root,
+                Exclude: host.Scope.ProjectSet.Exclude,
                 Status: host.Status,
                 StatusMessage: string.IsNullOrEmpty(host.StatusMessage) ? null : host.StatusMessage,
                 Isolated: host.Scope.Isolated,
                 LastIndexedAt: host.LastIndexedAt == DateTimeOffset.MinValue
                     ? null
                     : host.LastIndexedAt.ToString("o"),
-                ProjectCount: ProjectCount(host.Scope.ProjectSet),
+                ProjectCount: ProjectCount(host),
                 FailedProjects: host.FailedProjects
                     .Select(pf => new ListScopesProjectFailure(pf.Name, pf.Reason))
                     .ToList(),
@@ -160,7 +161,17 @@ public static class ScopeTools
         };
     }
 
-    private static int ProjectCount(Core.ScopeProjectSet projectSet) => projectSet switch
+    /// <summary>
+    /// Report the projects Roslyn actually loaded once a workspace is available. A solution
+    /// entry is only a container and may contain many projects, so counting configured solution
+    /// paths makes a healthy multi-project scope misleadingly appear as "1 project". Before the
+    /// initial workspace opens, retain the configured-item count as the only known value.
+    /// </summary>
+    internal static int ProjectCount(ScopeHost host) =>
+        host.Indexer.SanitizedSolution?.ProjectIds.Count
+        ?? ConfiguredProjectSetCount(host.Scope.ProjectSet);
+
+    private static int ConfiguredProjectSetCount(Core.ScopeProjectSet projectSet) => projectSet switch
     {
         Core.ScopeProjectSet.Solutions s => s.Items.Count,
         Core.ScopeProjectSet.Projects p => p.Items.Count,

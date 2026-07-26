@@ -6,6 +6,8 @@ using System.Threading.Tasks;
 using DevBitsLab.Mcp.SourceGraph.Indexing.Xaml.Parser;
 using DevBitsLab.Mcp.SourceGraph.Sdk;
 using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.CSharp.Syntax;
+using Microsoft.CodeAnalysis.Operations;
 
 namespace DevBitsLab.Mcp.SourceGraph.Indexing.Xaml;
 
@@ -37,7 +39,7 @@ internal sealed class XamlSemanticResolver
         _directBindingMembersOnly = directBindingMembersOnly;
         BuildBindingContexts(
             document.Root,
-            XamlBindingContextResolution.Unknown("no-known-data-context"));
+            ResolveCodeBehindDataContext(document));
     }
 
     public static async Task<XamlSemanticResolver?> CreateAsync(
@@ -226,6 +228,18 @@ internal sealed class XamlSemanticResolver
     {
         var effective = inherited;
         var associations = new List<XamlViewModelAssociation>(capacity: 2);
+        if (element.Parent is null
+            && inherited.Context is not null
+            && inherited.Outcome.Status == XamlResolutionStatus.Resolved)
+        {
+            AddAssociation(
+                associations,
+                inherited,
+                inherited.Context.Source,
+                element.Line,
+                element.Column,
+                element.LocalName.Length);
+        }
 
         var dataContextAttribute = element.Attributes.FirstOrDefault(a =>
             string.IsNullOrEmpty(a.Prefix)
@@ -291,6 +305,108 @@ internal sealed class XamlSemanticResolver
         {
             BuildBindingContexts(child, effective);
         }
+    }
+
+    private XamlBindingContextResolution ResolveCodeBehindDataContext(
+        XamlDocument document)
+    {
+        var xClass = document.Root.FindAttribute(
+            XamlReader.XamlNamespace,
+            "Class")?.Value.Trim();
+        if (string.IsNullOrEmpty(xClass))
+        {
+            return XamlBindingContextResolution.Unknown(
+                "no-known-data-context");
+        }
+
+        var codeBehindType = _compilation.GetTypeByMetadataName(xClass);
+        if (codeBehindType is null)
+        {
+            return XamlBindingContextResolution.Unknown(
+                "x-class-type-not-found");
+        }
+
+        var candidates = new List<INamedTypeSymbol>();
+        foreach (var constructor in codeBehindType.InstanceConstructors)
+        {
+            foreach (var syntaxReference in constructor.DeclaringSyntaxReferences)
+            {
+                if (syntaxReference.GetSyntax() is not
+                    ConstructorDeclarationSyntax syntax)
+                {
+                    continue;
+                }
+
+                var model = _compilation.GetSemanticModel(syntax.SyntaxTree);
+                foreach (var assignment in syntax
+                             .DescendantNodes()
+                             .OfType<AssignmentExpressionSyntax>())
+                {
+                    if (model.GetOperation(assignment) is not
+                        ISimpleAssignmentOperation operation
+                        || operation.Target is not
+                            IPropertyReferenceOperation propertyReference
+                        || !string.Equals(
+                            propertyReference.Property.Name,
+                            "DataContext",
+                            StringComparison.Ordinal))
+                    {
+                        continue;
+                    }
+
+                    var type = AssignedNamedType(operation.Value);
+                    if (type is null
+                        || candidates.Any(candidate =>
+                            SymbolEqualityComparer.Default.Equals(
+                                candidate,
+                                type)))
+                    {
+                        continue;
+                    }
+                    candidates.Add(type);
+                }
+            }
+        }
+
+        return candidates.Count switch
+        {
+            0 => XamlBindingContextResolution.Unknown(
+                "no-known-data-context"),
+            1 => XamlBindingContextResolution.Resolved(
+                candidates[0],
+                "code-behind-data-context"),
+            _ => new XamlBindingContextResolution(
+                new XamlResolutionOutcome(
+                    XamlResolutionStatus.Ambiguous,
+                    "multiple-code-behind-data-context-types"),
+                Context: null,
+                candidates
+                    .Select(candidate => candidate.ToDisplayString())
+                    .OrderBy(candidate => candidate, StringComparer.Ordinal)
+                    .ToArray()),
+        };
+    }
+
+    private static INamedTypeSymbol? AssignedNamedType(IOperation value)
+    {
+        while (value is IConversionOperation
+               {
+                   IsImplicit: true,
+                   Operand: { } operand,
+               })
+        {
+            value = operand;
+        }
+
+        var type = value switch
+        {
+            IFieldReferenceOperation field => field.Field.Type,
+            ILocalReferenceOperation local => local.Local.Type,
+            IParameterReferenceOperation parameter => parameter.Parameter.Type,
+            IPropertyReferenceOperation property => property.Property.Type,
+            _ => value.Type,
+        };
+        return type is null ? null : AsNamedType(type);
     }
 
     private static void AddAssociation(

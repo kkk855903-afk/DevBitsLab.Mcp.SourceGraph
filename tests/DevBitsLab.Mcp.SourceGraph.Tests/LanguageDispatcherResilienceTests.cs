@@ -233,6 +233,28 @@ public sealed class LanguageDispatcherResilienceTests : IDisposable
     }
 
     [Fact]
+    public void Compiler_errors_make_a_queryable_scope_partial_instead_of_ok()
+    {
+        var status = LiveIndexService.ResolveColdIndexStatus(
+            currentPassProducedUsableOutput: true,
+            new RowCountsRow(
+                Symbols: 12,
+                Refs: 20,
+                Edges: 4,
+                Files: 3,
+                Annotations: 0,
+                Diagnostics: 269),
+            failedProjectCount: 0,
+            failedFileCount: 0,
+            projectDiscoveryFailed: false,
+            compilationErrorCount: 269);
+
+        status.Status.Should().Be("partial");
+        status.UsesRetainedGraph.Should().BeFalse();
+        status.StatusMessage.Should().Contain("269 compiler error(s)");
+    }
+
+    [Fact]
     public async Task ProjectAnchorDeleteRetainsOldGraphWhenRoslynReloadFails()
     {
         var projectPath = await PlantAsync("src/App/App.csproj", "<Project />");

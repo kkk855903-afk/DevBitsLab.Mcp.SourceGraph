@@ -130,6 +130,83 @@ public sealed partial class SqliteGraphStore : IGraphStore
         }
     }
 
+    public async Task<bool> EnsureSemanticPipelineAsync(
+        string fingerprint,
+        CancellationToken ct = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(fingerprint);
+        if (fingerprint.Length > 2048)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(fingerprint),
+                "Semantic pipeline fingerprint must not exceed 2048 characters.");
+        }
+
+        const string metadataKey = "semantic-pipeline-fingerprint";
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            var current = await _connection.ExecuteScalarAsync<string?>(
+                new CommandDefinition(
+                    "SELECT value FROM index_metadata WHERE key = @key;",
+                    new { key = metadataKey },
+                    cancellationToken: ct)).ConfigureAwait(false);
+            if (string.Equals(current, fingerprint, StringComparison.Ordinal))
+            {
+                return false;
+            }
+
+            _logger.LogInformation(
+                "Semantic pipeline fingerprint changed; invalidating the complete derived graph");
+            using var tx = _connection.BeginTransaction();
+            await _connection.ExecuteAsync(
+                new CommandDefinition(
+                    Schema.DropAll,
+                    transaction: tx,
+                    cancellationToken: ct)).ConfigureAwait(false);
+            await _connection.ExecuteAsync(
+                new CommandDefinition(
+                    Schema.V1,
+                    transaction: tx,
+                    cancellationToken: ct)).ConfigureAwait(false);
+            await _connection.ExecuteAsync(
+                new CommandDefinition(
+                    Schema.V2,
+                    transaction: tx,
+                    cancellationToken: ct)).ConfigureAwait(false);
+            if (_vectorExtensionLoaded && _embeddingDimension > 0)
+            {
+                await _connection.ExecuteAsync(
+                    new CommandDefinition(
+                        Schema.V7Embeddings(_embeddingDimension),
+                        transaction: tx,
+                        cancellationToken: ct)).ConfigureAwait(false);
+            }
+            await _connection.ExecuteAsync(
+                new CommandDefinition(
+                    "INSERT OR REPLACE INTO schema_version(version) VALUES (@version);",
+                    new { version = Schema.Version },
+                    transaction: tx,
+                    cancellationToken: ct)).ConfigureAwait(false);
+            await _connection.ExecuteAsync(
+                new CommandDefinition(
+                    """
+                    INSERT INTO index_metadata(key, value)
+                    VALUES (@key, @value)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+                    """,
+                    new { key = metadataKey, value = fingerprint },
+                    transaction: tx,
+                    cancellationToken: ct)).ConfigureAwait(false);
+            tx.Commit();
+            return true;
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
     public Task<GraphReadVersion> GetReadVersionAsync(
         CancellationToken ct = default)
     {
@@ -2476,16 +2553,65 @@ public sealed partial class SqliteGraphStore : IGraphStore
         // tests) keep their pre-v7 behaviour.
         var sql = $"""
             SELECT r.id, r.symbol_id AS SymbolId, f.path AS FilePath, r.line, r.col, r.kind,
-                   f.is_generated AS IsGenerated
+                   f.is_generated AS IsGenerated,
+                   (
+                       SELECT ee.confidence
+                       FROM edge_evidence ee
+                       WHERE ee.dst = r.symbol_id
+                         AND ee.producing_file_id = r.file_id
+                         AND ee.start_line = r.line
+                         AND ee.start_col = r.col
+                         AND (
+                             r.kind <> @callKind
+                             OR ee.kind_name = @callsKind
+                         )
+                       ORDER BY ee.confidence DESC, ee.producer
+                       LIMIT 1
+                   ) AS EvidenceConfidence,
+                   (
+                       SELECT ee.producer
+                       FROM edge_evidence ee
+                       WHERE ee.dst = r.symbol_id
+                         AND ee.producing_file_id = r.file_id
+                         AND ee.start_line = r.line
+                         AND ee.start_col = r.col
+                         AND (
+                             r.kind <> @callKind
+                             OR ee.kind_name = @callsKind
+                         )
+                       ORDER BY ee.confidence DESC, ee.producer
+                       LIMIT 1
+                   ) AS EvidenceProducer
             FROM refs r
             JOIN files f ON f.id = r.file_id
             WHERE r.symbol_id = @id
               {(includeGenerated ? "" : "AND f.is_generated = 0")}
+              AND NOT (
+                r.kind = @genericKind
+                AND EXISTS (
+                    SELECT 1
+                    FROM refs specific
+                    WHERE specific.symbol_id = r.symbol_id
+                      AND specific.file_id = r.file_id
+                      AND specific.line = r.line
+                      AND specific.col = r.col
+                      AND specific.kind <> @genericKind
+                )
+              )
             ORDER BY f.path, r.line, r.col
             LIMIT @limit;
             """;
         var rows = await _connection.QueryAsync<RawReferenceHit>(new CommandDefinition(
-            sql, new { id = symbolId, limit }, cancellationToken: ct)).ConfigureAwait(false);
+            sql,
+            new
+            {
+                id = symbolId,
+                genericKind = (int)ReferenceKind.Reference,
+                callKind = (int)ReferenceKind.Call,
+                callsKind = DevBitsLab.Mcp.SourceGraph.Sdk.EdgeKinds.Calls,
+                limit,
+            },
+            cancellationToken: ct)).ConfigureAwait(false);
         return rows.Select(r => r.ToHit()).ToList();
     }
 
@@ -2987,6 +3113,12 @@ public sealed partial class SqliteGraphStore : IGraphStore
 
     public async Task<IReadOnlyList<SymbolHit>> ListSymbolsInFileAsync(string filePath, CancellationToken ct = default)
     {
+        ArgumentException.ThrowIfNullOrWhiteSpace(filePath);
+        var normalizedPath = filePath.Replace('\\', '/');
+        while (normalizedPath.StartsWith("./", StringComparison.Ordinal))
+        {
+            normalizedPath = normalizedPath[2..];
+        }
         const string sql = """
             SELECT s.id, s.name, s.fqn, s.kind_name AS Kind, f.path AS FilePath, s.start_line AS StartLine, s.start_col AS StartCol,
                    s.end_line AS EndLine, s.end_col AS EndCol, s.signature,
@@ -2995,11 +3127,12 @@ public sealed partial class SqliteGraphStore : IGraphStore
                    s.canonical_key AS CanonicalKey
             FROM symbols s
             JOIN files f ON f.id = s.file_id
-            WHERE f.path = @path OR f.path LIKE '%' || @path
+            WHERE REPLACE(f.path, '\', '/') = @path
+               OR REPLACE(f.path, '\', '/') LIKE '%/' || @path
             ORDER BY s.start_line, s.start_col;
             """;
         var rows = await _connection.QueryAsync<RawSymbolHit>(new CommandDefinition(
-            sql, new { path = filePath }, cancellationToken: ct)).ConfigureAwait(false);
+            sql, new { path = normalizedPath }, cancellationToken: ct)).ConfigureAwait(false);
         return rows.Select(r => r.ToHit()).ToList();
     }
 
@@ -3174,9 +3307,29 @@ public sealed partial class SqliteGraphStore : IGraphStore
             PayloadJson: PayloadJson);
     }
 
-    private sealed record RawReferenceHit(long Id, long SymbolId, string FilePath, long Line, long Col, long Kind, long IsGenerated)
+    private sealed record RawReferenceHit(
+        long Id,
+        long SymbolId,
+        string FilePath,
+        long Line,
+        long Col,
+        long Kind,
+        long IsGenerated,
+        long? EvidenceConfidence,
+        string? EvidenceProducer)
     {
-        public ReferenceHit ToHit() => new(Id, SymbolId, FilePath, (int)Line, (int)Col, (Core.ReferenceKind)Kind, IsGenerated != 0);
+        public ReferenceHit ToHit() => new(
+            Id,
+            SymbolId,
+            FilePath,
+            (int)Line,
+            (int)Col,
+            (Core.ReferenceKind)Kind,
+            IsGenerated != 0,
+            EvidenceConfidence is null
+                ? null
+                : (Core.EvidenceConfidence)EvidenceConfidence.Value,
+            EvidenceProducer);
     }
 
     public async Task<IReadOnlyList<SymbolKeyRow>> GetAllSymbolKeysAsync(CancellationToken ct = default)

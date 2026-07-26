@@ -420,7 +420,7 @@
         "dependencies": {
           "DevBitsLab.Mcp.SourceGraph.Core": "[1.0.0, )",
           "DevBitsLab.Mcp.SourceGraph.Embeddings": "[1.0.0, )",
-          "DevBitsLab.Mcp.SourceGraph.Sdk": "[2.4.0, )",
+          "DevBitsLab.Mcp.SourceGraph.Sdk": "[2.5.0, )",
           "DevBitsLab.Mcp.SourceGraph.Storage": "[1.0.0, )",
           "Google.Protobuf": "[3.35.1, )",
           "Microsoft.Build.Locator": "[1.11.2, )",
@@ -437,7 +437,7 @@
         "dependencies": {
           "Dapper": "[2.1.72, )",
           "DevBitsLab.Mcp.SourceGraph.Core": "[1.0.0, )",
-          "DevBitsLab.Mcp.SourceGraph.Sdk": "[2.4.0, )",
+          "DevBitsLab.Mcp.SourceGraph.Sdk": "[2.5.0, )",
           "Microsoft.Data.Sqlite": "[10.0.10, )",
           "Microsoft.Extensions.Logging.Abstractions": "[10.0.10, )",
           "sqlite-vec": "[0.1.7-alpha.2.1, )"

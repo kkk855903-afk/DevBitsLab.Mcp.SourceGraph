@@ -52,14 +52,6 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         OperatingSystem.IsWindows()
             ? StringComparison.OrdinalIgnoreCase
             : StringComparison.Ordinal;
-    private static readonly PropertyInfo? _documentStateProperty =
-        typeof(Document).GetProperty(
-            "DocumentState",
-            BindingFlags.Instance | BindingFlags.NonPublic);
-    private static readonly PropertyInfo? _documentStateIsGeneratedProperty =
-        _documentStateProperty?.PropertyType.GetProperty(
-            "IsGenerated",
-            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
     private static readonly string[] _analysisEdgeProducer =
     [
         InteropFactProducers.Analysis,
@@ -210,6 +202,55 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
     /// <see cref="MSBuildWorkspace.CurrentSolution"/>.
     /// </summary>
     public Solution? SanitizedSolution => _sanitizedSolution;
+
+    /// <summary>
+    /// Lists SDK/WPF build-generated documents retained only as compiler inputs. These documents
+    /// intentionally stay out of the ordinary generated-file search index, but exposing their
+    /// presence lets diagnostics distinguish "no source-generator output" from "the workspace
+    /// failed to load GlobalUsings.g.cs / WPF .g.cs inputs".
+    /// </summary>
+    public IReadOnlyList<BuildGeneratedCompilerInput>
+        ListBuildGeneratedCompilerInputs()
+    {
+        var solution = _sanitizedSolution;
+        if (solution is null)
+        {
+            return Array.Empty<BuildGeneratedCompilerInput>();
+        }
+
+        return solution.Projects
+            .SelectMany(project => project.Documents)
+            .Where(SolutionPrivacySanitizer.IsBuildGeneratedDocument)
+            .Select(document =>
+            {
+                var path = document.FilePath ?? document.Name;
+                var fileName = Path.GetFileName(path);
+                var category =
+                    fileName.EndsWith(
+                        "GlobalUsings.g.cs",
+                        StringComparison.OrdinalIgnoreCase)
+                    || fileName.Contains(
+                        "AssemblyInfo",
+                        StringComparison.OrdinalIgnoreCase)
+                    || fileName.Contains(
+                        "AssemblyAttributes",
+                        StringComparison.OrdinalIgnoreCase)
+                        ? "sdk-generated"
+                        : fileName.EndsWith(
+                                ".g.cs",
+                                StringComparison.OrdinalIgnoreCase)
+                            || fileName.EndsWith(
+                                ".g.i.cs",
+                                StringComparison.OrdinalIgnoreCase)
+                            ? "wpf-generated"
+                            : "build-generated";
+                return new BuildGeneratedCompilerInput(path, category);
+            })
+            .Distinct()
+            .OrderBy(input => input.Category, StringComparer.Ordinal)
+            .ThenBy(input => input.FilePath, _pathComparer)
+            .ToArray();
+    }
 
     /// <summary>
     /// Returns whether every Roslyn input for all target-framework iterations of
@@ -439,24 +480,8 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         }
     }
 
-    [SuppressMessage(
-        "ReflectionAnalysis",
-        "IL2075:UnrecognizedReflectionPattern",
-        Justification = "The pinned Roslyn workspace does not publicly expose DocumentInfo.IsGenerated from Document; missing or changed internals fail closed.")]
-    private static bool IsBuildGeneratedDocument(Document document)
-    {
-        try
-        {
-            var state = _documentStateProperty?.GetValue(document);
-            return state is not null
-                   && _documentStateIsGeneratedProperty?.GetValue(state)
-                       is true;
-        }
-        catch
-        {
-            return false;
-        }
-    }
+    private static bool IsBuildGeneratedDocument(Document document) =>
+        SolutionPrivacySanitizer.IsBuildGeneratedDocument(document);
 
     private enum ProjectSemanticInputState
     {
@@ -1824,6 +1849,9 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
     private MSBuildWorkspace CreateWorkspace()
     {
         var workspace = MSBuildWorkspace.Create();
+        // A solution may legitimately contain VC++ projects. Roslyn owns only managed-language
+        // projects; the native interop pipeline handles configured C/C++ translation units.
+        workspace.SkipUnrecognizedProjects = true;
         var diagnostics = new ConcurrentQueue<WorkspaceDiagnostic>();
         _workspaceDiagnostics[workspace] = diagnostics;
         workspace.RegisterWorkspaceFailedHandler(e =>
@@ -1831,7 +1859,18 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
             diagnostics.Enqueue(e.Diagnostic);
             if (e.Diagnostic.Kind == WorkspaceDiagnosticKind.Failure)
             {
-                _logger.LogWarning("Workspace failure: {Message}", e.Diagnostic.Message);
+                if (IsUnsupportedNativeProjectDiagnostic(e.Diagnostic))
+                {
+                    _logger.LogInformation(
+                        "Workspace skipped non-Roslyn native project: {Message}",
+                        e.Diagnostic.Message);
+                }
+                else
+                {
+                    _logger.LogWarning(
+                        "Workspace failure: {Message}",
+                        e.Diagnostic.Message);
+                }
             }
             else
             {
@@ -1900,7 +1939,8 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
     {
         var failureDiagnostics = diagnostics
             .Where(diagnostic =>
-                diagnostic.Kind == WorkspaceDiagnosticKind.Failure)
+                diagnostic.Kind == WorkspaceDiagnosticKind.Failure
+                && !IsUnsupportedNativeProjectDiagnostic(diagnostic))
             .ToList();
         if (failureDiagnostics.Count == 0)
         {
@@ -1912,6 +1952,33 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                 " | ",
                 failureDiagnostics.Select(diagnostic =>
                     FailureMessage.Truncate(diagnostic.Message))));
+    }
+
+    private static bool IsUnsupportedNativeProjectDiagnostic(
+        WorkspaceDiagnostic diagnostic)
+    {
+        if (diagnostic.Kind != WorkspaceDiagnosticKind.Failure)
+        {
+            return false;
+        }
+
+        // WorkspaceDiagnostic exposes only localized prose, not the failed project path or an
+        // error code. Project extensions and MSVC target names remain invariant across locales.
+        return diagnostic.Message.Contains(
+                ".vcxproj",
+                StringComparison.OrdinalIgnoreCase)
+            || diagnostic.Message.Contains(
+                ".vcproj",
+                StringComparison.OrdinalIgnoreCase)
+            || diagnostic.Message.Contains(
+                ".vcxitems",
+                StringComparison.OrdinalIgnoreCase)
+            || diagnostic.Message.Contains(
+                "VCTargetsPath",
+                StringComparison.OrdinalIgnoreCase)
+            || diagnostic.Message.Contains(
+                "Microsoft.Cpp.",
+                StringComparison.OrdinalIgnoreCase);
     }
 
     private bool IsCSharpStructureChange(Solution solution, string path)
@@ -2502,6 +2569,7 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         // state visible so a later integrity/structural retry can repair it.
         var walkedFileIds = new HashSet<long>();
         var failedFiles = new List<FileFailure>();
+        var compilationErrorCount = 0;
         if (initialFailures is not null)
         {
             foreach (var failure in initialFailures)
@@ -3261,7 +3329,22 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                     long dst,
                     string kind,
                     SyntaxNode evidenceNode,
-                    CoreEvidenceConfidence confidence)
+                    CoreEvidenceConfidence confidence) =>
+                    AddEdgeWithMetadata(
+                        src,
+                        dst,
+                        kind,
+                        evidenceNode,
+                        confidence,
+                        evidenceMetadata: null);
+
+                void AddEdgeWithMetadata(
+                    long src,
+                    long dst,
+                    string kind,
+                    SyntaxNode evidenceNode,
+                    CoreEvidenceConfidence confidence,
+                    IReadOnlyDictionary<string, string>? evidenceMetadata)
                 {
                     if (src == dst) return;
                     var lineSpan = evidenceNode.GetLocation().GetLineSpan();
@@ -3290,7 +3373,8 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                                     endLine,
                                     endColumn),
                                 confidence,
-                                "roslyn"),
+                                "roslyn",
+                                evidenceMetadata),
                         });
                     }
                 }
@@ -3300,14 +3384,20 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                     ISymbol? referenced = null;
                     ReferenceKind kind = ReferenceKind.Reference;
                     SyntaxNode? refNode = null; // node whose position we record
+                    var referenceConfidence =
+                        CoreEvidenceConfidence.Exact;
 
                     switch (node)
                     {
                         case IdentifierNameSyntax id when id.Parent is not (NamespaceDeclarationSyntax or BaseTypeDeclarationSyntax or MethodDeclarationSyntax or PropertyDeclarationSyntax or VariableDeclaratorSyntax or ParameterSyntax or TypeParameterSyntax):
-                            referenced = id.Parent is InvocationExpressionSyntax invocationId
+                            var identifierInfo =
+                                id.Parent is InvocationExpressionSyntax invocationId
                                 && invocationId.Expression == id
-                                    ? model.GetSymbolInfo(invocationId, ct).Symbol
-                                    : model.GetSymbolInfo(id, ct).Symbol;
+                                    ? model.GetSymbolInfo(invocationId, ct)
+                                    : model.GetSymbolInfo(id, ct);
+                            referenced = ResolveReferenceCandidate(
+                                identifierInfo,
+                                out referenceConfidence);
                             refNode = id;
                             kind = id.Parent is InvocationExpressionSyntax inv
                                 && inv.Expression == id
@@ -3316,10 +3406,14 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                             break;
 
                         case GenericNameSyntax gn:
-                            referenced = gn.Parent is InvocationExpressionSyntax invocationGeneric
+                            var genericInfo =
+                                gn.Parent is InvocationExpressionSyntax invocationGeneric
                                 && invocationGeneric.Expression == gn
-                                    ? model.GetSymbolInfo(invocationGeneric, ct).Symbol
-                                    : model.GetSymbolInfo(gn, ct).Symbol;
+                                    ? model.GetSymbolInfo(invocationGeneric, ct)
+                                    : model.GetSymbolInfo(gn, ct);
+                            referenced = ResolveReferenceCandidate(
+                                genericInfo,
+                                out referenceConfidence);
                             refNode = gn;
                             kind = gn.Parent is InvocationExpressionSyntax invGn
                                 && invGn.Expression == gn
@@ -3328,10 +3422,14 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                             break;
 
                         case MemberAccessExpressionSyntax mae:
-                            referenced = mae.Parent is InvocationExpressionSyntax invocationMember
+                            var memberInfo =
+                                mae.Parent is InvocationExpressionSyntax invocationMember
                                 && invocationMember.Expression == mae
-                                    ? model.GetSymbolInfo(invocationMember, ct).Symbol
-                                    : model.GetSymbolInfo(mae.Name, ct).Symbol;
+                                    ? model.GetSymbolInfo(invocationMember, ct)
+                                    : model.GetSymbolInfo(mae.Name, ct);
+                            referenced = ResolveReferenceCandidate(
+                                memberInfo,
+                                out referenceConfidence);
                             refNode = mae.Name;
                             kind = mae.Parent is InvocationExpressionSyntax invMa && invMa.Expression == mae
                                 ? ReferenceKind.Call
@@ -3339,22 +3437,30 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                             break;
 
                         case ObjectCreationExpressionSyntax oce:
-                            referenced = model.GetSymbolInfo(oce, ct).Symbol;
+                            referenced = ResolveReferenceCandidate(
+                                model.GetSymbolInfo(oce, ct),
+                                out referenceConfidence);
                             refNode = oce;
                             kind = ReferenceKind.Call;
                             break;
 
                         case ImplicitObjectCreationExpressionSyntax ioce:
-                            referenced = model.GetSymbolInfo(ioce, ct).Symbol;
+                            referenced = ResolveReferenceCandidate(
+                                model.GetSymbolInfo(ioce, ct),
+                                out referenceConfidence);
                             refNode = ioce;
                             kind = ReferenceKind.Call;
                             break;
 
                         case MemberBindingExpressionSyntax mbe:
-                            referenced = mbe.Parent is InvocationExpressionSyntax invocationBinding
+                            var bindingInfo =
+                                mbe.Parent is InvocationExpressionSyntax invocationBinding
                                 && invocationBinding.Expression == mbe
-                                    ? model.GetSymbolInfo(invocationBinding, ct).Symbol
-                                    : model.GetSymbolInfo(mbe.Name, ct).Symbol;
+                                    ? model.GetSymbolInfo(invocationBinding, ct)
+                                    : model.GetSymbolInfo(mbe.Name, ct);
+                            referenced = ResolveReferenceCandidate(
+                                bindingInfo,
+                                out referenceConfidence);
                             refNode = mbe.Name;
                             kind = mbe.Parent is InvocationExpressionSyntax invMb
                                 && invMb.Expression == mbe
@@ -3393,12 +3499,40 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                             var encKey = SymbolMapping.CanonicalKey(enclosing);
                             if (encKey is not null && _symbolIdByKey.TryGetValue(encKey, out var srcId))
                             {
-                                AddEdge(
+                                AddEdgeWithMetadata(
                                     srcId,
                                     symId,
                                     EdgeKinds.Calls,
                                     refNode,
-                                    CoreEvidenceConfidence.Exact);
+                                    referenceConfidence,
+                                    ConditionalControlFlowMetadata(refNode));
+                            }
+                        }
+                    }
+
+                    if (referenced is IEventSymbol)
+                    {
+                        var eventRelation = ClassifyEventRelation(refNode);
+                        if (eventRelation is not null)
+                        {
+                            var enclosing = FindEnclosingMember(
+                                model,
+                                refNode.SpanStart,
+                                ct);
+                            var enclosingKey = enclosing is null
+                                ? null
+                                : SymbolMapping.CanonicalKey(enclosing);
+                            if (enclosingKey is not null
+                                && _symbolIdByKey.TryGetValue(
+                                    enclosingKey,
+                                    out var sourceId))
+                            {
+                                AddEdge(
+                                    sourceId,
+                                    symId,
+                                    eventRelation,
+                                    refNode,
+                                    referenceConfidence);
                             }
                         }
                     }
@@ -3440,6 +3574,15 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                         }
                     }
                 }
+
+                EmitScheduledExecutions(root, model, AddEdge, ct);
+
+                // Connect an event directly to the source members executed by its subscription
+                // handler. Lambdas are intentionally projected without inventing unstable
+                // anonymous symbol identities: nested dispatcher callbacks still resolve to
+                // their concrete target method. For metadata-only framework events, retain the
+                // useful subscription-to-handler relation from the enclosing source member.
+                EmitEventExecutions(root, model, AddEdge, ct);
 
                 // Connect an ICommand property to the source method captured by the command
                 // object's single delegate argument. This is deliberately operation-based:
@@ -3790,8 +3933,10 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
             }
 
             var project = _sanitizedSolution!.GetProject(pid);
-            var compilationContainsErrors = diags.Any(diagnostic =>
+            var projectCompilationErrorCount = diags.Count(diagnostic =>
                 diagnostic.Severity == DiagnosticSeverity.Error);
+            compilationErrorCount += projectCompilationErrorCount;
+            var compilationContainsErrors = projectCompilationErrorCount > 0;
             var semanticInputComplete =
                 project?.FilePath is { Length: > 0 } projectFilePath
                 && IsProjectSemanticInputComplete(
@@ -4016,6 +4161,7 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         {
             FailedProjects = _probedFailures,
             FailedFiles = failedFiles,
+            CompilationErrorCount = compilationErrorCount,
         };
     }
 
@@ -4100,6 +4246,88 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
             _logger.LogInformation("Hydrated {Symbols} csharp symbol(s) and {Files} file(s) from graph store", hydrated, fileRows.Count);
         }
         _mapsHydrated = true;
+    }
+
+    /// <summary>
+    /// Prefer Roslyn's bound symbol. When binding fails but Roslyn still reports exactly one
+    /// candidate (most commonly an overload-resolution failure caused by an unresolved argument
+    /// type), retain that candidate with semantic rather than exact confidence. Multiple
+    /// candidates remain unprojected so a broken compilation cannot create guessed call edges.
+    /// </summary>
+    private static ISymbol? ResolveReferenceCandidate(
+        SymbolInfo symbolInfo,
+        out CoreEvidenceConfidence confidence)
+    {
+        if (symbolInfo.Symbol is not null)
+        {
+            confidence = CoreEvidenceConfidence.Exact;
+            return symbolInfo.Symbol;
+        }
+
+        if (symbolInfo.CandidateSymbols.Length == 1)
+        {
+            confidence = CoreEvidenceConfidence.Semantic;
+            return symbolInfo.CandidateSymbols[0];
+        }
+
+        confidence = CoreEvidenceConfidence.Inferred;
+        return null;
+    }
+
+    private static IReadOnlyDictionary<string, string>?
+        ConditionalControlFlowMetadata(SyntaxNode node)
+    {
+        foreach (var ancestor in node.Ancestors())
+        {
+            switch (ancestor)
+            {
+                case IfStatementSyntax ifStatement
+                    when ifStatement.Statement.Span.Contains(node.Span):
+                    return ConditionalMetadata(
+                        "if",
+                        ifStatement.Condition);
+                case IfStatementSyntax ifStatement
+                    when ifStatement.Else?.Statement.Span.Contains(node.Span) == true:
+                    return ConditionalMetadata(
+                        "else",
+                        ifStatement.Condition);
+                case ConditionalExpressionSyntax conditional
+                    when conditional.WhenTrue.Span.Contains(node.Span):
+                    return ConditionalMetadata(
+                        "when_true",
+                        conditional.Condition);
+                case ConditionalExpressionSyntax conditional
+                    when conditional.WhenFalse.Span.Contains(node.Span):
+                    return ConditionalMetadata(
+                        "when_false",
+                        conditional.Condition);
+                case AnonymousFunctionExpressionSyntax:
+                case MemberDeclarationSyntax:
+                    return null;
+            }
+        }
+
+        return null;
+    }
+
+    private static IReadOnlyDictionary<string, string> ConditionalMetadata(
+        string branch,
+        ExpressionSyntax condition)
+    {
+        var text = condition.ToString()
+            .Replace('\r', ' ')
+            .Replace('\n', ' ')
+            .Trim();
+        if (text.Length > 512)
+        {
+            text = text[..512] + "…";
+        }
+        return new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["control_flow"] = "conditional",
+            ["branch"] = branch,
+            ["condition"] = text,
+        };
     }
 
     private static ISymbol? FindEnclosingMember(SemanticModel model, int position, CancellationToken ct)
@@ -4312,6 +4540,260 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         }
     }
 
+    private void EmitScheduledExecutions(
+        SyntaxNode root,
+        SemanticModel model,
+        Action<long, long, string, SyntaxNode, CoreEvidenceConfidence> addEdge,
+        CancellationToken ct)
+    {
+        foreach (var schedulerSyntax in root
+                     .DescendantNodes()
+                     .OfType<InvocationExpressionSyntax>())
+        {
+            ct.ThrowIfCancellationRequested();
+            if (model.GetOperation(schedulerSyntax, ct) is not
+                IInvocationOperation scheduler)
+            {
+                continue;
+            }
+
+            var relation = SchedulerRelation(scheduler.TargetMethod);
+            if (relation is null)
+            {
+                continue;
+            }
+
+            var source = FindEnclosingNamedMember(
+                model,
+                schedulerSyntax.SpanStart,
+                ct);
+            var sourceKey = source is null
+                ? null
+                : SymbolMapping.CanonicalKey(source);
+            if (sourceKey is null
+                || !_symbolIdByKey.TryGetValue(sourceKey, out var sourceId))
+            {
+                continue;
+            }
+
+            foreach (var argument in schedulerSyntax.ArgumentList.Arguments)
+            {
+                if (UnwrapArgument(argument.Expression) is
+                    AnonymousFunctionExpressionSyntax lambda)
+                {
+                    foreach (var nestedCall in lambda
+                                 .DescendantNodes()
+                                 .OfType<InvocationExpressionSyntax>()
+                                 .Where(call =>
+                                     ReferenceEquals(
+                                         call.Ancestors()
+                                             .OfType<
+                                                 AnonymousFunctionExpressionSyntax>()
+                                             .FirstOrDefault(),
+                                         lambda)))
+                    {
+                        TryEmitTarget(
+                            model.GetSymbolInfo(nestedCall, ct).Symbol
+                            as IMethodSymbol,
+                            nestedCall);
+                    }
+                    continue;
+                }
+
+                TryEmitTarget(
+                    model.GetSymbolInfo(argument.Expression, ct).Symbol
+                    as IMethodSymbol,
+                    argument.Expression);
+            }
+
+            void TryEmitTarget(
+                IMethodSymbol? target,
+                SyntaxNode evidenceNode)
+            {
+                if (target is null)
+                {
+                    return;
+                }
+                var targetKey = SymbolMapping.CanonicalKey(target);
+                if (targetKey is null
+                    || !_symbolIdByKey.TryGetValue(
+                        targetKey,
+                        out var targetId))
+                {
+                    return;
+                }
+                addEdge(
+                    sourceId,
+                    targetId,
+                    relation,
+                    evidenceNode,
+                    CoreEvidenceConfidence.Semantic);
+            }
+        }
+    }
+
+    private void EmitEventExecutions(
+        SyntaxNode root,
+        SemanticModel model,
+        Action<long, long, string, SyntaxNode, CoreEvidenceConfidence> addEdge,
+        CancellationToken ct)
+    {
+        foreach (var assignment in root
+                     .DescendantNodes()
+                     .OfType<AssignmentExpressionSyntax>()
+                     .Where(candidate =>
+                         candidate.IsKind(SyntaxKind.AddAssignmentExpression)))
+        {
+            ct.ThrowIfCancellationRequested();
+            if (model.GetSymbolInfo(assignment.Left, ct).Symbol is not
+                IEventSymbol subscribedEvent)
+            {
+                continue;
+            }
+
+            var enclosing = FindEnclosingNamedMember(
+                model,
+                assignment.SpanStart,
+                ct);
+            var enclosingKey = enclosing is null
+                ? null
+                : SymbolMapping.CanonicalKey(enclosing);
+            if (enclosingKey is null
+                || !_symbolIdByKey.TryGetValue(enclosingKey, out var sourceId))
+            {
+                continue;
+            }
+
+            var eventKey = SymbolMapping.CanonicalKey(subscribedEvent);
+            var eventId = 0L;
+            var hasIndexedEvent = eventKey is not null
+                && _symbolIdByKey.TryGetValue(eventKey, out eventId);
+            var emittedTargets = new HashSet<long>();
+
+            TryEmitTarget(
+                model.GetSymbolInfo(
+                    UnwrapArgument(assignment.Right),
+                    ct).Symbol as IMethodSymbol,
+                assignment.Right);
+
+            foreach (var invocation in assignment.Right
+                         .DescendantNodesAndSelf()
+                         .OfType<InvocationExpressionSyntax>())
+            {
+                TryEmitTarget(
+                    model.GetSymbolInfo(invocation, ct).Symbol
+                    as IMethodSymbol,
+                    invocation);
+                foreach (var argument in invocation.ArgumentList.Arguments)
+                {
+                    TryEmitTarget(
+                        model.GetSymbolInfo(
+                            UnwrapArgument(argument.Expression),
+                            ct).Symbol as IMethodSymbol,
+                        argument.Expression);
+                }
+            }
+
+            void TryEmitTarget(
+                IMethodSymbol? target,
+                SyntaxNode evidenceNode)
+            {
+                if (target is null)
+                {
+                    return;
+                }
+                if (SchedulerRelation(target) is not null)
+                {
+                    // The event projection collapses the anonymous subscription handler to
+                    // concrete application targets; the scheduler boundary already has its own
+                    // dispatches/schedules edge and must not become an apparent handler target.
+                    return;
+                }
+                var targetKey = SymbolMapping.CanonicalKey(target);
+                if (targetKey is null
+                    || !_symbolIdByKey.TryGetValue(targetKey, out var targetId)
+                    || !emittedTargets.Add(targetId))
+                {
+                    return;
+                }
+
+                addEdge(
+                    hasIndexedEvent ? eventId : sourceId,
+                    targetId,
+                    hasIndexedEvent
+                        ? EdgeKinds.EventDispatchesTo
+                        : EdgeKinds.SubscribesHandler,
+                    evidenceNode,
+                    CoreEvidenceConfidence.Semantic);
+            }
+        }
+    }
+
+    private static ExpressionSyntax UnwrapArgument(ExpressionSyntax expression)
+    {
+        while (true)
+        {
+            switch (expression)
+            {
+                case ParenthesizedExpressionSyntax parenthesized:
+                    expression = parenthesized.Expression;
+                    continue;
+                case CastExpressionSyntax cast:
+                    expression = cast.Expression;
+                    continue;
+                default:
+                    return expression;
+            }
+        }
+    }
+
+    private static string? SchedulerRelation(IMethodSymbol method)
+    {
+        var containingType = method.ContainingType?.ToDisplayString();
+        if ((containingType == "System.Threading.Tasks.Task"
+             && method.Name == "Run")
+            || (containingType == "System.Threading.Tasks.TaskFactory"
+                && method.Name == "StartNew"))
+        {
+            return EdgeKinds.Schedules;
+        }
+
+        if ((containingType == "System.Windows.Threading.Dispatcher"
+             && method.Name is "Invoke" or "BeginInvoke" or "InvokeAsync")
+            || (containingType == "System.Threading.SynchronizationContext"
+                && method.Name == "Post"))
+        {
+            return EdgeKinds.Dispatches;
+        }
+
+        return null;
+    }
+
+    private static ISymbol? FindEnclosingNamedMember(
+        SemanticModel model,
+        int position,
+        CancellationToken ct)
+    {
+        var symbol = model.GetEnclosingSymbol(position, ct);
+        while (symbol is IMethodSymbol
+               {
+                   MethodKind: MethodKind.AnonymousFunction
+                       or MethodKind.LocalFunction,
+               })
+        {
+            symbol = symbol.ContainingSymbol;
+        }
+        while (symbol is not null
+               and not IMethodSymbol
+               and not IPropertySymbol
+               and not IFieldSymbol
+               and not IEventSymbol)
+        {
+            symbol = symbol.ContainingSymbol;
+        }
+        return symbol;
+    }
+
     private static IOperation UnwrapOperation(IOperation operation)
     {
         while (true)
@@ -4521,6 +5003,12 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                     EdgeKinds.ImplementsMember,
                     evidenceNode,
                     CoreEvidenceConfidence.Semantic);
+                addEdge(
+                    dstId,
+                    srcId,
+                    EdgeKinds.InterfaceDispatchesTo,
+                    evidenceNode,
+                    CoreEvidenceConfidence.Semantic);
             }
         }
     }
@@ -4598,11 +5086,16 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                 case ConstructorDeclarationSyntax:
                 case PropertyDeclarationSyntax:
                 case EventDeclarationSyntax:
-                case EventFieldDeclarationSyntax:
                 case EnumMemberDeclarationSyntax:
                 case OperatorDeclarationSyntax:
                 case ConversionOperatorDeclarationSyntax:
                     yield return node;
+                    break;
+                case EventFieldDeclarationSyntax eventField:
+                    foreach (var variable in eventField.Declaration.Variables)
+                    {
+                        yield return variable;
+                    }
                     break;
                 case FieldDeclarationSyntax fd:
                     foreach (var v in fd.Declaration.Variables) yield return v;
@@ -4666,6 +5159,57 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         {
             _lock.Release();
         }
+    }
+
+    private static string? ClassifyEventRelation(SyntaxNode reference)
+    {
+        var assignment = reference
+            .AncestorsAndSelf()
+            .OfType<AssignmentExpressionSyntax>()
+            .FirstOrDefault(candidate =>
+                candidate.Left.Span.Contains(reference.Span));
+        if (assignment is not null)
+        {
+            return assignment.Kind() switch
+            {
+                SyntaxKind.AddAssignmentExpression =>
+                    EdgeKinds.SubscribesEvent,
+                SyntaxKind.SubtractAssignmentExpression =>
+                    EdgeKinds.UnsubscribesEvent,
+                _ => null,
+            };
+        }
+
+        var conditionalRaise = reference
+            .AncestorsAndSelf()
+            .OfType<ConditionalAccessExpressionSyntax>()
+            .Any(candidate =>
+                candidate.Expression.Span.Contains(reference.Span)
+                && candidate.WhenNotNull
+                    .DescendantNodesAndSelf()
+                    .OfType<InvocationExpressionSyntax>()
+                    .Any(invocation =>
+                        invocation.Expression switch
+                        {
+                            MemberBindingExpressionSyntax binding =>
+                                binding.Name.Identifier.ValueText == "Invoke",
+                            MemberAccessExpressionSyntax access =>
+                                access.Name.Identifier.ValueText == "Invoke",
+                            _ => false,
+                        }));
+        if (conditionalRaise)
+        {
+            return EdgeKinds.RaisesEvent;
+        }
+
+        var directRaise = reference
+            .AncestorsAndSelf()
+            .OfType<InvocationExpressionSyntax>()
+            .Any(invocation =>
+                invocation.Expression is MemberAccessExpressionSyntax access
+                && access.Expression.Span.Contains(reference.Span)
+                && access.Name.Identifier.ValueText == "Invoke");
+        return directRaise ? EdgeKinds.RaisesEvent : null;
     }
 
     /// <summary>
@@ -4800,6 +5344,13 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
 public sealed record IndexResult(int FilesIndexed, int SymbolsIndexed, int ReferencesIndexed, TimeSpan Elapsed)
 {
     /// <summary>
+    /// Number of Roslyn error diagnostics observed in the projects touched by this pass.
+    /// A non-zero value means symbol/reference output can still be useful, but semantic
+    /// projections are not authoritative and the owning scope must not report itself as healthy.
+    /// </summary>
+    public int CompilationErrorCount { get; init; }
+
+    /// <summary>
     /// True only when this result came from a successful all-document discovery, index, and
     /// stale generated-owner reconciliation. An incremental entry point may return true when it
     /// internally performed the required structural full reload.
@@ -4820,3 +5371,11 @@ public sealed record IndexResult(int FilesIndexed, int SymbolsIndexed, int Refer
     /// </summary>
     public IReadOnlyList<FileFailure> FailedFiles { get; init; } = Array.Empty<FileFailure>();
 }
+
+/// <summary>
+/// One SDK/WPF build-generated document retained in the semantic Compilation but deliberately
+/// omitted from the normal generated-file symbol index.
+/// </summary>
+public sealed record BuildGeneratedCompilerInput(
+    string FilePath,
+    string Category);

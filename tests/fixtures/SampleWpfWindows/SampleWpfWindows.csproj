@@ -7,14 +7,10 @@
     <EnableWindowsTargeting>true</EnableWindowsTargeting>
     <RootNamespace>SampleWpfWindows</RootNamespace>
     <Nullable>enable</Nullable>
-    <!-- Keep SDK-authored obj inputs out of the design-time semantic universe. The WPF markup
-         compiler still emits its build-generated connector sources and BAML. -->
-    <ImplicitUsings>disable</ImplicitUsings>
+    <!-- Exercise SDK-authored GlobalUsings.g.cs alongside WPF connector sources. -->
+    <ImplicitUsings>enable</ImplicitUsings>
     <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
     <GenerateTargetFrameworkAttribute>false</GenerateTargetFrameworkAttribute>
-    <GenerateMSBuildEditorConfigFile>false</GenerateMSBuildEditorConfigFile>
-    <EnableNETAnalyzers>false</EnableNETAnalyzers>
-    <AnalysisLevel>none</AnalysisLevel>
   </PropertyGroup>
 
 </Project>

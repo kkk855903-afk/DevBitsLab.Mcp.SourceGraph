@@ -56,7 +56,8 @@ public sealed record ScopeRow(
     string Status,
     string? StatusMessage = null,
     IReadOnlyList<ProjectFailure>? FailedProjects = null,
-    IReadOnlyList<FileFailure>? FailedFiles = null);
+    IReadOnlyList<FileFailure>? FailedFiles = null,
+    int? ProjectCount = null);
 
 /// <summary>
 /// Factory that opens a per-scope <see cref="IGraphStore"/> against

@@ -67,7 +67,7 @@ public sealed class WpfWindowsFixtureContractTests
     }
 
     [SkippableFact]
-    public async Task RealWpfProductionIndexResolvesPositiveBindingsWithoutTrustingObj()
+    public async Task RealWpfProductionIndexUsesGeneratedDocumentsForCompleteSemantics()
     {
         Skip.IfNot(
             OperatingSystem.IsWindows(),
@@ -98,23 +98,56 @@ public sealed class WpfWindowsFixtureContractTests
                 .ToArray();
             rawProjects.Should().NotBeEmpty();
             var sanitized = roslyn.SanitizedSolution!;
-            var filteredGeneratedSources = rawProjects
+            var retainedGeneratedSources = rawProjects
                 .SelectMany(rawProject =>
                 {
                     var sanitizedProject = sanitized.GetProject(rawProject.Id);
                     return rawProject.Documents
                         .Where(document =>
-                            sanitizedProject?.GetDocument(document.Id) is null)
+                            sanitizedProject?.GetDocument(document.Id) is not null
+                            && SolutionPrivacySanitizer.IsBuildGeneratedDocument(
+                                document))
                         .Select(document => Path.GetFileName(document.FilePath));
                 })
                 .ToArray();
-            filteredGeneratedSources.Should().Contain("App.g.cs");
-            filteredGeneratedSources.Should().Contain("MainWindow.g.cs");
-            roslyn.IsProjectSemanticInputComplete(projectPath).Should().BeFalse(
-                "privacy-filtered WPF generated sources are part of the raw compiler input");
+            retainedGeneratedSources.Should().Contain(fileName =>
+                fileName.EndsWith("GlobalUsings.g.cs", StringComparison.Ordinal));
+            retainedGeneratedSources.Should().Contain("App.g.cs");
+            retainedGeneratedSources.Should().Contain("MainWindow.g.cs");
+            var retainedAnalyzerConfigs = rawProjects
+                .SelectMany(rawProject =>
+                {
+                    var sanitizedProject = sanitized.GetProject(rawProject.Id);
+                    return rawProject.AnalyzerConfigDocuments
+                        .Where(document =>
+                            sanitizedProject?.GetAnalyzerConfigDocument(
+                                document.Id) is not null)
+                        .Select(document => document.FilePath);
+                })
+                .OfType<string>()
+                .ToArray();
+            retainedAnalyzerConfigs.Should().Contain(path =>
+                path.EndsWith(
+                    "GeneratedMSBuildEditorConfig.editorconfig",
+                    StringComparison.Ordinal));
+            retainedAnalyzerConfigs.Should().Contain(path =>
+                path.EndsWith(
+                    ".globalconfig",
+                    StringComparison.Ordinal));
+            roslyn.IsProjectSemanticInputComplete(projectPath).Should().BeTrue(
+                "SDK, WPF, and analyzer configuration inputs remain in the semantic compilation");
             roslyn.IsProjectXamlPositiveResolutionSafe(projectPath)
                 .Should().BeTrue(
-                    "Roslyn build provenance permits direct positive facts without making absence authoritative");
+                    "the complete Roslyn compilation is authoritative");
+
+            var compilation = await sanitized.GetProject(rawProjects.Single().Id)!
+                .GetCompilationAsync();
+            compilation.Should().NotBeNull();
+            compilation!.GetDiagnostics()
+                .Where(diagnostic =>
+                    diagnostic.Severity == Microsoft.CodeAnalysis.DiagnosticSeverity.Error)
+                .Should().BeEmpty(
+                    "implicit usings and InitializeComponent must resolve as they do in dotnet build");
 
             await DispatchXamlAsync(
                 store,
@@ -151,25 +184,112 @@ public sealed class WpfWindowsFixtureContractTests
                     runButton.Id,
                     limit: 10,
                     edgeKind: "handles-event"))
-                .Should().BeEmpty(
-                    "positive-only safety does not authorize event-handler inference");
+                .Should().ContainSingle(target =>
+                    target.CanonicalKey == CanonicalKeys.ForMethod(
+                        "SampleWpfWindows.Views.MainWindow",
+                        "OnRunClick",
+                        new[]
+                        {
+                            "System.Object",
+                            "System.Windows.RoutedEventArgs",
+                        }));
 
             var missing = (await store.FindSymbolsAsync("MissingBinding"))
                 .Single(symbol => symbol.Kind == "xaml-element");
             (await store.ListCalleesAsync(
-                    missing.Id,
-                    limit: 10,
-                    edgeKind: "binds-path"))
+                missing.Id,
+                limit: 10,
+                edgeKind: "binds-path"))
                 .Should().BeEmpty(
-                    "an omitted build output never authorizes a negative binding claim");
+                    "the view model does not declare the requested property");
             var outcome = (await store.GetAnnotationsForSymbolAsync(missing.Id))
                 .Should().ContainSingle(annotation =>
-                    annotation.Flavor == "xaml-binding-outcome"
-                    && annotation.FullName == "incomplete")
+                    annotation.Flavor == "xaml-binding-finding"
+                    && annotation.FullName == "XAMLBINDING001")
                 .Subject;
             using var outcomeJson = JsonDocument.Parse(outcome.ArgsJson!);
             outcomeJson.RootElement.GetProperty("reason").GetString()
-                .Should().Be("compilation-has-errors");
+                .Should().Be("property-not-found");
+
+            (await store.ListGeneratedFilesAsync())
+                .Should().NotContain(file =>
+                    file.FilePath.EndsWith("GlobalUsings.g.cs", StringComparison.Ordinal)
+                    || file.FilePath.EndsWith("App.g.cs", StringComparison.Ordinal)
+                    || file.FilePath.EndsWith("MainWindow.g.cs", StringComparison.Ordinal),
+                    "build-generated compiler inputs are semantic support, not ordinary search noise");
+            var semanticCompilerInputs =
+                roslyn.ListBuildGeneratedCompilerInputs();
+            semanticCompilerInputs.Should().Contain(input =>
+                input.Category == "sdk-generated"
+                && input.FilePath.EndsWith(
+                    "GlobalUsings.g.cs",
+                    StringComparison.Ordinal));
+            semanticCompilerInputs.Should().Contain(input =>
+                input.Category == "wpf-generated"
+                && input.FilePath.EndsWith(
+                    "MainWindow.g.cs",
+                    StringComparison.Ordinal));
+        }
+        finally
+        {
+            try
+            {
+                Directory.Delete(tempRoot, recursive: true);
+            }
+            catch
+            {
+                // Best-effort cleanup; a failed assertion remains the useful signal.
+            }
+        }
+    }
+
+    [SkippableFact]
+    public async Task SlnAndSlnxLoadTheSameCompleteWpfProjectUniverse()
+    {
+        Skip.IfNot(
+            OperatingSystem.IsWindows(),
+            "The real WindowsDesktop/WPF solution-format regression runs on Windows.");
+
+        var fixtureRoot = LocateFixture("SampleWpfWindows");
+        var tempRoot = Path.Combine(
+            Path.GetTempPath(),
+            "sourcegraph-wpf-solution-formats-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tempRoot);
+
+        try
+        {
+            var observations = new List<(
+                string[] ProjectNames,
+                int CompilationErrors,
+                int FailedProjects,
+                int FailedFiles)>();
+            foreach (var extension in new[] { ".sln", ".slnx" })
+            {
+                await using var store = new SqliteGraphStore(
+                    Path.Combine(tempRoot, $"graph-{extension[1..]}.db"));
+                await using var roslyn = new RoslynIndexer(store);
+                await roslyn.OpenAsync(
+                    Path.Combine(
+                        fixtureRoot,
+                        "SampleWpfWindows" + extension));
+                var result = await roslyn.IndexAllAsync();
+                observations.Add((
+                    roslyn.SanitizedSolution!.Projects
+                        .Select(project => project.Name)
+                        .OrderBy(name => name, StringComparer.Ordinal)
+                        .ToArray(),
+                    result.CompilationErrorCount,
+                    result.FailedProjects.Count,
+                    result.FailedFiles.Count));
+            }
+
+            observations.Should().HaveCount(2);
+            observations[1].Should().BeEquivalentTo(
+                observations[0],
+                "the modern .slnx path must preserve the same projects and semantic completeness as .sln");
+            observations[0].ProjectNames.Should().ContainSingle()
+                .Which.Should().Be("SampleWpfWindows");
+            observations[0].CompilationErrors.Should().Be(0);
         }
         finally
         {

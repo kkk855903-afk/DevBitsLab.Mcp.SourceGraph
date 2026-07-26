@@ -7,6 +7,18 @@ public interface IGraphStore : IAsyncDisposable
     Task EnsureSchemaAsync(CancellationToken ct = default);
 
     /// <summary>
+    /// Ensures that the persisted graph was produced by the exact semantic pipeline identified
+    /// by <paramref name="fingerprint"/>. A missing or different fingerprint transactionally
+    /// clears every derived scope table and recreates the current schema before recording the
+    /// new value. Returns <see langword="true"/> when a cold rebuild was required.
+    /// </summary>
+    Task<bool> EnsureSemanticPipelineAsync(
+        string fingerprint,
+        CancellationToken ct = default) =>
+        throw new NotSupportedException(
+            "This graph-store implementation predates semantic-pipeline invalidation.");
+
+    /// <summary>
     /// Reads the bounded connection-local version pair used to detect graph changes caused by
     /// this connection or by another connection. The operation does not mutate graph state.
     /// </summary>

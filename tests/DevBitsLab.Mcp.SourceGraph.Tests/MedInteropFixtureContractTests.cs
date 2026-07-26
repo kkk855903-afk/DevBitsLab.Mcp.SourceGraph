@@ -193,7 +193,8 @@ public sealed class MedInteropFixtureContractTests
                     maxDepth: 8,
                     maxPaths: 10,
                     maxNodes: 1000,
-                    scope: scope.Id);
+                    scope: scope.Id,
+                    detail: "detail");
 
             result.IsError.Should().NotBe(true);
             var dto = result.StructuredContent!.Value.Deserialize(
@@ -243,7 +244,8 @@ public sealed class MedInteropFixtureContractTests
                     maxDepth: 8,
                     maxPaths: 10,
                     maxNodes: 1000,
-                    scope: scope.Id);
+                    scope: scope.Id,
+                    detail: "detail");
             var discoveredDto = discovered.StructuredContent!.Value.Deserialize(
                 ToolOutputJsonContext.Default.TraceCallPathResult)!;
             discoveredDto.ToQuery.Should().BeNull();

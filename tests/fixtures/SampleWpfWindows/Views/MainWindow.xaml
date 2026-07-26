@@ -1,13 +1,9 @@
 <Window x:Class="SampleWpfWindows.Views.MainWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        xmlns:vm="clr-namespace:SampleWpfWindows.ViewModels"
         Title="WPF analysis fixture"
         Width="480"
         Height="240">
-    <Window.DataContext>
-        <vm:MainViewModel />
-    </Window.DataContext>
     <StackPanel Margin="24">
         <TextBox x:Name="QueryTextBox"
                  Text="{Binding QueryText, UpdateSourceTrigger=PropertyChanged}" />

@@ -113,6 +113,30 @@ public sealed class IndexFixtureTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task InterfaceMemberDispatchesToImplementingMember()
+    {
+        var interfaceMethod = (await _store!.FindSymbolsAsync("IGreeter.Greet"))
+            .Should().ContainSingle(hit =>
+                hit.Fqn.Contains("IGreeter.Greet", StringComparison.Ordinal))
+            .Which;
+        var implementation = (await _store.ListCalleesAsync(
+                interfaceMethod.Id,
+                edgeKind: EdgeKinds.InterfaceDispatchesTo))
+            .Should().ContainSingle(hit =>
+                hit.Fqn.Contains("Greeter.Greet", StringComparison.Ordinal)
+                && !hit.Fqn.Contains("IGreeter.Greet", StringComparison.Ordinal))
+            .Which;
+
+        (await _store.ListEdgeEvidenceAsync(
+                interfaceMethod.Id,
+                implementation.Id,
+                EdgeKinds.InterfaceDispatchesTo))
+            .Should().ContainSingle(evidence =>
+                evidence.Confidence == CoreEvidenceConfidence.Semantic
+                && evidence.Producer == "roslyn");
+    }
+
+    [Fact]
     public async Task RepeatedRoslynCalls_preserveExactCallSiteEvidence()
     {
         var caller = (await _store!.FindSymbolsAsync("AddManyNumbers"))
@@ -144,6 +168,35 @@ public sealed class IndexFixtureTests : IAsyncLifetime
                 item.Location.EndLine,
                 item.Location.EndColumn))
             .Should().OnlyHaveUniqueItems("separate call sites must not collapse");
+    }
+
+    [Fact]
+    public async Task ConditionalRoslynCall_preserves_branch_condition_metadata()
+    {
+        var caller = (await _store!.FindSymbolsAsync("Calculator.Divide"))
+            .Should().ContainSingle(hit =>
+                hit.Fqn.Contains(
+                    "Sample.Domain.Calculator.Divide",
+                    StringComparison.Ordinal))
+            .Which;
+        var target = (await _store.ListCalleesAsync(
+                caller.Id,
+                edgeKind: EdgeKinds.Calls))
+            .Should().ContainSingle(hit =>
+                hit.Fqn.Contains(
+                    "DivisionByZero",
+                    StringComparison.Ordinal))
+            .Which;
+
+        var evidence = (await _store.ListEdgeEvidenceAsync(
+                caller.Id,
+                target.Id,
+                EdgeKinds.Calls))
+            .Should().ContainSingle().Subject;
+
+        evidence.Metadata.Should().Contain("control_flow", "conditional");
+        evidence.Metadata.Should().Contain("branch", "if");
+        evidence.Metadata.Should().Contain("condition", "b == 0");
     }
 
     [Fact]

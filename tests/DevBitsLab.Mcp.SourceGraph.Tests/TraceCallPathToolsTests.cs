@@ -56,6 +56,46 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
         var nativeAlternative = await SeedSymbolAsync(
             store,
             "NativeAlternative");
+        var scheduledStart = await SeedSymbolAsync(store, "ScheduledStart");
+        var scheduledLoop = await SeedSymbolAsync(store, "ScheduledLoop");
+        var uiDispatch = await SeedSymbolAsync(store, "UiDispatch");
+        var applyFrame = await SeedSymbolAsync(store, "ApplyFrame");
+        var interfaceCaller = await SeedSymbolAsync(store, "InterfaceCaller");
+        var interfaceMember = await SeedSymbolAsync(store, "InterfaceMember");
+        var interfaceImplementation = await SeedSymbolAsync(
+            store,
+            "InterfaceImplementation");
+        var xamlButton = await SeedSymbolAsync(store, "XamlButton");
+        var clickHandler = await SeedSymbolAsync(store, "ClickHandler");
+        var xamlBindingTarget = await SeedSymbolAsync(
+            store,
+            "XamlBindingTarget");
+        var eventLoop = await SeedSymbolAsync(store, "EventLoop");
+        var frameReady = await SeedSymbolAsync(store, "FrameReady");
+        var eventApplyFrame = await SeedSymbolAsync(
+            store,
+            "EventApplyFrame");
+        var frameworkSubscription = await SeedSymbolAsync(
+            store,
+            "FrameworkSubscription");
+        var frameworkHandler = await SeedSymbolAsync(
+            store,
+            "FrameworkHandler");
+        var nativeBridgeImport = await SeedSymbolAsync(
+            store,
+            "NativeBridgeImport");
+        var nativeBridgeExport = await SeedSymbolAsync(
+            store,
+            "NativeBridgeExport");
+        var cppDefinition = await SeedSymbolAsync(
+            store,
+            "CppDefinition");
+        var cppStop = await SeedSymbolAsync(store, "CppStop");
+        await SeedSymbolAsync(
+            store,
+            "NativeOrphan",
+            canonicalKey: "cpp:F:native/orphan.cpp::syntax::NativeOrphan()",
+            extension: ".cpp");
         var outOfOrderRpc = await SeedSymbolAsync(store, "OutOfOrderRpc");
         var outOfOrderServer = await SeedSymbolAsync(
             store,
@@ -82,12 +122,37 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
         var backwardImport = await SeedSymbolAsync(store, "BackwardImport");
         var backwardExport = await SeedSymbolAsync(store, "BackwardExport");
         var backwardNative = await SeedSymbolAsync(store, "BackwardNative");
+        var dedupImport = await SeedSymbolAsync(store, "DedupImport");
+        var dedupDirectExport = await SeedSymbolAsync(
+            store,
+            "DedupDirectExport");
+        var dedupBridgeExport = await SeedSymbolAsync(
+            store,
+            "DedupBridgeExport");
+        var dedupCppDefinition = await SeedSymbolAsync(
+            store,
+            "DedupCppDefinition");
+        var dedupTerminal = await SeedSymbolAsync(store, "DedupTerminal");
+        await SeedSymbolAsync(
+            store,
+            "SharedCandidateFirst",
+            symbolName: "SharedCandidate");
+        await SeedSymbolAsync(
+            store,
+            "SharedCandidateSecond",
+            symbolName: "SharedCandidate");
 
         await store.BulkInsertEdgesAsync(new[]
         {
             Edge(a, b, 5, CoreEvidenceConfidence.Exact, "a-to-b"),
             Edge(b, c, 8, CoreEvidenceConfidence.Semantic, "b-to-c"),
-            Edge(a, d, 6, CoreEvidenceConfidence.Exact, "a-to-d"),
+            Edge(
+                a,
+                d,
+                6,
+                CoreEvidenceConfidence.Exact,
+                "a-to-d",
+                condition: "flag is true"),
             Edge(d, c, 9, CoreEvidenceConfidence.Exact, "d-to-c"),
             Edge(c, a, 12, CoreEvidenceConfidence.Exact, "cycle"),
             Edge(starveSource, directTarget, 15, CoreEvidenceConfidence.Exact, "auditable-direct"),
@@ -102,6 +167,20 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
             Edge(import, export, 27, CoreEvidenceConfidence.Exact, "pinvoke", EdgeKinds.PInvokeMapsTo),
             Edge(export, native, 28, CoreEvidenceConfidence.Exact, "native-call"),
             Edge(export, nativeAlternative, 29, CoreEvidenceConfidence.Exact, "native-alternative"),
+            Edge(scheduledStart, scheduledLoop, 46, CoreEvidenceConfidence.Semantic, "scheduled-lambda", EdgeKinds.Schedules),
+            Edge(uiDispatch, applyFrame, 47, CoreEvidenceConfidence.Semantic, "dispatcher-lambda", EdgeKinds.Dispatches),
+            Edge(interfaceCaller, interfaceMember, 48, CoreEvidenceConfidence.Exact, "interface-call"),
+            Edge(interfaceMember, interfaceImplementation, 49, CoreEvidenceConfidence.Semantic, "interface-dispatch", EdgeKinds.InterfaceDispatchesTo),
+            Edge(xamlButton, xamlBindingTarget, 50, CoreEvidenceConfidence.Semantic, "xaml-binding", "binds-path"),
+            Edge(xamlButton, clickHandler, 51, CoreEvidenceConfidence.Semantic, "xaml-handler", EdgeKinds.HandlesEvent),
+            Edge(eventLoop, frameReady, 52, CoreEvidenceConfidence.Exact, "event-raise", EdgeKinds.RaisesEvent),
+            Edge(frameReady, eventApplyFrame, 53, CoreEvidenceConfidence.Semantic, "event-dispatch", EdgeKinds.EventDispatchesTo),
+            Edge(frameworkSubscription, frameworkHandler, 54, CoreEvidenceConfidence.Semantic, "external-handler", EdgeKinds.SubscribesHandler),
+            Edge(clickHandler, interfaceMember, 55, CoreEvidenceConfidence.Exact, "click-interface-call"),
+            Edge(interfaceImplementation, nativeBridgeImport, 56, CoreEvidenceConfidence.Exact, "implementation-import-call"),
+            Edge(nativeBridgeImport, nativeBridgeExport, 57, CoreEvidenceConfidence.Exact, "pinvoke-bridge", EdgeKinds.PInvokeMapsTo),
+            Edge(nativeBridgeExport, cppDefinition, 58, CoreEvidenceConfidence.Inferred, "cpp-implementation", EdgeKinds.NativeImplementation),
+            Edge(cppDefinition, cppStop, 59, CoreEvidenceConfidence.Inferred, "cpp-stop-call"),
             Edge(ui, native, 29, CoreEvidenceConfidence.Exact, "excluded-shortcut", EdgeKinds.Tests),
             Edge(ui, outOfOrderRpc, 30, CoreEvidenceConfidence.Semantic, "out-of-order-grpc", EdgeKinds.GrpcCalls),
             Edge(outOfOrderRpc, outOfOrderServer, 31, CoreEvidenceConfidence.Semantic, "out-of-order-dispatch", EdgeKinds.RpcDispatchesTo),
@@ -119,6 +198,11 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
             Edge(backwardServer, backwardImport, 43, CoreEvidenceConfidence.Exact, "backward-call"),
             Edge(backwardImport, backwardExport, 44, CoreEvidenceConfidence.Exact, "backward-pinvoke", EdgeKinds.PInvokeMapsTo),
             Edge(backwardExport, backwardNative, 45, CoreEvidenceConfidence.Exact, "backward-native"),
+            Edge(dedupImport, dedupDirectExport, 60, CoreEvidenceConfidence.Inferred, "dedup-direct-pinvoke", EdgeKinds.PInvokeMapsTo),
+            Edge(dedupDirectExport, dedupTerminal, 61, CoreEvidenceConfidence.Inferred, "dedup-direct-native"),
+            Edge(dedupImport, dedupBridgeExport, 62, CoreEvidenceConfidence.Inferred, "dedup-bridge-pinvoke", EdgeKinds.PInvokeMapsTo),
+            Edge(dedupBridgeExport, dedupCppDefinition, 63, CoreEvidenceConfidence.Inferred, "dedup-implementation", EdgeKinds.NativeImplementation),
+            Edge(dedupCppDefinition, dedupTerminal, 64, CoreEvidenceConfidence.Inferred, "dedup-implementation-call"),
         });
 
         // This raw legacy edge sorts before ZDirectTarget but has no occurrence evidence. An
@@ -170,7 +254,8 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
             int line,
             CoreEvidenceConfidence confidence,
             string marker,
-            string kind = EdgeKinds.Calls) =>
+            string kind = EdgeKinds.Calls,
+            string? condition = null) =>
             new(source.SymbolId, target.SymbolId, kind)
             {
                 Evidence = new CoreEvidence(
@@ -178,7 +263,18 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
                     new CoreSourceLocation(source.FilePath, line, 5, line, 12),
                     confidence,
                     "fixture",
-                    new Dictionary<string, string> { ["marker"] = marker }),
+                    condition is null
+                        ? new Dictionary<string, string>
+                        {
+                            ["marker"] = marker,
+                        }
+                        : new Dictionary<string, string>
+                        {
+                            ["marker"] = marker,
+                            ["control_flow"] = "conditional",
+                            ["branch"] = "if",
+                            ["condition"] = condition,
+                        }),
             };
     }
 
@@ -229,6 +325,8 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
         scope.Paths.Select(path => path.Hops.Select(hop => hop.To.Fqn))
             .Should().Contain(sequence => sequence.SequenceEqual(throughB))
             .And.Contain(sequence => sequence.SequenceEqual(throughD));
+        CallToolResultHelpers.ProseText(result).Should().Contain(
+            "selection: from `csharp:M:Graph.A`; to `csharp:M:Graph.C`");
 
         var semanticPath = scope.Paths.Single(path =>
             path.Hops[0].To.Fqn == "Graph.B");
@@ -247,7 +345,11 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
         var exactPath = scope.Paths.Single(path =>
             path.Hops[0].To.Fqn == "Graph.D");
         exactPath.Confidence.Should().Be("exact");
-        CallToolResultHelpers.ProseText(result).Should().Contain("2 paths");
+        CallToolResultHelpers.ProseText(result)
+            .Should().Contain("2 paths")
+            .And.Contain("[exact; conditional]")
+            .And.Contain("condition (if): `flag is true`")
+            .And.Contain("not guaranteed normal flow");
         result.Content.OfType<ResourceLinkBlock>().Should().HaveCount(4)
             .And.OnlyHaveUniqueItems(link => link.Uri);
     }
@@ -263,8 +365,43 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
         var shallowDto = shallow.StructuredContent!.Value.Deserialize(
             ToolOutputJsonContext.Default.TraceCallPathResult)!;
         shallowDto.Scopes.Single().Paths.Should().BeEmpty();
-        shallowDto.Scopes.Single().Truncated.Should().BeTrue(
+        var shallowScope = shallowDto.Scopes.Single();
+        shallowScope.Truncated.Should().BeTrue(
             "the configured depth cap prevented deeper traversal");
+        shallowScope.Truncation.Should().NotBeNull();
+        shallowScope.Truncation!.TruncatedBy.Should()
+            .Equal("max_depth");
+        shallowScope.Truncation.ExpandedNodes.Should().Be(1);
+        shallowScope.Truncation.MaxNodes.Should().Be(1000);
+        shallowScope.Truncation.DepthReached.Should().Be(1);
+        shallowScope.Truncation.MaxDepth.Should().Be(1);
+        shallowScope.Truncation.ReturnedPaths.Should().Be(0);
+        shallowScope.Truncation.MaxPaths.Should().Be(10);
+        shallowScope.LastResolved.Should().NotBeNull();
+        shallowScope.LastResolved!.Fqn.Should().Be(
+            "Graph.B",
+            "equal-depth frontiers use a stable ordinal tie-break");
+        shallowScope.CandidateNextSteps.Should().ContainSingle()
+            .Which.Fqn.Should().Be("Graph.C");
+        CallToolResultHelpers.ProseText(shallow).Should()
+            .Contain("truncated_by: max_depth")
+            .And.Contain("expanded_nodes: 1/1000")
+            .And.Contain("depth_reached: 1/1")
+            .And.Contain("returned_paths: 0/10");
+
+        var nodeBound = await TraceCallPathTools.TraceCallPathWithProfileAsync(
+            _router!,
+            from: "Graph.TerminalSource",
+            to: "Graph.C",
+            maxNodes: 1);
+        var nodeBoundScope = nodeBound.StructuredContent!.Value.Deserialize(
+            ToolOutputJsonContext.Default.TraceCallPathResult)!
+            .Scopes.Should().ContainSingle().Which;
+        nodeBoundScope.Truncated.Should().BeTrue();
+        nodeBoundScope.Truncation!.TruncatedBy.Should()
+            .Equal("max_nodes");
+        nodeBoundScope.Truncation.ExpandedNodes.Should().Be(1);
+        nodeBoundScope.Truncation.MaxNodes.Should().Be(1);
 
         var invalid = await TraceCallPathTools.TraceCallPathAsync(
             _router!,
@@ -314,6 +451,82 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task ExecutionNegativePathIgnoresUnreachableNativeProjection()
+    {
+        var result = await TraceCallPathTools.TraceCallPathWithProfileAsync(
+            _router!,
+            from: "csharp:M:Graph.TerminalLeaf",
+            to: "csharp:M:Graph.C",
+            profile: "execution",
+            maxDepth: 8,
+            maxNodes: 100);
+
+        var scope = result.StructuredContent!.Value.Deserialize(
+            ToolOutputJsonContext.Default.TraceCallPathResult)!
+            .Scopes.Should().ContainSingle().Which;
+        scope.Paths.Should().BeEmpty();
+        scope.Truncated.Should().BeFalse();
+        scope.ExecutionState!.Status.Should().Be("complete");
+        scope.ExecutionState.AbsenceAuthoritative.Should().BeTrue();
+        scope.ExecutionState.Projections.Should().Contain(projection =>
+            projection.Name == "native-interop"
+            && !projection.Applicable);
+        scope.ExecutionState.Failures.Should().BeEmpty();
+    }
+
+    [Fact]
+    public async Task ExecutionNegativePathRetainsReachableNativeProjectionGap()
+    {
+        var result = await TraceCallPathTools.TraceCallPathWithProfileAsync(
+            _router!,
+            from: "csharp:M:Graph.Ui",
+            to: "csharp:M:Graph.A",
+            profile: "execution",
+            maxDepth: 12,
+            maxNodes: 1000);
+
+        var scope = result.StructuredContent!.Value.Deserialize(
+            ToolOutputJsonContext.Default.TraceCallPathResult)!
+            .Scopes.Should().ContainSingle().Which;
+        scope.Paths.Should().BeEmpty();
+        scope.Truncated.Should().BeFalse();
+        scope.ExecutionState!.Status.Should().Be("partial");
+        scope.ExecutionState.AbsenceAuthoritative.Should().BeFalse();
+        scope.ExecutionState.Projections.Should().Contain(projection =>
+            projection.Name == "native-interop"
+            && projection.Applicable
+            && !projection.Authoritative);
+        scope.ExecutionState.Failures.Should().Contain(failure =>
+            failure.StartsWith(
+                "native-interop:",
+                StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task ExecutionNegativePathRetainsNativeGap_forNativeEndpoint()
+    {
+        var result = await TraceCallPathTools.TraceCallPathWithProfileAsync(
+            _router!,
+            from: "cpp:F:native/orphan.cpp::syntax::NativeOrphan()",
+            to: "csharp:M:Graph.A",
+            profile: "execution",
+            maxDepth: 8,
+            maxNodes: 100);
+
+        var scope = result.StructuredContent!.Value.Deserialize(
+                ToolOutputJsonContext.Default.TraceCallPathResult)!
+            .Scopes.Should().ContainSingle().Which;
+        scope.Paths.Should().BeEmpty();
+        scope.Truncated.Should().BeFalse();
+        scope.ExecutionState!.Status.Should().Be("partial");
+        scope.ExecutionState.AbsenceAuthoritative.Should().BeFalse();
+        scope.ExecutionState.Projections.Should().Contain(projection =>
+            projection.Name == "native-interop"
+            && projection.Applicable
+            && !projection.Authoritative);
+    }
+
+    [Fact]
     public async Task ExecutionProfile_tracesOnlyWhitelistedRelations_fromExactCanonicalKeys()
     {
         var result = await TraceCallPathTools.TraceCallPathWithProfileAsync(
@@ -323,7 +536,8 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
             profile: "execution",
             maxDepth: 9,
             maxPaths: 10,
-            maxNodes: 100);
+            maxNodes: 100,
+            detail: "detail");
 
         result.IsError.Should().NotBe(true);
         var dto = result.StructuredContent!.Value.Deserialize(
@@ -336,9 +550,17 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
             "binds-path",
             EdgeKinds.CommandExecutes,
             EdgeKinds.Calls,
+            EdgeKinds.Schedules,
+            EdgeKinds.Dispatches,
+            EdgeKinds.InterfaceDispatchesTo,
+            EdgeKinds.HandlesEvent,
+            EdgeKinds.RaisesEvent,
+            EdgeKinds.EventDispatchesTo,
+            EdgeKinds.SubscribesHandler,
             EdgeKinds.GrpcCalls,
             EdgeKinds.RpcDispatchesTo,
-            EdgeKinds.PInvokeMapsTo);
+            EdgeKinds.PInvokeMapsTo,
+            EdgeKinds.NativeImplementation);
         var scope = dto.Scopes.Should().ContainSingle().Which;
         scope.ExecutionState.Should().NotBeNull();
         scope.ExecutionState!.Status.Should().Be("partial");
@@ -381,6 +603,160 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
     }
 
     [Theory]
+    [InlineData(
+        "csharp:M:Graph.ScheduledStart",
+        "csharp:M:Graph.ScheduledLoop",
+        "schedules")]
+    [InlineData(
+        "csharp:M:Graph.UiDispatch",
+        "csharp:M:Graph.ApplyFrame",
+        "dispatches")]
+    public async Task ExecutionProfile_canStartAtManagedSchedulingMethods(
+        string from,
+        string to,
+        string relation)
+    {
+        var result = await TraceCallPathTools.TraceCallPathWithProfileAsync(
+            _router!,
+            from,
+            to,
+            profile: "execution",
+            maxDepth: 1);
+
+        var scope = result.StructuredContent!.Value.Deserialize(
+                ToolOutputJsonContext.Default.TraceCallPathResult)!
+            .Scopes.Should().ContainSingle().Which;
+        var path = scope.Paths.Should().ContainSingle().Which;
+        path.Hops.Should().ContainSingle().Which.Relation.Should().Be(relation);
+        scope.ExecutionState!.Status.Should().Be("complete",
+            "unrelated absent gRPC/native projections do not reduce a proven managed path");
+        scope.ExecutionState.Projections.Should().ContainSingle(projection =>
+            projection.Name
+                == (relation == EdgeKinds.Schedules
+                    ? "task-scheduling"
+                    : "ui-dispatch")
+            && projection.Applicable
+            && projection.Authoritative);
+        scope.ExecutionState.Projections.Should().Contain(projection =>
+            projection.Name == "native-interop"
+            && !projection.Applicable);
+    }
+
+    [Fact]
+    public async Task ExecutionProfile_crossesInterfaceDispatch()
+    {
+        var result = await TraceCallPathTools.TraceCallPathWithProfileAsync(
+            _router!,
+            from: "csharp:M:Graph.InterfaceCaller",
+            to: "csharp:M:Graph.InterfaceImplementation",
+            profile: "execution",
+            maxDepth: 2);
+
+        var path = result.StructuredContent!.Value.Deserialize(
+                ToolOutputJsonContext.Default.TraceCallPathResult)!
+            .Scopes.Should().ContainSingle().Which
+            .Paths.Should().ContainSingle().Which;
+        path.Hops.Select(hop => hop.Relation).Should().Equal(
+            EdgeKinds.Calls,
+            EdgeKinds.InterfaceDispatchesTo);
+    }
+
+    [Fact]
+    public async Task ExecutionProfile_connectsXaml_interface_and_cpp_implementation()
+    {
+        var result = await TraceCallPathTools.TraceCallPathWithProfileAsync(
+            _router!,
+            from: "csharp:M:Graph.XamlButton",
+            to: "csharp:M:Graph.CppStop",
+            profile: "execution",
+            maxDepth: 8,
+            maxPaths: 10,
+            maxNodes: 100);
+
+        result.IsError.Should().NotBe(true);
+        var scope = result.StructuredContent!.Value.Deserialize(
+                ToolOutputJsonContext.Default.TraceCallPathResult)!
+            .Scopes.Should().ContainSingle().Which;
+        var path = scope.Paths.Should().ContainSingle().Which;
+        path.Hops.Select(hop => hop.Relation).Should().Equal(
+            EdgeKinds.HandlesEvent,
+            EdgeKinds.Calls,
+            EdgeKinds.InterfaceDispatchesTo,
+            EdgeKinds.Calls,
+            EdgeKinds.PInvokeMapsTo,
+            EdgeKinds.NativeImplementation,
+            EdgeKinds.Calls);
+    }
+
+    [Theory]
+    [InlineData("XamlButton", "ClickHandler", "handles-event")]
+    [InlineData("FrameworkSubscription", "FrameworkHandler", "subscribes-handler")]
+    public async Task ExecutionProfile_crossesUiAndExternalEventHandlers(
+        string from,
+        string to,
+        string relation)
+    {
+        var result = await TraceCallPathTools.TraceCallPathWithProfileAsync(
+            _router!,
+            from: $"csharp:M:Graph.{from}",
+            to: $"csharp:M:Graph.{to}",
+            profile: "execution",
+            maxDepth: 4,
+            maxPaths: 10,
+            maxNodes: 100);
+
+        result.IsError.Should().NotBe(true);
+        var scope = result.StructuredContent!.Value.Deserialize(
+            ToolOutputJsonContext.Default.TraceCallPathResult)!
+            .Scopes.Should().ContainSingle().Which;
+        scope.Paths.Should().ContainSingle();
+        scope.Paths[0].Hops.Should().ContainSingle(hop =>
+            hop.Relation == relation);
+        if (relation == EdgeKinds.HandlesEvent)
+        {
+            scope.Truncated.Should().BeFalse(
+                "a binding on the same XAML element must not hide its event execution branch");
+        }
+        else
+        {
+            scope.ExecutionState!.Status.Should().Be("partial");
+            scope.ExecutionState.AbsenceAuthoritative.Should().BeFalse();
+            scope.ExecutionState.Projections.Should().ContainSingle(projection =>
+                projection.Name == "event-flow"
+                && projection.Status == "partial-external-trigger"
+                && !projection.Authoritative);
+            scope.ExecutionState.Failures.Should().ContainSingle(failure =>
+                failure.Contains(
+                    "partial because framework-owned event trigger is external",
+                    StringComparison.Ordinal));
+            CallToolResultHelpers.ProseText(result).Should().Contain(
+                "projection gap: event-flow: partial because framework-owned event trigger is external");
+        }
+    }
+
+    [Fact]
+    public async Task ExecutionProfile_connectsEventRaiseToSubscriberTarget()
+    {
+        var result = await TraceCallPathTools.TraceCallPathWithProfileAsync(
+            _router!,
+            from: "csharp:M:Graph.EventLoop",
+            to: "csharp:M:Graph.EventApplyFrame",
+            profile: "execution",
+            maxDepth: 4,
+            maxPaths: 10,
+            maxNodes: 100);
+
+        result.IsError.Should().NotBe(true);
+        var path = result.StructuredContent!.Value.Deserialize(
+                ToolOutputJsonContext.Default.TraceCallPathResult)!
+            .Scopes.Should().ContainSingle().Which
+            .Paths.Should().ContainSingle().Which;
+        path.Hops.Select(hop => hop.Relation).Should().Equal(
+            EdgeKinds.RaisesEvent,
+            EdgeKinds.EventDispatchesTo);
+    }
+
+    [Theory]
     [InlineData("csharp:M:Graph.OutOfOrderNative")]
     [InlineData("csharp:M:Graph.DuplicateNative")]
     [InlineData("csharp:M:Graph.BackwardNative")]
@@ -414,7 +790,8 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
             profile: "execution",
             maxDepth: 9,
             maxPaths: 10,
-            maxNodes: 100);
+            maxNodes: 100,
+            detail: "detail");
 
         result.IsError.Should().NotBe(true);
         var dto = result.StructuredContent!.Value.Deserialize(
@@ -436,6 +813,31 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task ExecutionTerminalDiscovery_keeps_one_shortest_path_per_terminal()
+    {
+        var result = await TraceCallPathTools.TraceCallPathWithProfileAsync(
+            _router!,
+            from: "csharp:M:Graph.DedupImport",
+            profile: "execution",
+            maxDepth: 4,
+            maxPaths: 10,
+            maxNodes: 100);
+
+        var paths = result.StructuredContent!.Value.Deserialize(
+                ToolOutputJsonContext.Default.TraceCallPathResult)!
+            .Scopes.Should().ContainSingle().Which
+            .Paths;
+        paths.Should().ContainSingle();
+        paths[0].To.Fqn.Should().Be("Graph.DedupTerminal");
+        paths[0].Hops.Should().BeEmpty();
+        paths[0].HopCount.Should().Be(2,
+            "breadth-first discovery keeps the shortest proven route");
+        CallToolResultHelpers.ProseText(result)
+            .Should().Contain("detail: summary")
+            .And.Contain("evidence omitted in summary");
+    }
+
+    [Fact]
     public async Task ExecutionTerminalDiscovery_reportsPathAndDepthTruncationAsNonAuthoritative()
     {
         var pathBound = await TraceCallPathTools.TraceCallPathWithProfileAsync(
@@ -451,6 +853,11 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
         pathBoundScope.Paths.Should().ContainSingle();
         pathBoundScope.Truncated.Should().BeTrue(
             "a second proven terminal remains after the path cap");
+        pathBoundScope.Truncation.Should().NotBeNull();
+        pathBoundScope.Truncation!.TruncatedBy.Should()
+            .Contain("max_paths");
+        pathBoundScope.Truncation.ReturnedPaths.Should().Be(1);
+        pathBoundScope.Truncation.MaxPaths.Should().Be(1);
 
         var depthBound = await TraceCallPathTools.TraceCallPathWithProfileAsync(
             _router!,
@@ -465,6 +872,11 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
         depthBoundScope.Paths.Should().BeEmpty();
         depthBoundScope.Truncated.Should().BeTrue(
             "the native calls frontier remains beyond the depth cap");
+        depthBoundScope.Truncation.Should().NotBeNull();
+        depthBoundScope.Truncation!.TruncatedBy.Should()
+            .Equal("max_depth");
+        depthBoundScope.Truncation.DepthReached.Should().Be(8);
+        depthBoundScope.Truncation.MaxDepth.Should().Be(8);
 
         foreach (var boundedScope in new[]
                  {
@@ -477,6 +889,16 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
                 projection => projection.Name == "query-bounds"
                     && projection.Status == "truncated"
                     && !projection.Authoritative);
+            boundedScope.ExecutionState.Failures.Should().Contain(failure =>
+                failure.StartsWith(
+                    "query-bounds: truncated_by=",
+                    StringComparison.Ordinal)
+                && failure.Contains(
+                    "expanded_nodes=",
+                    StringComparison.Ordinal)
+                && failure.Contains(
+                    "returned_paths=",
+                    StringComparison.Ordinal));
         }
     }
 
@@ -515,6 +937,52 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
         scope.Paths.Should().BeEmpty();
         scope.Note.Should().Contain(
             "No source symbol matches 'csharp:M:Graph.Ui.Missing'");
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task FuzzySelectionWithMultipleTopCandidatesIsAmbiguous(
+        bool ambiguousSource)
+    {
+        var result = await TraceCallPathTools.TraceCallPathWithProfileAsync(
+            _router!,
+            from: ambiguousSource
+                ? "SharedCandidate"
+                : "csharp:M:Graph.A",
+            to: ambiguousSource
+                ? "csharp:M:Graph.C"
+                : "SharedCandidate",
+            profile: "execution");
+
+        result.IsError.Should().NotBe(true);
+        var scope = result.StructuredContent!.Value.Deserialize(
+            ToolOutputJsonContext.Default.TraceCallPathResult)!
+            .Scopes.Should().ContainSingle().Which;
+        scope.Paths.Should().BeEmpty();
+        scope.Truncated.Should().BeFalse();
+        scope.Status.Should().Be("ambiguous");
+        scope.PathSearchExecuted.Should().BeFalse();
+        scope.AmbiguousRole.Should().Be(
+            ambiguousSource ? "source" : "destination");
+        scope.Candidates.Should().HaveCount(2);
+        scope.Candidates.Select(candidate => candidate.CanonicalKey).Should()
+            .BeEquivalentTo(
+                "csharp:M:Graph.SharedCandidateFirst",
+                "csharp:M:Graph.SharedCandidateSecond");
+        scope.ExecutionState.Should().BeNull();
+        scope.Note.Should()
+            .Contain(ambiguousSource
+                ? "Ambiguous source symbol"
+                : "Ambiguous destination symbol")
+            .And.Contain("csharp:M:Graph.SharedCandidateFirst")
+            .And.Contain("csharp:M:Graph.SharedCandidateSecond");
+        CallToolResultHelpers.ProseText(result).Should()
+            .Contain("ambiguous; path search not executed")
+            .And.NotContain("execution projection:")
+            .And.NotContain("projection gap:")
+            .And.NotContain("source equals destination")
+            .And.NotContain("traversal was truncated");
     }
 
     [Theory]
@@ -662,18 +1130,21 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
 
     private async Task<SeededSymbol> SeedSymbolAsync(
         SqliteGraphStore store,
-        string name)
+        string name,
+        string? symbolName = null,
+        string? canonicalKey = null,
+        string extension = ".cs")
     {
-        var path = Path.Join(_tempDir, $"{name}.cs");
+        var path = Path.Join(_tempDir, $"{name}{extension}");
         var fileId = await store.UpsertFileAsync(
             path,
             new byte[] { 1, 2, 3, 4 },
             DateTimeOffset.UtcNow);
         var symbolId = await store.UpsertSymbolAsync(
-            $"csharp:M:Graph.{name}",
+            canonicalKey ?? $"csharp:M:Graph.{name}",
             new Symbol(
                 0,
-                name,
+                symbolName ?? name,
                 $"Graph.{name}",
                 SymbolKinds.Method,
                 fileId,

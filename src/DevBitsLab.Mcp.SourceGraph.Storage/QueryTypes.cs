@@ -38,7 +38,9 @@ public sealed record ReferenceHit(
     int Line,
     int Col,
     ReferenceKind Kind,
-    bool IsGenerated = false);
+    bool IsGenerated = false,
+    EvidenceConfidence? Confidence = null,
+    string? Producer = null);
 
 /// <summary>
 /// One Roslyn diagnostic captured during indexing. <see cref="Severity"/> matches

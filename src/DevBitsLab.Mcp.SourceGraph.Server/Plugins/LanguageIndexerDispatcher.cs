@@ -3,9 +3,11 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Security.Cryptography;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using DevBitsLab.Mcp.SourceGraph.Core;
+using DevBitsLab.Mcp.SourceGraph.Embeddings;
 using DevBitsLab.Mcp.SourceGraph.Indexing.Xaml;
 using DevBitsLab.Mcp.SourceGraph.Sdk;
 using DevBitsLab.Mcp.SourceGraph.Server.Scoping;
@@ -34,17 +36,21 @@ public sealed class LanguageIndexerDispatcher
     private readonly LanguageIndexerRegistry _indexers;
     private readonly LanguageProjectFactoryRegistry _factories;
     private readonly AnalyzerPipeline? _analyzerPipeline;
+    private readonly IEmbeddingsRequestSink _embeddingsSink;
     private readonly ILogger<LanguageIndexerDispatcher> _logger;
 
     public LanguageIndexerDispatcher(
         LanguageIndexerRegistry indexers,
         LanguageProjectFactoryRegistry factories,
         ILogger<LanguageIndexerDispatcher>? logger = null,
-        AnalyzerPipeline? analyzerPipeline = null)
+        AnalyzerPipeline? analyzerPipeline = null,
+        IEmbeddingsRequestSink? embeddingsSink = null)
     {
         _indexers = indexers;
         _factories = factories;
         _analyzerPipeline = analyzerPipeline;
+        _embeddingsSink =
+            embeddingsSink ?? new NoOpEmbeddingsRequestSink();
         _logger = logger ?? NullLogger<LanguageIndexerDispatcher>.Instance;
     }
 
@@ -316,6 +322,7 @@ public sealed class LanguageIndexerDispatcher
                     symbolFileIdByKey,
                     fileIdByPath,
                     pathPolicy,
+                    _embeddingsSink,
                     ct).ConfigureAwait(false);
                 if (outcome.Replaced) indexedPaths.Add(file);
                 if (outcome.HasUsableOutput) usableOutputPaths.Add(file);
@@ -943,6 +950,7 @@ public sealed class LanguageIndexerDispatcher
             symbolFileIdByKey,
             fileIdByPath,
             pathPolicy,
+            host.EmbeddingsSink ?? _embeddingsSink,
             ct).ConfigureAwait(false);
 
     private async Task<DispatchFileOutcome> DispatchOneCoreAsync(
@@ -957,6 +965,7 @@ public sealed class LanguageIndexerDispatcher
         Dictionary<string, long> symbolFileIdByKey,
         Dictionary<string, long> fileIdByPath,
         ScopePathPolicy pathPolicy,
+        IEmbeddingsRequestSink embeddingsSink,
         CancellationToken ct)
     {
         if (pathPolicy.IsExcluded(filePath)) return DispatchFileOutcome.Skipped;
@@ -1035,6 +1044,12 @@ public sealed class LanguageIndexerDispatcher
             _logger);
         var committed =
             await store.ReplaceFileFactsAsync(replacement, ct).ConfigureAwait(false);
+        EnqueueEmbeddings(
+            filePath,
+            contents,
+            replacement.Symbols,
+            committed.SymbolIds,
+            embeddingsSink);
 
         // Mutate the cross-file lookup caches only after the storage transaction committed.
         // A failed replacement therefore leaves both the database and this pass's resolver view
@@ -1059,6 +1074,76 @@ public sealed class LanguageIndexerDispatcher
             || replacement.Annotations.Count > 0
             || replacement.References.Count > 0;
         return new DispatchFileOutcome(Replaced: true, HasUsableOutput: hasUsableOutput);
+    }
+
+    private static void EnqueueEmbeddings(
+        string filePath,
+        byte[] contents,
+        IReadOnlyList<FileSymbolFact> symbols,
+        IReadOnlyDictionary<string, long> symbolIds,
+        IEmbeddingsRequestSink sink)
+    {
+        if (!sink.IsEnabled || symbols.Count == 0)
+        {
+            return;
+        }
+
+        var sourceLines = Encoding.UTF8.GetString(contents)
+            .Replace("\r\n", "\n", StringComparison.Ordinal)
+            .Replace('\r', '\n')
+            .Split('\n');
+        foreach (var symbol in symbols)
+        {
+            if (!symbolIds.TryGetValue(symbol.CanonicalKey, out var symbolId))
+            {
+                continue;
+            }
+            var body = SourceExcerpt(
+                sourceLines,
+                symbol.StartLine,
+                symbol.EndLine,
+                maximumLines: 40);
+            if (SymbolTextBuilder.ShouldSkip(
+                    filePath,
+                    symbol.XmlSummary,
+                    symbol.Signature,
+                    body))
+            {
+                continue;
+            }
+            var text = SymbolTextBuilder.Build(
+                symbol.Kind,
+                symbol.Fqn,
+                symbol.XmlSummary,
+                symbol.Signature,
+                body);
+            sink.Enqueue(new EmbedRequest(
+                symbolId,
+                text,
+                SymbolTextBuilder.HashOf(text)));
+        }
+    }
+
+    private static string? SourceExcerpt(
+        IReadOnlyList<string> sourceLines,
+        int startLine,
+        int endLine,
+        int maximumLines)
+    {
+        if (startLine <= 0
+            || endLine < startLine
+            || startLine > sourceLines.Count
+            || maximumLines <= 0)
+        {
+            return null;
+        }
+        var startIndex = startLine - 1;
+        var count = Math.Min(
+            Math.Min(endLine - startLine + 1, maximumLines),
+            sourceLines.Count - startIndex);
+        return count <= 0
+            ? null
+            : string.Join('\n', sourceLines.Skip(startIndex).Take(count));
     }
 
     private static async Task<byte[]> ReadSourceBytesAsync(

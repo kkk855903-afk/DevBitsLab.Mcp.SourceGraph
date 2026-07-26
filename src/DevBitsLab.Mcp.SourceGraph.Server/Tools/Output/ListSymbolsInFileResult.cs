@@ -17,10 +17,13 @@ public sealed record ListSymbolsInFileResult(
 /// </summary>
 public sealed record ListSymbolsInFileRow(
     [property: JsonPropertyName("symbol_id")] long SymbolId,
+    [property: JsonPropertyName("canonical_key")] string? CanonicalKey,
     string Name,
     string Fqn,
     string Kind,
     int Line,
     int Column,
+    [property: JsonPropertyName("end_line")] int EndLine,
+    [property: JsonPropertyName("end_column")] int EndColumn,
     string? Signature,
     [property: JsonPropertyName("xml_summary")] string? XmlSummary);

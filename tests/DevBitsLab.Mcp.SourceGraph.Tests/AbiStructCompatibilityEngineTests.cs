@@ -201,6 +201,27 @@ public sealed class AbiStructCompatibilityEngineTests
     }
 
     [Fact]
+    public void Missing_record_pack_uses_configured_target_default()
+    {
+        var managed = PacketLayout(
+            AbiRecordKind.Sequential,
+            native: false,
+            pack: null);
+        var native = PacketLayout(
+            AbiRecordKind.Native,
+            native: true,
+            pack: null);
+
+        var result = _engine.Compare(managed, native);
+
+        result.Checks.Should().ContainSingle(check =>
+            check.Aspect == AbiCompatibilityAspect.Pack
+            && check.Compatibility == InteropCompatibility.Compatible
+            && check.Reason.Contains("effective pack 8")
+            && check.Reason.Contains("target default"));
+    }
+
+    [Fact]
     public void DifferentTargets_stopBeforeLayoutFactsAreCompared()
     {
         var managed = PacketLayout(AbiRecordKind.Sequential, native: false);

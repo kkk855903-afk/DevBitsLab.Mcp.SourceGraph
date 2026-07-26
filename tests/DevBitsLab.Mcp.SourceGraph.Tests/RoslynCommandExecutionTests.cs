@@ -145,9 +145,20 @@ public sealed class RoslynCommandExecutionTests
             var sourcePath = Path.Join(root, "App", "NegativeCommands.cs");
             await File.WriteAllTextAsync(sourcePath, """
                 using System;
+                using System.Threading.Tasks;
                 using System.Windows.Input;
+                using System.Windows.Threading;
 
-                namespace CommandFixture;
+                namespace System.Windows.Threading
+                {
+                    public sealed class Dispatcher
+                    {
+                        public void BeginInvoke(Action action) { }
+                    }
+                }
+
+                namespace CommandFixture
+                {
 
                 public sealed class NegativeCommands
                 {
@@ -200,6 +211,63 @@ public sealed class RoslynCommandExecutionTests
                     public bool CanExecute(object? parameter) => true;
                     public void Execute(object? parameter) => first();
                 }
+
+                public sealed class EventOwner
+                {
+                    public event EventHandler? Changed;
+
+                    public void Attach(EventOwner source)
+                    {
+                        source.Changed += Handle;
+                    }
+
+                    public void AttachDispatched(
+                        EventOwner source,
+                        Dispatcher dispatcher)
+                    {
+                        source.Changed += (_, _) =>
+                            dispatcher.BeginInvoke(() => ApplyEventFrame());
+                    }
+
+                    public void AttachExternal()
+                    {
+                        AppDomain.CurrentDomain.UnhandledException +=
+                            HandleUnhandled;
+                    }
+
+                    public void Detach(EventOwner source)
+                    {
+                        source.Changed -= Handle;
+                    }
+
+                    public void Raise()
+                    {
+                        Changed?.Invoke(this, EventArgs.Empty);
+                    }
+
+                    private void Handle(object? sender, EventArgs args) { }
+                    private static void ApplyEventFrame() { }
+                    private static void HandleUnhandled(
+                        object sender,
+                        UnhandledExceptionEventArgs args) { }
+                }
+
+                public sealed class Scheduler
+                {
+                    public void Start()
+                    {
+                        Task.Run(() => RunLoopAsync());
+                    }
+
+                    public void ApplyOnUi(Dispatcher dispatcher)
+                    {
+                        dispatcher.BeginInvoke(() => Apply());
+                    }
+
+                    private static Task RunLoopAsync() => Task.CompletedTask;
+                    private static void Apply() { }
+                }
+                }
                 """);
 
             await using var store =
@@ -211,7 +279,100 @@ public sealed class RoslynCommandExecutionTests
                 privacyRoot: root);
             await indexer.OpenAsync(solutionPath);
 
-            await indexer.IndexAllAsync();
+            var result = await indexer.IndexAllAsync();
+
+            result.FailedFiles.Should().BeEmpty();
+            (await store.ListSymbolsInFileAsync(sourcePath))
+                .Where(symbol =>
+                    symbol.Name == "CanExecuteChanged"
+                    && symbol.Kind == SymbolKinds.Event)
+                .Should().HaveCount(3,
+                    "field-like event declarations must be indexed as event symbols");
+            var eventSymbol = await SymbolNamedAsync(
+                store,
+                sourcePath,
+                "Changed",
+                SymbolKinds.Event);
+            foreach (var (methodName, relation) in new[]
+                     {
+                         ("Attach", EdgeKinds.SubscribesEvent),
+                         ("Detach", EdgeKinds.UnsubscribesEvent),
+                         ("Raise", EdgeKinds.RaisesEvent),
+                     })
+            {
+                var method = await SymbolNamedAsync(
+                    store,
+                    sourcePath,
+                    methodName,
+                    SymbolKinds.Method);
+                (await store.ListCalleesAsync(
+                        method.Id,
+                        edgeKind: relation))
+                    .Should().ContainSingle(symbol =>
+                        symbol.Id == eventSymbol.Id);
+                (await store.ListEdgeEvidenceAsync(
+                        method.Id,
+                        eventSymbol.Id,
+                        relation))
+                    .Should().ContainSingle(evidence =>
+                        evidence.Confidence
+                        == DevBitsLab.Mcp.SourceGraph.Core
+                            .EvidenceConfidence.Exact
+                        && evidence.Producer == "roslyn");
+            }
+            (await store.ListCalleesAsync(
+                    eventSymbol.Id,
+                    edgeKind: EdgeKinds.EventDispatchesTo))
+                .Select(symbol => symbol.Name)
+                .Should().BeEquivalentTo(["Handle", "ApplyEventFrame"]);
+
+            var attachExternal = await SymbolNamedAsync(
+                store,
+                sourcePath,
+                "AttachExternal",
+                SymbolKinds.Method);
+            var externalHandler = await SymbolNamedAsync(
+                store,
+                sourcePath,
+                "HandleUnhandled",
+                SymbolKinds.Method);
+            (await store.ListCalleesAsync(
+                    attachExternal.Id,
+                    edgeKind: EdgeKinds.SubscribesHandler))
+                .Should().ContainSingle(symbol =>
+                    symbol.Id == externalHandler.Id,
+                    "metadata-only framework events must retain a handler execution edge");
+
+            foreach (var (sourceName, targetName, relation) in new[]
+                     {
+                         ("Start", "RunLoopAsync", EdgeKinds.Schedules),
+                         ("ApplyOnUi", "Apply", EdgeKinds.Dispatches),
+                     })
+            {
+                var source = await SymbolNamedAsync(
+                    store,
+                    sourcePath,
+                    sourceName,
+                    SymbolKinds.Method);
+                var target = await SymbolNamedAsync(
+                    store,
+                    sourcePath,
+                    targetName,
+                    SymbolKinds.Method);
+                (await store.ListCalleesAsync(
+                        source.Id,
+                        edgeKind: relation))
+                    .Should().ContainSingle(symbol => symbol.Id == target.Id);
+                (await store.ListEdgeEvidenceAsync(
+                        source.Id,
+                        target.Id,
+                        relation))
+                    .Should().ContainSingle(evidence =>
+                        evidence.Confidence
+                        == DevBitsLab.Mcp.SourceGraph.Core
+                            .EvidenceConfidence.Semantic
+                        && evidence.Producer == "roslyn");
+            }
 
             foreach (var propertyName in new[]
                      {
@@ -233,6 +394,88 @@ public sealed class RoslynCommandExecutionTests
                     .Should().BeEmpty(
                         $"{propertyName} does not have one semantically proven command handler");
             }
+        }
+        finally
+        {
+            TryDeleteDirectory(root);
+        }
+    }
+
+    [Fact]
+    public async Task Calls_retains_one_Roslyn_candidate_but_rejects_ambiguous_candidates()
+    {
+        var root = CreateTemporaryRoot();
+        try
+        {
+            var solutionPath = await WriteProjectAsync(root);
+            var sourcePath = Path.Join(root, "App", "PartialCalls.cs");
+            await File.WriteAllTextAsync(sourcePath, """
+                namespace CommandFixture;
+
+                public sealed class PartialCalls
+                {
+                    public void UniqueCandidate()
+                    {
+                        TakesInt("wrong argument type");
+                    }
+
+                    public void AmbiguousCandidate()
+                    {
+                        Overloaded(true);
+                    }
+
+                    private static void TakesInt(int value) { }
+                    private static void Overloaded(int value) { }
+                    private static void Overloaded(string value) { }
+                }
+                """);
+
+            await using var store =
+                new SqliteGraphStore(Path.Join(root, "graph.db"));
+            await using var indexer = new RoslynIndexer(
+                store,
+                logger: null,
+                embeddingsSink: null,
+                privacyRoot: root);
+            await indexer.OpenAsync(solutionPath);
+
+            var result = await indexer.IndexAllAsync();
+
+            result.CompilationErrorCount.Should().BeGreaterThan(0);
+            var caller = await SymbolNamedAsync(
+                store,
+                sourcePath,
+                "UniqueCandidate",
+                SymbolKinds.Method);
+            var target = await SymbolNamedAsync(
+                store,
+                sourcePath,
+                "TakesInt",
+                SymbolKinds.Method);
+            (await store.ListCalleesAsync(
+                    caller.Id,
+                    edgeKind: EdgeKinds.Calls))
+                .Should().ContainSingle(symbol => symbol.Id == target.Id);
+            (await store.ListEdgeEvidenceAsync(
+                    caller.Id,
+                    target.Id,
+                    EdgeKinds.Calls))
+                .Should().ContainSingle(evidence =>
+                    evidence.Confidence
+                    == DevBitsLab.Mcp.SourceGraph.Core
+                        .EvidenceConfidence.Semantic);
+
+            var ambiguousCaller = await SymbolNamedAsync(
+                store,
+                sourcePath,
+                "AmbiguousCandidate",
+                SymbolKinds.Method);
+            (await store.ListCalleesAsync(
+                    ambiguousCaller.Id,
+                    edgeKind: EdgeKinds.Calls))
+                .Should().NotContain(symbol =>
+                    symbol.Name == "Overloaded",
+                    "multiple candidates must remain explicit ambiguity rather than guessed calls");
         }
         finally
         {

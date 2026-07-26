@@ -32,7 +32,8 @@ internal static class ServerInstructions
     public const string Template =
         """
         🌿 This MCP server exposes a live evidence-backed graph for the connected .NET
-        solution, including C#, WPF/XAML, protobuf/gRPC, and configured C/C++ interop.
+        solution, including C#, WPF/XAML, protobuf/gRPC, zero-build C/C++ syntax,
+        and configured C/C++ interop.
         For symbol-level questions ("where is X defined?", "who calls X?", "what would
         change if I edit X?", and similar) prefer these tools over Grep + Read — the
         graph answers in one structured call instead of dozens of file reads.
