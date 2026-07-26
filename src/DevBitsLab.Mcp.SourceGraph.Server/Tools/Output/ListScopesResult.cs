@@ -26,6 +26,7 @@ public sealed record ListScopesRow(
     string Id,
     string Name,
     string Root,
+    IReadOnlyList<string> Exclude,
     string Status,
     [property: JsonPropertyName("status_message")] string? StatusMessage,
     bool Isolated,

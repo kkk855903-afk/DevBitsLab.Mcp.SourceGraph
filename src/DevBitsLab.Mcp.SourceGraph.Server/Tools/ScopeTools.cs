@@ -136,6 +136,7 @@ public static class ScopeTools
                 Id: host.Scope.Id,
                 Name: host.Scope.Name,
                 Root: host.Scope.Root,
+                Exclude: host.Scope.ProjectSet.Exclude,
                 Status: host.Status,
                 StatusMessage: string.IsNullOrEmpty(host.StatusMessage) ? null : host.StatusMessage,
                 Isolated: host.Scope.Isolated,

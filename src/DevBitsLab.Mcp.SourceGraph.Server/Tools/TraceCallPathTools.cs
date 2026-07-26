@@ -532,11 +532,26 @@ public static class TraceCallPathTools
             StringComparer.Ordinal);
         var branchLimit = Math.Min(maxNodes, 1000);
         var stop = false;
+        PathState? deepestFrontier = null;
 
         while (queue.Count > 0 && !stop)
         {
             ct.ThrowIfCancellationRequested();
             var state = queue.Dequeue();
+            if (deepestFrontier is null
+                || state.Hops.Count > deepestFrontier.Hops.Count
+                || state.Hops.Count == deepestFrontier.Hops.Count
+                && (string.CompareOrdinal(
+                        state.Current.Fqn,
+                        deepestFrontier.Current.Fqn) < 0
+                    || string.Equals(
+                        state.Current.Fqn,
+                        deepestFrontier.Current.Fqn,
+                        StringComparison.Ordinal)
+                    && state.Current.Id < deepestFrontier.Current.Id))
+            {
+                deepestFrontier = state;
+            }
             depthReached = Math.Max(depthReached, state.Hops.Count);
             if (discoverTerminal
                 && state.Stage == ExecutionStage.NativeAlgorithm
@@ -726,6 +741,28 @@ public static class TraceCallPathTools
                     : "The returned paths use persisted evidence, but partial projections can omit additional current paths.");
         }
 
+        TraceCallPathSymbol? lastResolved = null;
+        IReadOnlyList<TraceCallPathSymbol> candidateNextSteps = [];
+        if (paths.Count == 0 && deepestFrontier is not null)
+        {
+            lastResolved = MapSymbol(deepestFrontier.Current);
+            var nextEdges = await ListOutboundEdgesAsync(
+                host.Store,
+                deepestFrontier.Current.Id,
+                executionProfile
+                    ? AllowedExecutionRelations(deepestFrontier.Stage)
+                    : relations,
+                Math.Min(branchLimit, 25),
+                ct).ConfigureAwait(false);
+            candidateNextSteps = nextEdges
+                .Where(edge =>
+                    !deepestFrontier.Visited.Contains(edge.Symbol.Id))
+                .Select(edge => MapSymbol(edge.Symbol))
+                .DistinctBy(symbol => symbol.SymbolId)
+                .Take(25)
+                .ToArray();
+        }
+
         return new TraceCallPathScopeResult(
             host.Scope.Id,
             paths,
@@ -735,6 +772,8 @@ public static class TraceCallPathTools
             executionState)
         {
             Truncation = truncation,
+            LastResolved = lastResolved,
+            CandidateNextSteps = candidateNextSteps,
         };
 
         void MarkTruncated(string reason)

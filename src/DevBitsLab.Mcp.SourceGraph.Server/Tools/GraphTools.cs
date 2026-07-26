@@ -766,11 +766,14 @@ public static class GraphTools
         var structuredSymbols = symbols
             .Select(s => new ListSymbolsInFileRow(
                 SymbolId: s.Id,
+                CanonicalKey: s.CanonicalKey,
                 Name: s.Name,
                 Fqn: s.Fqn,
                 Kind: s.Kind,
                 Line: s.StartLine,
                 Column: s.StartCol,
+                EndLine: s.EndLine,
+                EndColumn: s.EndCol,
                 Signature: string.IsNullOrEmpty(s.Signature) ? null : s.Signature,
                 XmlSummary: string.IsNullOrEmpty(s.XmlSummary) ? null : s.XmlSummary))
             .ToList();

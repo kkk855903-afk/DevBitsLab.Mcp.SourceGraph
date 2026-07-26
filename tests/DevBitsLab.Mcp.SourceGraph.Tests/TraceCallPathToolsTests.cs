@@ -377,6 +377,12 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
         shallowScope.Truncation.MaxDepth.Should().Be(1);
         shallowScope.Truncation.ReturnedPaths.Should().Be(0);
         shallowScope.Truncation.MaxPaths.Should().Be(10);
+        shallowScope.LastResolved.Should().NotBeNull();
+        shallowScope.LastResolved!.Fqn.Should().Be(
+            "Graph.B",
+            "equal-depth frontiers use a stable ordinal tie-break");
+        shallowScope.CandidateNextSteps.Should().ContainSingle()
+            .Which.Fqn.Should().Be("Graph.C");
         CallToolResultHelpers.ProseText(shallow).Should()
             .Contain("truncated_by: max_depth")
             .And.Contain("expanded_nodes: 1/1000")

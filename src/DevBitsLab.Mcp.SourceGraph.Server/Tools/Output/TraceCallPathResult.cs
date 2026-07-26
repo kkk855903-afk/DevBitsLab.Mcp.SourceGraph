@@ -40,6 +40,16 @@ public sealed record TraceCallPathScopeResult(
     public IReadOnlyList<TraceCallPathSymbol> Candidates { get; init; } = [];
 
     public TraceCallPathTruncation? Truncation { get; init; }
+
+    [JsonPropertyName("last_resolved")]
+    public TraceCallPathSymbol? LastResolved { get; init; }
+
+    [JsonPropertyName("candidate_next_steps")]
+    public IReadOnlyList<TraceCallPathSymbol> CandidateNextSteps
+    {
+        get;
+        init;
+    } = [];
 }
 
 public sealed record TraceCallPathTruncation(
