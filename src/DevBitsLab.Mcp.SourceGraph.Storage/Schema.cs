@@ -109,6 +109,7 @@ public static class Schema
         );
         CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(dst, kind_name);
         CREATE INDEX IF NOT EXISTS idx_edges_kind_name ON edges(kind_name);
+        CREATE INDEX IF NOT EXISTS idx_edges_kind_src ON edges(kind_name, src);
 
         CREATE TABLE IF NOT EXISTS edge_evidence (
             id INTEGER PRIMARY KEY,
@@ -149,6 +150,7 @@ public static class Schema
         CREATE INDEX IF NOT EXISTS idx_annotations_symbol ON annotations(symbol_id);
         CREATE INDEX IF NOT EXISTS idx_annotations_name ON annotations(name);
         CREATE INDEX IF NOT EXISTS idx_annotations_flavor ON annotations(flavor);
+        CREATE INDEX IF NOT EXISTS idx_annotations_flavor_symbol ON annotations(flavor, symbol_id);
         CREATE INDEX IF NOT EXISTS idx_annotations_attribute_symbol_id ON annotations(attribute_symbol_id);
 
         CREATE TABLE IF NOT EXISTS embedding_meta (

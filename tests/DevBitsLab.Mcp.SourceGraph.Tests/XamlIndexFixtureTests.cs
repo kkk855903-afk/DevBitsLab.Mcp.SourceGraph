@@ -312,24 +312,23 @@ public sealed class XamlIndexFixtureTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task SampleWpf_dynamicResourceIsUnsupportedWithoutFindingOrEdge()
+    public async Task SampleWpf_dynamicResourceResolvesKnownDeclarationWithoutMissingFinding()
     {
         var consumer = (await _wpfStore!.FindSymbolsAsync("DynamicResourceConsumer"))
             .First(h => h.Kind == "xaml-element");
         (await _wpfStore.ListCalleesAsync(
             consumer.Id,
             limit: 50,
-            edgeKind: "uses-resource")).Should().BeEmpty();
+            edgeKind: "uses-resource")).Should().ContainSingle(target =>
+                target.CanonicalKey == "xaml:resource:App.xaml#AccentBrush"
+                && target.PayloadJson != null
+                && target.PayloadJson.Contains("\"resource-lookup\":\"dynamic\""));
 
         var annotations = await _wpfStore.GetAnnotationsForSymbolAsync(consumer.Id);
         annotations.Should().NotContain(annotation =>
             annotation.Flavor == "xaml-resource-finding");
-        var outcome = annotations.Should().ContainSingle(annotation =>
-            annotation.Flavor == "xaml-resource-outcome"
-            && annotation.FullName == "unsupported").Subject;
-        using var json = JsonDocument.Parse(outcome.ArgsJson!);
-        json.RootElement.GetProperty("reason").GetString().Should()
-            .Be("dynamic-resource-runtime-lookup");
+        annotations.Should().NotContain(annotation =>
+            annotation.Flavor == "xaml-resource-outcome");
     }
 
     [Fact]

@@ -50,11 +50,13 @@ public static class WpfTools
         [Description("Optional binding path or final member name, for example `User.Name` or `Name`.")] string? binding = null,
         [Description("Optional scope id, '*', or comma-separated scope ids.")] string? scope = null,
         [Description("Maximum result rows, 1-200 (default 50).")] int limit = 50,
+        [Description("Output detail: summary | locations | evidence | audit.")] string detail = "summary",
+        [Description("Override whether occurrence evidence is included.")] bool? includeEvidence = null,
         CancellationToken ct = default) =>
         ToolMetrics.TrackAsync(
             "trace_binding",
-            new { element, binding, scope, limit },
-            () => TraceAsync(router, element, binding, scope, limit, isCommand: false, ct));
+            new { element, binding, scope, limit, detail, includeEvidence },
+            () => TraceAsync(router, element, binding, scope, limit, detail, includeEvidence, isCommand: false, ct));
 
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(TraceCommandResult))]
     [ToolAnnotation(ReadOnlyHint = true, IdempotentHint = true)]
@@ -71,11 +73,13 @@ public static class WpfTools
         [Description("Optional command binding path or command member name, for example `SaveCommand`.")] string? command = null,
         [Description("Optional scope id, '*', or comma-separated scope ids.")] string? scope = null,
         [Description("Maximum result rows, 1-200 (default 50).")] int limit = 50,
+        [Description("Output detail: summary | locations | evidence | audit.")] string detail = "summary",
+        [Description("Override whether occurrence evidence is included.")] bool? includeEvidence = null,
         CancellationToken ct = default) =>
         ToolMetrics.TrackAsync(
             "trace_command",
-            new { element, command, scope, limit },
-            () => TraceAsync(router, element, command, scope, limit, isCommand: true, ct));
+            new { element, command, scope, limit, detail, includeEvidence },
+            () => TraceAsync(router, element, command, scope, limit, detail, includeEvidence, isCommand: true, ct));
 
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(CheckResourcesResult))]
     [ToolAnnotation(ReadOnlyHint = true, IdempotentHint = true)]
@@ -104,6 +108,8 @@ public static class WpfTools
         string? member,
         object? scope,
         int limit,
+        string detail,
+        bool? includeEvidence,
         bool isCommand,
         CancellationToken ct)
     {
@@ -119,6 +125,12 @@ public static class WpfTools
             return Task.FromResult(DiagnosticResult.Error(
                 $"{(isCommand ? "trace_command" : "trace_binding")} `limit` must be between 1 and {MaxLimit}."));
         }
+        if (detail is not ("summary" or "locations" or "evidence" or "audit"))
+        {
+            return Task.FromResult(DiagnosticResult.Error(
+                "detail must be one of summary, locations, evidence, or audit."));
+        }
+        var emitEvidence = includeEvidence ?? detail is "evidence" or "audit";
 
         var normalizedElement = NormalizeFilter(element);
         var normalizedMember = NormalizeFilter(member);
@@ -132,6 +144,7 @@ public static class WpfTools
                 normalizedMember,
                 SharedRowLimit(limit, hostIndex, hostCount),
                 isCommand,
+                emitEvidence,
                 ct),
             scoped => MergeTraceResults(
                 scoped,
@@ -184,6 +197,7 @@ public static class WpfTools
         string? memberQuery,
         int limit,
         bool isCommand,
+        bool includeEvidence,
         CancellationToken ct)
     {
         var sw = Stopwatch.StartNew();
@@ -300,6 +314,7 @@ public static class WpfTools
                 host.Scope.Id,
                 row,
                 isCommand,
+                includeEvidence,
                 ct).ConfigureAwait(false);
             if (materialized is not null) matches.Add(materialized);
         }
@@ -847,13 +862,14 @@ public static class WpfTools
         string scopeId,
         PendingTrace row,
         bool includeCommandExecutions,
+        bool includeEvidence,
         CancellationToken ct)
     {
-        IReadOnlyList<WpfOccurrenceEvidence> evidence;
+        IReadOnlyList<WpfOccurrenceEvidence> proof;
         var evidenceTruncated = false;
         if (row.AnnotationEvidence is not null)
         {
-            evidence = new[] { row.AnnotationEvidence };
+            proof = new[] { row.AnnotationEvidence };
         }
         else if (row.Target is not null)
         {
@@ -864,7 +880,7 @@ public static class WpfTools
                 limit: MaxEvidencePerMatch + 1,
                 ct: ct).ConfigureAwait(false);
             if (stored.Count == 0) return null;
-            evidence = stored.Take(MaxEvidencePerMatch).Select(MapEvidence).ToList();
+            proof = stored.Take(MaxEvidencePerMatch).Select(MapEvidence).ToList();
             evidenceTruncated = stored.Count > MaxEvidencePerMatch;
         }
         else
@@ -877,6 +893,7 @@ public static class WpfTools
                 store,
                 scopeId,
                 row.Target.Id,
+                includeEvidence,
                 ct).ConfigureAwait(false)
             : Array.Empty<WpfCommandExecution>();
         return new WpfTraceMatch(
@@ -887,8 +904,8 @@ public static class WpfTools
             row.Reason,
             MapSymbol(row.Source, scopeId),
             row.Target is null ? null : MapSymbol(row.Target, scopeId),
-            StrongestConfidence(evidence),
-            evidence,
+            StrongestConfidence(proof),
+            includeEvidence ? proof : Array.Empty<WpfOccurrenceEvidence>(),
             evidenceTruncated,
             row.Candidates)
         {
@@ -900,6 +917,7 @@ public static class WpfTools
         IGraphStore store,
         string scopeId,
         long commandPropertyId,
+        bool includeEvidence,
         CancellationToken ct)
     {
         var hits = await store.ListAuditableOutboundEdgesByKindsAsync(
@@ -923,7 +941,7 @@ public static class WpfTools
                 CommandExecutes,
                 MapSymbol(hit.Symbol, scopeId),
                 StrongestConfidence(evidence),
-                evidence,
+                includeEvidence ? evidence : Array.Empty<WpfOccurrenceEvidence>(),
                 stored.Count > MaxEvidencePerMatch));
         }
         return executions;

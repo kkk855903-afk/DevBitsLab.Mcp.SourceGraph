@@ -430,7 +430,8 @@ public sealed class WpfToolBehaviorTests : IAsyncLifetime, IDisposable
             element: ElementKey,
             binding: "Name",
             scope: null,
-            limit: 50);
+            limit: 50,
+            detail: "evidence");
 
         call.IsError.Should().NotBe(true);
         var dto = Deserialize<TraceBindingResult>(call);
@@ -457,7 +458,8 @@ public sealed class WpfToolBehaviorTests : IAsyncLifetime, IDisposable
             element: ButtonKey,
             command: "SaveCommand",
             scope: null,
-            limit: 50);
+            limit: 50,
+            detail: "evidence");
 
         var dto = Deserialize<TraceCommandResult>(call);
         dto.Status.Should().Be("resolved");
@@ -501,7 +503,8 @@ public sealed class WpfToolBehaviorTests : IAsyncLifetime, IDisposable
             element: "xaml:element:View.xaml#DoesNotExist",
             binding: "Name",
             scope: null,
-            limit: 50);
+            limit: 50,
+            detail: "evidence");
 
         var dto = Deserialize<TraceBindingResult>(call);
         dto.Status.Should().Be("not-found");
@@ -665,7 +668,8 @@ public sealed class WpfToolBehaviorTests : IAsyncLifetime, IDisposable
             element: "Crowded",
             binding: "Name",
             scope: null,
-            limit: 50);
+            limit: 50,
+            detail: "evidence");
 
         var dto = Deserialize<TraceBindingResult>(call);
         dto.ElementStatus.Should().Be("resolved");
@@ -794,7 +798,8 @@ public sealed class WpfToolBehaviorTests : IAsyncLifetime, IDisposable
             element: ElementKey,
             binding: "Name",
             scope: null,
-            limit: 50);
+            limit: 50,
+            detail: "evidence");
 
         JsonSerializer.Serialize(call, McpJsonUtilities.DefaultOptions).Length
             .Should().BeLessThanOrEqualTo(OutputBudget.DefaultBudgetChars);
@@ -1050,7 +1055,8 @@ public sealed class WpfToolIndexedFixtureTests : IAsyncLifetime, IDisposable
             element: "UserNameBox",
             binding: "Name",
             scope: null,
-            limit: 50);
+            limit: 50,
+            detail: "evidence");
         var binding = Deserialize<TraceBindingResult>(bindingCall);
         binding.Status.Should().Be("resolved");
         binding.Matches.Should().ContainSingle(match =>
@@ -1068,7 +1074,8 @@ public sealed class WpfToolIndexedFixtureTests : IAsyncLifetime, IDisposable
             element: "SaveButton",
             command: "SaveCommand",
             scope: null,
-            limit: 50);
+            limit: 50,
+            detail: "evidence");
         var command = Deserialize<TraceCommandResult>(commandCall);
         command.Status.Should().Be("resolved");
         command.Matches.Should().ContainSingle(match =>
@@ -1084,7 +1091,8 @@ public sealed class WpfToolIndexedFixtureTests : IAsyncLifetime, IDisposable
             element: "BrokenBinding",
             binding: "Missing.Name",
             scope: null,
-            limit: 50);
+            limit: 50,
+            detail: "evidence");
         var missingBinding = Deserialize<TraceBindingResult>(missingBindingCall);
         missingBinding.Status.Should().Be("missing");
         missingBinding.Matches.Should().ContainSingle(match =>

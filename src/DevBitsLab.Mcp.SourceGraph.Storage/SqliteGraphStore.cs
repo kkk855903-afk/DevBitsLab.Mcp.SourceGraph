@@ -11,6 +11,7 @@ namespace DevBitsLab.Mcp.SourceGraph.Storage;
 public sealed partial class SqliteGraphStore : IGraphStore
 {
     private readonly SqliteConnection _connection;
+    private readonly string _readerConnectionString;
     private readonly ILogger<SqliteGraphStore> _logger;
     private readonly SemaphoreSlim _writeLock = new(1, 1);
     private bool _vectorExtensionLoaded;
@@ -30,7 +31,26 @@ public sealed partial class SqliteGraphStore : IGraphStore
         _connection = new SqliteConnection(builder.ConnectionString);
         _connection.Open();
         _connection.Execute("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA temp_store=MEMORY;");
+        builder.Mode = SqliteOpenMode.ReadOnly;
+        builder.ForeignKeys = false;
+        _readerConnectionString = builder.ConnectionString;
         _logger = logger ?? NullLogger<SqliteGraphStore>.Instance;
+    }
+
+    private async Task<SqliteConnection> OpenReaderAsync(CancellationToken ct)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        var connection = new SqliteConnection(_readerConnectionString);
+        try
+        {
+            await connection.OpenAsync(ct).ConfigureAwait(false);
+            return connection;
+        }
+        catch
+        {
+            await connection.DisposeAsync().ConfigureAwait(false);
+            throw;
+        }
     }
 
     /// <summary>True once <see cref="TryLoadVectorExtension"/> has succeeded for this connection.</summary>
@@ -2279,7 +2299,8 @@ public sealed partial class SqliteGraphStore : IGraphStore
             ORDER BY file_path, start_line, start_col, id
             LIMIT @Limit;
             """;
-        var rows = await _connection.QueryAsync<RawEvidenceRow>(new CommandDefinition(
+        await using var reader = await OpenReaderAsync(ct).ConfigureAwait(false);
+        var rows = await reader.QueryAsync<RawEvidenceRow>(new CommandDefinition(
             sql,
             new
             {
@@ -2423,19 +2444,16 @@ public sealed partial class SqliteGraphStore : IGraphStore
 
     public async Task<IReadOnlyList<SymbolHit>> FindSymbolsAsync(string query, string? filePathHint = null, int limit = 25, CancellationToken ct = default)
     {
-        // Strategy:
-        //  1. exact name match (highest)
-        //  2. exact FQN match
-        //  3. FQN suffix match (e.g. user types "Calculator.Add")
-        //  4. case-insensitive prefix match on name
+        // Strategy: canonical key, exact FQN, exact name, FQN suffix, name prefix, fuzzy.
         // Optionally restrict to a file-path hint.
         const string sql = """
             WITH ranked AS (
                 SELECT s.id, s.name, s.fqn, s.kind_name, f.path, s.start_line, s.start_col, s.end_line, s.end_col, s.signature,
                     s.modifiers, s.accessibility, s.xml_summary, f.is_generated, s.test_framework, s.canonical_key,
                     CASE
-                        WHEN s.name = @q THEN 1
-                        WHEN s.fqn  = @q THEN 2
+                        WHEN s.canonical_key = @q THEN 0
+                        WHEN s.fqn = @q THEN 1
+                        WHEN s.name = @q THEN 2
                         WHEN s.fqn LIKE '%' || @q THEN 3
                         WHEN s.name LIKE @q || '%' COLLATE NOCASE THEN 4
                         WHEN s.fqn LIKE '%' || @q || '%' COLLATE NOCASE THEN 5
@@ -2445,7 +2463,8 @@ public sealed partial class SqliteGraphStore : IGraphStore
                 JOIN files   f ON f.id = s.file_id
                 WHERE (@hint IS NULL OR f.path LIKE '%' || @hint || '%')
                   AND (
-                    s.name = @q
+                    s.canonical_key = @q
+                    OR s.name = @q
                     OR s.fqn = @q
                     OR s.fqn LIKE '%' || @q
                     OR s.name LIKE @q || '%' COLLATE NOCASE
@@ -2461,9 +2480,16 @@ public sealed partial class SqliteGraphStore : IGraphStore
             ORDER BY rank, length(fqn), fqn
             LIMIT @limit;
             """;
-        var rows = await _connection.QueryAsync<RawSymbolHit>(new CommandDefinition(
+        await using var reader = await OpenReaderAsync(ct).ConfigureAwait(false);
+        var rows = await reader.QueryAsync<RawSymbolHit>(new CommandDefinition(
             sql, new { q = query, hint = filePathHint, limit }, cancellationToken: ct)).ConfigureAwait(false);
-        return rows.Select(r => r.ToHit()).ToList();
+        var hits = rows.Select(r => r.ToHit()).ToList();
+        var canonical = hits.Where(hit =>
+            string.Equals(hit.CanonicalKey, query, StringComparison.Ordinal)).ToList();
+        if (canonical.Count > 0) return canonical;
+        var exactFqn = hits.Where(hit =>
+            string.Equals(hit.Fqn, query, StringComparison.Ordinal)).ToList();
+        return exactFqn.Count > 0 ? exactFqn : hits;
     }
 
     public Task<IReadOnlyList<ReferenceHit>> FindReferencesAsync(long symbolId, int limit = 200, CancellationToken ct = default)
@@ -2683,7 +2709,8 @@ public sealed partial class SqliteGraphStore : IGraphStore
             ORDER BY e.kind_name, f.path, s.start_line, s.start_col, s.id
             LIMIT @limit;
             """;
-        var rows = await _connection.QueryAsync<RawAuditableEdgeHit>(new CommandDefinition(
+        await using var reader = await OpenReaderAsync(ct).ConfigureAwait(false);
+        var rows = await reader.QueryAsync<RawAuditableEdgeHit>(new CommandDefinition(
             sql,
             new { id = symbolId, limit, kind = edgeKind },
             cancellationToken: ct)).ConfigureAwait(false);
@@ -2744,7 +2771,8 @@ public sealed partial class SqliteGraphStore : IGraphStore
             ORDER BY e.kind_name, f.path, s.start_line, s.start_col, s.id
             LIMIT @limit;
             """;
-        var rows = await _connection.QueryAsync<RawAuditableEdgeHit>(new CommandDefinition(
+        await using var reader = await OpenReaderAsync(ct).ConfigureAwait(false);
+        var rows = await reader.QueryAsync<RawAuditableEdgeHit>(new CommandDefinition(
             sql,
             new { id = symbolId, limit, kind = edgeKind },
             cancellationToken: ct)).ConfigureAwait(false);
@@ -2798,7 +2826,8 @@ public sealed partial class SqliteGraphStore : IGraphStore
             ORDER BY e.kind_name, f.path, s.start_line, s.start_col, s.id
             LIMIT @limit;
             """;
-        var rows = await _connection.QueryAsync<RawAuditableEdgeHit>(new CommandDefinition(
+        await using var reader = await OpenReaderAsync(ct).ConfigureAwait(false);
+        var rows = await reader.QueryAsync<RawAuditableEdgeHit>(new CommandDefinition(
             sql,
             new { id = symbolId, kinds = normalizedKinds.ToArray(), limit },
             cancellationToken: ct)).ConfigureAwait(false);
@@ -2938,7 +2967,8 @@ public sealed partial class SqliteGraphStore : IGraphStore
         parameters.Add("limit", limit);
         parameters.AddDynamicParams(extraParameters);
 
-        var rows = await _connection.QueryAsync<RawEdgeWithPayload>(new CommandDefinition(
+        await using var reader = await OpenReaderAsync(ct).ConfigureAwait(false);
+        var rows = await reader.QueryAsync<RawEdgeWithPayload>(new CommandDefinition(
             sql, parameters, cancellationToken: ct)).ConfigureAwait(false);
         return rows.Select(r => r.ToEdgeWithPayload()).ToList();
     }
@@ -2977,7 +3007,8 @@ public sealed partial class SqliteGraphStore : IGraphStore
             JOIN files f ON f.id = s.file_id
             WHERE s.canonical_key = @canonicalKey;
             """;
-        var row = await _connection.QueryFirstOrDefaultAsync<RawSymbolHit>(
+        await using var reader = await OpenReaderAsync(ct).ConfigureAwait(false);
+        var row = await reader.QueryFirstOrDefaultAsync<RawSymbolHit>(
             new CommandDefinition(
                 sql,
                 new { canonicalKey },
@@ -2998,7 +3029,8 @@ public sealed partial class SqliteGraphStore : IGraphStore
             WHERE f.path = @path OR f.path LIKE '%' || @path
             ORDER BY s.start_line, s.start_col;
             """;
-        var rows = await _connection.QueryAsync<RawSymbolHit>(new CommandDefinition(
+        await using var reader = await OpenReaderAsync(ct).ConfigureAwait(false);
+        var rows = await reader.QueryAsync<RawSymbolHit>(new CommandDefinition(
             sql, new { path = filePath }, cancellationToken: ct)).ConfigureAwait(false);
         return rows.Select(r => r.ToHit()).ToList();
     }
@@ -3181,7 +3213,8 @@ public sealed partial class SqliteGraphStore : IGraphStore
 
     public async Task<IReadOnlyList<SymbolKeyRow>> GetAllSymbolKeysAsync(CancellationToken ct = default)
     {
-        var rows = await _connection.QueryAsync<SymbolKeyRow>(new CommandDefinition(
+        await using var reader = await OpenReaderAsync(ct).ConfigureAwait(false);
+        var rows = await reader.QueryAsync<SymbolKeyRow>(new CommandDefinition(
             "SELECT canonical_key AS CanonicalKey, id AS Id, file_id AS FileId FROM symbols;",
             cancellationToken: ct)).ConfigureAwait(false);
         return rows.AsList();
@@ -3189,7 +3222,8 @@ public sealed partial class SqliteGraphStore : IGraphStore
 
     public async Task<IReadOnlyList<FileRow>> GetAllFilesAsync(CancellationToken ct = default)
     {
-        var rows = await _connection.QueryAsync<FileRow>(new CommandDefinition(
+        await using var reader = await OpenReaderAsync(ct).ConfigureAwait(false);
+        var rows = await reader.QueryAsync<FileRow>(new CommandDefinition(
             "SELECT path AS Path, id AS Id FROM files;",
             cancellationToken: ct)).ConfigureAwait(false);
         return rows.AsList();
@@ -3329,7 +3363,8 @@ public sealed partial class SqliteGraphStore : IGraphStore
             ORDER BY f.path, s.start_line
             LIMIT @limit;
             """;
-        var rows = await _connection.QueryAsync<RawSymbolHit>(new CommandDefinition(
+        await using var reader = await OpenReaderAsync(ct).ConfigureAwait(false);
+        var rows = await reader.QueryAsync<RawSymbolHit>(new CommandDefinition(
             sql,
             new { name, flavor, fts = ftsTerm, kind = kindFilter, limit },
             cancellationToken: ct)).ConfigureAwait(false);
@@ -3349,7 +3384,8 @@ public sealed partial class SqliteGraphStore : IGraphStore
             WHERE symbol_id = @id
             ORDER BY id;
             """;
-        var rows = await _connection.QueryAsync<AnnotationRecord>(new CommandDefinition(
+        await using var reader = await OpenReaderAsync(ct).ConfigureAwait(false);
+        var rows = await reader.QueryAsync<AnnotationRecord>(new CommandDefinition(
             sql, new { id = symbolId }, cancellationToken: ct)).ConfigureAwait(false);
         return rows.AsList();
     }

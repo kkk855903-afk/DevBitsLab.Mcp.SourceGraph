@@ -14,7 +14,11 @@ public sealed record WpfSymbolIdentity(
     [property: JsonPropertyName("file_path")] string FilePath,
     int Line,
     int Column,
-    [property: JsonPropertyName("scope_id")] string ScopeId);
+    [property: JsonPropertyName("scope_id")] string ScopeId)
+{
+    [JsonPropertyName("canonical_id")]
+    public string? CanonicalId => CanonicalKey;
+}
 
 /// <summary>
 /// One candidate retained by an ambiguous XAML resolver outcome.
@@ -98,7 +102,19 @@ public sealed record TraceBindingResult(
     bool Truncated,
     [property: JsonPropertyName("omitted_count")] int OmittedCount,
     IReadOnlyList<WpfTraceMatch> Matches,
-    IReadOnlyList<WpfScopeSummary> Scopes);
+    IReadOnlyList<WpfScopeSummary> Scopes)
+{
+    public string Result => Matches.Count > 0
+        ? "found"
+        : Partial || Truncated ? "unknown" : "absent";
+    public string Completeness => Partial || Truncated ? "partial" : "complete";
+    [JsonPropertyName("absence_authoritative")]
+    public bool AbsenceAuthoritative =>
+        Matches.Count == 0 && !Partial && !Truncated;
+    public string Reason => Truncated
+        ? "scan-cap"
+        : Partial ? "partial-scope" : Matches.Count == 0 ? "not-found" : "matched";
+}
 
 /// <summary>
 /// Structured output for <c>trace_command</c>.
@@ -116,7 +132,19 @@ public sealed record TraceCommandResult(
     bool Truncated,
     [property: JsonPropertyName("omitted_count")] int OmittedCount,
     IReadOnlyList<WpfTraceMatch> Matches,
-    IReadOnlyList<WpfScopeSummary> Scopes);
+    IReadOnlyList<WpfScopeSummary> Scopes)
+{
+    public string Result => Matches.Count > 0
+        ? "found"
+        : Partial || Truncated ? "unknown" : "absent";
+    public string Completeness => Partial || Truncated ? "partial" : "complete";
+    [JsonPropertyName("absence_authoritative")]
+    public bool AbsenceAuthoritative =>
+        Matches.Count == 0 && !Partial && !Truncated;
+    public string Reason => Truncated
+        ? "scan-cap"
+        : Partial ? "partial-scope" : Matches.Count == 0 ? "not-found" : "matched";
+}
 
 /// <summary>
 /// One resolved <c>uses-resource</c>/<c>applies-style</c> edge or unresolved XAML resource
@@ -150,4 +178,16 @@ public sealed record CheckResourcesResult(
     bool Truncated,
     [property: JsonPropertyName("omitted_count")] int OmittedCount,
     IReadOnlyList<WpfResourceCheck> Resources,
-    IReadOnlyList<WpfScopeSummary> Scopes);
+    IReadOnlyList<WpfScopeSummary> Scopes)
+{
+    public string Result => Resources.Count > 0
+        ? "found"
+        : Partial || Truncated ? "unknown" : "absent";
+    public string Completeness => Partial || Truncated ? "partial" : "complete";
+    [JsonPropertyName("absence_authoritative")]
+    public bool AbsenceAuthoritative =>
+        Resources.Count == 0 && !Partial && !Truncated;
+    public string Reason => Truncated
+        ? "scan-cap"
+        : Partial ? "partial-scope" : Resources.Count == 0 ? "not-found" : "matched";
+}
