@@ -585,7 +585,8 @@ public interface IGraphStore : IAsyncDisposable
         string? modeExact,
         string? converterExact,
         int limit = 50,
-        CancellationToken ct = default);
+        CancellationToken ct = default,
+        string? elementNameExact = null);
 
     /// <summary>
     /// Walk <c>handles-event</c> edges with optional payload-aware filters (<c>event</c>,
@@ -598,6 +599,17 @@ public interface IGraphStore : IAsyncDisposable
         string? eventExact,
         string? elementCanonicalKey,
         string? commandExact,
+        int limit = 50,
+        CancellationToken ct = default);
+
+    /// <summary>
+    /// Walk an exact XAML resource relation (<c>uses-resource</c> or <c>applies-style</c>)
+    /// with an optional exact resource-key filter. This avoids enumerating every XAML source
+    /// symbol when a caller already supplied a precise key.
+    /// </summary>
+    Task<IReadOnlyList<EdgeWithPayload>> FindResourceReferencesAsync(
+        string edgeKind,
+        string? keyExact,
         int limit = 50,
         CancellationToken ct = default);
 

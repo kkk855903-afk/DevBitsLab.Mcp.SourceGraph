@@ -573,6 +573,54 @@ public sealed class XamlBindingOutcomeTests
     }
 
     [Fact]
+    public async Task UnsafeOmissionsExposeUniqueDirectCommandCandidateWithoutEmittingEdge()
+    {
+        var xaml = $$"""
+            <Window xmlns="{{PresentationNamespace}}"
+                    xmlns:x="{{XamlNamespace}}"
+                    xmlns:vm="clr-namespace:Test"
+                    x:DataType="vm:Vm">
+                <Button x:Name="NestedCommand"
+                        Command="{Binding Container.PreviousCommand}" />
+            </Window>
+            """;
+        var events = await IndexMultiTargetAsync(
+            [
+                """
+                using System.Windows.Input;
+                namespace Test
+                {
+                    public sealed class Vm
+                    {
+                        public Container Container { get; } = new();
+                    }
+                    public sealed class Container
+                    {
+                        public ICommand PreviousCommand { get; } = null!;
+                    }
+                }
+                """,
+            ],
+            xaml,
+            semanticInputComplete: false,
+            semanticPositiveResolutionSafe: false);
+
+        events.OfType<IndexEvent.EdgeEmitted>().Should().NotContain(edge =>
+            edge.SourceCanonicalKey.EndsWith("#NestedCommand", StringComparison.Ordinal)
+            && edge.EdgeKindName == "binds-path");
+        var outcome = AnnotationFor(
+            events,
+            "NestedCommand",
+            "xaml-command-outcome");
+        using var json = JsonDocument.Parse(outcome.ArgsJson!);
+        json.RootElement.GetProperty("status").GetString().Should().Be("incomplete");
+        json.RootElement.GetProperty("reason").GetString().Should()
+            .Be("semantic-input-incomplete");
+        json.RootElement.GetProperty("candidates")[0].GetString().Should()
+            .Be("csharp:P:Test.Container.PreviousCommand");
+    }
+
+    [Fact]
     public async Task BuildGeneratedOmissionDoesNotAuthorizeEventHandlerInference()
     {
         var xaml = $$"""

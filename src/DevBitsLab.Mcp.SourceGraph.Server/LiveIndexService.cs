@@ -981,7 +981,8 @@ public sealed class LiveIndexService : BackgroundService
         perScopeFactories.Register(
             new DevBitsLab.Mcp.SourceGraph.Indexing.Xaml.XamlLanguageProjectFactory(
                 () => host.Indexer.SanitizedSolution,
-                host.Indexer.IsProjectSemanticInputComplete));
+                host.Indexer.IsProjectSemanticInputComplete,
+                host.Indexer.IsProjectXamlPositiveResolutionSafe));
         foreach (var factory in _projectFactories.All())
         {
             // Replace the process-wide discovery-only XAML factory with this scope's

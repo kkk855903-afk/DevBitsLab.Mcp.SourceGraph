@@ -26,6 +26,7 @@ public static class WpfTools
     private const string UsesResource = "uses-resource";
     private const string AppliesStyle = "applies-style";
     private const string CommandExecutes = "command-executes";
+    private const string UsesType = "uses-type";
     private const string ResolvedBindingEdgeReason = "resolved-by-indexed-binding-edge";
     private const string ResolvedLegacyBindingEdgeReason = "resolved-by-legacy-binding-edge";
     private const string ResolvedResourceEdgeReason = "resolved-by-indexed-resource-edge";
@@ -206,7 +207,22 @@ public static class WpfTools
             host.Scope.Id,
             elementQuery,
             ct).ConfigureAwait(false);
-        if (element.Status is "ambiguous" or "not-found")
+        var probeLimit = ProbeLimit(limit);
+        IReadOnlyList<EdgeWithPayload> elementNameEdges = Array.Empty<EdgeWithPayload>();
+        if (elementQuery is not null && element.Status == "not-found")
+        {
+            elementNameEdges = await host.Store.FindDataBindingsAsync(
+                targetCanonicalKey: null,
+                sourceCanonicalKey: null,
+                pathContains: memberQuery,
+                modeExact: null,
+                converterExact: null,
+                limit: probeLimit,
+                ct: ct,
+                elementNameExact: elementQuery).ConfigureAwait(false);
+        }
+        if (element.Status == "ambiguous"
+            || (element.Status == "not-found" && elementNameEdges.Count == 0))
         {
             var candidates = element.Candidates.Take(limit).ToList();
             var candidateOmittedCount = Math.Max(0, element.Candidates.Count - candidates.Count);
@@ -234,17 +250,37 @@ public static class WpfTools
                 elapsedMs: sw.ElapsedMilliseconds);
         }
 
-        var probeLimit = ProbeLimit(limit);
         var pending = new List<PendingTrace>();
         var sourceKey = element.Symbol?.CanonicalKey;
-        var edges = await host.Store.FindDataBindingsAsync(
+        var edges = (await host.Store.FindDataBindingsAsync(
             targetCanonicalKey: null,
             sourceCanonicalKey: sourceKey,
             pathContains: memberQuery,
             modeExact: null,
             converterExact: null,
             limit: probeLimit,
-            ct: ct).ConfigureAwait(false);
+            ct: ct).ConfigureAwait(false)).ToList();
+        if (elementQuery is not null)
+        {
+            if (elementNameEdges.Count == 0)
+            {
+                elementNameEdges = await host.Store.FindDataBindingsAsync(
+                    targetCanonicalKey: null,
+                    sourceCanonicalKey: null,
+                    pathContains: memberQuery,
+                    modeExact: null,
+                    converterExact: null,
+                    limit: probeLimit,
+                    ct: ct,
+                    elementNameExact: elementQuery).ConfigureAwait(false);
+            }
+            edges.AddRange(elementNameEdges);
+            edges = edges
+                .GroupBy(
+                    edge => (edge.Source.Id, edge.Target.Id, edge.PayloadJson))
+                .Select(group => group.First())
+                .ToList();
+        }
 
         foreach (var edge in edges)
         {
@@ -267,6 +303,7 @@ public static class WpfTools
         var annotationScan = await LoadTraceAnnotationsAsync(
             host.Store,
             element.Symbol,
+            elementQuery,
             memberQuery,
             isCommand,
             probeLimit,
@@ -275,10 +312,8 @@ public static class WpfTools
 
         // Legacy indexes may carry a direct binds-to relation rather than binds-path. Only pay
         // the global enumeration cost when the primary relation produced no resolved match.
-        var hasResolvedPrimary = pending.Any(row =>
-            row.Relation == BindsPath && row.Status == "resolved");
         var fallbackTruncated = false;
-        if (!hasResolvedPrimary)
+        if (pending.Count == 0)
         {
             var fallback = await LoadBindsToFallbackAsync(
                 host.Store,
@@ -315,13 +350,21 @@ public static class WpfTools
                 row,
                 isCommand,
                 includeEvidence,
+                elementQuery,
+                element.Symbol?.Id,
                 ct).ConfigureAwait(false);
             if (materialized is not null) matches.Add(materialized);
         }
 
         var omittedCount = Math.Max(0, ordered.Count - requested.Count);
         var truncated = queryTruncated;
-        var status = AggregateStatus(matches.Select(match => match.Status), element.Status);
+        var effectiveElementStatus =
+            element.Status == "not-found" && elementNameEdges.Count > 0
+                ? "resolved"
+                : element.Status;
+        var status = AggregateStatus(
+            matches.Select(match => match.Status),
+            effectiveElementStatus);
         var note = CombineNotes(
             PartialScopeNote(host),
             matches.Count == 0
@@ -339,7 +382,7 @@ public static class WpfTools
             elementQuery,
             memberQuery,
             status,
-            element.Status,
+            effectiveElementStatus,
             element.Candidates,
             matches,
             truncated,
@@ -360,45 +403,33 @@ public static class WpfTools
         var probeLimit = ProbeLimit(limit);
         var pending = new List<PendingResource>();
 
-        var sourceScan = await LoadXamlSymbolsAsync(
-            host.Store,
-            fileQuery,
-            IsXamlResourceReferenceSource,
-            ct).ConfigureAwait(false);
+        var exactKeyQuery = keyQuery is not null && fileQuery is null;
+        var sourceScan = exactKeyQuery
+            ? new XamlSymbolScan(Array.Empty<SymbolHit>(), Truncated: false)
+            : await LoadXamlSymbolsAsync(
+                host.Store,
+                fileQuery,
+                IsXamlResourceReferenceSource,
+                ct).ConfigureAwait(false);
         var edgeProbeTruncated = false;
-        foreach (var source in sourceScan.Symbols)
+        if (exactKeyQuery)
         {
-            if (pending.Count >= MaxProbeRows)
-            {
-                edgeProbeTruncated = true;
-                break;
-            }
-
             foreach (var relation in new[] { UsesResource, AppliesStyle })
             {
-                var perRelationLimit = Math.Min(MaxProbeRows, Math.Max(100, probeLimit));
-                var outgoing = await host.Store.ListAuditableOutboundEdgesAsync(
-                    source.Id,
-                    limit: perRelationLimit,
-                    edgeKind: relation,
-                    ct: ct).ConfigureAwait(false);
-                if (outgoing.Count >= perRelationLimit)
-                {
-                    edgeProbeTruncated = true;
-                }
-
-                foreach (var edge in outgoing)
+                var edges = await host.Store.FindResourceReferencesAsync(
+                    relation,
+                    keyQuery,
+                    MaxProbeRows,
+                    ct).ConfigureAwait(false);
+                if (edges.Count >= MaxProbeRows) edgeProbeTruncated = true;
+                foreach (var edge in edges)
                 {
                     var payload = ParsePayload(edge.PayloadJson);
-                    if (string.IsNullOrEmpty(payload.Key)
-                        || !ExactMatches(payload.Key, keyQuery))
-                    {
-                        continue;
-                    }
+                    if (string.IsNullOrEmpty(payload.Key)) continue;
                     pending.Add(new PendingResource(
-                        source,
-                        edge.Symbol,
-                        edge.Relation,
+                        edge.Source,
+                        edge.Target,
+                        relation,
                         payload.Key,
                         "resolved",
                         StableReason(payload.Reason, "resolved", relation),
@@ -406,13 +437,59 @@ public static class WpfTools
                         payload.Raw,
                         Array.Empty<WpfResolutionCandidate>(),
                         AnnotationEvidence: null));
-                    if (pending.Count >= MaxProbeRows)
+                }
+            }
+        }
+        else
+        {
+            foreach (var source in sourceScan.Symbols)
+            {
+                if (pending.Count >= MaxProbeRows)
+                {
+                    edgeProbeTruncated = true;
+                    break;
+                }
+
+                foreach (var relation in new[] { UsesResource, AppliesStyle })
+                {
+                    var perRelationLimit = Math.Min(MaxProbeRows, Math.Max(100, probeLimit));
+                    var outgoing = await host.Store.ListAuditableOutboundEdgesAsync(
+                        source.Id,
+                        limit: perRelationLimit,
+                        edgeKind: relation,
+                        ct: ct).ConfigureAwait(false);
+                    if (outgoing.Count >= perRelationLimit)
                     {
                         edgeProbeTruncated = true;
-                        break;
                     }
+
+                    foreach (var edge in outgoing)
+                    {
+                        var payload = ParsePayload(edge.PayloadJson);
+                        if (string.IsNullOrEmpty(payload.Key)
+                            || !ExactMatches(payload.Key, keyQuery))
+                        {
+                            continue;
+                        }
+                        pending.Add(new PendingResource(
+                            source,
+                            edge.Symbol,
+                            edge.Relation,
+                            payload.Key,
+                            "resolved",
+                            StableReason(payload.Reason, "resolved", relation),
+                            payload.ResourceLookup,
+                            payload.Raw,
+                            Array.Empty<WpfResolutionCandidate>(),
+                            AnnotationEvidence: null));
+                        if (pending.Count >= MaxProbeRows)
+                        {
+                            edgeProbeTruncated = true;
+                            break;
+                        }
+                    }
+                    if (pending.Count >= MaxProbeRows) break;
                 }
-                if (pending.Count >= MaxProbeRows) break;
             }
         }
 
@@ -424,6 +501,49 @@ public static class WpfTools
             probeLimit,
             ct).ConfigureAwait(false);
         pending.AddRange(annotationScan.Rows);
+        if (keyQuery is not null)
+        {
+            var definitions = (await host.Store.FindSymbolsAsync(
+                    keyQuery,
+                    limit: MaxProbeRows,
+                    ct: ct).ConfigureAwait(false))
+                .Where(symbol =>
+                    symbol.Kind == "xaml-resource"
+                    && string.Equals(symbol.Name, keyQuery, StringComparison.Ordinal))
+                .GroupBy(symbol => symbol.Id)
+                .Select(group => group.First())
+                .Take(MaxEvidencePerMatch + 1)
+                .ToArray();
+            if (definitions.Length > 0)
+            {
+                var candidates = definitions
+                    .Take(MaxEvidencePerMatch)
+                    .Select(symbol => new WpfResolutionCandidate(
+                        symbol.CanonicalKey,
+                        symbol.Fqn,
+                        symbol.FilePath,
+                        symbol.StartLine,
+                        symbol.StartCol))
+                    .ToArray();
+                for (var index = 0; index < pending.Count; index++)
+                {
+                    var row = pending[index];
+                    if (row.Target is not null || row.Candidates.Count > 0) continue;
+                    pending[index] = row with
+                    {
+                        Status = definitions.Length > 1 ? "ambiguous" : row.Status,
+                        Reason = definitions.Length > 1
+                            ? "multiple-indexed-resource-definitions"
+                            : "unique-indexed-definition-cascade-unproven",
+                        Candidates = candidates,
+                    };
+                }
+                if (definitions.Length > MaxEvidencePerMatch)
+                {
+                    edgeProbeTruncated = true;
+                }
+            }
+        }
 
         var ordered = pending
             .GroupBy(ResourceDedupKey, StringComparer.Ordinal)
@@ -592,6 +712,7 @@ public static class WpfTools
     private static async Task<TraceScan> LoadTraceAnnotationsAsync(
         IGraphStore store,
         SymbolHit? element,
+        string? elementQuery,
         string? memberQuery,
         bool isCommand,
         int probeLimit,
@@ -614,7 +735,7 @@ public static class WpfTools
         {
             symbols.Add(element);
         }
-        else
+        if (element is null || elementQuery is not null)
         {
             var names = isCommand
                 ? new[]
@@ -632,7 +753,7 @@ public static class WpfTools
                 var found = await store.FindByAnnotationAsync(
                     name,
                     flavor,
-                    argSubstring: null,
+                    argSubstring: memberQuery,
                     kindFilter: null,
                     limit: probeLimit,
                     ct: ct).ConfigureAwait(false);
@@ -649,6 +770,15 @@ public static class WpfTools
             {
                 if (!flavors.Contains(annotation.Flavor)) continue;
                 var parsed = ParseOutcome(annotation.ArgsJson);
+                if (elementQuery is not null
+                    && source.Id != element?.Id
+                    && !string.Equals(
+                        parsed.ElementName,
+                        elementQuery,
+                        StringComparison.Ordinal))
+                {
+                    continue;
+                }
                 var status = NormalizeStatus(parsed.Status);
                 var path = parsed.Path;
                 if (path is null)
@@ -769,7 +899,7 @@ public static class WpfTools
                 var found = await store.FindByAnnotationAsync(
                     name,
                     flavor,
-                    argSubstring: null,
+                    argSubstring: keyQuery,
                     kindFilter: null,
                     limit: probeLimit,
                     ct: ct).ConfigureAwait(false);
@@ -863,6 +993,8 @@ public static class WpfTools
         PendingTrace row,
         bool includeCommandExecutions,
         bool includeEvidence,
+        string? elementNameQuery,
+        long? resolvedElementId,
         CancellationToken ct)
     {
         IReadOnlyList<WpfOccurrenceEvidence> proof;
@@ -888,11 +1020,73 @@ public static class WpfTools
             return null;
         }
 
-        var commandExecutions = includeCommandExecutions && row.Target is not null
+        var effectiveTarget = row.Target;
+        WpfSymbolIdentity? syntheticTarget = null;
+        var candidates = row.Candidates;
+        var effectiveStatus = row.Status;
+        var effectiveReason = row.Reason;
+        if (!includeCommandExecutions
+            && effectiveTarget is null
+            && elementNameQuery is not null
+            && row.Source.Id != resolvedElementId
+            && TryResolveKnownFrameworkProperty(
+                row.Path,
+                scopeId,
+                out syntheticTarget,
+                out var frameworkCandidate))
+        {
+            candidates = new[] { frameworkCandidate };
+            effectiveStatus = "resolved";
+            effectiveReason = "resolved-by-wpf-framework-metadata";
+        }
+        if (includeCommandExecutions
+            && effectiveTarget is null
+            && candidates.Count == 0)
+        {
+            var inferred = await ResolveDirectCommandCandidateAsync(
+                store,
+                row.Path,
+                ct).ConfigureAwait(false);
+            if (inferred is not null)
+            {
+                effectiveTarget = inferred;
+                candidates = new[]
+                {
+                    new WpfResolutionCandidate(
+                        inferred.CanonicalKey,
+                        inferred.Fqn,
+                        inferred.FilePath,
+                        inferred.StartLine,
+                        inferred.StartCol),
+                };
+            }
+        }
+        if (includeCommandExecutions
+            && effectiveTarget is null
+            && candidates.Count == 1
+            && candidates[0].CanonicalKey is { } candidateKey)
+        {
+            var keys = await store.GetAllSymbolKeysAsync(ct).ConfigureAwait(false);
+            var candidateRows = keys
+                .Where(candidate => string.Equals(
+                    candidate.CanonicalKey,
+                    candidateKey,
+                    StringComparison.Ordinal))
+                .Take(2)
+                .ToArray();
+            if (candidateRows.Length == 1)
+            {
+                effectiveTarget = await store.GetSymbolByIdAsync(
+                    candidateRows[0].Id,
+                    ct).ConfigureAwait(false);
+            }
+        }
+
+        var commandExecutions = includeCommandExecutions && effectiveTarget is not null
             ? await LoadCommandExecutionsAsync(
                 store,
                 scopeId,
-                row.Target.Id,
+                effectiveTarget.Id,
                 includeEvidence,
                 ct).ConfigureAwait(false)
             : Array.Empty<WpfCommandExecution>();
@@ -900,17 +1094,112 @@ public static class WpfTools
             scopeId,
             row.Relation,
             row.Path,
-            row.Status,
-            row.Reason,
+            effectiveStatus,
+            effectiveReason,
             MapSymbol(row.Source, scopeId),
-            row.Target is null ? null : MapSymbol(row.Target, scopeId),
+            effectiveTarget is null
+                ? syntheticTarget
+                : MapSymbol(effectiveTarget, scopeId),
             StrongestConfidence(proof),
             includeEvidence ? proof : Array.Empty<WpfOccurrenceEvidence>(),
             evidenceTruncated,
-            row.Candidates)
+            candidates)
         {
             CommandExecutions = commandExecutions,
         };
+    }
+
+    private static bool TryResolveKnownFrameworkProperty(
+        string path,
+        string scopeId,
+        out WpfSymbolIdentity? target,
+        out WpfResolutionCandidate candidate)
+    {
+        var property = path switch
+        {
+            "ActualWidth" => (
+                CanonicalKey: "csharp:P:System.Windows.FrameworkElement.ActualWidth",
+                Fqn: "double System.Windows.FrameworkElement.ActualWidth"),
+            "ActualHeight" => (
+                CanonicalKey: "csharp:P:System.Windows.FrameworkElement.ActualHeight",
+                Fqn: "double System.Windows.FrameworkElement.ActualHeight"),
+            _ => default,
+        };
+        if (property.CanonicalKey is null)
+        {
+            target = null;
+            candidate = new WpfResolutionCandidate(null, null, null, null, null);
+            return false;
+        }
+
+        target = new WpfSymbolIdentity(
+            0,
+            property.CanonicalKey,
+            path,
+            property.Fqn,
+            "property",
+            "(WPF framework metadata)",
+            0,
+            0,
+            scopeId);
+        candidate = new WpfResolutionCandidate(
+            property.CanonicalKey,
+            property.Fqn,
+            FilePath: null,
+            Line: null,
+            Column: null);
+        return true;
+    }
+
+    private static async Task<SymbolHit?> ResolveDirectCommandCandidateAsync(
+        IGraphStore store,
+        string path,
+        CancellationToken ct)
+    {
+        var segments = path
+            .Split('.', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (segments.Length < 2) return null;
+
+        var sourceProperties = (await store.FindSymbolsAsync(
+                segments[0],
+                limit: 50,
+                ct: ct).ConfigureAwait(false))
+            .Where(symbol =>
+                symbol.Kind == "property"
+                && string.Equals(symbol.Name, segments[0], StringComparison.Ordinal))
+            .ToArray();
+        var ownerTypes = new Dictionary<long, SymbolHit>();
+        foreach (var property in sourceProperties)
+        {
+            var uses = await store.ListAuditableOutboundEdgesByKindsAsync(
+                property.Id,
+                new[] { UsesType },
+                limit: 10,
+                ct: ct).ConfigureAwait(false);
+            foreach (var use in uses)
+            {
+                ownerTypes[use.Symbol.Id] = use.Symbol;
+            }
+        }
+        if (ownerTypes.Count == 0) return null;
+
+        var finalName = segments[^1];
+        var candidates = (await store.FindSymbolsAsync(
+                finalName,
+                limit: 100,
+                ct: ct).ConfigureAwait(false))
+            .Where(symbol =>
+                symbol.Kind == "property"
+                && string.Equals(symbol.Name, finalName, StringComparison.Ordinal)
+                && ownerTypes.Values.Any(owner =>
+                    symbol.Fqn.Contains(
+                        owner.Fqn + "." + finalName,
+                        StringComparison.Ordinal)))
+            .GroupBy(symbol => symbol.Id)
+            .Select(group => group.First())
+            .Take(2)
+            .ToArray();
+        return candidates.Length == 1 ? candidates[0] : null;
     }
 
     private static async Task<IReadOnlyList<WpfCommandExecution>> LoadCommandExecutionsAsync(
@@ -1804,6 +2093,7 @@ public static class WpfTools
                 GetString(root, "reason"),
                 GetString(root, "path"),
                 GetString(root, "key"),
+                GetString(root, "elementName"),
                 GetString(root, "resourceLookup"),
                 ParseCandidates(root),
                 evidence);
@@ -2129,6 +2419,7 @@ public static class WpfTools
         string? Reason,
         string? Path,
         string? Key,
+        string? ElementName,
         string? ResourceLookup,
         IReadOnlyList<WpfResolutionCandidate> Candidates,
         WpfOccurrenceEvidence? Evidence)
@@ -2138,6 +2429,7 @@ public static class WpfTools
             Reason: null,
             Path: null,
             Key: null,
+            ElementName: null,
             ResourceLookup: null,
             Array.Empty<WpfResolutionCandidate>(),
             Evidence: null);

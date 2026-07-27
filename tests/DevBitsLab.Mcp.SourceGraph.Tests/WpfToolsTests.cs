@@ -84,6 +84,7 @@ public sealed class WpfToolBehaviorTests : IAsyncLifetime, IDisposable
     private const string CommandKey = "csharp:P:Sample.MainViewModel.SaveCommand";
     private const string CommandHandlerKey = "csharp:M:Sample.MainViewModel.Save";
     private const string ResourceKey = "xaml:resource:App.xaml#AccentBrush";
+    private const string ActualWidthKey = "csharp:P:System.Windows.FrameworkElement.ActualWidth";
 
     public WpfToolBehaviorTests() => LeafFormatter.Suppressed = false;
     public void Dispose() => LeafFormatter.Suppressed = false;
@@ -133,6 +134,34 @@ public sealed class WpfToolBehaviorTests : IAsyncLifetime, IDisposable
             "xaml-element",
             xamlFileId,
             20);
+        var widthBindingOwnerId = await SeedSymbolAsync(
+            "xaml:element:View.xaml#WidthLabel",
+            "WidthLabel",
+            "View.xaml#WidthLabel",
+            "xaml-element",
+            xamlFileId,
+            24);
+        var candidateCommandOwnerId = await SeedSymbolAsync(
+            "xaml:element:View.xaml#CandidateCommandButton",
+            "CandidateCommandButton",
+            "View.xaml#CandidateCommandButton",
+            "xaml-element",
+            xamlFileId,
+            26);
+        await SeedSymbolAsync(
+            "xaml:element:View.xaml#frameworkImage",
+            "frameworkImage",
+            "View.xaml#frameworkImage",
+            "xaml-element",
+            xamlFileId,
+            28);
+        var frameworkWidthOwnerId = await SeedSymbolAsync(
+            "xaml:element:View.xaml#FrameworkWidthLabel",
+            "FrameworkWidthLabel",
+            "View.xaml#FrameworkWidthLabel",
+            "xaml-element",
+            xamlFileId,
+            29);
         await SeedSymbolAsync(
             "xaml:element:View.xaml#DuplicateA",
             "Duplicate",
@@ -168,6 +197,13 @@ public sealed class WpfToolBehaviorTests : IAsyncLifetime, IDisposable
             SymbolKinds.Method,
             codeFileId,
             16);
+        var actualWidthId = await SeedSymbolAsync(
+            ActualWidthKey,
+            "ActualWidth",
+            "System.Windows.FrameworkElement.ActualWidth",
+            SymbolKinds.Property,
+            codeFileId,
+            20);
         var resourceId = await SeedSymbolAsync(
             ResourceKey,
             "AccentBrush",
@@ -231,6 +267,13 @@ public sealed class WpfToolBehaviorTests : IAsyncLifetime, IDisposable
             ["resolution-status"] = "resolved",
             ["resolution-reason"] = "unique-command-property",
         };
+        var elementNameMetadata = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            [PayloadKeys.Path] = "ActualWidth",
+            [PayloadKeys.ElementName] = "imageview",
+            ["resolution-status"] = "resolved",
+            ["resolution-reason"] = "element-name-framework-property",
+        };
         var resourceMetadata = new Dictionary<string, string>(StringComparer.Ordinal)
         {
             [PayloadKeys.Key] = "AccentBrush",
@@ -281,6 +324,17 @@ public sealed class WpfToolBehaviorTests : IAsyncLifetime, IDisposable
                     CoreEvidenceConfidence.Semantic,
                     "roslyn",
                     null)),
+            new Edge(
+                widthBindingOwnerId,
+                actualWidthId,
+                "binds-path",
+                elementNameMetadata,
+                new Evidence(
+                    xamlFileId,
+                    new CoreSourceLocation("/repo/View.xaml", 24, 18, 24, 68),
+                    CoreEvidenceConfidence.Semantic,
+                    "xaml-semantic",
+                    elementNameMetadata)),
             new Edge(
                 buttonId,
                 resourceId,
@@ -340,6 +394,48 @@ public sealed class WpfToolBehaviorTests : IAsyncLifetime, IDisposable
 
         await _store.BulkInsertAnnotationsAsync(new[]
         {
+            new AnnotationRecord(
+                frameworkWidthOwnerId,
+                "Binding解析结果",
+                "incomplete",
+                "xaml-binding-outcome",
+                JsonSerializer.Serialize(new Dictionary<string, object?>
+                {
+                    ["status"] = "incomplete",
+                    ["reason"] = "roslyn-compilation-unavailable",
+                    ["path"] = "ActualWidth",
+                    ["elementName"] = "frameworkImage",
+                    ["candidateCount"] = 0,
+                    ["file"] = "/repo/View.xaml",
+                    ["startLine"] = 29,
+                    ["startColumn"] = 18,
+                    ["endLine"] = 29,
+                    ["endColumn"] = 68,
+                    ["confidence"] = "semantic",
+                    ["producer"] = "xaml-semantic",
+                }),
+                AttributeSymbolId: null),
+            new AnnotationRecord(
+                candidateCommandOwnerId,
+                "Command解析结果",
+                "incomplete",
+                "xaml-command-outcome",
+                JsonSerializer.Serialize(new Dictionary<string, object?>
+                {
+                    ["status"] = "incomplete",
+                    ["reason"] = "semantic-input-incomplete",
+                    ["path"] = "Container.SaveCommand",
+                    ["candidateCount"] = 1,
+                    ["candidates"] = new[] { CommandKey },
+                    ["file"] = "/repo/View.xaml",
+                    ["startLine"] = 26,
+                    ["startColumn"] = 18,
+                    ["endLine"] = 26,
+                    ["endColumn"] = 65,
+                    ["confidence"] = "semantic",
+                    ["producer"] = "xaml-semantic",
+                }),
+                AttributeSymbolId: null),
             new AnnotationRecord(
                 buttonId,
                 "Resource不存在",
@@ -451,6 +547,46 @@ public sealed class WpfToolBehaviorTests : IAsyncLifetime, IDisposable
     }
 
     [Fact]
+    public async Task TraceBinding_elementNameFilter_matchesTheTargetElement_notOnlyTheBindingOwner()
+    {
+        var call = await WpfTools.TraceBindingAsync(
+            _router!,
+            element: "imageview",
+            binding: "ActualWidth",
+            scope: null,
+            limit: 50,
+            detail: "evidence");
+
+        call.IsError.Should().NotBe(true);
+        var dto = Deserialize<TraceBindingResult>(call);
+        dto.Status.Should().Be("resolved");
+        var match = dto.Matches.Should().ContainSingle().Subject;
+        match.Source.Name.Should().Be("WidthLabel");
+        match.Target!.CanonicalKey.Should().Be(ActualWidthKey);
+        match.Path.Should().Be("ActualWidth");
+    }
+
+    [Fact]
+    public async Task TraceBinding_resolvesKnownFrameworkPropertyFromElementNameOutcome()
+    {
+        var call = await WpfTools.TraceBindingAsync(
+            _router!,
+            element: "frameworkImage",
+            binding: "ActualWidth",
+            scope: null,
+            limit: 50,
+            detail: "evidence");
+
+        var dto = Deserialize<TraceBindingResult>(call);
+        dto.Status.Should().Be("resolved");
+        var match = dto.Matches.Should().ContainSingle().Subject;
+        match.Reason.Should().Be("resolved-by-wpf-framework-metadata");
+        match.Target!.CanonicalKey.Should()
+            .Be("csharp:P:System.Windows.FrameworkElement.ActualWidth");
+        match.Target.FilePath.Should().Be("(WPF framework metadata)");
+    }
+
+    [Fact]
     public async Task TraceCommand_returnsResolvedCommand_andDoesNotMixOrdinaryBindings()
     {
         var call = await WpfTools.TraceCommandAsync(
@@ -475,6 +611,28 @@ public sealed class WpfToolBehaviorTests : IAsyncLifetime, IDisposable
             && execution.Evidence[0].StartLine == 14);
         match.Evidence.Should().ContainSingle(item =>
             item.StartLine == 22 && item.Producer == "xaml-semantic");
+    }
+
+    [Fact]
+    public async Task TraceCommand_stitchesUniqueIncompleteCandidateToCommandExecution()
+    {
+        var call = await WpfTools.TraceCommandAsync(
+            _router!,
+            element: null,
+            command: "Container.SaveCommand",
+            scope: null,
+            limit: 50,
+            detail: "evidence");
+
+        var dto = Deserialize<TraceCommandResult>(call);
+        dto.Status.Should().Be("incomplete");
+        dto.Truncated.Should().BeFalse();
+        var match = dto.Matches.Should().ContainSingle().Subject;
+        match.Target!.CanonicalKey.Should().Be(CommandKey);
+        match.Candidates.Should().ContainSingle(candidate =>
+            candidate.CanonicalKey == CommandKey);
+        match.CommandExecutions.Should().ContainSingle(execution =>
+            execution.Target.CanonicalKey == CommandHandlerKey);
     }
 
     [Fact]
@@ -548,6 +706,26 @@ public sealed class WpfToolBehaviorTests : IAsyncLifetime, IDisposable
         dto.Resources.Should().NotContain(item =>
             item.Source.FilePath.EndsWith("Preview.xaml", StringComparison.OrdinalIgnoreCase),
             "the file suffix `View.xaml` must not match the final segment `Preview.xaml`");
+    }
+
+    [Fact]
+    public async Task CheckResources_exactKeyUsesDirectPayloadQueryWithoutGlobalXamlScan()
+    {
+        var call = await WpfTools.CheckResourcesAsync(
+            _router!,
+            file: null,
+            key: "AccentBrush",
+            scope: null,
+            limit: 50);
+
+        var dto = Deserialize<CheckResourcesResult>(call);
+        dto.Status.Should().Be("resolved");
+        dto.Truncated.Should().BeFalse();
+        dto.Result.Should().Be("found");
+        dto.Completeness.Should().Be("complete");
+        dto.AbsenceAuthoritative.Should().BeFalse();
+        dto.Resources.Should().HaveCount(3);
+        dto.Resources.Should().OnlyContain(item => item.Key == "AccentBrush");
     }
 
     [Fact]
