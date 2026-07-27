@@ -11,6 +11,26 @@ below note which package the change applies to.
 ## [Unreleased]
 
 ### Changed
+- **WPF semantic chains and compact query results.** Command traces now continue
+  from the bound `ICommand` property through persisted `command-executes`
+  evidence to the handler. Element-name bindings resolve inherited WPF
+  properties such as `FrameworkElement.ActualWidth`, resource lookup covers
+  project dictionaries and pack-URI component paths, and interface-member
+  projection covers inherited and constructed generic implementations.
+  `trace_binding` and `trace_command` add compatible result/completeness fields,
+  a `canonical_id`, and summary/evidence detail modes while retaining the
+  existing response fields.
+- **Independent read connections and deterministic symbol selection.** Read-only
+  graph queries use pooled SQLite readers, common edge/annotation paths have
+  compound indexes, and exact canonical-key/FQN matches take precedence over
+  suffix, name, and fuzzy matches. Bounded concurrent-reader coverage prevents
+  regressions to a shared read lock.
+- **Actionable native-interoperability discovery.** An unconfigured interop
+  query performs a bounded, read-only scan for `.vcxproj`, CMake,
+  `compile_commands.json`, and DLL candidates. Diagnostics disclose detected
+  Debug/Release and x86/x64/arm64 targets, report ambiguity, and require an
+  explicit `interop.target` plus translation units instead of guessing. The
+  existing PE export and ABI engines remain the authority after configuration.
 - **Reliable partial-workspace and XAML indexing.** Initial Roslyn workspace
   opens that return at least one project now keep those projects queryable while
   surfacing failure diagnostics through `FailedProjects` / `partial` scope

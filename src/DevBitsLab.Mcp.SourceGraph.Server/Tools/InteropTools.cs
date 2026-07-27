@@ -170,13 +170,15 @@ public static class InteropTools
     {
         if (host.NativeInteropState is null)
         {
+            var discovery = NativeInteropDiscovery.Discover(host.Scope.Root);
             var notConfigured = ScopeFailure(
                 host.Scope.Id,
                 query,
                 host.Status,
                 status: "not_configured",
                 code: "interop-not-configured",
-                "This scope has no native interop configuration.");
+                "This scope has no native interop configuration."
+                + discovery.ToDiagnostic());
             return ScopeCall(
                 InteropQueryBudget.Apply(notConfigured, scopeBudget).Result,
                 isError: false);

@@ -531,7 +531,7 @@ public sealed class AbiCompatibilityQueryServiceTests : IAsyncLifetime
             "ok",
             _store!,
             CompleteState(),
-            "Packet",
+            "acket",
             native.Layout.SymbolCanonicalKey,
             managedInputComplete: true);
 
