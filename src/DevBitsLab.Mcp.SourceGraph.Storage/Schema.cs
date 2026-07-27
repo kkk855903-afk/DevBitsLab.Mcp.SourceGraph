@@ -16,9 +16,17 @@ public static class Schema
     /// drops all data tables when the on-disk version is below this, since the index can always be
     /// rebuilt from source.
     /// </summary>
-    public const int Version = 14;
+    public const int Version = 16;
 
     /// <summary>
+    /// V16 rebuilds V15 projections after incomplete Roslyn compilations gained unique-candidate
+    /// call recovery and source-declared code-behind bindings became independently provable.
+    ///
+    /// V15 is an intentional projection rebuild with no layout change. It invalidates cached
+    /// per-file graph facts so existing databases gain lambda-contained call edges,
+    /// code-behind DataContext binding resolution, interface dispatch edges, and the updated
+    /// managed/native execution projection introduced after V14.
+    ///
     /// V14 adds the insert-only <c>grpc_contract_baselines</c> table. Each exact protobuf
     /// canonical key retains its first complete successful contract payload and source range;
     /// later checks can therefore prove field-number and streaming changes against real prior
@@ -48,9 +56,9 @@ public static class Schema
     /// test/history awareness, V8 added <c>files.is_generated</c> and <c>diagnostics</c>,
     /// V7 wired in <c>sqlite-vec</c>, V6 added <c>attributes</c> + <c>attributes_fts</c>,
     /// V5 enriched symbols with modifiers/accessibility/xml_summary, V3 dropped FK constraints
-    /// from refs/edges. V14 is the cumulative drop-and-rebuild target — there is no preserved
+    /// from refs/edges. V16 is the cumulative drop-and-rebuild target — there is no preserved
     /// data path; <see cref="SqliteGraphStore.EnsureSchemaAsync"/> calls <see cref="DropAll"/>
-    /// when the on-disk version is anything below 14.
+    /// when the on-disk version is anything below 16.
     /// </summary>
     internal const string V1 = """
         CREATE TABLE IF NOT EXISTS schema_version (
@@ -63,6 +71,12 @@ public static class Schema
             content_sha256 BLOB NOT NULL,
             last_indexed_at INTEGER NOT NULL,
             is_generated INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS projection_versions (
+            producer TEXT PRIMARY KEY,
+            version INTEGER NOT NULL,
+            completed_at INTEGER NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS symbols (
@@ -110,6 +124,7 @@ public static class Schema
         CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(dst, kind_name);
         CREATE INDEX IF NOT EXISTS idx_edges_kind_name ON edges(kind_name);
         CREATE INDEX IF NOT EXISTS idx_edges_kind_src ON edges(kind_name, src);
+        CREATE INDEX IF NOT EXISTS idx_edges_kind_dst_src ON edges(kind_name, dst, src);
 
         CREATE TABLE IF NOT EXISTS edge_evidence (
             id INTEGER PRIMARY KEY,
@@ -137,6 +152,8 @@ public static class Schema
             ON edge_evidence(producing_file_id);
         CREATE INDEX IF NOT EXISTS idx_edge_evidence_producer
             ON edge_evidence(producer);
+        CREATE INDEX IF NOT EXISTS idx_edge_evidence_kind_dst_src
+            ON edge_evidence(kind_name, dst, src);
 
         CREATE TABLE IF NOT EXISTS annotations (
             id INTEGER PRIMARY KEY,
@@ -341,5 +358,6 @@ public static class Schema
         DROP TABLE   IF EXISTS refs;
         DROP TABLE   IF EXISTS symbols;
         DROP TABLE   IF EXISTS files;
+        DROP TABLE   IF EXISTS projection_versions;
         """;
 }

@@ -244,7 +244,7 @@ public sealed class InteropAnalysisPublisherTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task Source_only_match_remains_queryable_without_edge_or_findings()
+    public async Task Source_only_match_publishes_traversable_edge_without_findings()
     {
         var managed = await SeedManagedAsync();
         await SeedNativeAsync(
@@ -259,7 +259,7 @@ public sealed class InteropAnalysisPublisherTests : IAsyncLifetime
         result.IsComplete.Should().BeTrue();
         result.MatchesPublished.Should().Be(1);
         result.FindingsPublished.Should().Be(0);
-        result.EdgesPublished.Should().Be(0);
+        result.EdgesPublished.Should().Be(1);
         var match = (await InteropFactStoreReader.ReadMatchesAsync(_store!))
             .Facts.Should().ContainSingle().Subject.Fact;
         match.Status.Should().Be(InteropMatchStatus.SourceMatched);
@@ -269,7 +269,8 @@ public sealed class InteropAnalysisPublisherTests : IAsyncLifetime
         (await _store!.ListCalleesAsync(
             managed.SymbolId,
             edgeKind: EdgeKinds.PInvokeMapsTo))
-            .Should().BeEmpty();
+            .Should().ContainSingle()
+            .Which.CanonicalKey.Should().Be("c:E:native/source.h::run");
     }
 
     [Theory]

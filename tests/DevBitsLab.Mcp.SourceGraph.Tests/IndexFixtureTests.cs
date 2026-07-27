@@ -115,6 +115,30 @@ public sealed class IndexFixtureTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task InterfaceMemberDispatchesToImplementingMember()
+    {
+        var interfaceMethod = (await _store!.FindSymbolsAsync("IGreeter.Greet"))
+            .Should().ContainSingle(hit =>
+                hit.Fqn.Contains("IGreeter.Greet", StringComparison.Ordinal))
+            .Which;
+        var implementation = (await _store.ListCalleesAsync(
+                interfaceMethod.Id,
+                edgeKind: EdgeKinds.InterfaceDispatchesTo))
+            .Should().ContainSingle(hit =>
+                hit.Fqn.Contains("Greeter.Greet", StringComparison.Ordinal)
+                && !hit.Fqn.Contains("IGreeter.Greet", StringComparison.Ordinal))
+            .Which;
+
+        (await _store.ListEdgeEvidenceAsync(
+                interfaceMethod.Id,
+                implementation.Id,
+                EdgeKinds.InterfaceDispatchesTo))
+            .Should().ContainSingle(evidence =>
+                evidence.Confidence == CoreEvidenceConfidence.Semantic
+                && evidence.Producer == "roslyn");
+    }
+
+    [Fact]
     public async Task RepeatedRoslynCalls_preserveExactCallSiteEvidence()
     {
         var caller = (await _store!.FindSymbolsAsync("AddManyNumbers"))
@@ -146,6 +170,49 @@ public sealed class IndexFixtureTests : IAsyncLifetime
                 item.Location.EndLine,
                 item.Location.EndColumn))
             .Should().OnlyHaveUniqueItems("separate call sites must not collapse");
+    }
+
+    [Fact]
+    public async Task CallInsideLambda_isAttributedToContainingMethod()
+    {
+        var caller = (await _store!.FindSymbolsAsync(
+                "CallsInsideLambda_areAttributedToTheContainingMethod"))
+            .Should().ContainSingle()
+            .Which;
+        var target = (await _store.FindSymbolsAsync("Calculator.Add"))
+            .Should().ContainSingle(hit =>
+                hit.Fqn.Contains(
+                    "Sample.Domain.Calculator.Add",
+                    StringComparison.Ordinal))
+            .Which;
+
+        (await _store.ListEdgeEvidenceAsync(
+                caller.Id,
+                target.Id,
+                EdgeKinds.Calls))
+            .Should().ContainSingle(evidence =>
+                evidence.Confidence == CoreEvidenceConfidence.Exact
+                && evidence.Producer == "roslyn");
+    }
+
+    [Fact]
+    public async Task UniqueCandidateCallInsideNestedAsyncLambda_isAttributedToContainingMethod()
+    {
+        var caller = (await _store!.FindSymbolsAsync(
+                "CandidateCallInsideNestedAsyncLambda_isAttributedToContainingMethod"))
+            .Should().ContainSingle()
+            .Which;
+        var target = (await _store.FindSymbolsAsync(
+                "CandidateOnlyTargetAsync"))
+            .Should().ContainSingle()
+            .Which;
+
+        (await _store.ListEdgeEvidenceAsync(
+                caller.Id,
+                target.Id,
+                EdgeKinds.Calls))
+            .Should().ContainSingle(evidence =>
+                evidence.Producer == "roslyn");
     }
 
     [Fact]

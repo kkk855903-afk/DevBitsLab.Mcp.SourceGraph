@@ -163,6 +163,50 @@ public sealed partial class SqliteGraphStore : IGraphStore
             new CommandDefinition(sql, cancellationToken: ct));
     }
 
+    public Task<int?> GetProjectionVersionAsync(
+        string producer,
+        CancellationToken ct = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(producer);
+        return _connection.ExecuteScalarAsync<int?>(new CommandDefinition(
+            "SELECT version FROM projection_versions WHERE producer = @producer;",
+            new { producer },
+            cancellationToken: ct));
+    }
+
+    public async Task SetProjectionVersionAsync(
+        string producer,
+        int version,
+        CancellationToken ct = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(producer);
+        ArgumentOutOfRangeException.ThrowIfLessThan(version, 1);
+        const string sql = """
+            INSERT INTO projection_versions(producer, version, completed_at)
+            VALUES (@producer, @version, @completedAt)
+            ON CONFLICT(producer) DO UPDATE SET
+                version = excluded.version,
+                completed_at = excluded.completed_at;
+            """;
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await _connection.ExecuteAsync(new CommandDefinition(
+                sql,
+                new
+                {
+                    producer,
+                    version,
+                    completedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                },
+                cancellationToken: ct)).ConfigureAwait(false);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
     public async Task<long> UpsertFileAsync(string path, byte[] contentSha256, DateTimeOffset indexedAt, bool isGenerated = false, CancellationToken ct = default)
     {
         const string sql = """

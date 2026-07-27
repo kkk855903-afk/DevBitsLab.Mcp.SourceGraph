@@ -31,18 +31,22 @@ public static class TraceCallPathTools
     private const int MaximumScopeFanout = 32;
     private const string ExecutionProfile = "execution";
     private const string ExecutionTerminalDefinition =
-        "A terminal algorithm is reached only by binds-path, command-executes, one or more "
-        + "managed calls, grpc-calls, rpc-dispatches-to, one or more server calls, "
-        + "pinvoke-maps-to, and one or more native calls, in that order; its final node has "
+        "A terminal algorithm is reached through optional UI/command entry edges, one or more "
+        + "managed calls or interface dispatches, an optional gRPC dispatch stage, "
+        + "pinvoke-maps-to, a native implementation or call edge, and zero or more native "
+        + "calls, in that order; its final node has "
         + "no auditable outbound calls edge.";
     private static readonly string[] ExecutionRelations =
     [
         "binds-path",
         EdgeKinds.CommandExecutes,
         EdgeKinds.Calls,
+        EdgeKinds.InterfaceDispatchesTo,
+        EdgeKinds.HandlesEvent,
         EdgeKinds.GrpcCalls,
         EdgeKinds.RpcDispatchesTo,
         EdgeKinds.PInvokeMapsTo,
+        EdgeKinds.NativeImplementation,
     ];
 
     /// <summary>
@@ -414,7 +418,10 @@ public static class TraceCallPathTools
                 new List<TraceCallPathHop>(),
                 new HashSet<long> { source.Id },
                 executionProfile
-                    ? ExecutionStage.AwaitBinding
+                    ? await InitialExecutionStageAsync(
+                        host.Store,
+                        source.Id,
+                        ct).ConfigureAwait(false)
                     : ExecutionStage.Relation));
         }
 
@@ -712,17 +719,24 @@ public static class TraceCallPathTools
         ExecutionStage stage) =>
         stage switch
         {
-            ExecutionStage.AwaitBinding => ["binds-path"],
+            ExecutionStage.AwaitBinding =>
+                ["binds-path", EdgeKinds.HandlesEvent],
             ExecutionStage.AwaitCommand => [EdgeKinds.CommandExecutes],
             ExecutionStage.AwaitManagedCall => [EdgeKinds.Calls],
             ExecutionStage.ManagedClient =>
-                [EdgeKinds.Calls, EdgeKinds.GrpcCalls],
+                [
+                    EdgeKinds.Calls,
+                    EdgeKinds.InterfaceDispatchesTo,
+                    EdgeKinds.GrpcCalls,
+                    EdgeKinds.PInvokeMapsTo,
+                ],
             ExecutionStage.AwaitRpcDispatch =>
                 [EdgeKinds.RpcDispatchesTo],
             ExecutionStage.AwaitServerCall => [EdgeKinds.Calls],
             ExecutionStage.ManagedServer =>
                 [EdgeKinds.Calls, EdgeKinds.PInvokeMapsTo],
-            ExecutionStage.AwaitNativeCall => [EdgeKinds.Calls],
+            ExecutionStage.AwaitNativeCall =>
+                [EdgeKinds.NativeImplementation, EdgeKinds.Calls],
             ExecutionStage.NativeAlgorithm => [EdgeKinds.Calls],
             _ => throw new InvalidOperationException(
                 $"Execution relation requested for invalid stage `{stage}`."),
@@ -737,14 +751,20 @@ public static class TraceCallPathTools
         {
             (ExecutionStage.AwaitBinding, "binds-path") =>
                 ExecutionStage.AwaitCommand,
+            (ExecutionStage.AwaitBinding, EdgeKinds.HandlesEvent) =>
+                ExecutionStage.ManagedClient,
             (ExecutionStage.AwaitCommand, EdgeKinds.CommandExecutes) =>
                 ExecutionStage.AwaitManagedCall,
             (ExecutionStage.AwaitManagedCall, EdgeKinds.Calls) =>
                 ExecutionStage.ManagedClient,
             (ExecutionStage.ManagedClient, EdgeKinds.Calls) =>
                 ExecutionStage.ManagedClient,
+            (ExecutionStage.ManagedClient, EdgeKinds.InterfaceDispatchesTo) =>
+                ExecutionStage.ManagedClient,
             (ExecutionStage.ManagedClient, EdgeKinds.GrpcCalls) =>
                 ExecutionStage.AwaitRpcDispatch,
+            (ExecutionStage.ManagedClient, EdgeKinds.PInvokeMapsTo) =>
+                ExecutionStage.AwaitNativeCall,
             (ExecutionStage.AwaitRpcDispatch, EdgeKinds.RpcDispatchesTo) =>
                 ExecutionStage.AwaitServerCall,
             (ExecutionStage.AwaitServerCall, EdgeKinds.Calls) =>
@@ -753,6 +773,8 @@ public static class TraceCallPathTools
                 ExecutionStage.ManagedServer,
             (ExecutionStage.ManagedServer, EdgeKinds.PInvokeMapsTo) =>
                 ExecutionStage.AwaitNativeCall,
+            (ExecutionStage.AwaitNativeCall, EdgeKinds.NativeImplementation) =>
+                ExecutionStage.NativeAlgorithm,
             (ExecutionStage.AwaitNativeCall, EdgeKinds.Calls) =>
                 ExecutionStage.NativeAlgorithm,
             (ExecutionStage.NativeAlgorithm, EdgeKinds.Calls) =>
@@ -760,6 +782,35 @@ public static class TraceCallPathTools
             _ => ExecutionStage.Invalid,
         };
         return next != ExecutionStage.Invalid;
+    }
+
+    private static async Task<ExecutionStage> InitialExecutionStageAsync(
+        IGraphStore store,
+        long symbolId,
+        CancellationToken ct)
+    {
+        if (await HasAnyAuditableOutboundAsync(
+                store,
+                symbolId,
+                "binds-path",
+                ct).ConfigureAwait(false)
+            || await HasAnyAuditableOutboundAsync(
+                store,
+                symbolId,
+                EdgeKinds.HandlesEvent,
+                ct).ConfigureAwait(false))
+        {
+            return ExecutionStage.AwaitBinding;
+        }
+        if (await HasAnyAuditableOutboundAsync(
+                store,
+                symbolId,
+                EdgeKinds.CommandExecutes,
+                ct).ConfigureAwait(false))
+        {
+            return ExecutionStage.AwaitCommand;
+        }
+        return ExecutionStage.ManagedClient;
     }
 
     private static TraceCallPathExecutionState BuildExecutionState(

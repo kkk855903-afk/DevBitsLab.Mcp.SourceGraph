@@ -81,6 +81,8 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
     private const int MaximumManagedAbiRecordsPerFile = 4096;
     private const int MaximumManagedInteropUsagesPerFile = 4096;
     private const int MaximumManagedImportFanoutProbeRows = 50_000;
+    private const string CoreProjectionProducer = "roslyn-core";
+    private const int CoreProjectionVersion = 2;
     /// <inheritdoc />
     IReadOnlyCollection<string> ILanguageIndexer.FileExtensions => _fileExtensions;
 
@@ -870,6 +872,7 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                 snapshotPreparation.Snapshots,
                 forceInteropProjectionRefresh:
                     refreshAllManagedInteropUsages,
+                forceCoreProjectionRefresh: false,
                 ct).ConfigureAwait(false);
             if (generatedPathsForReconcile is not null)
             {
@@ -954,12 +957,18 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         {
             AddFileFailure(initialFailures, failure.Path, failure.Reason);
         }
+        var storedProjectionVersion = await _store
+            .GetProjectionVersionAsync(CoreProjectionProducer, ct)
+            .ConfigureAwait(false);
+        var forceCoreProjectionRefresh =
+            storedProjectionVersion != CoreProjectionVersion;
         var result = await IndexCoreAsync(
             discovery.Documents,
             fullReset,
             initialFailures,
             snapshotPreparation.Snapshots,
             forceInteropProjectionRefresh: _interopTarget is not null,
+            forceCoreProjectionRefresh,
             ct).ConfigureAwait(false);
         var passIsComplete =
             discovery.IsComplete
@@ -974,6 +983,11 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
             {
                 ReconciledCompleteUniverse = true,
             };
+            await _store.SetProjectionVersionAsync(
+                    CoreProjectionProducer,
+                    CoreProjectionVersion,
+                    ct)
+                .ConfigureAwait(false);
         }
         else
         {
@@ -2519,6 +2533,7 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         IReadOnlyCollection<FileFailure>? initialFailures,
         IReadOnlyDictionary<string, RegularDocumentSnapshot> regularSnapshots,
         bool forceInteropProjectionRefresh,
+        bool forceCoreProjectionRefresh,
         CancellationToken ct)
     {
         var sw = Stopwatch.StartNew();
@@ -2753,7 +2768,9 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
             }
             var sha = SHA256.HashData(bytes);
             var stored = await _store.GetFileContentHashAsync(path, ct).ConfigureAwait(false);
-            var unchanged = stored is not null && stored.AsSpan().SequenceEqual(sha);
+            var unchanged = !forceCoreProjectionRefresh
+                && stored is not null
+                && stored.AsSpan().SequenceEqual(sha);
 
             var fileId = await _store.UpsertFileAsync(path, sha, DateTimeOffset.UtcNow, isGenerated, ct).ConfigureAwait(false);
             _fileIdByPath[path] = fileId;
@@ -3346,14 +3363,17 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                     ISymbol? referenced = null;
                     ReferenceKind kind = ReferenceKind.Reference;
                     SyntaxNode? refNode = null; // node whose position we record
+                    var referenceConfidence = CoreEvidenceConfidence.Exact;
 
                     switch (node)
                     {
                         case IdentifierNameSyntax id when id.Parent is not (NamespaceDeclarationSyntax or BaseTypeDeclarationSyntax or MethodDeclarationSyntax or PropertyDeclarationSyntax or VariableDeclaratorSyntax or ParameterSyntax or TypeParameterSyntax):
-                            referenced = id.Parent is InvocationExpressionSyntax invocationId
+                            referenced = ResolveReferencedSymbol(
+                                id.Parent is InvocationExpressionSyntax invocationId
                                 && invocationId.Expression == id
-                                    ? model.GetSymbolInfo(invocationId, ct).Symbol
-                                    : model.GetSymbolInfo(id, ct).Symbol;
+                                    ? model.GetSymbolInfo(invocationId, ct)
+                                    : model.GetSymbolInfo(id, ct),
+                                out referenceConfidence);
                             refNode = id;
                             kind = id.Parent is InvocationExpressionSyntax inv
                                 && inv.Expression == id
@@ -3362,10 +3382,12 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                             break;
 
                         case GenericNameSyntax gn:
-                            referenced = gn.Parent is InvocationExpressionSyntax invocationGeneric
+                            referenced = ResolveReferencedSymbol(
+                                gn.Parent is InvocationExpressionSyntax invocationGeneric
                                 && invocationGeneric.Expression == gn
-                                    ? model.GetSymbolInfo(invocationGeneric, ct).Symbol
-                                    : model.GetSymbolInfo(gn, ct).Symbol;
+                                    ? model.GetSymbolInfo(invocationGeneric, ct)
+                                    : model.GetSymbolInfo(gn, ct),
+                                out referenceConfidence);
                             refNode = gn;
                             kind = gn.Parent is InvocationExpressionSyntax invGn
                                 && invGn.Expression == gn
@@ -3374,10 +3396,12 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                             break;
 
                         case MemberAccessExpressionSyntax mae:
-                            referenced = mae.Parent is InvocationExpressionSyntax invocationMember
+                            referenced = ResolveReferencedSymbol(
+                                mae.Parent is InvocationExpressionSyntax invocationMember
                                 && invocationMember.Expression == mae
-                                    ? model.GetSymbolInfo(invocationMember, ct).Symbol
-                                    : model.GetSymbolInfo(mae.Name, ct).Symbol;
+                                    ? model.GetSymbolInfo(invocationMember, ct)
+                                    : model.GetSymbolInfo(mae.Name, ct),
+                                out referenceConfidence);
                             refNode = mae.Name;
                             kind = mae.Parent is InvocationExpressionSyntax invMa && invMa.Expression == mae
                                 ? ReferenceKind.Call
@@ -3385,22 +3409,28 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                             break;
 
                         case ObjectCreationExpressionSyntax oce:
-                            referenced = model.GetSymbolInfo(oce, ct).Symbol;
+                            referenced = ResolveReferencedSymbol(
+                                model.GetSymbolInfo(oce, ct),
+                                out referenceConfidence);
                             refNode = oce;
                             kind = ReferenceKind.Call;
                             break;
 
                         case ImplicitObjectCreationExpressionSyntax ioce:
-                            referenced = model.GetSymbolInfo(ioce, ct).Symbol;
+                            referenced = ResolveReferencedSymbol(
+                                model.GetSymbolInfo(ioce, ct),
+                                out referenceConfidence);
                             refNode = ioce;
                             kind = ReferenceKind.Call;
                             break;
 
                         case MemberBindingExpressionSyntax mbe:
-                            referenced = mbe.Parent is InvocationExpressionSyntax invocationBinding
+                            referenced = ResolveReferencedSymbol(
+                                mbe.Parent is InvocationExpressionSyntax invocationBinding
                                 && invocationBinding.Expression == mbe
-                                    ? model.GetSymbolInfo(invocationBinding, ct).Symbol
-                                    : model.GetSymbolInfo(mbe.Name, ct).Symbol;
+                                    ? model.GetSymbolInfo(invocationBinding, ct)
+                                    : model.GetSymbolInfo(mbe.Name, ct),
+                                out referenceConfidence);
                             refNode = mbe.Name;
                             kind = mbe.Parent is InvocationExpressionSyntax invMb
                                 && invMb.Expression == mbe
@@ -3444,7 +3474,7 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                                     symId,
                                     EdgeKinds.Calls,
                                     refNode,
-                                    CoreEvidenceConfidence.Exact);
+                                    referenceConfidence);
                             }
                         }
                     }
@@ -4157,11 +4187,44 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
     private static ISymbol? FindEnclosingMember(SemanticModel model, int position, CancellationToken ct)
     {
         var symbol = model.GetEnclosingSymbol(position, ct);
-        while (symbol is not null and not IMethodSymbol and not IPropertySymbol and not IFieldSymbol and not IEventSymbol)
+        while (symbol is not null)
         {
+            if (symbol is IMethodSymbol method
+                && method.MethodKind is MethodKind.AnonymousFunction
+                    or MethodKind.LocalFunction)
+            {
+                symbol = symbol.ContainingSymbol;
+                continue;
+            }
+            if (symbol is IMethodSymbol
+                or IPropertySymbol
+                or IFieldSymbol
+                or IEventSymbol)
+            {
+                return symbol;
+            }
             symbol = symbol.ContainingSymbol;
         }
-        return symbol;
+        return null;
+    }
+
+    private static ISymbol? ResolveReferencedSymbol(
+        SymbolInfo info,
+        out CoreEvidenceConfidence confidence)
+    {
+        if (info.Symbol is not null)
+        {
+            confidence = CoreEvidenceConfidence.Exact;
+            return info.Symbol;
+        }
+        if (info.CandidateSymbols.Length == 1)
+        {
+            confidence = CoreEvidenceConfidence.Semantic;
+            return info.CandidateSymbols[0];
+        }
+
+        confidence = CoreEvidenceConfidence.Exact;
+        return null;
     }
 
     /// <summary>
@@ -4571,6 +4634,12 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                     srcId,
                     dstId,
                     EdgeKinds.ImplementsMember,
+                    evidenceNode,
+                    CoreEvidenceConfidence.Semantic);
+                addEdge(
+                    dstId,
+                    srcId,
+                    EdgeKinds.InterfaceDispatchesTo,
                     evidenceNode,
                     CoreEvidenceConfidence.Semantic);
             }

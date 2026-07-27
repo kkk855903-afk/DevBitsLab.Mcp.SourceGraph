@@ -183,6 +183,23 @@ public sealed class Phase1QueryEvidenceTests : IAsyncLifetime
             .Should().Equal("Graph.B", "Graph.C");
         a.Confidence.Should().Be("semantic", "the path uses its weakest hop confidence");
         a.Path.Should().AllSatisfy(AssertHopIsAuditable);
+
+        CallToolResultHelpers.ProseText(result)
+            .Should().NotContain("Auditable predecessor paths:",
+                "the default summary must not duplicate every structured evidence path");
+
+        var evidenceResult = await Phase1CompatibilityTools.ImpactAnalysisAsync(
+            _router!,
+            "Graph.C",
+            maxDepth: 4,
+            limit: 10,
+            kind: EdgeKinds.Calls,
+            detail: "evidence");
+        var compactProse = CallToolResultHelpers.ProseText(result);
+        var evidenceProse = CallToolResultHelpers.ProseText(evidenceResult);
+        evidenceProse.Should().Contain("Auditable predecessor paths:");
+        compactProse.Length.Should().BeLessThan(evidenceProse.Length / 2,
+            "the default mode should materially reduce tokens, not merely rename the evidence section");
     }
 
     [Fact]

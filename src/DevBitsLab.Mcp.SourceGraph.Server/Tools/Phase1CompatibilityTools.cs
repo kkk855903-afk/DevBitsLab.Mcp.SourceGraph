@@ -169,15 +169,29 @@ public static class Phase1CompatibilityTools
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(ImpactOfChangeResult))]
     [ToolAnnotation(ReadOnlyHint = true, IdempotentHint = true)]
     [ToolTrigger("\"analyze the impact of changing X\"")]
-    [Description("Compute bounded evidence-backed upstream impact. Compatibility name for impact_of_change; every row includes its BFS predecessor and a source-to-target path whose hops carry real occurrence evidence.")]
+    [Description("Compute bounded evidence-backed upstream impact. Compatibility name for impact_of_change; defaults to a compact summary while structured output retains auditable paths.")]
     public static Task<CallToolResult> ImpactAnalysisAsync(
         ScopeRouter router,
         [Description("Symbol name or FQN")] string symbol,
         [Description("Maximum traversal depth (default 4)")] int maxDepth = 4,
         [Description("Maximum results (default 100)")] int limit = 100,
         [Description("Edge kind to walk (default calls); pass all to walk every indexed edge kind")] string? kind = null,
+        [Description("Output detail: summary (default) | paths | evidence")] string detail = "summary",
+        [Description("Optional file-path hint used to disambiguate symbols with the same name.")] string? file = null,
+        [Description("Optional kebab-case symbol kind used to disambiguate the target.")] string? symbolKind = null,
         [Description(ScopeDescription)] string? scope = null,
         IProgress<ProgressNotificationValue>? progress = null,
         CancellationToken ct = default) =>
-        GraphTools.ImpactOfChangeAsync(router, symbol, maxDepth, limit, kind, scope, progress, ct);
+        GraphTools.ImpactOfChangeAsync(
+            router,
+            symbol,
+            maxDepth,
+            limit,
+            kind,
+            detail,
+            file,
+            symbolKind,
+            scope,
+            progress,
+            ct);
 }

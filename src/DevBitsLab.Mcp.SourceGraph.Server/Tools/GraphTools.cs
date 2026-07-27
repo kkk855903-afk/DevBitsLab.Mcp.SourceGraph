@@ -1867,17 +1867,20 @@ public static class GraphTools
 
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(ImpactOfChangeResult))]
     [ToolTrigger("\"what would change if I edit X?\" — transitive callers")]
-    [Description("Compute bounded evidence-backed upstream impact with breadth-first, cycle-safe traversal. Every row includes its canonical identity, BFS predecessor, path confidence, and a source-to-target path whose hops carry real occurrence evidence. maxDepth is 1-12 and limit is 1-1000; truncation is explicit.")]
+    [Description("Compute bounded evidence-backed upstream impact with breadth-first, cycle-safe traversal. Defaults to a token-efficient summary; set detail=paths for predecessor chains or detail=evidence for occurrence evidence. maxDepth is 1-12 and limit is 1-1000; truncation is explicit.")]
     public static Task<CallToolResult> ImpactOfChangeAsync(
         ScopeRouter router,
         [Description("Symbol name or FQN")] string symbol,
         [Description("Maximum traversal depth (default 4)")] int maxDepth = 4,
         [Description("Maximum results (default 100)")] int limit = 100,
         [Description("Edge kind to walk (kebab-case): calls (default) | uses-type | overrides-member | implements-member | instantiates | throws | tests | code-behind | binds-to | binds-path | binds-element | handles-event | uses-resource | instantiates-type | merges | applies-style | all. Plugin-defined kinds are accepted.")] string? kind = null,
+        [Description("Output detail: summary (default, smallest) | paths (predecessors only) | evidence (full occurrence evidence). Structured output always remains auditable.")] string detail = "summary",
+        [Description("Optional file-path hint used to disambiguate symbols with the same name.")] string? file = null,
+        [Description("Optional kebab-case symbol kind used to disambiguate the target.")] string? symbolKind = null,
         [Description(ScopeDescription)] string? scope = null,
         IProgress<ProgressNotificationValue>? progress = null,
         CancellationToken ct = default) =>
-        ToolMetrics.TrackAsync("impact_of_change", new { symbol, maxDepth, limit, kind, scope }, () =>
+        ToolMetrics.TrackAsync("impact_of_change", new { symbol, maxDepth, limit, kind, detail, file, symbolKind, scope }, () =>
             ScopedExecution.RunAsync(router, scope, async host =>
             {
                 var sw = System.Diagnostics.Stopwatch.StartNew();
@@ -1889,6 +1892,12 @@ public static class GraphTools
                 {
                     return DiagnosticResult.Error("impact_of_change `limit` must be between 1 and 1000.");
                 }
+                var detailLevel = detail.Trim().ToLowerInvariant();
+                if (detailLevel is not ("summary" or "paths" or "evidence"))
+                {
+                    return DiagnosticResult.Error(
+                        "impact_of_change `detail` must be summary, paths, or evidence.");
+                }
                 var (edgeKind, label, isAll) = NormaliseEdgeKindParam(kind);
                 if (!isAll && edgeKind is not null)
                 {
@@ -1896,7 +1905,14 @@ public static class GraphTools
                     if (unknownNote is not null) return DiagnosticResult.Error(unknownNote);
                 }
 
-                var hits = await host.Store.FindSymbolsAsync(symbol, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
+                var hits = await host.Store.FindSymbolsAsync(symbol, filePathHint: file, limit: 20, ct).ConfigureAwait(false);
+                var targetKind = NormaliseKindFilter(symbolKind);
+                if (targetKind is not null)
+                {
+                    hits = hits.Where(hit =>
+                            string.Equals(hit.Kind, targetKind, StringComparison.Ordinal))
+                        .ToList();
+                }
                 if (hits.Count == 0) return DiagnosticResult.Build($"No matches for '{symbol}'.");
                 var top = hits[0];
                 progress?.Report(Format.Progress(0.0, "querying"));
@@ -1950,7 +1966,14 @@ public static class GraphTools
                         sb.AppendLine($"- d{r.Depth}: **{r.Symbol.Fqn}** ({KindLabel(r.Symbol.Kind)}) at {Format.Location(r.Symbol.FilePath, r.Symbol.StartLine, r.Symbol.StartCol)}");
                     }
                 }
-                EvidenceTraversal.AppendImpactPaths(sb, rows);
+                if (detailLevel == "paths")
+                {
+                    EvidenceTraversal.AppendImpactPredecessors(sb, rows);
+                }
+                else if (detailLevel == "evidence")
+                {
+                    EvidenceTraversal.AppendImpactPaths(sb, rows);
+                }
                 if (traversal.Truncated)
                 {
                     sb.AppendLine();
@@ -2173,38 +2196,85 @@ public static class GraphTools
 
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(SemanticSearchResult))]
     [ToolTrigger("\"find code that does retry logic\", \"how does this codebase handle authentication\", \"show me the rate-limiting code\"")]
-    [Description("Semantic / intent search: encode a natural-language query, find symbols whose code embeddings are nearest by cosine similarity. Complements (not replaces) search_symbols, which does name-fragment FTS5 trigram matching. Returns a top-k list with location, kind, and a similarity score in [-1, 1].")]
+    [Description("Hybrid code search. strategy=auto first resolves identifier-like queries through FTS5 and skips semantic encoding when exact lexical hits exist; natural-language queries use embeddings. strategy=semantic forces vector search and strategy=lexical forces FTS5.")]
     public static Task<CallToolResult> SemanticSearchAsync(
         ScopeRouter router,
         ICodeEmbeddingGenerator generator,
         [Description("Free-text intent query, e.g. 'retry on transient errors', 'masks PII in logs'")] string query,
         [Description("Top-K results to return (default 20)")] int k = 20,
         [Description("Optional kebab-case symbol kind filter: class|method|property|field|interface|namespace|enum|enum-member|operator|record|delegate|struct|event|xaml-view|xaml-element|xaml-resource|xaml-style|xaml-template|... (any plugin-defined kebab-case kind also accepted).")] string? kind = null,
+        [Description("Retrieval strategy: auto (default) | semantic | lexical.")] string strategy = "auto",
         [Description(ScopeDescription)] string? scope = null,
         IProgress<ProgressNotificationValue>? progress = null,
         CancellationToken ct = default) =>
-        ToolMetrics.TrackAsync("semantic_search", new { query, k, kind, scope }, () =>
+        ToolMetrics.TrackAsync("semantic_search", new { query, k, kind, strategy, scope }, () =>
             ScopedExecution.RunAsync(router, scope, async host =>
             {
                 var sw = System.Diagnostics.Stopwatch.StartNew();
-                // The next three short-circuits ship as plain prose (no structuredContent) — by
+                // The next short-circuits ship as plain prose (no structuredContent) — by
                 // design. They're config-/input-/encoder-failure diagnostics, NOT zero-row query
                 // results. The "Empty result populates structured content" spec scenario applies
                 // only when the search ran cleanly and produced zero matches (handled below by
                 // BuildSemanticSearchResult with hits=[]). Distinguishing the two lets agents
                 // detect "search was attempted, found nothing" vs. "search couldn't run" without
                 // string-matching the prose.
-                if (!host.EmbeddingsStore.IsAvailable || !generator.IsAvailable)
-                {
-                    return DiagnosticResult.Error(
-                        "semantic_search disabled: install the embedding model (run with the network on for first start) or remove `--no-embeddings`. The graph itself is fully indexed; other tools (`find_definition`, `search_symbols`, `list_callers`, …) work as normal.");
-                }
                 if (string.IsNullOrWhiteSpace(query))
                 {
                     return DiagnosticResult.Error("semantic_search: provide a non-empty query.");
                 }
+                if (k is < 1 or > 1000)
+                {
+                    return DiagnosticResult.Error("semantic_search `k` must be between 1 and 1000.");
+                }
 
                 var kindFilter = NormaliseKindFilter(kind);
+                var retrievalStrategy = strategy.Trim().ToLowerInvariant();
+                if (retrievalStrategy is not ("auto" or "semantic" or "lexical"))
+                {
+                    return DiagnosticResult.Error(
+                        "semantic_search `strategy` must be auto, semantic, or lexical.");
+                }
+
+                if (retrievalStrategy == "lexical"
+                    || (retrievalStrategy == "auto" && LooksLikeIdentifierQuery(query)))
+                {
+                    var lexicalHits = await host.Store.SearchSymbolsAsync(
+                        query,
+                        kindFilter,
+                        k,
+                        ct).ConfigureAwait(false);
+                    if (lexicalHits.Count > 0 || retrievalStrategy == "lexical")
+                    {
+                        var lexicalRows = lexicalHits
+                            .Select((symbol, index) =>
+                                (new EmbeddingHit(
+                                    symbol.Id,
+                                    Math.Max(0.5, 1.0 - index * 0.01)),
+                                 symbol))
+                            .ToList();
+                        var lexicalProse = new StringBuilder();
+                        lexicalProse.AppendLine(
+                            $"{lexicalRows.Count} lexical hits for '{query}' (semantic encoding skipped):");
+                        foreach (var (hit, symbol) in lexicalRows)
+                        {
+                            lexicalProse.AppendLine(
+                                $"- score {hit.Score:F3} — **{symbol.Fqn}** ({Format.KindWithAttrs(symbol)}) at {Format.Location(symbol.FilePath, symbol.StartLine, symbol.StartCol)}");
+                        }
+                        return BuildSemanticSearchResult(
+                            lexicalProse.ToString(),
+                            query,
+                            lexicalRows,
+                            host.Scope.Id,
+                            sw.ElapsedMilliseconds,
+                            mode: "lexical");
+                    }
+                }
+
+                if (!host.EmbeddingsStore.IsAvailable || !generator.IsAvailable)
+                {
+                    return DiagnosticResult.Error(
+                        "semantic_search disabled: no lexical match was found and semantic embeddings are unavailable. Install the embedding model or remove `--no-embeddings`; exact identifier queries can still use strategy=lexical.");
+                }
 
                 // Cold-start: the JinaCodeEmbeddingGenerator singleton is lazy-instantiated by DI
                 // on first use, so the first `EmbedAsync` call after server start carries the ONNX
@@ -2225,7 +2295,8 @@ public static class GraphTools
                         query: query,
                         rows: Array.Empty<(EmbeddingHit Hit, SymbolHit Symbol)>(),
                         scopeId: host.Scope.Id,
-                        elapsedMs: sw.ElapsedMilliseconds);
+                        elapsedMs: sw.ElapsedMilliseconds,
+                        mode: "semantic");
                 }
 
                 progress?.Report(Format.Progress(0.9, "formatting results"));
@@ -2278,7 +2349,8 @@ public static class GraphTools
                     rows: resolved,
                     scopeId: host.Scope.Id,
                     elapsedMs: sw.ElapsedMilliseconds,
-                    omittedSize: hitsOmitted);
+                    omittedSize: hitsOmitted,
+                    mode: "semantic");
             }, ct, progress));
 
     private static CallToolResult BuildSemanticSearchResult(
@@ -2287,7 +2359,8 @@ public static class GraphTools
         IReadOnlyList<(EmbeddingHit Hit, SymbolHit Symbol)> rows,
         string scopeId,
         long elapsedMs,
-        int omittedSize = 0)
+        int omittedSize = 0,
+        string mode = "semantic")
     {
         var content = new List<ContentBlock>(capacity: 2 + rows.Count)
         {
@@ -2307,8 +2380,8 @@ public static class GraphTools
         }
 
         var extras = omittedSize > 0
-            ? new[] { ("hits", rows.Count.ToString()), ("omitted_size", omittedSize.ToString()) }
-            : new[] { ("hits", rows.Count.ToString()) };
+            ? new[] { ("hits", rows.Count.ToString()), ("mode", mode), ("omitted_size", omittedSize.ToString()) }
+            : new[] { ("hits", rows.Count.ToString()), ("mode", mode) };
         content.Add(AudienceMetadata.Build(scopeId, elapsedMs, extras));
 
         var structuredHits = rows
@@ -2322,7 +2395,7 @@ public static class GraphTools
                 Column: r.Symbol.StartCol,
                 XmlSummary: string.IsNullOrEmpty(r.Symbol.XmlSummary) ? null : r.Symbol.XmlSummary))
             .ToList();
-        var dto = new SemanticSearchResult(Query: query, Hits: structuredHits);
+        var dto = new SemanticSearchResult(Query: query, Mode: mode, Hits: structuredHits);
         return new CallToolResult
         {
             Content = content,
@@ -2330,6 +2403,114 @@ public static class GraphTools
                 dto,
                 ToolOutputJsonContext.Default.SemanticSearchResult),
         };
+    }
+
+    [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(SearchSymbolsBatchResult))]
+    [ToolTrigger("\"find several symbols in one request\"")]
+    [Description("Run 1-20 independent FTS5 symbol queries in one MCP round-trip. Use this instead of repeated search_symbols calls when resolving several names.")]
+    public static Task<CallToolResult> SearchSymbolsBatchAsync(
+        ScopeRouter router,
+        [Description("Independent symbol queries (1-20).")] IReadOnlyList<string> queries,
+        [Description("Maximum results per query (default 10, maximum 100).")] int topK = 10,
+        [Description("Optional kebab-case symbol kind applied to every query.")] string? kind = null,
+        [Description(ScopeDescription)] string? scope = null,
+        CancellationToken ct = default) =>
+        ToolMetrics.TrackAsync(
+            "search_symbols_batch",
+            new { queries, topK, kind, scope },
+            () => ScopedExecution.RunAsync(router, scope, async host =>
+            {
+                if (queries is null || queries.Count is < 1 or > 20)
+                {
+                    return DiagnosticResult.Error(
+                        "search_symbols_batch `queries` must contain between 1 and 20 items.");
+                }
+                if (queries.Any(string.IsNullOrWhiteSpace))
+                {
+                    return DiagnosticResult.Error(
+                        "search_symbols_batch queries must be non-empty.");
+                }
+                if (topK is < 1 or > 100)
+                {
+                    return DiagnosticResult.Error(
+                        "search_symbols_batch `topK` must be between 1 and 100.");
+                }
+
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                var kindFilter = NormaliseKindFilter(kind);
+                var batches = new List<SearchSymbolsBatchQueryResult>(queries.Count);
+                foreach (var query in queries)
+                {
+                    var hits = await host.Store.SearchSymbolsAsync(
+                        query,
+                        kindFilter,
+                        topK,
+                        ct).ConfigureAwait(false);
+                    batches.Add(new SearchSymbolsBatchQueryResult(
+                        query,
+                        hits.Select(MapSearchSymbolHit).ToList()));
+                }
+
+                var sb = new StringBuilder();
+                sb.AppendLine(
+                    $"{batches.Sum(batch => batch.Hits.Count)} hits across {batches.Count} queries:");
+                foreach (var batch in batches)
+                {
+                    sb.Append("- **")
+                      .Append(batch.Query)
+                      .Append("**: ");
+                    if (batch.Hits.Count == 0)
+                    {
+                        sb.AppendLine("(none)");
+                        continue;
+                    }
+                    sb.AppendLine(string.Join(
+                        ", ",
+                        batch.Hits.Select(hit =>
+                            $"{hit.Fqn} ({Format.Location(hit.FilePath, hit.StartLine, hit.StartColumn)})")));
+                }
+
+                return new CallToolResult
+                {
+                    Content =
+                    [
+                        new TextContentBlock { Text = sb.ToString() },
+                        AudienceMetadata.Build(
+                            host.Scope.Id,
+                            sw.ElapsedMilliseconds,
+                            ("queries", batches.Count.ToString()),
+                            ("hits", batches.Sum(batch => batch.Hits.Count).ToString())),
+                    ],
+                    StructuredContent = JsonSerializer.SerializeToElement(
+                        new SearchSymbolsBatchResult(batches),
+                        ToolOutputJsonContext.Default.SearchSymbolsBatchResult),
+                };
+            }, ct));
+
+    private static SearchSymbolHit MapSearchSymbolHit(SymbolHit hit) =>
+        new(
+            SymbolId: hit.Id,
+            CanonicalKey: hit.CanonicalKey,
+            Fqn: hit.Fqn,
+            Kind: hit.Kind,
+            Relation: "defines",
+            Confidence: "exact",
+            FilePath: hit.FilePath,
+            StartLine: hit.StartLine,
+            StartColumn: hit.StartCol,
+            EndLine: hit.EndLine,
+            EndColumn: hit.EndCol,
+            Signature: string.IsNullOrEmpty(hit.Signature) ? null : hit.Signature,
+            XmlSummary: string.IsNullOrEmpty(hit.XmlSummary) ? null : hit.XmlSummary);
+
+    private static bool LooksLikeIdentifierQuery(string query)
+    {
+        var value = query.Trim();
+        if (value.Length is 0 or > 160) return false;
+        if (value.Any(char.IsWhiteSpace)) return false;
+        return value.All(ch =>
+            char.IsLetterOrDigit(ch)
+            || ch is '_' or '.' or ':' or '#' or '`' or '<' or '>' or '(' or ')' or ',');
     }
 
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(GraphStatsResult))]

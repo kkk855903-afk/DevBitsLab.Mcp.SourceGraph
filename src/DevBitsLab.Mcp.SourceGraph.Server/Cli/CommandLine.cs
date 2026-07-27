@@ -544,8 +544,8 @@ internal sealed class CommandLine
                             Defaults to the directory holding `--solution`, then CWD.
           --model <id>      Override the embedding model identity (default:
                             jinaai/jina-embeddings-v2-base-code). Applies to serve/index.
-          --no-embeddings   Skip the embedding pipeline entirely. semantic_search returns the
-                            disabled-message; every other tool works as before.
+          --no-embeddings   Skip the embedding pipeline entirely. semantic_search can still
+                            return lexical identifier hits; intent queries report disabled.
           --allow-model-download
                             Explicitly allow serve/index to auto-fetch the embedding model from
                             Hugging Face when the local cache is empty. Automatic network access is
@@ -685,7 +685,7 @@ internal sealed class CommandLine
           --model <id>      覆盖嵌入模型标识（默认：
                             jinaai/jina-embeddings-v2-base-code），用于 serve/index。
           --no-embeddings   完全跳过嵌入流程，不下载模型、不写入 vec0。
-                            semantic_search 返回禁用说明，其他工具不受影响。
+                            semantic_search 仍可返回标识符词法命中；意图查询会报告禁用。
           --allow-model-download
                             显式允许 serve/index 在本地缓存为空时从 Hugging Face
                             自动下载模型。默认禁止自动联网。等价于

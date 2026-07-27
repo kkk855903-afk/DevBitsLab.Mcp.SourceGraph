@@ -6,6 +6,7 @@ using System.Threading.Tasks;
 using DevBitsLab.Mcp.SourceGraph.Indexing.Xaml.Parser;
 using DevBitsLab.Mcp.SourceGraph.Sdk;
 using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.CSharp.Syntax;
 
 namespace DevBitsLab.Mcp.SourceGraph.Indexing.Xaml;
 
@@ -29,7 +30,8 @@ internal sealed class XamlSemanticResolver
         bool compilationIsComplete,
         bool semanticResolutionIsSafe,
         bool directBindingMembersOnly,
-        XamlDocument document)
+        XamlDocument document,
+        CancellationToken ct)
     {
         _compilation = compilation;
         _compilationIsComplete = compilationIsComplete;
@@ -37,7 +39,7 @@ internal sealed class XamlSemanticResolver
         _directBindingMembersOnly = directBindingMembersOnly;
         BuildBindingContexts(
             document.Root,
-            XamlBindingContextResolution.Unknown("no-known-data-context"));
+            ResolveCodeBehindDataContext(document, ct));
     }
 
     public static async Task<XamlSemanticResolver?> CreateAsync(
@@ -56,7 +58,72 @@ internal sealed class XamlSemanticResolver
                 compilationState.IsComplete,
                 compilationState.CanResolve,
                 compilationState.DirectBindingMembersOnly,
-                document);
+                document,
+                ct);
+    }
+
+    private XamlBindingContextResolution ResolveCodeBehindDataContext(
+        XamlDocument document,
+        CancellationToken ct)
+    {
+        var xClass = document.Root
+            .FindAttribute(XamlReader.XamlNamespace, "Class")
+            ?.Value
+            ?.Trim();
+        if (string.IsNullOrEmpty(xClass)
+            || _compilation.GetTypeByMetadataName(xClass) is not { } viewType)
+        {
+            return XamlBindingContextResolution.Unknown(
+                "no-known-data-context");
+        }
+
+        var candidates = new List<INamedTypeSymbol>();
+        foreach (var declarationReference in viewType.DeclaringSyntaxReferences)
+        {
+            ct.ThrowIfCancellationRequested();
+            var declaration = declarationReference.GetSyntax(ct);
+            var model = _compilation.GetSemanticModel(declaration.SyntaxTree);
+            foreach (var assignment in declaration
+                         .DescendantNodes()
+                         .OfType<AssignmentExpressionSyntax>())
+            {
+                ct.ThrowIfCancellationRequested();
+                if (model.GetSymbolInfo(assignment.Left, ct).Symbol is not
+                        IPropertySymbol { Name: "DataContext" }
+                    || model.GetEnclosingSymbol(assignment.SpanStart, ct) is not
+                        IMethodSymbol
+                        {
+                            MethodKind: MethodKind.Constructor,
+                        } constructor
+                    || !SymbolEqualityComparer.Default.Equals(
+                        constructor.ContainingType,
+                        viewType)
+                    || model.GetTypeInfo(assignment.Right, ct).Type is not
+                        INamedTypeSymbol assignedType)
+                {
+                    continue;
+                }
+
+                if (!candidates.Any(candidate =>
+                        SymbolEqualityComparer.Default.Equals(
+                            candidate,
+                            assignedType)))
+                {
+                    candidates.Add(assignedType);
+                }
+            }
+        }
+
+        return candidates.Count switch
+        {
+            1 => XamlBindingContextResolution.Resolved(
+                candidates[0],
+                "code-behind-data-context"),
+            > 1 => XamlBindingContextResolution.Ambiguous(
+                "multiple-code-behind-data-context-types"),
+            _ => XamlBindingContextResolution.Unknown(
+                "no-known-data-context"),
+        };
     }
 
     public XamlBindingResolution ResolveBinding(
@@ -91,10 +158,34 @@ internal sealed class XamlSemanticResolver
                 context.Type,
                 path,
                 directMembersOnly: true);
-            var directKey = directResolution.Property is { } directProperty
+            var directProperty = directResolution.Property;
+            var directKey = directProperty is not null
                 && (!requireCommand || IsCommandType(directProperty.Type))
-                    ? CanonicalKey(directProperty)
-                    : null;
+                ? CanonicalKey(directProperty)
+                : null;
+            if (directProperty is not null
+                && directKey is not null
+                && string.Equals(
+                    context.Source,
+                    "code-behind-data-context",
+                    StringComparison.Ordinal))
+            {
+                var directDataTypeKey = CanonicalKey(context.Type);
+                if (directDataTypeKey is not null)
+                {
+                    return new XamlBindingResolution(
+                        new XamlResolutionOutcome(
+                            XamlResolutionStatus.Resolved,
+                            "unique-source-declared-code-behind-binding"),
+                        new XamlBindingTarget(
+                            directProperty,
+                            directKey,
+                            directDataTypeKey,
+                            EvidenceConfidence.Semantic,
+                            context.Source),
+                        Array.Empty<string>());
+                }
+            }
             return new XamlBindingResolution(
                 new XamlResolutionOutcome(
                     XamlResolutionStatus.Incomplete,

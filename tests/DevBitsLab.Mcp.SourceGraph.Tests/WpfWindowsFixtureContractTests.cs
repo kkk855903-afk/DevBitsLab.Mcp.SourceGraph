@@ -137,6 +137,18 @@ public sealed class WpfWindowsFixtureContractTests
                     "SampleWpfWindows.ViewModels.MainViewModel",
                     "QueryText"));
 
+            var codeBehindStatus = (await store.FindSymbolsAsync(
+                    "CodeBehindStatusText"))
+                .Single(symbol => symbol.Kind == "xaml-element");
+            (await store.ListCalleesAsync(
+                    codeBehindStatus.Id,
+                    limit: 10,
+                    edgeKind: "binds-path"))
+                .Should().ContainSingle(target =>
+                    target.CanonicalKey == CanonicalKeys.ForProperty(
+                        "SampleWpfWindows.ViewModels.MainViewModel",
+                        "Status"));
+
             var runButton = (await store.FindSymbolsAsync("RunButton"))
                 .Single(symbol => symbol.Kind == "xaml-element");
             (await store.ListCalleesAsync(

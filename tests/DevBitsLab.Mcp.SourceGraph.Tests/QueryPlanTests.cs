@@ -278,6 +278,7 @@ public sealed class QueryPlanTests : IAsyncLifetime
                 line.Contains("idx_edges_dst")
                 || line.Contains("idx_edges_kind_name")
                 || line.Contains("idx_edges_kind_src")
+                || line.Contains("idx_edges_kind_dst_src")
                 || line.Contains("sqlite_autoindex_edges_"); // PK auto-index
             usesAcceptableIndex.Should().BeTrue(
                 $"the {queryName} plan reads edges via an unexpected index: \"{line}\". Full plan:\n{plan}");

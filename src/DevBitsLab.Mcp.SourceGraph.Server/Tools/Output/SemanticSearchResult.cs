@@ -9,6 +9,7 @@ namespace DevBitsLab.Mcp.SourceGraph.Server.Tools.Output;
 /// </summary>
 public sealed record SemanticSearchResult(
     string Query,
+    string Mode,
     IReadOnlyList<SemanticSearchHit> Hits);
 
 /// <summary>

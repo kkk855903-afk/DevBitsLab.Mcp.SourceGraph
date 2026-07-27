@@ -17,6 +17,7 @@ namespace DevBitsLab.Mcp.SourceGraph.Server.Tools.Output;
 [JsonSerializable(typeof(FindDefinitionResult))]
 [JsonSerializable(typeof(FindReferencesResult))]
 [JsonSerializable(typeof(SearchSymbolsResult))]
+[JsonSerializable(typeof(SearchSymbolsBatchResult))]
 [JsonSerializable(typeof(FindByAnnotationResult))]
 [JsonSerializable(typeof(ListCallersResult))]
 [JsonSerializable(typeof(ListCalleesResult))]

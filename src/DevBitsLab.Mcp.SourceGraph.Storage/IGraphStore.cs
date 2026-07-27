@@ -12,6 +12,23 @@ public interface IGraphStore : IAsyncDisposable
     /// </summary>
     Task<GraphReadVersion> GetReadVersionAsync(CancellationToken ct = default);
 
+    /// <summary>
+    /// Returns the last completely published version for a derived-fact producer, or null when
+    /// that producer has never completed. Producer versions let an indexer refresh only its own
+    /// files after an implementation upgrade instead of forcing a whole-schema rebuild.
+    /// </summary>
+    Task<int?> GetProjectionVersionAsync(
+        string producer,
+        CancellationToken ct = default) =>
+        Task.FromResult<int?>(null);
+
+    /// <summary>Records a producer version only after its complete projection succeeds.</summary>
+    Task SetProjectionVersionAsync(
+        string producer,
+        int version,
+        CancellationToken ct = default) =>
+        Task.CompletedTask;
+
     Task<long> UpsertFileAsync(string path, byte[] contentSha256, DateTimeOffset indexedAt, bool isGenerated = false, CancellationToken ct = default);
     Task<byte[]?> GetFileContentHashAsync(string path, CancellationToken ct = default);
 

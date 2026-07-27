@@ -11,6 +11,23 @@ below note which package the change applies to.
 ## [Unreleased]
 
 ### Changed
+- **Faster, smaller graph retrieval and incremental projection upgrades.**
+  Impact analysis now defaults to a compact summary while retaining full
+  auditable paths in structured output and exposing `paths` / `evidence`
+  detail modes. Identifier-shaped semantic searches use FTS5 first and skip
+  ONNX encoding on a lexical hit, while `search_symbols_batch` combines up to
+  20 independent lookups in one MCP round-trip. Impact target resolution
+  accepts file and symbol-kind hints. Per-producer projection versions let a
+  Roslyn projection upgrade refresh only C# facts after one complete pass, and
+  new covering SQLite indexes accelerate kind-filtered inbound traversal on
+  large graphs.
+- **Broader managed, WPF, and native execution paths.** Calls inside lambdas
+  and source-declared code-behind handlers are attributed to their executable
+  owners, interface dispatch and unique incomplete-compilation candidates gain
+  evidence-backed execution edges, and managed P/Invoke calls connect through
+  native imports to implementation symbols. WPF code-behind `DataContext`
+  assignments now resolve binding targets without requiring a XAML
+  `DataContext` declaration.
 - **WPF semantic chains and compact query results.** Command traces now continue
   from the bound `ICommand` property through persisted `command-executes`
   evidence to the handler. Element-name bindings resolve inherited WPF

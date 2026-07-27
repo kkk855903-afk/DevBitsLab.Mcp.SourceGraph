@@ -307,6 +307,38 @@ public sealed class TabularRenderingTests : IAsyncLifetime, IDisposable
     }
 
     [Fact]
+    public async Task SemanticSearch_identifierQuery_skipsUnavailableEncoder()
+    {
+        using var generator = new DisabledEmbeddingGenerator(
+            new EmbeddingModelInfo("disabled/test", 384));
+
+        var output = CallToolResultHelpers.ProseText(
+            await GraphTools.SemanticSearchAsync(
+                _router!,
+                generator,
+                "Calculator"));
+
+        output.Should().Contain("lexical hits");
+        output.Should().Contain("semantic encoding skipped");
+        output.Should().NotContain("semantic_search disabled");
+    }
+
+    [Fact]
+    public async Task SearchSymbolsBatch_combinesIndependentQueries()
+    {
+        var result = await GraphTools.SearchSymbolsBatchAsync(
+            _router!,
+            ["Calculator", "Greeter"],
+            topK: 3);
+        var output = CallToolResultHelpers.ProseText(result);
+
+        output.Should().Contain("across 2 queries");
+        output.Should().Contain("**Calculator**");
+        output.Should().Contain("**Greeter**");
+        result.StructuredContent.Should().NotBeNull();
+    }
+
+    [Fact]
     public async Task RecentChanges_multipleHits_rendersTable()
     {
         // The history pipeline doesn't run during the tabular tests (we don't spin up the hosted

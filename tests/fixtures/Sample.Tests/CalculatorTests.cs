@@ -28,4 +28,30 @@ public sealed class CalculatorTests
         Assert.Equal(expected, c.Add(a, b));
         Assert.Equal(expected, c.Add(b, a));
     }
+
+    [Fact]
+    public void CallsInsideLambda_areAttributedToTheContainingMethod()
+    {
+        var c = new Calculator();
+        System.Func<System.Func<int>, int> dispatch = callback => callback();
+        System.Func<int> calculate = () => dispatch(() => c.Add(20, 22));
+
+        Assert.Equal(42, calculate());
+    }
+
+    [Fact]
+    public void CandidateCallInsideNestedAsyncLambda_isAttributedToContainingMethod()
+    {
+        System.Action invoke = () => Dispatch(
+            async () => await CandidateOnlyTargetAsync());
+
+        invoke();
+    }
+
+    private static void Dispatch(
+        System.Func<System.Threading.Tasks.Task> callback) =>
+        _ = callback();
+
+    private static async Task CandidateOnlyTargetAsync() =>
+        await System.Threading.Tasks.Task.CompletedTask;
 }
