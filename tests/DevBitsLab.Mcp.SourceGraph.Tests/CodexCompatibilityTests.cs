@@ -82,16 +82,35 @@ public sealed class CodexCompatibilityTests
             Path.GetTempPath(),
             OperatingSystem.IsWindows() ? "dotnet.exe" : "dotnet");
         var serverAssembly = Path.Join(Path.GetTempPath(), "sourcegraph-mcp.dll");
-        var solution = Path.Join(Path.GetTempPath(), "repo", "App.slnx");
+        var root = Path.Join(Path.GetTempPath(), "repo");
+        var solution = Path.Join(root, "src", "App.slnx");
+        var database = Path.Join(root, ".sourcegraph", "scopes", "default.db");
         var attempts = PrewarmLauncher.BuildAttempts(
             solution,
+            root,
+            database,
             processPath: dotnetHost,
             serverAssemblyPath: serverAssembly);
 
         attempts[0].FileName.Should().Be(dotnetHost);
-        attempts[0].Arguments.Should().Equal(serverAssembly, "index", solution);
+        attempts[0].Arguments.Should().Equal(
+            serverAssembly,
+            "index",
+            solution,
+            "--root",
+            root,
+            "--db",
+            database);
         attempts.Should().Contain(attempt =>
             attempt.FileName == "sourcegraph-mcp"
-            && attempt.Arguments.SequenceEqual(new[] { "index", solution }));
+            && attempt.Arguments.SequenceEqual(new[]
+            {
+                "index",
+                solution,
+                "--root",
+                root,
+                "--db",
+                database,
+            }));
     }
 }

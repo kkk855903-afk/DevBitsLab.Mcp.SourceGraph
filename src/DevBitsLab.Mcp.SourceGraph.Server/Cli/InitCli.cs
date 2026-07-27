@@ -445,8 +445,9 @@ internal static class InitCli
         Console.WriteLine();
         Console.WriteLine($"Pre-warming index against {Path.GetFileName(abs)}…");
         var startedAt = DateTimeOffset.UtcNow;
+        var databasePath = ScopeLayout.ScopeDbPath(root, "default");
         var exitCode = await PrewarmLauncher.RunAttemptsAsync(
-            PrewarmLauncher.BuildAttempts(abs),
+            PrewarmLauncher.BuildAttempts(abs, root, databasePath),
             PrewarmLauncher.RunProcessAsync).ConfigureAwait(false);
         var elapsed = DateTimeOffset.UtcNow - startedAt;
         if (exitCode == 0)

@@ -120,6 +120,8 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
     // for the duration of a pass.
     private IReadOnlyDictionary<ProjectId, Compilation> _probedCompilations = new Dictionary<ProjectId, Compilation>();
     private IReadOnlyList<ProjectFailure> _probedFailures = Array.Empty<ProjectFailure>();
+    private IReadOnlyList<ProjectFailure> _workspaceOpenFailures =
+        Array.Empty<ProjectFailure>();
     private HashSet<ProjectId> _probedFailedProjectIds = new();
     private IReadOnlyDictionary<ProjectId, bool> _analyzerReferenceLoadCompleteByProject =
         new Dictionary<ProjectId, bool>();
@@ -448,14 +450,32 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         try
         {
             var state = _documentStateProperty?.GetValue(document);
-            return state is not null
-                   && _documentStateIsGeneratedProperty?.GetValue(state)
-                       is true;
+            if (state is not null
+                && _documentStateIsGeneratedProperty?.GetValue(state) is true)
+            {
+                return true;
+            }
         }
         catch
         {
+            // Fall through to the narrow path/name check used for Roslyn versions
+            // that no longer expose the same internal generated-document flag.
+        }
+
+        var path = document.FilePath;
+        if (string.IsNullOrWhiteSpace(path))
+        {
             return false;
         }
+
+        var fileName = Path.GetFileName(path);
+        return document.Project.Solution.Workspace is MSBuildWorkspace
+               && (fileName.EndsWith(".g.cs", StringComparison.OrdinalIgnoreCase)
+                   || fileName.EndsWith(".g.i.cs", StringComparison.OrdinalIgnoreCase))
+               && path.Split(
+                       Path.DirectorySeparatorChar,
+                       Path.AltDirectorySeparatorChar)
+                   .Contains("obj", StringComparer.OrdinalIgnoreCase);
     }
 
     private enum ProjectSemanticInputState
@@ -493,15 +513,33 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
             // isolation.
             var candidateWorkspace = CreateWorkspace();
             Solution candidateSolution;
+            IReadOnlyList<ProjectFailure> candidateWorkspaceFailures =
+                Array.Empty<ProjectFailure>();
             try
             {
                 var openResult = await OpenWorkspaceSolutionAsync(
                     candidateWorkspace,
                     candidateSolutionPath,
                     ct).ConfigureAwait(false);
-                ThrowIfWorkspaceLoadFailed(
-                    openResult.Diagnostics,
-                    _workspace is null ? "Initial" : "Re-open");
+                var isInitialWorkspaceOpen = _workspace is null;
+                var failureDiagnostics = WorkspaceFailureDiagnostics(
+                    openResult.Diagnostics);
+                if (failureDiagnostics.Count > 0
+                    && isInitialWorkspaceOpen
+                    && openResult.Solution.Projects.Any())
+                {
+                    candidateWorkspaceFailures = failureDiagnostics
+                        .Select((diagnostic, index) => new ProjectFailure(
+                            $"workspace-load-{index + 1}",
+                            FailureMessage.Truncate(diagnostic.Message)))
+                        .ToArray();
+                }
+                else
+                {
+                    ThrowIfWorkspaceLoadFailed(
+                        openResult.Diagnostics,
+                        isInitialWorkspaceOpen ? "Initial" : "Re-open");
+                }
                 candidateSolution = SolutionPrivacySanitizer.SanitizeForScope(
                     openResult.Solution,
                     candidatePathPolicy);
@@ -517,6 +555,7 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                 previousWorkspace is not null && _requiresStructuralReload;
             _workspace = candidateWorkspace;
             _sanitizedSolution = candidateSolution;
+            _workspaceOpenFailures = candidateWorkspaceFailures;
             _analyzerReferenceLoadCompleteByProject =
                 new Dictionary<ProjectId, bool>();
             _pathPolicy = candidatePathPolicy;
@@ -1752,8 +1791,10 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         var previousSolution = _sanitizedSolution!;
         var previousAnalyzerReferenceState =
             _analyzerReferenceLoadCompleteByProject;
+        var previousWorkspaceOpenFailures = _workspaceOpenFailures;
         _workspace = replacementWorkspace;
         _sanitizedSolution = replacementSolution;
+        _workspaceOpenFailures = Array.Empty<ProjectFailure>();
         _analyzerReferenceLoadCompleteByProject =
             new Dictionary<ProjectId, bool>();
         IndexResult result;
@@ -1793,6 +1834,7 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
             // next watcher batch and therefore force another reload + full reconciliation.
             _workspace = previousWorkspace;
             _sanitizedSolution = previousSolution;
+            _workspaceOpenFailures = previousWorkspaceOpenFailures;
             _analyzerReferenceLoadCompleteByProject =
                 previousAnalyzerReferenceState;
             DisposeWorkspace(replacementWorkspace);
@@ -1898,10 +1940,7 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         IReadOnlyList<WorkspaceDiagnostic> diagnostics,
         string phase)
     {
-        var failureDiagnostics = diagnostics
-            .Where(diagnostic =>
-                diagnostic.Kind == WorkspaceDiagnosticKind.Failure)
-            .ToList();
+        var failureDiagnostics = WorkspaceFailureDiagnostics(diagnostics);
         if (failureDiagnostics.Count == 0)
         {
             return;
@@ -1913,6 +1952,13 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                 failureDiagnostics.Select(diagnostic =>
                     FailureMessage.Truncate(diagnostic.Message))));
     }
+
+    private static IReadOnlyList<WorkspaceDiagnostic> WorkspaceFailureDiagnostics(
+        IReadOnlyList<WorkspaceDiagnostic> diagnostics) =>
+        diagnostics
+            .Where(diagnostic =>
+                diagnostic.Kind == WorkspaceDiagnosticKind.Failure)
+            .ToArray();
 
     private bool IsCSharpStructureChange(Solution solution, string path)
     {
@@ -3928,7 +3974,9 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
 
         if (unchangedManagedInteropRefreshes.Count > 0)
         {
-            if (failedFiles.Count > 0 || _probedFailures.Count > 0)
+            if (failedFiles.Count > 0
+                || _probedFailures.Count > 0
+                || _workspaceOpenFailures.Count > 0)
             {
                 // Keep every prior caller-owned fact if any other part of the pass is
                 // incomplete. A structural retry will rebuild the import and caller universes
@@ -4012,9 +4060,13 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
             }
         }
 
+        var failedProjects = _workspaceOpenFailures
+            .Concat(_probedFailures)
+            .Distinct()
+            .ToArray();
         return new IndexResult(filesIndexed, symbolsIndexed, refsIndexed, sw.Elapsed)
         {
-            FailedProjects = _probedFailures,
+            FailedProjects = failedProjects,
             FailedFiles = failedFiles,
         };
     }

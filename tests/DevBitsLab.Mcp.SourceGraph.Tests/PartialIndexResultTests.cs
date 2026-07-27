@@ -5,6 +5,7 @@ using System.Threading.Tasks;
 using DevBitsLab.Mcp.SourceGraph.Indexing;
 using DevBitsLab.Mcp.SourceGraph.Storage;
 using FluentAssertions;
+using Microsoft.CodeAnalysis;
 using Xunit;
 
 namespace DevBitsLab.Mcp.SourceGraph.Tests;
@@ -92,6 +93,128 @@ public sealed class PartialIndexResultTests
         finally
         {
             try { Directory.Delete(tmp, recursive: true); } catch { /* best-effort */ }
+        }
+    }
+
+    [Fact]
+    public async Task ColdIndex_partialWorkspaceWithLoadedProjects_reportsPartialAndIndexesLoadedSymbols()
+    {
+        var slnPath = LocateSampleSolution();
+        var tmp = Path.Combine(
+            Path.GetTempPath(),
+            "partial-workspace-tests-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tmp);
+
+        try
+        {
+            await using var store = new SqliteGraphStore(Path.Combine(tmp, "graph.db"));
+            var hooks = new RoslynIndexer.TestHooks(
+                OpenWorkspaceAsync: async (workspace, path, ct) =>
+                {
+                    var solution = await workspace.OpenSolutionAsync(
+                        path,
+                        cancellationToken: ct);
+                    return new RoslynIndexer.WorkspaceOpenResult(
+                        solution,
+                        [
+                            new WorkspaceDiagnostic(
+                                WorkspaceDiagnosticKind.Warning,
+                                "simulated non-fatal warning"),
+                            new WorkspaceDiagnostic(
+                                WorkspaceDiagnosticKind.Failure,
+                                "simulated partial workspace load"),
+                        ]);
+                });
+            await using var indexer = new RoslynIndexer(
+                store,
+                logger: null,
+                embeddingsSink: null,
+                privacyRoot: Path.GetDirectoryName(slnPath),
+                excludePatterns: Array.Empty<string>(),
+                testHooks: hooks);
+
+            await indexer.OpenAsync(slnPath);
+            var result = await indexer.IndexAllAsync();
+
+            result.FailedProjects.Should().ContainSingle(failure =>
+                failure.Name == "workspace-load-1"
+                && failure.Reason.Contains("simulated partial workspace load"));
+            result.FailedProjects.Should().NotContain(failure =>
+                failure.Reason.Contains("simulated non-fatal warning"));
+            result.FilesIndexed.Should().BeGreaterThan(0);
+            (await store.GetAllSymbolKeysAsync()).Should().NotBeEmpty(
+                "projects returned by a partial initial workspace remain queryable");
+        }
+        finally
+        {
+            try { Directory.Delete(tmp, recursive: true); } catch { /* best-effort */ }
+        }
+    }
+
+    [Fact]
+    public async Task ColdIndex_explicitInterfaceImplementation_emitsImplementationEdge()
+    {
+        var root = Path.Combine(
+            Path.GetTempPath(),
+            "explicit-interface-tests-" + Guid.NewGuid().ToString("N"));
+        var projectDir = Path.Combine(root, "App");
+        Directory.CreateDirectory(projectDir);
+        var solutionPath = Path.Combine(root, "ExplicitInterface.slnx");
+        var projectPath = Path.Combine(projectDir, "App.csproj");
+        var sourcePath = Path.Combine(projectDir, "Lookup.cs");
+
+        try
+        {
+            await File.WriteAllTextAsync(
+                solutionPath,
+                """
+                <Solution>
+                  <Project Path="App/App.csproj" />
+                </Solution>
+                """);
+            await File.WriteAllTextAsync(
+                projectPath,
+                """
+                <Project Sdk="Microsoft.NET.Sdk">
+                  <PropertyGroup>
+                    <TargetFramework>net10.0</TargetFramework>
+                    <Nullable>enable</Nullable>
+                  </PropertyGroup>
+                </Project>
+                """);
+            await File.WriteAllTextAsync(
+                sourcePath,
+                """
+                namespace ExplicitFixture;
+
+                public interface ILookup
+                {
+                    string? Find(string key);
+                }
+
+                public sealed class Lookup : ILookup
+                {
+                    string? ILookup.Find(string key) => key;
+                }
+                """);
+
+            await using var store = new SqliteGraphStore(Path.Combine(root, "graph.db"));
+            await RoslynIndexer.IndexSolutionOnceAsync(solutionPath, store);
+
+            var interfaceMethod = (await store.FindSymbolsAsync("ILookup.Find"))
+                .Should().ContainSingle(hit =>
+                    hit.Fqn.Contains("ExplicitFixture.ILookup.Find"))
+                .Which;
+            var implementations = await store.ListImplementationsAsync(
+                interfaceMethod.Id);
+
+            implementations.Should().ContainSingle(hit =>
+                hit.Fqn.Contains("ExplicitFixture.Lookup")
+                && hit.CanonicalKey != null);
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch { /* best-effort */ }
         }
     }
 

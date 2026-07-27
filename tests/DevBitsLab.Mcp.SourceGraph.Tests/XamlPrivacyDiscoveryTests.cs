@@ -254,6 +254,37 @@ public sealed class XamlPrivacyDiscoveryTests : IDisposable
     }
 
     [Fact]
+    public async Task Discover_missingExplicitXaml_skipsFileAndMarksResourceSnapshotIncomplete()
+    {
+        var projectDir = Path.Join(_root, "ManagedApp");
+        var projectPath = await PlantAsync(
+            Path.Join(projectDir, "ManagedApp.csproj"),
+            """
+            <Project Sdk="Microsoft.NET.Sdk">
+              <ItemGroup>
+                <Page Include="Language/Language.en-US.xaml" />
+              </ItemGroup>
+            </Project>
+            """);
+        var existingXaml = await PlantAsync(
+            Path.Join(projectDir, "MainWindow.xaml"),
+            """<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" />""");
+
+        var projects = await new XamlLanguageProjectFactory().DiscoverAsync(
+            _root,
+            CancellationToken.None);
+
+        var project = projects.Should().ContainSingle().Which
+            .Should().BeOfType<XamlLanguageProject>().Subject;
+        project.Id.Should().Be(projectPath);
+        project.FilePaths.Should().Equal(existingXaml);
+        project.ResourceSnapshot.IsComplete.Should().BeFalse();
+        project.ResourceSnapshot.UnknownReasons.Should().ContainSingle()
+            .Which.Should().Be(
+                "project-xaml-item-missing:Language/Language.en-US.xaml");
+    }
+
+    [Fact]
     public async Task Discover_parentFallbackScanStopsAtNestedProjectRoot()
     {
         var parentDir = Path.Join(_root, "Parent");

@@ -1268,6 +1268,20 @@ That writes `command = "dotnet"`, absolute `--project`, `--solution`, and
 
 Re-run `dotnet build` after each change so the next launch picks it up.
 
+Older Windows 10 builds that cannot start the SDK-generated CET-compatible
+apphost can opt into a local compatibility package without changing the
+published security default:
+
+```powershell
+dotnet pack src/DevBitsLab.Mcp.SourceGraph.Server `
+  -c Release `
+  -p:SourceGraphLegacyWindowsCompat=true `
+  -o .\out
+```
+
+That property disables CET compatibility metadata only for the explicit build.
+Do not use it for normal packages or on hosts that can run the default apphost.
+
 ## Contributing & security
 
 - Contribution workflow, coding conventions, and the MCP-tool authoring

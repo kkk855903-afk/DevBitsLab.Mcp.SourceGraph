@@ -11,6 +11,21 @@ below note which package the change applies to.
 ## [Unreleased]
 
 ### Changed
+- **Reliable partial-workspace and XAML indexing.** Initial Roslyn workspace
+  opens that return at least one project now keep those projects queryable while
+  surfacing failure diagnostics through `FailedProjects` / `partial` scope
+  status. Roslyn workspace packages move to 5.6.0. Explicit project XAML items
+  that no longer exist are skipped and make the resource cascade incomplete
+  instead of aborting discovery for every surviving XAML file. Explicit
+  interface implementations remain indexable with `implements-member` edges,
+  and WPF generated sources retain compiler provenance across the Roslyn 5.6
+  workspace metadata change without trusting spoofed `obj/*.g.cs` paths.
+- **Root-aligned pre-warm and opt-in legacy Windows compatibility.**
+  `init --prewarm` now passes the repository root and its
+  `.sourcegraph/scopes/default.db` explicitly, so a solution nested below the
+  root is immediately visible to `demo --root`. Source builds retain the
+  platform CET default unless `SourceGraphLegacyWindowsCompat=true` is passed
+  explicitly for older Windows hosts.
 - **Codex MCP transport compatibility and deterministic project paths.** Codex
   configs now use absolute `--solution` / `--root` paths plus an absolute
   `cwd`, and add `--codex-compat`. That mode emits one plain text content block

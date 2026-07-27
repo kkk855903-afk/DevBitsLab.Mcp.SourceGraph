@@ -4,6 +4,7 @@
     <OutputType>Exe</OutputType>
     <AssemblyName>sourcegraph-mcp</AssemblyName>
     <RootNamespace>DevBitsLab.Mcp.SourceGraph.Server</RootNamespace>
+    <CETCompat Condition="'$(SourceGraphLegacyWindowsCompat)' == 'true'">false</CETCompat>
 
     <!-- dotnet tool packaging -->
     <PackAsTool>true</PackAsTool>

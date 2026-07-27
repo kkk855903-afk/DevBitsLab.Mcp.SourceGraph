@@ -315,8 +315,19 @@ public sealed class XamlLanguageProjectFactory : IExclusionAwareLanguageProjectF
             pathPolicy,
             ct);
         var projectItems = projectMetadata.Items;
+        var metadataUnknownReasons = new HashSet<string>(
+            projectMetadata.UnknownReasons,
+            StringComparer.Ordinal);
         foreach (var item in projectItems)
         {
+            if (!File.Exists(item.Path))
+            {
+                var relativePath = Path.GetRelativePath(projectDir, item.Path)
+                    .Replace('\\', '/');
+                metadataUnknownReasons.Add(
+                    "project-xaml-item-missing:" + relativePath);
+                continue;
+            }
             results.Add(item.Path);
         }
 
@@ -400,9 +411,6 @@ public sealed class XamlLanguageProjectFactory : IExclusionAwareLanguageProjectF
                 .Where(item => !item.IsApplicationDefinition)
                 .Select(item => item.Path),
             StringComparer.OrdinalIgnoreCase);
-        var metadataUnknownReasons = new HashSet<string>(
-            projectMetadata.UnknownReasons,
-            StringComparer.Ordinal);
         foreach (var conflictingPath in applicationDefinitionPaths
                      .Where(nonApplicationDefinitionPaths.Contains))
         {
