@@ -71,13 +71,6 @@ internal sealed class XamlSemanticResolver
                 "binding-path-syntax-not-supported");
         }
 
-        if (!_semanticResolutionIsSafe)
-        {
-            return XamlBindingResolution.Unresolved(
-                XamlResolutionStatus.Incomplete,
-                "semantic-input-incomplete");
-        }
-
         if (!_bindingContexts.TryGetValue(element, out var contextResolution)
             || contextResolution.Context is null
             || contextResolution.Outcome.Status != XamlResolutionStatus.Resolved)
@@ -92,6 +85,26 @@ internal sealed class XamlSemanticResolver
         }
 
         var context = contextResolution.Context;
+        if (!_semanticResolutionIsSafe)
+        {
+            var directResolution = ResolvePropertyPath(
+                context.Type,
+                path,
+                directMembersOnly: true);
+            var directKey = directResolution.Property is { } directProperty
+                && (!requireCommand || IsCommandType(directProperty.Type))
+                    ? CanonicalKey(directProperty)
+                    : null;
+            return new XamlBindingResolution(
+                new XamlResolutionOutcome(
+                    XamlResolutionStatus.Incomplete,
+                    "semantic-input-incomplete"),
+                Target: null,
+                directKey is null
+                    ? Array.Empty<string>()
+                    : new[] { directKey });
+        }
+
         var propertyResolution = ResolvePropertyPath(
             context.Type,
             path,
@@ -151,13 +164,6 @@ internal sealed class XamlSemanticResolver
                 XamlResolutionStatus.Unsupported,
                 "binding-path-syntax-not-supported");
         }
-        if (!_semanticResolutionIsSafe)
-        {
-            return XamlBindingResolution.Unresolved(
-                XamlResolutionStatus.Incomplete,
-                "semantic-input-incomplete");
-        }
-
         var typeResolution = ResolveElementType(targetElement);
         if (typeResolution.Type is null)
         {
@@ -177,6 +183,22 @@ internal sealed class XamlSemanticResolver
                 propertyResolution.Outcome,
                 Target: null,
                 propertyResolution.Candidates);
+        }
+
+        if (!_semanticResolutionIsSafe
+            && SymbolEqualityComparer.Default.Equals(
+                propertyResolution.Property.ContainingAssembly,
+                _compilation.Assembly))
+        {
+            var candidateKey = CanonicalKey(propertyResolution.Property);
+            return new XamlBindingResolution(
+                new XamlResolutionOutcome(
+                    XamlResolutionStatus.Incomplete,
+                    "semantic-input-incomplete"),
+                Target: null,
+                candidateKey is null
+                    ? Array.Empty<string>()
+                    : new[] { candidateKey });
         }
 
         var propertyKey = CanonicalKey(propertyResolution.Property);

@@ -188,6 +188,71 @@ public sealed class PayloadToolingTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task FindDataBindings_filtersByElementNameTarget()
+    {
+        var source = await SeedSymbolAsync(
+            "xaml:element:View.xaml#WidthOwner",
+            "WidthOwner",
+            SymbolKinds.Class);
+        var target = await SeedSymbolAsync(
+            "csharp:P:System.Windows.FrameworkElement.ActualWidth",
+            "ActualWidth",
+            SymbolKinds.Property);
+        await _store!.BulkInsertEdgesAsync([
+            new Edge(source, target, "binds-path", new Dictionary<string, string>
+            {
+                [PayloadKeys.Path] = "ActualWidth",
+                [PayloadKeys.ElementName] = "imageview",
+            }),
+        ]);
+
+        var hits = await _store.FindDataBindingsAsync(
+            targetCanonicalKey: null,
+            sourceCanonicalKey: null,
+            pathContains: "ActualWidth",
+            modeExact: null,
+            converterExact: null,
+            limit: 50,
+            elementNameExact: "imageview");
+
+        hits.Should().ContainSingle();
+        hits[0].Source.Id.Should().Be(source);
+        hits[0].Target.Id.Should().Be(target);
+    }
+
+    [Fact]
+    public async Task FindResourceReferences_filtersExactKeyAndRelation()
+    {
+        var source = await SeedSymbolAsync(
+            "xaml:element:View.xaml#Consumer",
+            "Consumer",
+            "xaml-element");
+        var target = await SeedSymbolAsync(
+            "xaml:resource:App.xaml#ReverseBoolConverter",
+            "ReverseBoolConverter",
+            "xaml-resource");
+        await _store!.BulkInsertEdgesAsync([
+            new Edge(source, target, "uses-resource", new Dictionary<string, string>
+            {
+                [PayloadKeys.Key] = "ReverseBoolConverter",
+            }),
+            new Edge(source, target, "applies-style", new Dictionary<string, string>
+            {
+                [PayloadKeys.Key] = "OtherStyle",
+            }),
+        ]);
+
+        var hits = await _store.FindResourceReferencesAsync(
+            "uses-resource",
+            "ReverseBoolConverter",
+            limit: 50);
+
+        hits.Should().ContainSingle();
+        hits[0].Source.Id.Should().Be(source);
+        hits[0].Target.Id.Should().Be(target);
+    }
+
+    [Fact]
     public async Task FindDataBindings_unfiltered_returnsAllBindsPathRows_withinLimit()
     {
         // The "all filters null" case is documented as "first `limit` rows, with a note".

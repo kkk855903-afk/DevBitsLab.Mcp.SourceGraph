@@ -724,6 +724,7 @@ public sealed class XamlLanguageIndexer : ILanguageIndexer
                     attr,
                     hostKey,
                     path,
+                    elementName,
                     isCommand,
                     resolution);
                 return;
@@ -756,6 +757,7 @@ public sealed class XamlLanguageIndexer : ILanguageIndexer
             XamlAttribute attribute,
             string hostKey,
             string? path,
+            string? elementName,
             bool isCommand,
             XamlBindingResolution resolution)
         {
@@ -766,6 +768,7 @@ public sealed class XamlLanguageIndexer : ILanguageIndexer
                 ["reason"] = resolution.Outcome.Reason,
                 ["kind"] = kind,
                 ["path"] = path,
+                ["elementName"] = elementName,
                 ["candidateCount"] = resolution.Candidates.Count,
                 ["file"] = _ctx.FilePath,
                 ["startLine"] = attribute.Line,

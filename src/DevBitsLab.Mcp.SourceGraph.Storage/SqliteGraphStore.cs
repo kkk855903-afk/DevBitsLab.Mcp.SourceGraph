@@ -2847,7 +2847,8 @@ public sealed partial class SqliteGraphStore : IGraphStore
         string? modeExact,
         string? converterExact,
         int limit = 50,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        string? elementNameExact = null)
     {
         // path uses INSTR for substring match; mode/converter are exact-equality on json_extract.
         // The kebab JSON keys ("path", "mode", "converter") mirror SDK PayloadKeys constants;
@@ -2855,12 +2856,22 @@ public sealed partial class SqliteGraphStore : IGraphStore
         var pathClause = pathContains is null ? "" : "AND INSTR(json_extract(e.payload, '$.path'), @pathContains) > 0";
         var modeClause = modeExact is null ? "" : "AND json_extract(e.payload, '$.mode') = @modeExact";
         var converterClause = converterExact is null ? "" : "AND json_extract(e.payload, '$.converter') = @converterExact";
+        var elementNameClause = elementNameExact is null
+            ? ""
+            : "AND json_extract(e.payload, '$.element-name') = @elementNameExact";
         return QueryEdgesWithPayloadAsync(
             edgeKind: EdgeKindBindsPath,
             targetCanonicalKey: targetCanonicalKey,
             sourceCanonicalKey: sourceCanonicalKey,
-            extraWhere: $"{pathClause} {modeClause} {converterClause}",
-            extraParameters: new { pathContains, modeExact, converterExact },
+            extraWhere:
+                $"{pathClause} {modeClause} {converterClause} {elementNameClause}",
+            extraParameters: new
+            {
+                pathContains,
+                modeExact,
+                converterExact,
+                elementNameExact,
+            },
             limit: limit,
             ct: ct);
     }
@@ -2888,10 +2899,39 @@ public sealed partial class SqliteGraphStore : IGraphStore
             ct: ct);
     }
 
+    public Task<IReadOnlyList<EdgeWithPayload>> FindResourceReferencesAsync(
+        string edgeKind,
+        string? keyExact,
+        int limit = 50,
+        CancellationToken ct = default)
+    {
+        if (edgeKind is not (EdgeKindUsesResource or EdgeKindAppliesStyle))
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(edgeKind),
+                edgeKind,
+                $"Only '{EdgeKindUsesResource}' and '{EdgeKindAppliesStyle}' are supported.");
+        }
+
+        var keyClause = keyExact is null
+            ? ""
+            : "AND json_extract(e.payload, '$.key') = @keyExact";
+        return QueryEdgesWithPayloadAsync(
+            edgeKind: edgeKind,
+            targetCanonicalKey: null,
+            sourceCanonicalKey: null,
+            extraWhere: keyClause,
+            extraParameters: new { keyExact },
+            limit: limit,
+            ct: ct);
+    }
+
     // Edge kind name constants kept local — the Storage layer does not depend on the SDK and
     // these strings already appear in indexer code and tools as the well-known kebab vocabulary.
     private const string EdgeKindBindsPath = "binds-path";
     private const string EdgeKindHandlesEvent = "handles-event";
+    private const string EdgeKindUsesResource = "uses-resource";
+    private const string EdgeKindAppliesStyle = "applies-style";
 
     /// <summary>
     /// Two-sided edge walk projecting both endpoints + payload. Used by the payload-aware
