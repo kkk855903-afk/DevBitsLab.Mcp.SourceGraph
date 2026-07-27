@@ -82,6 +82,7 @@ public sealed class WpfToolBehaviorTests : IAsyncLifetime, IDisposable
     private const string ButtonKey = "xaml:element:View.xaml#SaveButton";
     private const string PropertyKey = "csharp:P:Sample.MainViewModel.Name";
     private const string CommandKey = "csharp:P:Sample.MainViewModel.SaveCommand";
+    private const string CommandHandlerKey = "csharp:M:Sample.MainViewModel.Save";
     private const string ResourceKey = "xaml:resource:App.xaml#AccentBrush";
 
     public WpfToolBehaviorTests() => LeafFormatter.Suppressed = false;
@@ -160,6 +161,13 @@ public sealed class WpfToolBehaviorTests : IAsyncLifetime, IDisposable
             SymbolKinds.Property,
             codeFileId,
             12);
+        var commandHandlerId = await SeedSymbolAsync(
+            CommandHandlerKey,
+            "Save",
+            "Sample.MainViewModel.Save",
+            SymbolKinds.Method,
+            codeFileId,
+            16);
         var resourceId = await SeedSymbolAsync(
             ResourceKey,
             "AccentBrush",
@@ -262,6 +270,17 @@ public sealed class WpfToolBehaviorTests : IAsyncLifetime, IDisposable
                     CoreEvidenceConfidence.Semantic,
                     "xaml-semantic",
                     commandMetadata)),
+            new Edge(
+                commandId,
+                commandHandlerId,
+                EdgeKinds.CommandExecutes,
+                null,
+                new Evidence(
+                    codeFileId,
+                    new CoreSourceLocation("/repo/MainViewModel.cs", 14, 45, 14, 49),
+                    CoreEvidenceConfidence.Semantic,
+                    "roslyn",
+                    null)),
             new Edge(
                 buttonId,
                 resourceId,
@@ -447,6 +466,11 @@ public sealed class WpfToolBehaviorTests : IAsyncLifetime, IDisposable
         match.Target!.CanonicalKey.Should().Be(CommandKey);
         match.Path.Should().Be("SaveCommand");
         match.Relation.Should().Be("binds-path");
+        match.CommandExecutions.Should().ContainSingle(execution =>
+            execution.Relation == EdgeKinds.CommandExecutes
+            && execution.Target.CanonicalKey == CommandHandlerKey
+            && execution.Evidence.Count == 1
+            && execution.Evidence[0].StartLine == 14);
         match.Evidence.Should().ContainSingle(item =>
             item.StartLine == 22 && item.Producer == "xaml-semantic");
     }

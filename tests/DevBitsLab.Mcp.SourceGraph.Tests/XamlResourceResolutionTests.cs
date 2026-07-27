@@ -53,21 +53,16 @@ public sealed class XamlResourceResolutionTests
                 edge.SourceCanonicalKey.EndsWith("#NestedConsumer", StringComparison.Ordinal)
                 && edge.TargetCanonicalKey == "xaml:resource:View.xaml#Converter"
                 && edge.Metadata!["resource-lookup"] == "static");
-            resourceEdges.Should().NotContain(edge =>
-                edge.SourceCanonicalKey.EndsWith("#DynamicConsumer", StringComparison.Ordinal));
+            resourceEdges.Should().ContainSingle(edge =>
+                edge.SourceCanonicalKey.EndsWith("#DynamicConsumer", StringComparison.Ordinal)
+                && edge.TargetCanonicalKey == "xaml:resource:View.xaml#Accent"
+                && edge.Metadata!["resource-lookup"] == "dynamic");
             resourceEdges.Should().OnlyContain(edge =>
                 edge.Evidence != null
                 && edge.Evidence.Confidence == EvidenceConfidence.Exact
                 && edge.Evidence.Producer == "xaml-resource");
-            var dynamicOutcome = events.OfType<IndexEvent.AnnotationAttached>()
-                .Should().ContainSingle(annotation =>
-                    annotation.Flavor == "xaml-resource-outcome"
-                    && annotation.FullName == "unsupported").Subject;
-            using var dynamicJson = JsonDocument.Parse(dynamicOutcome.ArgsJson!);
-            dynamicJson.RootElement.GetProperty("status").GetString().Should()
-                .Be("unsupported");
-            dynamicJson.RootElement.GetProperty("reason").GetString().Should()
-                .Be("dynamic-resource-runtime-lookup");
+            events.OfType<IndexEvent.AnnotationAttached>().Should().NotContain(annotation =>
+                annotation.Flavor == "xaml-resource-outcome");
             events.OfType<IndexEvent.AnnotationAttached>().Should().NotContain(annotation =>
                 annotation.Flavor == "xaml-resource-finding");
         }
@@ -1210,12 +1205,19 @@ public sealed class XamlResourceResolutionTests
                     annotation.Flavor == "xaml-resource-outcome")
                 .ToArray();
             runtimeOutcomes.Should().HaveCount(2);
-            foreach (var annotation in runtimeOutcomes)
+            var runtimeStates = runtimeOutcomes.Select(annotation =>
             {
                 using var json = JsonDocument.Parse(annotation.ArgsJson!);
-                json.RootElement.GetProperty("status").GetString().Should()
-                    .Be("unsupported");
-            }
+                return (
+                    Status: json.RootElement.GetProperty("status").GetString(),
+                    Reason: json.RootElement.GetProperty("reason").GetString());
+            }).ToArray();
+            runtimeStates.Should().ContainSingle(state =>
+                state.Status == "unknown"
+                && state.Reason == "dynamic-resource-not-present-in-indexed-cascade");
+            runtimeStates.Should().ContainSingle(state =>
+                state.Status == "unsupported"
+                && state.Reason == "theme-resource-runtime-lookup");
         }
         finally
         {

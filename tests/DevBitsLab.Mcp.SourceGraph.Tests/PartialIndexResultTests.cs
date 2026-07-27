@@ -196,6 +196,15 @@ public sealed class PartialIndexResultTests
                 {
                     string? ILookup.Find(string key) => key;
                 }
+
+                public class LookupBase
+                {
+                    public string? Find(string key) => key;
+                }
+
+                public sealed class InheritedLookup : LookupBase, ILookup
+                {
+                }
                 """);
 
             await using var store = new SqliteGraphStore(Path.Combine(root, "graph.db"));
@@ -208,9 +217,13 @@ public sealed class PartialIndexResultTests
             var implementations = await store.ListImplementationsAsync(
                 interfaceMethod.Id);
 
-            implementations.Should().ContainSingle(hit =>
+            implementations.Should().Contain(hit =>
                 hit.Fqn.Contains("ExplicitFixture.Lookup")
                 && hit.CanonicalKey != null);
+            implementations.Should().Contain(hit =>
+                hit.Fqn.Contains("ExplicitFixture.LookupBase.Find")
+                && hit.CanonicalKey != null,
+                "a derived type may introduce an interface while inheriting its implementation");
         }
         finally
         {

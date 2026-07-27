@@ -53,7 +53,22 @@ public sealed record WpfTraceMatch(
     string Confidence,
     IReadOnlyList<WpfOccurrenceEvidence> Evidence,
     [property: JsonPropertyName("evidence_truncated")] bool EvidenceTruncated,
-    IReadOnlyList<WpfResolutionCandidate> Candidates);
+    IReadOnlyList<WpfResolutionCandidate> Candidates)
+{
+    [JsonPropertyName("command_executions")]
+    public IReadOnlyList<WpfCommandExecution> CommandExecutions { get; init; } =
+        Array.Empty<WpfCommandExecution>();
+}
+
+/// <summary>
+/// One evidence-backed command handler reached from an ICommand property.
+/// </summary>
+public sealed record WpfCommandExecution(
+    string Relation,
+    WpfSymbolIdentity Target,
+    string Confidence,
+    IReadOnlyList<WpfOccurrenceEvidence> Evidence,
+    [property: JsonPropertyName("evidence_truncated")] bool EvidenceTruncated);
 
 /// <summary>
 /// Per-scope provenance and completeness state retained by single- and multi-scope WPF results.

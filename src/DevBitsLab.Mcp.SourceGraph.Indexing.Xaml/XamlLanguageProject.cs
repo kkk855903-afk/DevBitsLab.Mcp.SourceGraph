@@ -186,20 +186,30 @@ public sealed class XamlLanguageProject : IDeclarationFirstLanguageProject
                     "multiple-visible-resource-declarations"),
                 candidates);
         }
+        var knownCandidateIsSafe = snapshot.IsComplete
+            || snapshot.UnknownReasons.All(reason =>
+                reason.StartsWith(
+                    "project-xaml-item-missing:",
+                    StringComparison.Ordinal)
+                || reason.StartsWith(
+                    "merged-dictionary-target-unavailable:",
+                    StringComparison.Ordinal));
+        if (candidates.Count == 1 && knownCandidateIsSafe)
+        {
+            return new ResourceResolution(
+                new XamlResolutionOutcome(
+                    XamlResolutionStatus.Resolved,
+                    snapshot.IsComplete
+                        ? "unique-visible-resource-declaration"
+                        : "unique-known-resource-declaration"),
+                candidates);
+        }
         if (!snapshot.IsComplete)
         {
             return new ResourceResolution(
                 new XamlResolutionOutcome(
                     XamlResolutionStatus.Incomplete,
                     "project-resource-cascade-incomplete"),
-                candidates);
-        }
-        if (candidates.Count == 1)
-        {
-            return new ResourceResolution(
-                new XamlResolutionOutcome(
-                    XamlResolutionStatus.Resolved,
-                    "unique-visible-resource-declaration"),
                 candidates);
         }
         return new ResourceResolution(

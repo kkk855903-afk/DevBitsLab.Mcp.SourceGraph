@@ -248,7 +248,7 @@ public sealed class XamlBindingOutcomeTests
 
         var events = await IndexAsync(csharp, xaml);
 
-        foreach (var name in new[] { "Element", "Relative", "Explicit", "Compiled" })
+        foreach (var name in new[] { "Relative", "Explicit", "Compiled" })
         {
             AnnotationFor(events, name, "xaml-binding-outcome")
                 .FullName.Should().Be("unsupported");
@@ -258,6 +258,8 @@ public sealed class XamlBindingOutcomeTests
                     StringComparison.Ordinal)
                 && edge.EdgeKindName == "binds-path");
         }
+        AnnotationFor(events, "Element", "xaml-binding-outcome")
+            .FullName.Should().Be("unknown");
         events.OfType<IndexEvent.AnnotationAttached>().Should().NotContain(annotation =>
             annotation.Flavor == "xaml-binding-finding");
     }

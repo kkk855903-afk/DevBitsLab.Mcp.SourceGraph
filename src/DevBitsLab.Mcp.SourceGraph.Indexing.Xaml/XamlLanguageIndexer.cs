@@ -106,6 +106,7 @@ public sealed class XamlLanguageIndexer : ILanguageIndexer
         private readonly string? _xClass;
         private readonly string _viewKey;
         private readonly Dictionary<string, string> _namedElementKeysByName = new(StringComparer.Ordinal);
+        private readonly Dictionary<string, XamlElement> _namedElementsByName = new(StringComparer.Ordinal);
         private readonly IReadOnlyDictionary<XamlElement, string>
             _resourceCanonicalDiscriminators;
         private readonly Dictionary<string, List<LocalResourceDefinition>> _localResources =
@@ -141,6 +142,7 @@ public sealed class XamlLanguageIndexer : ILanguageIndexer
             if (name is null) return;
             var key = $"xaml:element:{_relativePath}#{name}";
             _namedElementKeysByName[name] = key;
+            _namedElementsByName[name] = element;
         }
 
         public void RegisterResourceScope(
@@ -673,9 +675,16 @@ public sealed class XamlLanguageIndexer : ILanguageIndexer
             }
             else if (ext.NamedArgs.ContainsKey("ElementName"))
             {
-                resolution = XamlBindingResolution.Unresolved(
-                    XamlResolutionStatus.Unsupported,
-                    "element-name-property-resolution-not-supported");
+                resolution = string.IsNullOrEmpty(elementName)
+                    || !_namedElementsByName.TryGetValue(elementName, out var namedElement)
+                    ? XamlBindingResolution.Unresolved(
+                        XamlResolutionStatus.Missing,
+                        "element-name-target-not-found")
+                    : _semanticResolver is null
+                        ? XamlBindingResolution.Unresolved(
+                            XamlResolutionStatus.Incomplete,
+                            "roslyn-compilation-unavailable")
+                        : _semanticResolver.ResolveElementBinding(namedElement, path!);
             }
             else if (ext.NamedArgs.ContainsKey("RelativeSource"))
             {
@@ -863,15 +872,16 @@ public sealed class XamlLanguageIndexer : ILanguageIndexer
                 return;
             }
 
-            var resolution = lookupKind == "static"
-                ? ResolveResource(element, attr, key!)
-                : new ResourceResolution(
+            var resolution = lookupKind switch
+            {
+                "static" => ResolveResource(element, attr, key!),
+                "dynamic" => ResolveDynamicResource(element, key!),
+                _ => new ResourceResolution(
                     new XamlResolutionOutcome(
                         XamlResolutionStatus.Unsupported,
-                        lookupKind == "dynamic"
-                            ? "dynamic-resource-runtime-lookup"
-                            : "theme-resource-runtime-lookup"),
-                    Array.Empty<ResourceDefinition>());
+                        "theme-resource-runtime-lookup"),
+                    Array.Empty<ResourceDefinition>()),
+            };
             if (resolution.Outcome.Status != XamlResolutionStatus.Resolved
                 || resolution.Definition is null)
             {
@@ -1031,7 +1041,50 @@ public sealed class XamlLanguageIndexer : ILanguageIndexer
                     new XamlResolutionOutcome(
                         XamlResolutionStatus.Unknown,
                         "project-resource-snapshot-unavailable"),
-                    Array.Empty<ResourceDefinition>());
+                        Array.Empty<ResourceDefinition>());
+        }
+
+        private ResourceResolution ResolveDynamicResource(
+            XamlElement consumer,
+            string key)
+        {
+            if (_localResources.TryGetValue(key, out var localCandidates))
+            {
+                for (var scope = consumer; scope is not null; scope = scope.Parent)
+                {
+                    var visible = localCandidates
+                        .Where(candidate => ReferenceEquals(candidate.ScopeOwner, scope))
+                        .Select(candidate => candidate.Definition)
+                        .ToArray();
+                    if (visible.Length == 1)
+                    {
+                        return new ResourceResolution(
+                            new XamlResolutionOutcome(
+                                XamlResolutionStatus.Resolved,
+                                "unique-dynamic-local-resource-declaration"),
+                            visible);
+                    }
+                    if (visible.Length > 1)
+                    {
+                        return new ResourceResolution(
+                            new XamlResolutionOutcome(
+                                XamlResolutionStatus.Ambiguous,
+                                "multiple-dynamic-local-resource-declarations"),
+                            visible);
+                    }
+                }
+            }
+
+            var project = _project?.ResolveResource(key);
+            if (project?.Definition is not null)
+            {
+                return project;
+            }
+            return new ResourceResolution(
+                new XamlResolutionOutcome(
+                    XamlResolutionStatus.Unknown,
+                    "dynamic-resource-not-present-in-indexed-cascade"),
+                project?.Candidates ?? Array.Empty<ResourceDefinition>());
         }
 
         private ResourceResolution? ResolveCompleteProjectRootScope(

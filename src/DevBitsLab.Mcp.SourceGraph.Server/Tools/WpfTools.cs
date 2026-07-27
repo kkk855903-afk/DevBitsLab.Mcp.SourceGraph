@@ -25,6 +25,7 @@ public static class WpfTools
     private const string BindsTo = "binds-to";
     private const string UsesResource = "uses-resource";
     private const string AppliesStyle = "applies-style";
+    private const string CommandExecutes = "command-executes";
     private const string ResolvedBindingEdgeReason = "resolved-by-indexed-binding-edge";
     private const string ResolvedLegacyBindingEdgeReason = "resolved-by-legacy-binding-edge";
     private const string ResolvedResourceEdgeReason = "resolved-by-indexed-resource-edge";
@@ -298,6 +299,7 @@ public static class WpfTools
                 host.Store,
                 host.Scope.Id,
                 row,
+                isCommand,
                 ct).ConfigureAwait(false);
             if (materialized is not null) matches.Add(materialized);
         }
@@ -844,6 +846,7 @@ public static class WpfTools
         IGraphStore store,
         string scopeId,
         PendingTrace row,
+        bool includeCommandExecutions,
         CancellationToken ct)
     {
         IReadOnlyList<WpfOccurrenceEvidence> evidence;
@@ -869,6 +872,13 @@ public static class WpfTools
             return null;
         }
 
+        var commandExecutions = includeCommandExecutions && row.Target is not null
+            ? await LoadCommandExecutionsAsync(
+                store,
+                scopeId,
+                row.Target.Id,
+                ct).ConfigureAwait(false)
+            : Array.Empty<WpfCommandExecution>();
         return new WpfTraceMatch(
             scopeId,
             row.Relation,
@@ -880,7 +890,43 @@ public static class WpfTools
             StrongestConfidence(evidence),
             evidence,
             evidenceTruncated,
-            row.Candidates);
+            row.Candidates)
+        {
+            CommandExecutions = commandExecutions,
+        };
+    }
+
+    private static async Task<IReadOnlyList<WpfCommandExecution>> LoadCommandExecutionsAsync(
+        IGraphStore store,
+        string scopeId,
+        long commandPropertyId,
+        CancellationToken ct)
+    {
+        var hits = await store.ListAuditableOutboundEdgesByKindsAsync(
+            commandPropertyId,
+            new[] { CommandExecutes },
+            MaxEvidencePerMatch + 1,
+            ct).ConfigureAwait(false);
+        var executions = new List<WpfCommandExecution>(
+            Math.Min(hits.Count, MaxEvidencePerMatch));
+        foreach (var hit in hits.Take(MaxEvidencePerMatch))
+        {
+            var stored = await store.ListEdgeEvidenceAsync(
+                commandPropertyId,
+                hit.Symbol.Id,
+                CommandExecutes,
+                MaxEvidencePerMatch + 1,
+                ct).ConfigureAwait(false);
+            if (stored.Count == 0) continue;
+            var evidence = stored.Take(MaxEvidencePerMatch).Select(MapEvidence).ToArray();
+            executions.Add(new WpfCommandExecution(
+                CommandExecutes,
+                MapSymbol(hit.Symbol, scopeId),
+                StrongestConfidence(evidence),
+                evidence,
+                stored.Count > MaxEvidencePerMatch));
+        }
+        return executions;
     }
 
     private static async Task<WpfResourceCheck?> MaterializeResourceAsync(

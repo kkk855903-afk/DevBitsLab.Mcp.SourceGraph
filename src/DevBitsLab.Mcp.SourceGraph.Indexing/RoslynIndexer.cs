@@ -4556,15 +4556,15 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                 if (ifaceMember is not (IMethodSymbol or IPropertySymbol or IEventSymbol)) continue;
                 var impl = typeSymbol.FindImplementationForInterfaceMember(ifaceMember);
                 if (impl is null) continue;
-                // Only emit when the implementation lives on this type (not inherited from a base).
-                if (!SymbolEqualityComparer.Default.Equals(impl.ContainingType, typeSymbol)) continue;
-                var srcKey = SymbolMapping.CanonicalKey(impl);
+                // A derived type may introduce the interface while inheriting the concrete
+                // implementation from a base class. Roslyn still proves that exact contract, so
+                // retain the edge instead of dropping it because ContainingType differs.
+                var srcKey = SymbolMapping.CanonicalKey(impl.OriginalDefinition);
                 if (srcKey is null || !_symbolIdByKey.TryGetValue(srcKey, out var srcId)) continue;
-                var dstKey = SymbolMapping.CanonicalKey(ifaceMember);
+                var dstKey = SymbolMapping.CanonicalKey(ifaceMember.OriginalDefinition);
                 if (dstKey is null || !_symbolIdByKey.TryGetValue(dstKey, out var dstId)) continue;
                 var evidenceNode = impl.DeclaringSyntaxReferences
-                    .FirstOrDefault(reference =>
-                        reference.SyntaxTree == typeDeclarationNode.SyntaxTree)
+                    .FirstOrDefault()
                     ?.GetSyntax(ct)
                     ?? typeDeclarationNode;
                 addEdge(
