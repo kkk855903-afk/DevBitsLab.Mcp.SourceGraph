@@ -29,6 +29,15 @@ public interface IGraphStore : IAsyncDisposable
         CancellationToken ct = default) =>
         Task.CompletedTask;
 
+    /// <summary>
+    /// Clears a producer checkpoint before a new publication pass. If the process stops before
+    /// completion, the missing checkpoint forces a safe refresh on the next startup.
+    /// </summary>
+    Task ClearProjectionVersionAsync(
+        string producer,
+        CancellationToken ct = default) =>
+        Task.CompletedTask;
+
     Task<long> UpsertFileAsync(string path, byte[] contentSha256, DateTimeOffset indexedAt, bool isGenerated = false, CancellationToken ct = default);
     Task<byte[]?> GetFileContentHashAsync(string path, CancellationToken ct = default);
 

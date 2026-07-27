@@ -18,6 +18,8 @@ namespace DevBitsLab.Mcp.SourceGraph.Server.Scoping;
 public sealed class ScopeHost : IAsyncDisposable
 {
     private readonly TaskCompletionSource<bool> _readiness = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly TaskCompletionSource<bool> _embeddingsReadiness =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     public ScopeHost(
         Scope scope,
@@ -58,6 +60,16 @@ public sealed class ScopeHost : IAsyncDisposable
     /// always see the host's terminal status rather than hang).
     /// </summary>
     public void MarkReady() => _readiness.TrySetResult(true);
+
+    /// <summary>
+    /// Completes after every embedding request from the initial index has settled. The boolean is
+    /// false when at least one request failed; only semantic search waits on this task, so normal
+    /// graph queries are not delayed by model inference.
+    /// </summary>
+    public Task<bool> EmbeddingsReady => _embeddingsReadiness.Task;
+
+    public void MarkEmbeddingsReady(bool complete) =>
+        _embeddingsReadiness.TrySetResult(complete);
 
     public Scope Scope { get; }
     public SqliteGraphStore Store { get; }
@@ -123,6 +135,7 @@ public sealed class ScopeHost : IAsyncDisposable
     /// Started by <c>LiveIndexService.OpenScopeAsync</c> and stopped by <see cref="DisposeAsync"/>.
     /// </summary>
     public EmbeddingsHostedService? EmbeddingsService { get; set; }
+    internal string? EmbeddingProducerName { get; set; }
 
     /// <summary>
     /// Per-scope file-path → <see cref="ILanguageProject"/> map populated at scope startup by
@@ -154,6 +167,7 @@ public sealed class ScopeHost : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
+        MarkEmbeddingsReady(false);
         // Stop the embeddings drain first so any in-flight upserts complete before the underlying
         // SQLite store is disposed. Best-effort with a short bound — losing a few queued requests
         // on shutdown is preferable to hanging the process. BackgroundService implements

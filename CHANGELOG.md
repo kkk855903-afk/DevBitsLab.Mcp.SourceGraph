@@ -11,6 +11,13 @@ below note which package the change applies to.
 ## [Unreleased]
 
 ### Changed
+- **Complete, upgrade-safe semantic embedding indexes.** Embedding production
+  now publishes a model/text-version checkpoint only after every accepted
+  symbol request is persisted. Missing, stale, or interrupted checkpoints
+  force unchanged C# files through a safe backfill on the next startup.
+  Semantic queries wait for that independent embedding readiness signal while
+  graph-only tools remain available, and the producer queue no longer drops
+  early symbols when a cold index exceeds its former 4096-item capacity.
 - **Faster, smaller graph retrieval and incremental projection upgrades.**
   Impact analysis now defaults to a compact summary while retaining full
   auditable paths in structured output and exposing `paths` / `evidence`

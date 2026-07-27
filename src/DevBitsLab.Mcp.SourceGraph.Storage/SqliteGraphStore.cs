@@ -207,6 +207,25 @@ public sealed partial class SqliteGraphStore : IGraphStore
         }
     }
 
+    public async Task ClearProjectionVersionAsync(
+        string producer,
+        CancellationToken ct = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(producer);
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await _connection.ExecuteAsync(new CommandDefinition(
+                "DELETE FROM projection_versions WHERE producer = @producer;",
+                new { producer },
+                cancellationToken: ct)).ConfigureAwait(false);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
     public async Task<long> UpsertFileAsync(string path, byte[] contentSha256, DateTimeOffset indexedAt, bool isGenerated = false, CancellationToken ct = default)
     {
         const string sql = """

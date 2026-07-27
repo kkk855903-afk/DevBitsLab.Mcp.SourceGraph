@@ -2276,6 +2276,13 @@ public static class GraphTools
                         "semantic_search disabled: no lexical match was found and semantic embeddings are unavailable. Install the embedding model or remove `--no-embeddings`; exact identifier queries can still use strategy=lexical.");
                 }
 
+                progress?.Report(Format.Progress(0.0, "waiting for embedding index"));
+                if (!await host.EmbeddingsReady.WaitAsync(ct).ConfigureAwait(false))
+                {
+                    return DiagnosticResult.Error(
+                        "semantic_search unavailable: the initial embedding backfill did not complete. Restart the server to retry the safe full backfill; lexical and graph queries remain available.");
+                }
+
                 // Cold-start: the JinaCodeEmbeddingGenerator singleton is lazy-instantiated by DI
                 // on first use, so the first `EmbedAsync` call after server start carries the ONNX
                 // model load (3-5s). Subsequent calls reuse the loaded model and are sub-second.

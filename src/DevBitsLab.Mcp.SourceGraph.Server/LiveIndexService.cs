@@ -467,7 +467,19 @@ public sealed class LiveIndexService : BackgroundService
             IEmbeddingsRequestSink indexerSink;
             if (embeddingsStore.IsAvailable && _embeddingGenerator.IsAvailable)
             {
-                scopeSink = new ChannelEmbeddingsRequestSink();
+                var embeddingProducer =
+                    SymbolTextBuilder.ProducerName(_embeddingGenerator.Model.Version);
+                var storedEmbeddingVersion = await store
+                    .GetProjectionVersionAsync(embeddingProducer, ct)
+                    .ConfigureAwait(false);
+                scopeSink = new ChannelEmbeddingsRequestSink(
+                    requiresFullRefresh:
+                        storedEmbeddingVersion != SymbolTextBuilder.ProducerVersion);
+                // Publish-on-success: remove the previous completion marker before indexing.
+                // A crash after file hashes change but before embeddings drain will therefore
+                // force a complete backfill on the next startup.
+                await store.ClearProjectionVersionAsync(embeddingProducer, ct)
+                    .ConfigureAwait(false);
                 scopeEmbeddings = new EmbeddingsHostedService(
                     scopeSink,
                     _embeddingGenerator,
@@ -499,6 +511,9 @@ public sealed class LiveIndexService : BackgroundService
             {
                 EmbeddingsSink = scopeSink,
                 EmbeddingsService = scopeEmbeddings,
+                EmbeddingProducerName = scopeSink is null
+                    ? null
+                    : SymbolTextBuilder.ProducerName(_embeddingGenerator.Model.Version),
             };
             if (scope.Interop is not null)
             {
@@ -827,7 +842,8 @@ public sealed class LiveIndexService : BackgroundService
 
             // Autonomous embeddings prune: cold-index can leave behind embeddings for symbols
             // that were deleted (refactors, file renames, generator-output drift). Prune is
-            // cheap (one DELETE) and reversible (embeddings regenerate on next semantic_search).
+            // cheap (one DELETE) and reversible (the next producer-checkpoint backfill
+            // regenerates missing rows).
             // Best-effort: a failure here does NOT revert the scope to degraded — the cold-index
             // outcome is what counts; the prune is opportunistic cleanup.
             try
@@ -866,6 +882,41 @@ public sealed class LiveIndexService : BackgroundService
             // (because the Ready task completed) sees the final 1.0 first.
             host.ProgressSource.MarkReady();
             host.MarkReady();
+
+            if (host.EmbeddingsSink is null)
+            {
+                host.MarkEmbeddingsReady(false);
+            }
+            else
+            {
+                try
+                {
+                    var complete = await host.EmbeddingsSink
+                        .WaitForDrainAsync(ct)
+                        .ConfigureAwait(false);
+                    if (complete && host.EmbeddingProducerName is not null)
+                    {
+                        await host.Store.SetProjectionVersionAsync(
+                                host.EmbeddingProducerName,
+                                SymbolTextBuilder.ProducerVersion,
+                                ct)
+                            .ConfigureAwait(false);
+                    }
+                    host.MarkEmbeddingsReady(complete);
+                }
+                catch (OperationCanceledException)
+                {
+                    host.MarkEmbeddingsReady(false);
+                }
+                catch (Exception embeddingEx)
+                {
+                    _logger.LogWarning(
+                        embeddingEx,
+                        "Scope `{Id}` embedding backfill did not complete; semantic search will fail closed",
+                        scope.Id);
+                    host.MarkEmbeddingsReady(false);
+                }
+            }
         }
     }
 

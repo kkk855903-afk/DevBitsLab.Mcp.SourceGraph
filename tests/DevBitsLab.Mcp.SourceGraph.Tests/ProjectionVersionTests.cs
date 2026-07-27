@@ -30,6 +30,10 @@ public sealed class ProjectionVersionTests : IAsyncLifetime
 
         (await _store.GetProjectionVersionAsync("roslyn-core"))
             .Should().Be(2);
+
+        await _store.ClearProjectionVersionAsync("roslyn-core");
+        (await _store.GetProjectionVersionAsync("roslyn-core"))
+            .Should().BeNull();
     }
 
     public async Task DisposeAsync()

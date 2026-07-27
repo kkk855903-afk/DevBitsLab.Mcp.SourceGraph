@@ -2769,6 +2769,7 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
             var sha = SHA256.HashData(bytes);
             var stored = await _store.GetFileContentHashAsync(path, ct).ConfigureAwait(false);
             var unchanged = !forceCoreProjectionRefresh
+                && !_embeddingsSink.RequiresFullRefresh
                 && stored is not null
                 && stored.AsSpan().SequenceEqual(sha);
 
