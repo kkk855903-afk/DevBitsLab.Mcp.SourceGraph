@@ -39,6 +39,22 @@
     <None Include="..\..\README.md" Pack="true" PackagePath="\" />
   </ItemGroup>
 
+  <!--
+    Roslyn's MSBuildWorkspace package carries its own BuildHost contracts PDBs as runtime
+    content. They are not SourceGraph symbols and Roslyn 5.6 publishes them with an upstream
+    SourceLink commit that is not independently verifiable. Keep the required contracts DLLs
+    while excluding only those third-party PDBs from tool and symbol packages.
+  -->
+  <Target Name="ExcludeThirdPartyBuildHostSymbols"
+          AfterTargets="ComputeFilesToPublish">
+    <ItemGroup>
+      <ResolvedFileToPublish
+          Remove="@(ResolvedFileToPublish)"
+          Condition="'%(ResolvedFileToPublish.Filename)%(ResolvedFileToPublish.Extension)' == 'Microsoft.CodeAnalysis.Workspaces.MSBuild.Contracts.pdb'
+            and $([System.String]::Copy('%(ResolvedFileToPublish.RelativePath)').StartsWith('BuildHost-'))" />
+    </ItemGroup>
+  </Target>
+
   <ItemGroup>
     <PackageReference Include="ModelContextProtocol" />
     <PackageReference Include="Microsoft.Extensions.Hosting" />
