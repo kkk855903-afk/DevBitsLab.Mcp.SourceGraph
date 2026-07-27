@@ -315,8 +315,19 @@ public sealed class XamlLanguageProjectFactory : IExclusionAwareLanguageProjectF
             pathPolicy,
             ct);
         var projectItems = projectMetadata.Items;
+        var metadataUnknownReasons = new HashSet<string>(
+            projectMetadata.UnknownReasons,
+            StringComparer.Ordinal);
         foreach (var item in projectItems)
         {
+            if (!File.Exists(item.Path))
+            {
+                var relativePath = Path.GetRelativePath(projectDir, item.Path)
+                    .Replace('\\', '/');
+                metadataUnknownReasons.Add(
+                    "project-xaml-item-missing:" + relativePath);
+                continue;
+            }
             results.Add(item.Path);
         }
 
@@ -400,9 +411,6 @@ public sealed class XamlLanguageProjectFactory : IExclusionAwareLanguageProjectF
                 .Where(item => !item.IsApplicationDefinition)
                 .Select(item => item.Path),
             StringComparer.OrdinalIgnoreCase);
-        var metadataUnknownReasons = new HashSet<string>(
-            projectMetadata.UnknownReasons,
-            StringComparer.Ordinal);
         foreach (var conflictingPath in applicationDefinitionPaths
                      .Where(nonApplicationDefinitionPaths.Contains))
         {
@@ -939,10 +947,17 @@ public sealed class XamlLanguageProjectFactory : IExclusionAwareLanguageProjectF
         var clean = source;
         var suffix = clean.IndexOfAny(new[] { '?', '#' });
         if (suffix >= 0) clean = clean.Substring(0, suffix);
+        if (clean.StartsWith("pack://application:,,,/", StringComparison.OrdinalIgnoreCase))
+        {
+            clean = clean.Substring("pack://application:,,,/".Length);
+        }
+        var component = clean.IndexOf(";component/", StringComparison.OrdinalIgnoreCase);
+        if (component >= 0)
+        {
+            clean = clean.Substring(component + ";component/".Length);
+        }
         if (string.IsNullOrWhiteSpace(clean)
             || clean.Contains("://", StringComparison.Ordinal)
-            || clean.StartsWith("pack:", StringComparison.OrdinalIgnoreCase)
-            || clean.Contains(";component/", StringComparison.OrdinalIgnoreCase)
             || Path.IsPathRooted(clean))
         {
             return new MergedDictionaryResolution(
@@ -970,11 +985,24 @@ public sealed class XamlLanguageProjectFactory : IExclusionAwareLanguageProjectF
                     Path: null,
                     UnknownReason: "merged-dictionary-target-excluded:" + source);
             }
-            return documents.ContainsKey(candidate)
-                ? new MergedDictionaryResolution(candidate, UnknownReason: null)
+            if (documents.ContainsKey(candidate))
+            {
+                return new MergedDictionaryResolution(candidate, UnknownReason: null);
+            }
+            var normalizedSuffix = clean.Replace('\\', '/').TrimStart('/');
+            var suffixMatches = documents.Keys
+                .Where(path => path.Replace('\\', '/').EndsWith(
+                    "/" + normalizedSuffix,
+                    StringComparison.OrdinalIgnoreCase))
+                .Take(2)
+                .ToArray();
+            return suffixMatches.Length == 1
+                ? new MergedDictionaryResolution(suffixMatches[0], UnknownReason: null)
                 : new MergedDictionaryResolution(
                     Path: null,
-                    UnknownReason: "merged-dictionary-target-unavailable:" + source);
+                    UnknownReason: suffixMatches.Length > 1
+                        ? "merged-dictionary-target-ambiguous:" + source
+                        : "merged-dictionary-target-unavailable:" + source);
         }
         catch (Exception ex) when (ex is ArgumentException
                                    or NotSupportedException

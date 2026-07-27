@@ -207,6 +207,13 @@ from the host and the native pipeline does not execute a native build or import
 `compile_commands.json`. Paths are repository-relative, while `arguments` are
 the exact libclang parse arguments:
 
+When an interop query is made before this block is configured, the server runs
+a bounded, read-only discovery pass and reports `.vcxproj`, `CMakeLists.txt`,
+`compile_commands.json`, and DLL candidates. It also reports target hints found
+in paths (Debug/Release and x86/x64/arm64). Discovery never imports build
+arguments or selects an ambiguous target; use its paths to create the explicit
+configuration below.
+
 ```json
 {
   "$schema": "./schema/sourcegraph.schema.json",
@@ -574,8 +581,8 @@ never build, mutate, or run the indexed application.
 | `find_symbol` | Resolve a symbol query without guessing among ambiguous matches. Compatibility name for `search_symbols`. |
 | `trace_call` | Trace an evidence-backed relation path. Set `profile="execution"` (and omit `kind`) for the ordered UI-to-native state machine and completeness disclosure. With an exact canonical `from`, omit `to` to discover proven terminal native algorithms. |
 | `impact_analysis` | Compute bounded upstream change impact with an evidence-backed predecessor path. Compatibility name for `impact_of_change`. |
-| `trace_binding` | Resolve a WPF binding from an element and/or path, including explicit resolved, missing, ambiguous, incomplete, unsupported, or unknown outcomes and occurrence evidence. |
-| `trace_command` | Resolve a WPF `Command` binding to its canonical command property with the same conservative outcome model. |
+| `trace_binding` | Resolve a WPF binding from an element and/or path, including explicit resolved, missing, ambiguous, incomplete, unsupported, or unknown outcomes. `detail=summary` is compact by default; use `locations`, `evidence`, or `audit` when more proof is needed. |
+| `trace_command` | Resolve a WPF `Command` binding through its canonical command property and persisted `command-executes` edge to the handler, with the same detail and conservative completeness model. |
 | `check_resources` | Audit WPF resource/style references by optional file and exact key; reports resolved and unresolved outcomes without substituting similarly named resources. |
 | `trace_rpc` | From one exact `proto:R:` or `csharp:` canonical key, return persisted `grpc-calls` clients and `implements-rpc` server implementations. No name-only matching. |
 | `check_proto_contract` | Check complete current contracts for missing server implementations, uniquely proven generated signature mismatches, field-number changes, and streaming changes against the first complete baseline. |
@@ -1267,6 +1274,20 @@ That writes `command = "dotnet"`, absolute `--project`, `--solution`, and
 `[mcp_servers.sourcegraph]`.
 
 Re-run `dotnet build` after each change so the next launch picks it up.
+
+Older Windows 10 builds that cannot start the SDK-generated CET-compatible
+apphost can opt into a local compatibility package without changing the
+published security default:
+
+```powershell
+dotnet pack src/DevBitsLab.Mcp.SourceGraph.Server `
+  -c Release `
+  -p:SourceGraphLegacyWindowsCompat=true `
+  -o .\out
+```
+
+That property disables CET compatibility metadata only for the explicit build.
+Do not use it for normal packages or on hosts that can run the default apphost.
 
 ## Contributing & security
 

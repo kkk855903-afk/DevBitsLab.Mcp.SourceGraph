@@ -12,29 +12,40 @@ internal static class PrewarmLauncher
 {
     public static IReadOnlyList<PrewarmAttempt> BuildAttempts(
         string solutionPath,
+        string repoRoot,
+        string databasePath,
         string? processPath = null,
         string? serverAssemblyPath = null)
     {
         processPath ??= Environment.ProcessPath;
         serverAssemblyPath ??= typeof(InitCli).Assembly.Location;
+        var indexArguments = new[]
+        {
+            "index",
+            solutionPath,
+            "--root",
+            repoRoot,
+            "--db",
+            databasePath,
+        };
 
         var attempts = new List<PrewarmAttempt>();
         if (!string.IsNullOrWhiteSpace(processPath) && !IsDotnetHost(processPath))
         {
-            attempts.Add(new PrewarmAttempt(processPath, ["index", solutionPath]));
+            attempts.Add(new PrewarmAttempt(processPath, indexArguments));
         }
         else if (!string.IsNullOrWhiteSpace(processPath)
             && !string.IsNullOrWhiteSpace(serverAssemblyPath))
         {
             attempts.Add(new PrewarmAttempt(
                 processPath,
-                [serverAssemblyPath, "index", solutionPath]));
+                [serverAssemblyPath, .. indexArguments]));
         }
 
-        attempts.Add(new PrewarmAttempt("sourcegraph-mcp", ["index", solutionPath]));
+        attempts.Add(new PrewarmAttempt("sourcegraph-mcp", indexArguments));
         attempts.Add(new PrewarmAttempt(
             "dotnet",
-            ["tool", "run", "sourcegraph-mcp", "--", "index", solutionPath]));
+            ["tool", "run", "sourcegraph-mcp", "--", .. indexArguments]));
 
         return attempts
             .DistinctBy(

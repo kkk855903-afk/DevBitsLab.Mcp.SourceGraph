@@ -290,7 +290,10 @@ The subcommand SHALL accept the following flags:
 
 #### Scenario: Pre-warm runs after writing configs
 - **WHEN** `sourcegraph-mcp init --yes --client claude-code --prewarm --solution ./MySln.slnx` is invoked
-- **THEN** after the `.mcp.json` write completes, `RoslynIndexer.IndexSolutionOnceAsync` is invoked against `./MySln.slnx`; the closing report includes the line `pre-warmed index: N files in T s`
+- **THEN** after the `.mcp.json` write completes, the index subprocess receives
+  the resolved solution, `--root <root>`, and
+  `--db <root>/.sourcegraph/scopes/default.db`; a solution nested below the
+  repository root is therefore immediately readable by `demo --root <root>`
 
 ### Requirement: doctor subcommand
 The CLI SHALL accept `sourcegraph-mcp doctor` that runs a read-only environment diagnostic and prints a per-check `pass | warn | fail` summary. The subcommand SHALL accept `--root <path>` and `--json` flags. The exit code SHALL follow the convention: `0` if every check passed, `2` if at least one warn was raised, `1` if any check produced a hard fail.

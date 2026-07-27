@@ -457,8 +457,15 @@ its graph, keep structural reload pending, and retry before stale deletion.
   the prior workspace and graph remain available, and the next allowed C# event
   retries the structural reload
 
-#### Scenario: Initial partial workspace open is retryable
-- **WHEN** the first `OpenAsync` returns a partial solution with a `Failure`
+#### Scenario: Initial partial workspace keeps loaded projects queryable
+- **WHEN** the first `OpenAsync` returns at least one project together with a
+  `Failure` diagnostic
+- **THEN** the loaded projects are accepted and indexed, each failure is
+  surfaced through `IndexResult.FailedProjects`, and the scope remains
+  explicitly `partial` until a complete structural reopen succeeds
+
+#### Scenario: Initial failed workspace with no projects is retryable
+- **WHEN** the first `OpenAsync` returns no projects together with a `Failure`
   diagnostic
 - **THEN** the candidate workspace is disposed, `Workspace` and
   `SanitizedSolution` remain null, and a later `OpenAsync` on the same indexer
@@ -1015,9 +1022,11 @@ For every project that contains XAML files, the `XamlLanguageProjectFactory` SHA
 Discovery SHALL use two passes: first parse every scope-approved project XAML file into resource declarations and merge links, then walk the project-global cascade roots. The implementation SHALL NOT open a file excluded by the scope/privacy policy, reached through a reparse point outside the physical scope, or not owned by the project. Duplicate visible declarations SHALL be retained as an ambiguous candidate set; filesystem enumeration order SHALL NOT silently choose one.
 
 Any non-excluded directory enumeration, project/XAML read, or XML parse failure
-SHALL make XAML discovery incomplete and propagate to the dispatcher; the
-factory SHALL NOT return a partial project list or publish a partial resource
-snapshot. Scope/privacy exclusions SHALL still be checked before each read.
+after a file was discovered SHALL make XAML discovery incomplete and propagate
+to the dispatcher; the factory SHALL NOT return a partial project list or
+publish a partial resource snapshot. An explicit project item already missing
+when discovery begins is skipped with the incomplete reason defined below.
+Scope/privacy exclusions SHALL still be checked before each read.
 Explicit `Include` and `Update` items SHALL be unioned with a complete,
 policy-pruned `*.xaml` scan and SHALL NOT suppress discovery of SDK-default or
 otherwise implicit XAML files. A safely identified lexical scope/privacy
@@ -1028,6 +1037,14 @@ factory entry and around each synchronous enumeration, read, XML parse, and
 per-project build boundary; it SHALL propagate without publishing a result.
 
 The snapshot SHALL be reused for every `.xaml` file in the project so resource-resolution lookups (`{StaticResource AccentBrush}` → declaration site) do not re-walk the cascade per file. `XamlLanguageProject` SHALL implement `IDeclarationFirstLanguageProject`; its `DeclarationFilePaths` SHALL be the deterministic, duplicate-free set of real files that own the snapshot's resource declarations. A capable host dispatches that subset before consuming XAML files, so a cold index never depends on filesystem enumeration order. `XamlLanguageProject.RebuildResourceCache()` SHALL atomically replace the snapshot from the same scope-filtered project file set after an incremental resource edit; callers already using the prior immutable snapshot may finish against it.
+
+#### Scenario: Declared XAML item is missing from disk
+- **WHEN** a project explicitly declares a XAML item that does not exist while
+  other project-owned XAML files remain
+- **THEN** the missing path is excluded from `FilePaths`, surviving XAML files
+  are indexed, and the resource snapshot is incomplete with reason
+  `project-xaml-item-missing:<project-relative-path>` so missing-resource
+  findings do not become authoritative
 
 #### Scenario: Resource resolved from App.xaml
 - **WHEN** the indexer encounters `<Button Background="{StaticResource AccentBrush}"/>` in `Views/Main.xaml`, and `App.xaml` declares `<SolidColorBrush x:Key="AccentBrush" Color="Blue"/>`

@@ -141,6 +141,63 @@ internal sealed class XamlSemanticResolver
             Array.Empty<string>());
     }
 
+    public XamlBindingResolution ResolveElementBinding(
+        XamlElement targetElement,
+        string path)
+    {
+        if (!IsSimplePropertyPath(path))
+        {
+            return XamlBindingResolution.Unresolved(
+                XamlResolutionStatus.Unsupported,
+                "binding-path-syntax-not-supported");
+        }
+        if (!_semanticResolutionIsSafe)
+        {
+            return XamlBindingResolution.Unresolved(
+                XamlResolutionStatus.Incomplete,
+                "semantic-input-incomplete");
+        }
+
+        var typeResolution = ResolveElementType(targetElement);
+        if (typeResolution.Type is null)
+        {
+            return new XamlBindingResolution(
+                typeResolution.Outcome,
+                Target: null,
+                typeResolution.Candidates);
+        }
+
+        var propertyResolution = ResolvePropertyPath(
+            typeResolution.Type,
+            path,
+            directMembersOnly: false);
+        if (propertyResolution.Property is null)
+        {
+            return new XamlBindingResolution(
+                propertyResolution.Outcome,
+                Target: null,
+                propertyResolution.Candidates);
+        }
+
+        var propertyKey = CanonicalKey(propertyResolution.Property);
+        var typeKey = CanonicalKey(typeResolution.Type);
+        return propertyKey is null || typeKey is null
+            ? XamlBindingResolution.Unresolved(
+                XamlResolutionStatus.Unknown,
+                "canonical-symbol-identity-unavailable")
+            : new XamlBindingResolution(
+                new XamlResolutionOutcome(
+                    XamlResolutionStatus.Resolved,
+                    "unique-element-name-property"),
+                new XamlBindingTarget(
+                    propertyResolution.Property,
+                    propertyKey,
+                    typeKey,
+                    EvidenceConfidence.Semantic,
+                    "element-name"),
+                Array.Empty<string>());
+    }
+
     public IReadOnlyList<XamlViewModelAssociation> GetViewModelAssociations(
         XamlElement element) =>
         _semanticResolutionIsSafe
@@ -469,6 +526,13 @@ internal sealed class XamlSemanticResolver
     {
         string namespaceName;
         string? assemblyName = null;
+        if (string.Equals(
+                namespaceUri,
+                "http://schemas.microsoft.com/winfx/2006/xaml/presentation",
+                StringComparison.Ordinal))
+        {
+            return ResolvePresentationType(localName);
+        }
         if (namespaceUri.StartsWith("clr-namespace:", StringComparison.Ordinal))
         {
             var body = namespaceUri.Substring("clr-namespace:".Length);
@@ -508,6 +572,45 @@ internal sealed class XamlSemanticResolver
 
         var metadataName = namespaceName.Trim() + "." + localName.Trim();
         return ResolveMetadataType(metadataName, assemblyName);
+    }
+
+    private XamlTypeResolution ResolvePresentationType(string localName)
+    {
+        var metadataNames = new[]
+        {
+            "System.Windows.Controls." + localName,
+            "System.Windows." + localName,
+            "System.Windows.Shapes." + localName,
+            "System.Windows.Documents." + localName,
+            "System.Windows.Media." + localName,
+        };
+        var candidates = metadataNames
+            .Select(name => ResolveMetadataType(name, assemblyName: null))
+            .Where(result => result.Type is not null)
+            .Select(result => result.Type!)
+            .Distinct(SymbolEqualityComparer.Default)
+            .OfType<INamedTypeSymbol>()
+            .ToArray();
+        if (candidates.Length == 1)
+        {
+            return XamlTypeResolution.Resolved(candidates[0]);
+        }
+        if (candidates.Length == 0)
+        {
+            return XamlTypeResolution.Unresolved(
+                XamlResolutionStatus.Unknown,
+                "wpf-framework-type-metadata-unavailable");
+        }
+        return new XamlTypeResolution(
+            new XamlResolutionOutcome(
+                XamlResolutionStatus.Ambiguous,
+                "multiple-wpf-framework-types"),
+            Type: null,
+            candidates
+                .Select(candidate => CanonicalKey(candidate)
+                    ?? candidate.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat))
+                .OrderBy(candidate => candidate, StringComparer.Ordinal)
+                .ToArray());
     }
 
     private XamlTypeResolution ResolveMetadataType(

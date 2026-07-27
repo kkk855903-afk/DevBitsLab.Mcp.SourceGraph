@@ -94,7 +94,9 @@ public sealed class IndexFixtureTests : IAsyncLifetime
     public async Task Calculator_classRow_hasSummaryAndNoModifiers()
     {
         var hits = await _store!.FindSymbolsAsync("Sample.Domain.Calculator");
-        var calc = hits.Should().Contain(h => h.Kind == SymbolKinds.Class).Which;
+        var calc = hits.Should().ContainSingle(h => h.Kind == SymbolKinds.Class).Which;
+        hits.Should().ContainSingle(
+            "an exact FQN must not include members whose FQN merely contains the type name");
         calc.Modifiers.Should().BeNullOrEmpty();
         calc.XmlSummary.Should().NotBeNullOrEmpty();
         calc.XmlSummary!.Should().Contain("Simple integer arithmetic");

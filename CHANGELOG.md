@@ -11,6 +11,41 @@ below note which package the change applies to.
 ## [Unreleased]
 
 ### Changed
+- **WPF semantic chains and compact query results.** Command traces now continue
+  from the bound `ICommand` property through persisted `command-executes`
+  evidence to the handler. Element-name bindings resolve inherited WPF
+  properties such as `FrameworkElement.ActualWidth`, resource lookup covers
+  project dictionaries and pack-URI component paths, and interface-member
+  projection covers inherited and constructed generic implementations.
+  `trace_binding` and `trace_command` add compatible result/completeness fields,
+  a `canonical_id`, and summary/evidence detail modes while retaining the
+  existing response fields.
+- **Independent read connections and deterministic symbol selection.** Read-only
+  graph queries use pooled SQLite readers, common edge/annotation paths have
+  compound indexes, and exact canonical-key/FQN matches take precedence over
+  suffix, name, and fuzzy matches. Bounded concurrent-reader coverage prevents
+  regressions to a shared read lock.
+- **Actionable native-interoperability discovery.** An unconfigured interop
+  query performs a bounded, read-only scan for `.vcxproj`, CMake,
+  `compile_commands.json`, and DLL candidates. Diagnostics disclose detected
+  Debug/Release and x86/x64/arm64 targets, report ambiguity, and require an
+  explicit `interop.target` plus translation units instead of guessing. The
+  existing PE export and ABI engines remain the authority after configuration.
+- **Reliable partial-workspace and XAML indexing.** Initial Roslyn workspace
+  opens that return at least one project now keep those projects queryable while
+  surfacing failure diagnostics through `FailedProjects` / `partial` scope
+  status. Roslyn workspace packages move to 5.6.0. Explicit project XAML items
+  that no longer exist are skipped and make the resource cascade incomplete
+  instead of aborting discovery for every surviving XAML file. Explicit
+  interface implementations remain indexable with `implements-member` edges,
+  and WPF generated sources retain compiler provenance across the Roslyn 5.6
+  workspace metadata change without trusting spoofed `obj/*.g.cs` paths.
+- **Root-aligned pre-warm and opt-in legacy Windows compatibility.**
+  `init --prewarm` now passes the repository root and its
+  `.sourcegraph/scopes/default.db` explicitly, so a solution nested below the
+  root is immediately visible to `demo --root`. Source builds retain the
+  platform CET default unless `SourceGraphLegacyWindowsCompat=true` is passed
+  explicitly for older Windows hosts.
 - **Codex MCP transport compatibility and deterministic project paths.** Codex
   configs now use absolute `--solution` / `--root` paths plus an absolute
   `cwd`, and add `--codex-compat`. That mode emits one plain text content block

@@ -19,6 +19,15 @@ package id `DevBitsLab.Mcp.SourceGraph.Tool`.
   with `<packageType name="DotnetTool" />` in its nuspec and the
   `sourcegraph-mcp` command exposed
 
+#### Scenario: Legacy Windows compatibility is explicit
+- **WHEN** the Server project is built normally
+- **THEN** the SDK/platform CET default is retained
+- **AND WHEN** the build explicitly passes
+  `SourceGraphLegacyWindowsCompat=true`
+- **THEN** `CETCompat=false` is applied only to that build so an operator can
+  create a local package for an older Windows host without weakening published
+  packages by default
+
 ### Requirement: Complete NuGet listing metadata
 The package SHALL include `Description`, `Authors`, `PackageTags`,
 `PackageLicenseExpression=MIT`, `PackageProjectUrl`, `RepositoryUrl`

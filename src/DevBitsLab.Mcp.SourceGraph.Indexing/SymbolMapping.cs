@@ -89,7 +89,11 @@ internal static class SymbolMapping
     {
         INamespaceSymbol ns => !ns.IsGlobalNamespace,
         ITypeSymbol t => t.TypeKind is TypeKind.Class or TypeKind.Struct or TypeKind.Interface or TypeKind.Enum or TypeKind.Delegate,
-        IMethodSymbol m => m.MethodKind is MethodKind.Ordinary or MethodKind.Constructor or MethodKind.UserDefinedOperator or MethodKind.Conversion,
+        IMethodSymbol m => m.MethodKind is MethodKind.Ordinary
+            or MethodKind.Constructor
+            or MethodKind.UserDefinedOperator
+            or MethodKind.Conversion
+            or MethodKind.ExplicitInterfaceImplementation,
         IPropertySymbol => true,
         IFieldSymbol => true,
         IEventSymbol => true,
