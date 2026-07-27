@@ -56,7 +56,11 @@ public sealed class InteropAnalysisPublisherTests : IAsyncLifetime
 
         var result = await Publisher().PublishAsync(Target, true);
 
-        result.IsComplete.Should().BeTrue();
+        result.IsComplete.Should().BeTrue(
+            string.Join(
+                "; ",
+                result.Failures.Select(failure =>
+                    $"{failure.Stage}: {failure.Message}")));
         result.FilesPublished.Should().Be(1);
         result.MatchesPublished.Should().Be(1);
         result.FindingsPublished.Should().Be(1);
@@ -91,6 +95,80 @@ public sealed class InteropAnalysisPublisherTests : IAsyncLifetime
         evidence.Should().ContainSingle();
         evidence[0].Location.FilePath.Should().Be(managed.Path);
         evidence[0].Producer.Should().Be(InteropAnalysisPublisher.Producer);
+    }
+
+    [Fact]
+    public async Task Native_export_links_to_unique_cpp_syntax_implementation()
+    {
+        await SeedManagedAsync();
+        var native = await SeedNativeAsync(
+            "native/export.h",
+            "c:E:native/export.h::run",
+            library: "native.dll",
+            callingConvention: InteropCallingConvention.Cdecl,
+            binaryVerified: true);
+        var implementation = await SeedOwnerAsync(
+            "native/export.cpp",
+            "cpp:F:native/export.cpp::syntax::run()",
+            "run",
+            "function",
+            modifiers: "syntax-only");
+
+        var result = await Publisher().PublishAsync(Target, true);
+
+        result.IsComplete.Should().BeTrue(
+            string.Join(
+                "; ",
+                result.Failures.Select(failure =>
+                    $"{failure.Stage}: {failure.Message}")));
+        var targets = await _store!.ListCalleesAsync(
+            native.SymbolId,
+            edgeKind: EdgeKinds.NativeImplementation);
+        targets.Should().ContainSingle()
+            .Which.CanonicalKey.Should().Be(implementation.Key);
+        var evidence = await _store.ListEdgeEvidenceAsync(
+            native.SymbolId,
+            implementation.SymbolId,
+            EdgeKinds.NativeImplementation);
+        evidence.Should().ContainSingle();
+        evidence[0].Location.FilePath.Should().Be(implementation.Path);
+        evidence[0].Confidence.Should().Be(EvidenceConfidence.Inferred);
+    }
+
+    [Fact]
+    public async Task Native_export_does_not_guess_between_cpp_implementations()
+    {
+        await SeedManagedAsync();
+        var native = await SeedNativeAsync(
+            "native/export.h",
+            "c:E:native/export.h::run",
+            library: "native.dll",
+            callingConvention: InteropCallingConvention.Cdecl,
+            binaryVerified: true);
+        await SeedOwnerAsync(
+            "native/first.cpp",
+            "cpp:F:native/first.cpp::syntax::run()",
+            "run",
+            "function",
+            modifiers: "syntax-only");
+        await SeedOwnerAsync(
+            "native/second.cpp",
+            "cpp:F:native/second.cpp::syntax::run()",
+            "run",
+            "function",
+            modifiers: "syntax-only");
+
+        var result = await Publisher().PublishAsync(Target, true);
+
+        result.IsComplete.Should().BeTrue(
+            string.Join(
+                "; ",
+                result.Failures.Select(failure =>
+                    $"{failure.Stage}: {failure.Message}")));
+        (await _store!.ListCalleesAsync(
+                native.SymbolId,
+                edgeKind: EdgeKinds.NativeImplementation))
+            .Should().BeEmpty();
     }
 
     [Fact]
@@ -1039,7 +1117,8 @@ public sealed class InteropAnalysisPublisherTests : IAsyncLifetime
         string relativePath,
         string canonicalKey,
         string name,
-        string kind)
+        string kind,
+        string? modifiers = null)
     {
         var path = Path.GetFullPath(Path.Join(_tempDirectory, relativePath));
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
@@ -1061,7 +1140,8 @@ public sealed class InteropAnalysisPublisherTests : IAsyncLifetime
                 2,
                 1,
                 $"void {name}()",
-                null));
+                null,
+                modifiers));
         return new Owner(fileId, symbolId, canonicalKey, path);
     }
 

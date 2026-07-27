@@ -51,7 +51,10 @@ public static class EdgeKinds
     /// <summary>A managed P/Invoke declaration maps to a native ABI export.</summary>
     public const string PInvokeMapsTo = "pinvoke-maps-to";
 
-    /// <summary>A native ABI export is implemented by a source declaration or definition.</summary>
+    /// <summary>
+    /// A native ABI export declaration is implemented by a compiler-independent C/C++ syntax
+    /// definition in an implementation file.
+    /// </summary>
     public const string NativeImplementation = "native-implementation";
 
     /// <summary>A managed interop struct maps to a native struct declaration.</summary>

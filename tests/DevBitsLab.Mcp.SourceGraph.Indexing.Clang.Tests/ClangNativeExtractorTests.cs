@@ -1478,6 +1478,50 @@ public sealed class ClangNativeExtractorTests
                 StringComparison.Ordinal));
     }
 
+    [Fact]
+    public void Injected_class_name_does_not_duplicate_record_declaration()
+    {
+        using var workspace = new NativeTestWorkspace();
+        var sourcePath = workspace.Write(
+            "native/camera.h",
+            """
+            using HRESULT = long;
+            using BOOL = int;
+            using PgUInt8 = unsigned char;
+            using PgUInt32 = unsigned int;
+            using PgUInt64 = unsigned long long;
+            using PgInt64 = long long;
+            #define PG_CAMERA_API extern "C" __declspec(dllexport)
+
+            struct PgCameraFormat
+            {
+                PgUInt32 width;
+                PgUInt32 height;
+                PgUInt32 stride;
+                PgUInt32 frame_bytes;
+            };
+
+            PG_CAMERA_API HRESULT __cdecl pg_camera_start(
+                void* camera,
+                PgUInt32 camera_index,
+                PgUInt32 requested_width,
+                PgUInt32 requested_height,
+                PgUInt32 requested_fps,
+                PgCameraFormat* actual_format);
+            """);
+
+        var result = ExtractWindows(workspace.Root, sourcePath);
+
+        result.Types.Where(type => type.Name == "PgCameraFormat")
+            .Should().ContainSingle()
+            .Which.QualifiedName.Should().Be("PgCameraFormat");
+        result.RecordLayouts.Where(layout =>
+                layout.SymbolCanonicalKey.EndsWith(
+                    "::PgCameraFormat",
+                    StringComparison.Ordinal))
+            .Should().ContainSingle();
+    }
+
     private static ClangNativeExtractionResult ExtractWindows(
         string scopeRoot,
         string sourcePath) =>

@@ -25,9 +25,11 @@ below note which package the change applies to.
   and source-declared code-behind handlers are attributed to their executable
   owners, interface dispatch and unique incomplete-compilation candidates gain
   evidence-backed execution edges, and managed P/Invoke calls connect through
-  native imports to implementation symbols. WPF code-behind `DataContext`
-  assignments now resolve binding targets without requiring a XAML
-  `DataContext` declaration.
+  native imports to implementation symbols. A lightweight C/C++ syntax index
+  keeps implementation-file definitions available even when Clang translation
+  units are configured from headers, and uniquely links native exports to
+  those definitions. WPF code-behind `DataContext` assignments now resolve
+  binding targets without requiring a XAML `DataContext` declaration.
 - **WPF semantic chains and compact query results.** Command traces now continue
   from the bound `ICommand` property through persisted `command-executes`
   evidence to the handler. Element-name bindings resolve inherited WPF

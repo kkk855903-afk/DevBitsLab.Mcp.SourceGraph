@@ -694,6 +694,14 @@
           "libclang": "[21.1.8, )"
         }
       },
+      "devbitslab.mcp.sourcegraph.indexing.cpp": {
+        "type": "Project",
+        "dependencies": {
+          "DevBitsLab.Mcp.SourceGraph.Indexing.TreeSitter": "[1.0.0, )",
+          "DevBitsLab.Mcp.SourceGraph.Sdk": "[2.5.0, )",
+          "Microsoft.Extensions.Logging.Abstractions": "[10.0.10, )"
+        }
+      },
       "devbitslab.mcp.sourcegraph.indexing.treesitter": {
         "type": "Project",
         "dependencies": {
@@ -747,6 +755,7 @@
           "DevBitsLab.Mcp.SourceGraph.Embeddings": "[1.0.0, )",
           "DevBitsLab.Mcp.SourceGraph.Indexing": "[1.0.0, )",
           "DevBitsLab.Mcp.SourceGraph.Indexing.Clang": "[1.0.0, )",
+          "DevBitsLab.Mcp.SourceGraph.Indexing.Cpp": "[1.0.0, )",
           "DevBitsLab.Mcp.SourceGraph.Indexing.TreeSitter": "[1.0.0, )",
           "DevBitsLab.Mcp.SourceGraph.Indexing.TypeScript": "[1.0.0, )",
           "DevBitsLab.Mcp.SourceGraph.Indexing.Xaml": "[1.0.0, )",

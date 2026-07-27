@@ -114,6 +114,14 @@ calls with a single structured tool call:
   install from indexing dependency trees. Cross-file ref resolution is
   intra-file at this version; tsconfig `paths`-aware module resolution +
   optional `typescript-language-server` enrichment ship as follow-ups.
+- **Zero-build C/C++ implementation search.** A built-in tree-sitter layer
+  indexes `.c`, `.cc`, `.cpp`, `.cxx`, common header extensions, and inline
+  implementation files without requiring a working native toolchain or reading
+  system headers outside the repository. It exposes classes, structs, unions,
+  enums, aliases, functions, methods, constructors, and uniquely resolved
+  intra-file calls as `syntax-only` facts. Configured libclang indexing remains
+  the authoritative layer for ABI layouts, exports, P/Invoke matching, and
+  compiler-resolved native calls.
 - **FTS5 name search.** Trigram fragment matching for cases where you only
   remember "`…Greet…Async`".
 - **Optional code-aware semantic search.** ONNX embeddings (default model:
@@ -158,7 +166,7 @@ cheap structural queries against a stable solution.
 | **Initial indexing** | `MSBuildWorkspace` load (10–60 s on a real solution), paid in every consumer process | Scope open + full indexing on host start (and after `clear` or workspace reloads); tool calls await `ScopeHost.Ready` until the pass completes. Borne once by the host, shared across every connected client. |
 | **Steady-state query** | Fast in-memory queries against the loaded workspace | Milliseconds — SQLite query against the warm DB; incremental re-indexing handled by the watcher (see *Freshness* below) |
 | **Search shape** | Exact-identity lookups (`SymbolFinder.FindReferencesAsync`) | Same exact lookups *plus* FTS5 fragment search and ONNX semantic search |
-| **Languages** | C# / VB only | C# + XAML + protobuf + configured C/C++ interop + TypeScript / JavaScript / TSX / JSX, with cross-language joins; plugin SDK for more |
+| **Languages** | C# / VB only | C# + XAML + protobuf + zero-build C/C++ structure + configured C/C++ interop + TypeScript / JavaScript / TSX / JSX, with cross-language joins; plugin SDK for more |
 | **Multi-solution** | One workspace per solution | Native scope router with isolation flags for vendored / generated code |
 | **Freshness** | Caller's problem | File watcher + `.git/HEAD` watcher with 200 ms debounce |
 | **Semantic accuracy** | 100% live | Snapshot-accurate, refreshed on file changes |
