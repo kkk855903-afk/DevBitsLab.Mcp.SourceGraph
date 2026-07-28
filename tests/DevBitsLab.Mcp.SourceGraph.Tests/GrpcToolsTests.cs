@@ -235,6 +235,14 @@ public sealed class GrpcToolsTests : IAsyncLifetime
 
         scope.Failures.Should().HaveCount(failures.Length);
         scope.TotalFailureCount.Should().Be(failures.Length);
+        scope.Status.Should().Be("partial");
+        scope.Partial.Should().BeTrue();
+        scope.RetainedLastGood.Should().BeTrue();
+        scope.Rpcs.Should().ContainSingle(rpc =>
+            rpc.CanonicalKey == RpcKey);
+        scope.TotalRpcCount.Should().Be(1);
+        scope.TotalClientCount.Should().Be(1);
+        scope.TotalServerCount.Should().Be(1);
         scope.Truncated.Should().BeFalse();
         scope.OmittedCount.Should().Be(0);
     }

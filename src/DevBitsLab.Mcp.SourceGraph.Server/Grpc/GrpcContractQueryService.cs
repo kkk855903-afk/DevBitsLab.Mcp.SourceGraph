@@ -41,7 +41,11 @@ public sealed class GrpcContractQueryService
             1,
             MaximumRelationsPerRpc);
 
-        if (runtimeState?.Status != GrpcLinkRuntimeStatus.Complete)
+        var retainedSnapshot =
+            runtimeState?.Status != GrpcLinkRuntimeStatus.Complete
+            && runtimeState?.RetainedLastGood == true;
+        if (runtimeState?.Status != GrpcLinkRuntimeStatus.Complete
+            && !retainedSnapshot)
         {
             return TraceRuntimeUnavailable(
                 scopeId,
@@ -62,31 +66,43 @@ public sealed class GrpcContractQueryService
                 .ConfigureAwait(false);
             if (selection.Rpcs.Count == 0)
             {
-                return new GrpcTraceScopeResult(
-                    scopeId,
-                    scopeStatus,
-                    "not_found",
-                    Partial: false,
-                    RetainedLastGood: false,
-                    selection.Status,
-                    selection.CanonicalKey,
-                    [],
-                    TotalRpcCount: 0,
-                    TotalClientCount: 0,
-                    TotalServerCount: 0,
-                    Failures:
-                    [
+                var runtimeFailures = retainedSnapshot
+                    ? RuntimeFailures(runtimeState)
+                    : [];
+                var failures = runtimeFailures
+                    .Append(
                         new GrpcToolFailureRow(
                             "selection",
                             selection.FailureCode
                                 ?? "rpc-not-found",
                             selection.FailureMessage
                                 ?? "No evidence-backed RPC relationship matched the exact canonical key.",
-                            selection.CanonicalKey),
-                    ],
-                    TotalFailureCount: 1,
-                    Truncated: false,
-                    OmittedCount: 0,
+                            selection.CanonicalKey))
+                    .ToArray();
+                return new GrpcTraceScopeResult(
+                    scopeId,
+                    scopeStatus,
+                    retainedSnapshot ? "partial" : "not_found",
+                    Partial: retainedSnapshot,
+                    RetainedLastGood: retainedSnapshot,
+                    selection.Status,
+                    selection.CanonicalKey,
+                    [],
+                    TotalRpcCount: 0,
+                    TotalClientCount: 0,
+                    TotalServerCount: 0,
+                    failures,
+                    TotalFailureCount: retainedSnapshot
+                        ? Math.Max(
+                            failures.Length,
+                            SaturatingAdd(
+                                runtimeState!.FailureCount,
+                                1))
+                        : 1,
+                    Truncated:
+                        (runtimeState?.OmittedFailures ?? 0) > 0,
+                    OmittedCount:
+                        runtimeState?.OmittedFailures ?? 0,
                     OmittedEvidenceCount: 0);
             }
 
@@ -151,20 +167,31 @@ public sealed class GrpcContractQueryService
                         clients.OmittedCount + servers.OmittedCount));
             }
 
+            var retainedFailures = retainedSnapshot
+                ? RuntimeFailures(runtimeState)
+                : [];
+            var runtimeOmitted = retainedSnapshot
+                ? runtimeState!.OmittedFailures
+                : 0;
+            omitted = SaturatingAdd(omitted, runtimeOmitted);
             return new GrpcTraceScopeResult(
                 scopeId,
                 scopeStatus,
-                "ok",
-                Partial: omitted > 0,
-                RetainedLastGood: false,
+                retainedSnapshot || omitted > 0 ? "partial" : "ok",
+                Partial: retainedSnapshot || omitted > 0,
+                RetainedLastGood: retainedSnapshot,
                 selection.Status,
                 selection.CanonicalKey,
                 rows,
                 rows.Count,
                 totalClients,
                 totalServers,
-                [],
-                TotalFailureCount: 0,
+                retainedFailures,
+                TotalFailureCount: retainedSnapshot
+                    ? Math.Max(
+                        retainedFailures.Count,
+                        runtimeState!.FailureCount)
+                    : 0,
                 Truncated: omitted > 0,
                 OmittedCount: omitted,
                 OmittedEvidenceCount: omittedEvidence);
@@ -181,7 +208,7 @@ public sealed class GrpcContractQueryService
                 "partial",
                 Partial: true,
                 RetainedLastGood:
-                    runtimeState.RetainedLastGood,
+                    runtimeState?.RetainedLastGood ?? false,
                 SelectionStatus: "unknown",
                 SelectionCanonicalKey: query,
                 Rpcs: [],
