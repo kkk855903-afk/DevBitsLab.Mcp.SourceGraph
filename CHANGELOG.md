@@ -11,6 +11,15 @@ below note which package the change applies to.
 ## [Unreleased]
 
 ### Changed
+- **Lossless and observable semantic indexing.** Cold indexing now retains every
+  accepted embedding request instead of dropping the oldest work above a
+  4096-item queue cap. Interactive semantic-query inference receives priority
+  over queued background batches, while `embeddings_status` reports per-scope
+  pending/completed/dropped counts and query/background inference wait time.
+  `trace_binding` also joins `binds-element` evidence to known WPF framework
+  properties, and never reports authoritative absence when relevant
+  lower-level evidence could not be materialized. A same-process benchmark
+  probe separates first-call, warm, and managed-lock wait measurements.
 - **WPF semantic chains and compact query results.** Command traces now continue
   from the bound `ICommand` property through persisted `command-executes`
   evidence to the handler. Element-name bindings resolve inherited WPF

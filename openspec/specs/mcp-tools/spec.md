@@ -282,6 +282,22 @@ The server SHALL expose a `semantic_search` tool whose intent is fuzzy intent re
 - **WHEN** the agent invokes `semantic_search(query = "logging that masks PII")`
 - **THEN** the response is a top-k list of symbols ranked by cosine similarity to the query embedding, each annotated with location, score, and a one-line snippet
 
+The cold-index embedding queue SHALL retain every accepted symbol request until it reaches a
+terminal completed or dropped state; capacity pressure SHALL NOT discard the oldest request.
+Interactive query encoding SHALL receive the next available inference slot ahead of already
+queued background batches, without preempting an in-flight ONNX call.
+
+#### Scenario: Cold index exceeds the former queue capacity
+- **GIVEN** a cold index enqueues more than 4096 symbol embedding requests
+- **WHEN** the background worker is slower than the producer
+- **THEN** every request remains pending or completes, and `dropped` remains zero unless an
+  explicit terminal processing failure occurs
+
+#### Scenario: Semantic query overtakes queued background work
+- **GIVEN** one background inference is running and another background batch is waiting
+- **WHEN** `semantic_search` begins waiting for query inference
+- **THEN** the query receives the next inference slot before the waiting background batch
+
 ### Requirement: find_diagnostics tool
 The server SHALL expose a `find_diagnostics(severity? = "warning", code?, symbol?, limit = 100)` tool that returns Roslyn diagnostic rows filtered by severity, code, and/or attached symbol.
 
@@ -961,7 +977,7 @@ Each tool's description SHALL include a `Use when:` line that describes the user
 
 #### Scenario: embeddings_status returns the cache report
 - **WHEN** an MCP client invokes `embeddings_status` with no arguments
-- **THEN** `result.structuredContent` includes `model_id`, `dimension`, `cache_dir`, an array of `files` each with `local_name` / `remote_path` / `present` / `size_bytes` / `computed_sha` / `pinned_sha` / `match`, and `free_disk_bytes` (snake_case per `ToolOutputJsonContext`'s `JsonKnownNamingPolicy.SnakeCaseLower`); the prose narrates the same data
+- **THEN** `result.structuredContent` includes `model_id`, `dimension`, `cache_dir`, an array of `files` each with `local_name` / `remote_path` / `present` / `size_bytes` / `computed_sha` / `pinned_sha` / `match`, `free_disk_bytes`, per-scope `queues[*].pending/completed/dropped`, and `inference.query_wait_ms/background_wait_ms`; the prose narrates the same data
 
 #### Scenario: embeddings_pull on empty cache populates the cache
 - **WHEN** an MCP client invokes `embeddings_pull` with no arguments and the active model's cache directory is empty

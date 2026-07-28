@@ -8,6 +8,24 @@ namespace DevBitsLab.Mcp.SourceGraph.Embeddings;
 public sealed record EmbedRequest(long SymbolId, string Text, byte[] ContentHash);
 
 /// <summary>
+/// Process-local state for one scope's embedding work queue.
+/// <c>Completed</c> includes both newly persisted vectors and requests skipped by the
+/// content-hash gate. <c>Dropped</c> is reserved for terminal failures or writes attempted
+/// after shutdown; capacity pressure never increments it.
+/// </summary>
+public sealed record EmbeddingQueueStatistics(long Pending, long Completed, long Dropped);
+
+/// <summary>
+/// Wait-time counters for the shared ONNX inference gate. Query calls are high priority;
+/// background calls are the indexer's batched embedding work.
+/// </summary>
+public sealed record EmbeddingInferenceStatistics(
+    long QueryCalls,
+    double QueryWaitMs,
+    long BackgroundCalls,
+    double BackgroundWaitMs);
+
+/// <summary>
 /// Identity of the embedding model in use. Surfaces in the <c>embedding_meta.model_version</c>
 /// column so swapping models (different dimension or different training corpus) invalidates the
 /// existing rows rather than mixing dimensions.

@@ -104,16 +104,22 @@ public sealed record TraceBindingResult(
     IReadOnlyList<WpfTraceMatch> Matches,
     IReadOnlyList<WpfScopeSummary> Scopes)
 {
+    [JsonPropertyName("lower_level_evidence_present")]
+    public bool LowerLevelEvidencePresent { get; init; }
     public string Result => Matches.Count > 0
         ? "found"
-        : Partial || Truncated ? "unknown" : "absent";
-    public string Completeness => Partial || Truncated ? "partial" : "complete";
+        : Partial || Truncated || LowerLevelEvidencePresent ? "unknown" : "absent";
+    public string Completeness =>
+        Partial || Truncated || LowerLevelEvidencePresent ? "partial" : "complete";
     [JsonPropertyName("absence_authoritative")]
     public bool AbsenceAuthoritative =>
-        Matches.Count == 0 && !Partial && !Truncated;
+        Matches.Count == 0 && !Partial && !Truncated && !LowerLevelEvidencePresent;
     public string Reason => Truncated
         ? "scan-cap"
-        : Partial ? "partial-scope" : Matches.Count == 0 ? "not-found" : "matched";
+        : Partial ? "partial-scope"
+        : LowerLevelEvidencePresent && Matches.Count == 0
+            ? "lower-level-evidence-unresolved"
+            : Matches.Count == 0 ? "not-found" : "matched";
 }
 
 /// <summary>
@@ -134,16 +140,22 @@ public sealed record TraceCommandResult(
     IReadOnlyList<WpfTraceMatch> Matches,
     IReadOnlyList<WpfScopeSummary> Scopes)
 {
+    [JsonPropertyName("lower_level_evidence_present")]
+    public bool LowerLevelEvidencePresent { get; init; }
     public string Result => Matches.Count > 0
         ? "found"
-        : Partial || Truncated ? "unknown" : "absent";
-    public string Completeness => Partial || Truncated ? "partial" : "complete";
+        : Partial || Truncated || LowerLevelEvidencePresent ? "unknown" : "absent";
+    public string Completeness =>
+        Partial || Truncated || LowerLevelEvidencePresent ? "partial" : "complete";
     [JsonPropertyName("absence_authoritative")]
     public bool AbsenceAuthoritative =>
-        Matches.Count == 0 && !Partial && !Truncated;
+        Matches.Count == 0 && !Partial && !Truncated && !LowerLevelEvidencePresent;
     public string Reason => Truncated
         ? "scan-cap"
-        : Partial ? "partial-scope" : Matches.Count == 0 ? "not-found" : "matched";
+        : Partial ? "partial-scope"
+        : LowerLevelEvidencePresent && Matches.Count == 0
+            ? "lower-level-evidence-unresolved"
+            : Matches.Count == 0 ? "not-found" : "matched";
 }
 
 /// <summary>

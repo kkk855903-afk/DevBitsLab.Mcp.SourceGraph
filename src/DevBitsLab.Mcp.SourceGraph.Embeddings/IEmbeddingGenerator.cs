@@ -24,6 +24,20 @@ public interface ICodeEmbeddingGenerator : IDisposable
     /// The batch size SHOULD be in the 16-32 range to amortise ONNX <c>Run</c> startup cost.
     /// </summary>
     Task<IReadOnlyList<float[]>> EmbedAsync(IReadOnlyList<string> inputs, CancellationToken ct = default);
+
+    /// <summary>
+    /// Embed an interactive semantic-search query. Implementations may prioritize this work
+    /// ahead of queued background indexing batches. The default preserves compatibility with
+    /// generators that do not need a scheduler.
+    /// </summary>
+    Task<IReadOnlyList<float[]>> EmbedQueryAsync(
+        IReadOnlyList<string> inputs,
+        CancellationToken ct = default) =>
+        EmbedAsync(inputs, ct);
+
+    /// <summary>Snapshot of inference-gate wait time for diagnostics and benchmarks.</summary>
+    EmbeddingInferenceStatistics InferenceStatistics =>
+        new(0, 0, 0, 0);
 }
 
 /// <summary>

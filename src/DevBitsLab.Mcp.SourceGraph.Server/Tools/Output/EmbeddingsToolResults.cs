@@ -14,7 +14,23 @@ public sealed record EmbeddingsStatusResult(
     int Dimension,
     [property: JsonPropertyName("cache_dir")] string CacheDir,
     IReadOnlyList<EmbeddingsFileRow> Files,
-    [property: JsonPropertyName("free_disk_bytes")] long? FreeDiskBytes);
+    [property: JsonPropertyName("free_disk_bytes")] long? FreeDiskBytes,
+    [property: JsonPropertyName("queues")] IReadOnlyList<EmbeddingsQueueRow>? Queues = null,
+    [property: JsonPropertyName("inference")] EmbeddingsInferenceRow? Inference = null);
+
+/// <summary>Live queue counters for one indexed scope.</summary>
+public sealed record EmbeddingsQueueRow(
+    [property: JsonPropertyName("scope_id")] string ScopeId,
+    long Pending,
+    long Completed,
+    long Dropped);
+
+/// <summary>Process-local wait-time counters for the shared ONNX inference gate.</summary>
+public sealed record EmbeddingsInferenceRow(
+    [property: JsonPropertyName("query_calls")] long QueryCalls,
+    [property: JsonPropertyName("query_wait_ms")] double QueryWaitMs,
+    [property: JsonPropertyName("background_calls")] long BackgroundCalls,
+    [property: JsonPropertyName("background_wait_ms")] double BackgroundWaitMs);
 
 /// <summary>
 /// One file row inside <see cref="EmbeddingsStatusResult.Files"/>. <see cref="Match"/> is null

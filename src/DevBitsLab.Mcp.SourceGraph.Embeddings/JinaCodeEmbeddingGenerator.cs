@@ -42,10 +42,11 @@ public sealed class JinaCodeEmbeddingGenerator : ICodeEmbeddingGenerator
     private bool _initialised;
     private bool _available;
     private readonly object _initLock = new();
-    // Serialises EmbedAsync calls. The interface contract only guarantees single-worker access,
-    // but the host now wires one drain per scope (all sharing this singleton generator), so we
-    // serialise inside the implementation rather than push the concern out to every caller.
-    private readonly SemaphoreSlim _embedGate = new(initialCount: 1, maxCount: 1);
+    // Serialises ONNX calls. Interactive semantic queries increment _queryWaiters before
+    // waiting; background batches that win the semaphore concurrently yield it back while a
+    // query is queued. The current ONNX batch is not preempted, but a query always wins the
+    // next scheduling slot.
+    private readonly PriorityInferenceGate _inferenceGate = new();
 
     public JinaCodeEmbeddingGenerator(
         string modelOnnxPath,
@@ -72,7 +73,23 @@ public sealed class JinaCodeEmbeddingGenerator : ICodeEmbeddingGenerator
         }
     }
 
-    public async Task<IReadOnlyList<float[]>> EmbedAsync(IReadOnlyList<string> inputs, CancellationToken ct = default)
+    public Task<IReadOnlyList<float[]>> EmbedAsync(
+        IReadOnlyList<string> inputs,
+        CancellationToken ct = default) =>
+        EmbedCoreAsync(inputs, highPriority: false, ct);
+
+    public Task<IReadOnlyList<float[]>> EmbedQueryAsync(
+        IReadOnlyList<string> inputs,
+        CancellationToken ct = default) =>
+        EmbedCoreAsync(inputs, highPriority: true, ct);
+
+    public EmbeddingInferenceStatistics InferenceStatistics =>
+        _inferenceGate.Statistics;
+
+    private async Task<IReadOnlyList<float[]>> EmbedCoreAsync(
+        IReadOnlyList<string> inputs,
+        bool highPriority,
+        CancellationToken ct)
     {
         if (inputs.Count == 0) return Array.Empty<float[]>();
         EnsureInitialised();
@@ -81,19 +98,10 @@ public sealed class JinaCodeEmbeddingGenerator : ICodeEmbeddingGenerator
             throw new InvalidOperationException("Embedding generator is not available; check IsAvailable before calling.");
         }
 
-        // Run the synchronous ONNX session call on a worker so we don't block the indexer's
-        // task pump. ORT's Run() is reentrant-safe per session, but we serialise here because
-        // the host now shares this singleton across one drain task per scope — the interface
-        // only guarantees safety from a single background worker.
-        await _embedGate.WaitAsync(ct).ConfigureAwait(false);
-        try
-        {
-            return await Task.Run(() => EncodeBatch(inputs, ct), ct).ConfigureAwait(false);
-        }
-        finally
-        {
-            _embedGate.Release();
-        }
+        using var lease = await _inferenceGate
+            .AcquireAsync(highPriority, ct)
+            .ConfigureAwait(false);
+        return await Task.Run(() => EncodeBatch(inputs, ct), ct).ConfigureAwait(false);
     }
 
     private float[][] EncodeBatch(IReadOnlyList<string> inputs, CancellationToken ct)
@@ -439,6 +447,6 @@ public sealed class JinaCodeEmbeddingGenerator : ICodeEmbeddingGenerator
         _session?.Dispose();
         _session = null;
         _tokenizer = null;
-        _embedGate.Dispose();
+        _inferenceGate.Dispose();
     }
 }

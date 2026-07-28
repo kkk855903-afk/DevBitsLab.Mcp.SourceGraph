@@ -94,6 +94,7 @@ public sealed class EmbeddingsHostedService : BackgroundService
                         pending.Add(req);
                     }
                 }
+                _sink.MarkCompleted(batch.Count - pending.Count);
                 if (pending.Count == 0)
                 {
                     // Optional small wait so we don't spin on a stream of unchanged hashes.
@@ -110,23 +111,41 @@ public sealed class EmbeddingsHostedService : BackgroundService
                 catch (Exception ex) when (ex is not OperationCanceledException)
                 {
                     _logger.LogWarning(ex, "Batch embed failed (size={Size}); dropping batch", pending.Count);
+                    _sink.MarkDropped(pending.Count);
                     continue;
                 }
 
                 for (var i = 0; i < pending.Count; i++)
                 {
+                    if (i >= vectors.Count)
+                    {
+                        _sink.MarkDropped(pending.Count - i);
+                        _logger.LogWarning(
+                            "Embedding generator returned {Actual} vectors for {Expected} requests; dropping the unmatched tail",
+                            vectors.Count,
+                            pending.Count);
+                        break;
+                    }
                     try
                     {
                         await _store.UpsertAsync(pending[i].SymbolId, pending[i].ContentHash, vectors[i], modelVersion, stoppingToken).ConfigureAwait(false);
+                        _sink.MarkCompleted();
                     }
                     catch (Exception ex) when (ex is not OperationCanceledException)
                     {
                         _logger.LogWarning(ex, "Persist failed for symbol {Id}", pending[i].SymbolId);
+                        _sink.MarkDropped();
                     }
                 }
             }
         }
         catch (OperationCanceledException) { /* shutting down */ }
+        finally
+        {
+            var abandoned = 0;
+            while (_sink.Reader.TryRead(out _)) abandoned++;
+            _sink.MarkDropped(abandoned);
+        }
     }
 
     public override async Task StopAsync(CancellationToken cancellationToken)

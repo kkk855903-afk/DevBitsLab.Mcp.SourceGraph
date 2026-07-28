@@ -673,7 +673,7 @@ The WPF risk codes intentionally cover only statically proven shapes:
 | `reconcile_drift` | Walk a scope's source tree, compare each file's on-disk SHA-256 to the DB, and apply the symmetric difference (reindex changed + index added + remove vanished). Use when results look stale or after a long offline period. `dry_run` previews without applying. |
 | `graph_stats` | Counts of files / symbols / references / edges — confirm the index is populated |
 | `usage_stats` | Per-tool call count, error count, latency, average response size, last-called time for the current process |
-| `embeddings_status` | Inspect the embedding model cache (read-only): cache directory, model id + dimension, per-file presence/size/SHA, free disk |
+| `embeddings_status` | Inspect the embedding model cache and live pipeline (read-only): cache files, free disk, per-scope `pending` / `completed` / `dropped`, plus query/background inference wait time |
 | `embeddings_pull` | Synchronously download the embedding model manifest into the cache (idempotent; mutating tool — host should confirm) |
 | `embeddings_remove` | Delete the cache directory for the active model (default), one specific model, or every cached model with `all=true` (**destructive** — host should confirm) |
 | `embeddings_verify` | Recompute SHAs of every cached file and compare against the manifest. Default model has pinned SHAs (mismatch → `isError=true`); override `--model` paths report `match=null` (informational only) |
@@ -1196,6 +1196,23 @@ database per scope. The current limits are:
 | Default `SearchSymbols` / `find_references` / `list_members` result limit | 25 / 50 / 100 rows | Pass `limit` on the MCP tool call. A soft serialized-size cap (~50K chars) trims further if a larger `limit` would exceed Claude Code's per-call ceiling; trim is signalled via `omitted_size=N` in the audience-restricted `_meta:` block. |
 | `impact_of_change` max depth | 4 hops | Pass `maxDepth` on the tool call. |
 | `semantic_search` top-k default | 10 | Pass `k` on the tool call. |
+
+### Reproducible cold/warm query probe
+
+Do not compare cumulative `usage_stats` averages from different server processes. Run the
+same operation with identical arguments against one open store so first-call, warm-call, and
+managed lock wait remain separate:
+
+```powershell
+dotnet build .\bench\DevBitsLab.Mcp.SourceGraph.Benchmarks -c Release
+dotnet .\bench\DevBitsLab.Mcp.SourceGraph.Benchmarks\bin\Release\net10.0\DevBitsLab.Mcp.SourceGraph.Benchmarks.dll `
+  --same-process-query .\.sourcegraph\scopes\default.db Calculator 20
+```
+
+The JSON result reports `cold_ms`, warm min/median/max, and `lock_wait_ms`. Symbol search uses
+independent read-only readers, so its managed lock wait is explicitly zero. For semantic
+search, use `embeddings_status`: `inference.query_wait_ms` and
+`inference.background_wait_ms` report contention at the shared ONNX gate.
 | Embedding model download | ~640 MB, automatic download disabled by default | Populate deliberately with `embeddings pull`, or opt in with `--allow-model-download`; use `--no-embeddings` to disable the pipeline. |
 | Per-symbol `git blame` shellout | enabled | Disable with `--no-history`. |
 | MCP `initialize` instructions payload | enabled | Disable with `--no-instructions` or `SOURCEGRAPH_NO_INSTRUCTIONS=1`. |

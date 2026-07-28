@@ -23,6 +23,7 @@ public static class WpfTools
 {
     private const string BindsPath = "binds-path";
     private const string BindsTo = "binds-to";
+    private const string BindsElement = "binds-element";
     private const string UsesResource = "uses-resource";
     private const string AppliesStyle = "applies-style";
     private const string CommandExecutes = "command-executes";
@@ -41,7 +42,8 @@ public static class WpfTools
     [ToolTrigger("\"trace this WPF binding\", \"where does this XAML binding resolve?\", \"why is this binding missing?\"")]
     [Description(
         "Trace a WPF data binding from a XAML element and/or binding path to its canonical target. " +
-        "Returns resolved `binds-path` (and legacy `binds-to` fallback) edges together with " +
+        "Returns resolved `binds-path`, `binds-element` (ElementName), and legacy `binds-to` " +
+        "edges together with " +
         "xaml-binding-finding/outcome rows for missing, ambiguous, incomplete, or unknown bindings. " +
         "Every match includes stored occurrence evidence; ambiguous element queries are returned " +
         "as candidates and are never guessed.")]
@@ -247,6 +249,7 @@ public static class WpfTools
                         ? "Candidates were bounded by the shared query limit; narrow the element filter for a complete slice."
                         : null),
                 scopes: null,
+                lowerLevelEvidencePresent: false,
                 elapsedMs: sw.ElapsedMilliseconds);
         }
 
@@ -300,6 +303,63 @@ public static class WpfTools
                 AnnotationEvidence: null));
         }
 
+        var elementEdges = Array.Empty<EdgeTraversalHit>();
+        var inboundElementEdges = Array.Empty<EdgeTraversalHit>();
+        var matchedElementEdge = false;
+        if (!isCommand && element.Symbol is not null)
+        {
+            elementEdges = (await host.Store.ListAuditableOutboundEdgesAsync(
+                element.Symbol.Id,
+                limit: probeLimit,
+                edgeKind: BindsElement,
+                ct: ct).ConfigureAwait(false)).ToArray();
+            foreach (var edge in elementEdges)
+            {
+                var payload = ParsePayload(edge.PayloadJson);
+                if (string.IsNullOrEmpty(payload.Path)
+                    || !MemberMatches(payload.Path, memberQuery))
+                {
+                    continue;
+                }
+                matchedElementEdge = true;
+                pending.Add(new PendingTrace(
+                    element.Symbol,
+                    edge.Symbol,
+                    BindsElement,
+                    payload.Path,
+                    "resolved",
+                    StableReason(payload.Reason, "resolved", BindsElement),
+                    payload.Raw,
+                    Array.Empty<WpfResolutionCandidate>(),
+                    AnnotationEvidence: null));
+            }
+            inboundElementEdges = (await host.Store.ListAuditableInboundEdgesAsync(
+                element.Symbol.Id,
+                limit: probeLimit,
+                edgeKind: BindsElement,
+                ct: ct).ConfigureAwait(false)).ToArray();
+            foreach (var edge in inboundElementEdges)
+            {
+                var payload = ParsePayload(edge.PayloadJson);
+                if (string.IsNullOrEmpty(payload.Path)
+                    || !MemberMatches(payload.Path, memberQuery))
+                {
+                    continue;
+                }
+                matchedElementEdge = true;
+                pending.Add(new PendingTrace(
+                    edge.Symbol,
+                    element.Symbol,
+                    BindsElement,
+                    payload.Path,
+                    "resolved",
+                    StableReason(payload.Reason, "resolved", BindsElement),
+                    payload.Raw,
+                    Array.Empty<WpfResolutionCandidate>(),
+                    AnnotationEvidence: null));
+            }
+        }
+
         var annotationScan = await LoadTraceAnnotationsAsync(
             host.Store,
             element.Symbol,
@@ -337,6 +397,8 @@ public static class WpfTools
             .ToList();
 
         var queryTruncated = edges.Count >= probeLimit
+            || elementEdges.Length >= probeLimit
+            || inboundElementEdges.Length >= probeLimit
             || annotationScan.Truncated
             || fallbackTruncated
             || ordered.Count > limit;
@@ -373,6 +435,8 @@ public static class WpfTools
             truncated
                 ? "Results were bounded by the query limit, scan cap, or output-size budget; narrow the element/path filter for a complete slice."
                 : null);
+        var lowerLevelEvidencePresent =
+            edges.Count > 0 || matchedElementEdge || annotationScan.Rows.Count > 0;
 
         sw.Stop();
         return BuildTraceResult(
@@ -389,6 +453,7 @@ public static class WpfTools
             omittedCount,
             note,
             scopes: null,
+            lowerLevelEvidencePresent,
             elapsedMs: sw.ElapsedMilliseconds);
     }
 
@@ -1020,15 +1085,15 @@ public static class WpfTools
             return null;
         }
 
-        var effectiveTarget = row.Target;
+        var effectiveTarget = row.Relation == BindsElement ? null : row.Target;
         WpfSymbolIdentity? syntheticTarget = null;
         var candidates = row.Candidates;
         var effectiveStatus = row.Status;
         var effectiveReason = row.Reason;
         if (!includeCommandExecutions
             && effectiveTarget is null
-            && elementNameQuery is not null
-            && row.Source.Id != resolvedElementId
+            && (row.Relation == BindsElement
+                || (elementNameQuery is not null && row.Source.Id != resolvedElementId))
             && TryResolveKnownFrameworkProperty(
                 row.Path,
                 scopeId,
@@ -1294,6 +1359,7 @@ public static class WpfTools
         int omittedCount,
         string? note,
         IReadOnlyList<WpfScopeSummary>? scopes,
+        bool lowerLevelEvidencePresent,
         long elapsedMs)
     {
         elementQuery = BoundOutputText(elementQuery);
@@ -1331,6 +1397,7 @@ public static class WpfTools
             note,
             scopeRows,
             includeScopeProse,
+            lowerLevelEvidencePresent,
             elapsedMs);
 
         while (SerializedLength(result) > EffectiveOutputBudget)
@@ -1418,6 +1485,7 @@ public static class WpfTools
                 note,
                 scopeRows,
                 includeScopeProse,
+                lowerLevelEvidencePresent,
                 elapsedMs);
         }
         return result;
@@ -1438,6 +1506,7 @@ public static class WpfTools
         string? note,
         IReadOnlyList<WpfScopeSummary> scopes,
         bool includeScopeProse,
+        bool lowerLevelEvidencePresent,
         long elapsedMs)
     {
         var sb = new StringBuilder();
@@ -1514,7 +1583,10 @@ public static class WpfTools
                 truncated,
                 omittedCount,
                 matches,
-                scopes);
+                scopes)
+            {
+                LowerLevelEvidencePresent = lowerLevelEvidencePresent,
+            };
             return new CallToolResult
             {
                 Content = content,
@@ -1538,7 +1610,10 @@ public static class WpfTools
                 truncated,
                 omittedCount,
                 matches,
-                scopes);
+                scopes)
+            {
+                LowerLevelEvidencePresent = lowerLevelEvidencePresent,
+            };
             return new CallToolResult
             {
                 Content = content,
@@ -1796,6 +1871,7 @@ public static class WpfTools
         var matches = new List<WpfTraceMatch>();
         var scopes = new List<WpfScopeSummary>(perScope.Count);
         var elementStatuses = new List<string>(perScope.Count);
+        var lowerLevelEvidencePresent = false;
         foreach (var scoped in perScope)
         {
             if (scoped.Result.StructuredContent is not { } structured)
@@ -1825,6 +1901,7 @@ public static class WpfTools
                 scopes.Add(ScopeSummary(scoped, dto.Status, dto.Partial, dto.Truncated,
                     dto.OmittedCount, dto.Note, dto.Scopes));
                 elementStatuses.Add(dto.ElementStatus);
+                lowerLevelEvidencePresent |= dto.LowerLevelEvidencePresent;
             }
             else
             {
@@ -1839,6 +1916,7 @@ public static class WpfTools
                 scopes.Add(ScopeSummary(scoped, dto.Status, dto.Partial, dto.Truncated,
                     dto.OmittedCount, dto.Note, dto.Scopes));
                 elementStatuses.Add(dto.ElementStatus);
+                lowerLevelEvidencePresent |= dto.LowerLevelEvidencePresent;
             }
         }
 
@@ -1858,6 +1936,7 @@ public static class WpfTools
             SaturatingSum(scopes.Select(item => item.OmittedCount)),
             "Multi-scope result; inspect `scopes` and each row's `scope_id` for provenance and completeness.",
             scopes,
+            lowerLevelEvidencePresent,
             elapsedMs);
     }
 

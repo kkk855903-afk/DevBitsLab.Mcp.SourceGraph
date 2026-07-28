@@ -177,4 +177,31 @@ public sealed class SemanticIndexingFlowTests : IAsyncLifetime
         // No throw, no observable side effect — that's the contract.
     }
 
+    [Fact]
+    public void ColdIndexQueue_doesNotDropWhenProducerExceedsFormerCapacity()
+    {
+        var sink = new ChannelEmbeddingsRequestSink();
+        const int requestCount = 12_000;
+
+        for (var i = 0; i < requestCount; i++)
+        {
+            sink.Enqueue(new EmbedRequest(i + 1, $"symbol-{i}", new byte[32]));
+        }
+
+        sink.Statistics.Should().Be(new EmbeddingQueueStatistics(
+            Pending: requestCount,
+            Completed: 0,
+            Dropped: 0));
+
+        var drained = 0;
+        while (sink.Reader.TryRead(out _)) drained++;
+        sink.MarkCompleted(drained);
+
+        drained.Should().Be(requestCount);
+        sink.Statistics.Should().Be(new EmbeddingQueueStatistics(
+            Pending: 0,
+            Completed: requestCount,
+            Dropped: 0));
+    }
+
 }

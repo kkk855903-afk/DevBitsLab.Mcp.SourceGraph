@@ -457,6 +457,22 @@ styles, and templates, including both `uses-resource` and `applies-style`. A fil
 match a normalized complete path suffix on a segment boundary; `View.xaml` SHALL NOT match
 `Preview.xaml`.
 
+For an `ElementName` binding whose lower-level graph stores
+`binding-owner --binds-element(path=P)--> named-element`, `trace_binding` SHALL join that edge to
+known WPF framework metadata and return `FrameworkElement.P` when the property is known. If
+relevant lower-level edges or outcome annotations exist but the high-level row cannot be
+materialized, the result SHALL be `unknown`, completeness SHALL be partial, and
+`absence_authoritative` SHALL be false.
+
+#### Scenario: ElementName ActualWidth resolves from a canonical binding owner
+
+- **GIVEN** an anonymous XAML element has a `binds-element` edge with
+  `element-name=imageview` and `path=ActualWidth`
+- **WHEN** `trace_binding` is called with the anonymous element's canonical key and
+  `binding=ActualWidth`
+- **THEN** the result contains the stored occurrence evidence and targets
+  `System.Windows.FrameworkElement.ActualWidth`
+
 #### Scenario: Unsupported binding remains unsupported through the tool
 
 - **GIVEN** an indexed binding outcome with status `unsupported`

@@ -2210,7 +2210,7 @@ public static class GraphTools
                 // on first use, so the first `EmbedAsync` call after server start carries the ONNX
                 // model load (3-5s). Subsequent calls reuse the loaded model and are sub-second.
                 progress?.Report(Format.Progress(0.0, "encoding query"));
-                var queryEmbeddings = await generator.EmbedAsync(new[] { query }, ct).ConfigureAwait(false);
+                var queryEmbeddings = await generator.EmbedQueryAsync(new[] { query }, ct).ConfigureAwait(false);
                 if (queryEmbeddings.Count == 0)
                 {
                     return DiagnosticResult.Error("semantic_search: encoder produced no vector for the query.");

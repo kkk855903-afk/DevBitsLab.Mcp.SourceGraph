@@ -10,5 +10,12 @@ namespace DevBitsLab.Mcp.SourceGraph.Benchmarks;
 public static class Program
 {
     public static int Main(string[] args)
-        => BenchmarkSwitcher.FromAssembly(typeof(Program).Assembly).Run(args).Any() ? 0 : 1;
+    {
+        if (args.Length > 0
+            && string.Equals(args[0], "--same-process-query", StringComparison.Ordinal))
+        {
+            return SameProcessQueryProbe.RunAsync(args[1..]).GetAwaiter().GetResult();
+        }
+        return BenchmarkSwitcher.FromAssembly(typeof(Program).Assembly).Run(args).Any() ? 0 : 1;
+    }
 }

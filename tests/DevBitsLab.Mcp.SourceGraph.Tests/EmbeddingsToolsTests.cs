@@ -6,6 +6,7 @@ using System.Text.Json;
 using System.Threading.Tasks;
 using DevBitsLab.Mcp.SourceGraph.Embeddings;
 using DevBitsLab.Mcp.SourceGraph.Server;
+using DevBitsLab.Mcp.SourceGraph.Server.Scoping;
 using DevBitsLab.Mcp.SourceGraph.Server.Tools;
 using FluentAssertions;
 using Xunit;
@@ -30,7 +31,10 @@ public sealed class EmbeddingsToolsTests : IDisposable
     public async Task EmbeddingsStatusAsync_returnsTypedStructuredContent()
     {
         var (mgr, _) = MakeManager();
-        var result = await EmbeddingsTools.EmbeddingsStatusAsync(mgr);
+        var result = await EmbeddingsTools.EmbeddingsStatusAsync(
+            mgr,
+            new ScopeRouter(),
+            new DisabledEmbeddingGenerator(DefaultEmbeddingModel.Info));
 
         result.IsError.Should().NotBe(true);
         result.StructuredContent.HasValue.Should().BeTrue();
@@ -39,6 +43,8 @@ public sealed class EmbeddingsToolsTests : IDisposable
         json.GetProperty("dimension").GetInt32().Should().Be(DefaultEmbeddingModel.Dimension);
         json.GetProperty("cache_dir").GetString().Should().NotBeNullOrEmpty();
         json.GetProperty("files").GetArrayLength().Should().Be(2);
+        json.GetProperty("queues").GetArrayLength().Should().Be(0);
+        json.GetProperty("inference").GetProperty("query_wait_ms").GetDouble().Should().Be(0);
     }
 
     [Fact]
