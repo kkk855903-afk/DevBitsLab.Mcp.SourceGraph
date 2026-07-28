@@ -2764,6 +2764,7 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                 _fileIdByPath[displayPath] = fileId;
             }
             _storedPathByFileId[fileId] = path;
+            var protectedSyntaxInput = false;
             foreach (var document in groupedDocuments)
             {
                 var syntaxTree = await document.GetSyntaxTreeAsync(ct)
@@ -2771,9 +2772,17 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                 if (syntaxTree is not null)
                 {
                     fileIdBySyntaxTree[syntaxTree] = fileId;
+                    if (!protectedSyntaxInput)
+                    {
+                        var sourceText = await syntaxTree.GetTextAsync(ct)
+                            .ConfigureAwait(false);
+                        protectedSyntaxInput =
+                            HasHsKeyPrefix(sourceText);
+                    }
                 }
             }
-            if (!isGenerated && HasHsKeyPrefix(bytes))
+            if (!isGenerated
+                && (HasHsKeyPrefix(bytes) || protectedSyntaxInput))
             {
                 protectedFileIds.Add(fileId);
                 foreach (var document in groupedDocuments)
@@ -4682,6 +4691,14 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         && bytes[2] == (byte)'K'
         && bytes[3] == (byte)'e'
         && bytes[4] == (byte)'y';
+
+    private static bool HasHsKeyPrefix(SourceText text) =>
+        text.Length >= 5
+        && text[0] == 'H'
+        && text[1] == 'S'
+        && text[2] == 'K'
+        && text[3] == 'e'
+        && text[4] == 'y';
 
     private sealed class SourceSyntaxFailureException(string message)
         : Exception(message);
