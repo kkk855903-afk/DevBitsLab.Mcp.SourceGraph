@@ -527,12 +527,17 @@ existing row rather than inserting a differently spelled alias.
 - **THEN** the indexer reads every `(canonical_key, id, file_id)` from
   `symbols` and `(path, id)` from `files`, logs
   `"Hydrated N symbol(s) and M file(s) from graph store"`, and every file
-  whose SHA matches the stored value AND has either zero declared symbols
-  or at least one outgoing pass-2 artifact (a `refs` row, or an outgoing
-  edge from a symbol declared in that file) is skipped in pass 1 (per the
-  self-heal integrity check); files that match the SHA but have declared
-  symbols with zero outgoing refs AND zero outgoing edges are bypassed
-  and re-walked
+  whose SHA matches the stored value AND has at least one declared symbol plus
+  an outgoing pass-2 artifact (a `refs` row, or an outgoing edge from a symbol
+  declared in that file) is skipped in pass 1 (per the self-heal integrity
+  check); files that match the SHA but have zero declared symbols, or have
+  declared symbols with zero outgoing refs AND zero outgoing edges, are
+  bypassed and re-walked
+
+#### Scenario: Syntax-error file with no declarations stays visible after restart
+- **GIVEN** a source file whose syntax tree has one or more errors and yields zero indexable declarations, such as a protected-file header presented to Roslyn instead of C# source
+- **WHEN** a cold index walks the file, and a later process indexes the same unchanged bytes
+- **THEN** both runs include the path in `FailedFiles` with a bounded `protected-hskey` or `syntax-errors-with-no-declarations` reason; the unchanged-SHA fast path does not mistake it for a legitimate symbol-free file, and the scope remains explicitly partial
 
 ### Requirement: Physical source-path identity follows the host OS
 Regular source paths SHALL use case-insensitive identity on Windows and

@@ -20,6 +20,15 @@ below note which package the change applies to.
   properties, and never reports authoritative absence when relevant
   lower-level evidence could not be materialized. A same-process benchmark
   probe separates first-call, warm, and managed-lock wait measurements.
+- **Exhaustive relationship queries disclose incomplete coverage.**
+  `list_callers`/`find_callers`, `find_implementations`, and
+  `impact_of_change` now return `result`, `scope_status`, `completeness`,
+  `absence_authoritative`, selection mode, candidate count, and canonical
+  identities. Partial scopes can no longer silently present a shortened
+  relation set as exhaustive, and exact-FQN collisions are explicitly
+  ambiguous. Source files that produce syntax errors and zero declarations
+  are retained in `FailedFiles` and retried after restart instead of being
+  mistaken for valid symbol-free files.
 - **WPF semantic chains and compact query results.** Command traces now continue
   from the bound `ICommand` property through persisted `command-executes`
   evidence to the handler. Element-name bindings resolve inherited WPF

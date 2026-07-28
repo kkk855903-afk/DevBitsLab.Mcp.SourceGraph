@@ -2796,30 +2796,34 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                 // branch fires on a process restart even for symbol-less files.
                 if (keysForFile.Count == 0)
                 {
-                    if (forceInteropProjectionRefresh)
-                    {
-                        unchangedManagedInteropRefreshes[fileId] =
-                            (path, groupedDocuments);
-                    }
-                    continue;
-                }
-                var hasOutgoingRefs =
-                    await _store.HasOutgoingReferencesAsync(fileId, ct).ConfigureAwait(false);
-                if (!hasOutgoingRefs)
-                {
-                    _logger.LogInformation(
-                        "Re-walking references for {Path}: file SHA matches but no outgoing references in store " +
-                        "(likely zombied by a prior incomplete indexing pass; recovering)",
+                    // A zero-symbol row can be a legitimate usings/assembly-attribute file, but
+                    // it can also be a prior parse failure (for example a protected source that
+                    // Roslyn saw as an HSKey header). Re-walk it so syntax failures become an
+                    // explicit FailedFile instead of remaining a permanently silent omission.
+                    _logger.LogDebug(
+                        "Re-walking {Path}: file SHA matches but no declarations are stored",
                         path);
                 }
-                if (hasOutgoingRefs)
+                else
                 {
-                    if (forceInteropProjectionRefresh)
+                    var hasOutgoingRefs =
+                        await _store.HasOutgoingReferencesAsync(fileId, ct).ConfigureAwait(false);
+                    if (!hasOutgoingRefs)
                     {
-                        unchangedManagedInteropRefreshes[fileId] =
-                            (path, groupedDocuments);
+                        _logger.LogInformation(
+                            "Re-walking references for {Path}: file SHA matches but no outgoing references in store " +
+                            "(likely zombied by a prior incomplete indexing pass; recovering)",
+                            path);
                     }
-                    continue;
+                    if (hasOutgoingRefs)
+                    {
+                        if (forceInteropProjectionRefresh)
+                        {
+                            unchangedManagedInteropRefreshes[fileId] =
+                                (path, groupedDocuments);
+                        }
+                        continue;
+                    }
                 }
                 // Fall through to the changed-file path so pass 2 walks this file.
             }
@@ -2892,6 +2896,7 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
 
                     fileIdBySyntaxTree[tree] = fileId;
                     var root = await tree.GetRootAsync(ct).ConfigureAwait(false);
+                    var declarationsBefore = fileKeys.Count;
                     foreach (var node in EnumerateDeclarations(root))
                     {
                         var symbol = model.GetDeclaredSymbol(node, ct);
@@ -3039,6 +3044,33 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                         }
                     }
 
+                    if (fileKeys.Count == declarationsBefore)
+                    {
+                        var syntaxErrors = tree.GetDiagnostics(ct)
+                            .Where(diagnostic =>
+                                diagnostic.Severity == DiagnosticSeverity.Error)
+                            .Take(5)
+                            .ToArray();
+                        if (syntaxErrors.Length > 0)
+                        {
+                            var codes = string.Join(
+                                ", ",
+                                syntaxErrors.Select(diagnostic => diagnostic.Id)
+                                    .Distinct(StringComparer.Ordinal));
+                            var text = await tree.GetTextAsync(ct)
+                                .ConfigureAwait(false);
+                            var prefix = text.ToString(
+                                new TextSpan(0, Math.Min(text.Length, 16)));
+                            var reason = prefix.StartsWith(
+                                "HSKey",
+                                StringComparison.Ordinal)
+                                ? "protected-hskey"
+                                : "syntax-errors-with-no-declarations";
+                            throw new SourceSyntaxFailureException(
+                                reason + ": " + codes);
+                        }
+                    }
+
                     if (_interopTarget is not null)
                     {
                         var usage = ManagedInteropUsageExtractor.Extract(
@@ -3102,6 +3134,14 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                 walkedFileIds.Add(fileId);
             }
             catch (OperationCanceledException) { throw; }
+            catch (SourceSyntaxFailureException ex)
+            {
+                _logger.LogWarning(
+                    "Pass 1 skipped {Path}: {Reason}",
+                    path,
+                    ex.Message);
+                AddFileFailure(failedFiles, path, ex.Message);
+            }
             catch (Exception ex)
             {
                 // One file's Pass-1B walk threw — log it and let the next file proceed.
@@ -4576,6 +4616,9 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
             }
         }
     }
+
+    private sealed class SourceSyntaxFailureException(string message)
+        : Exception(message);
 
     private void DropFileFromMaps(long fileId)
     {

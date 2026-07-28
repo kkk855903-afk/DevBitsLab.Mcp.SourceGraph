@@ -66,6 +66,18 @@ relation, and occurrence-evidence contract as direct caller/callee rows. Reachin
 result, or bounded branch-query cap while unseen evidence-backed relations may remain SHALL set
 `truncated = true`.
 
+`list_callers`/`find_callers`, `find_implementations`, and
+`impact_of_change`/`impact_analysis` SHALL expose `result` (`found | absent |
+unknown | ambiguous`), `scope_status`, `completeness` (`complete | partial`),
+`absence_authoritative`, `reason`, `selection_mode`, `fallback_used`,
+`candidate_count`, and `selection_ambiguous` in structured output. A scope
+whose status is not `ok`, a truncated traversal, or an ambiguous target
+selection SHALL produce `completeness = partial` and
+`absence_authoritative = false`. An empty result is authoritative only when
+the scope and traversal are complete. Markdown SHALL include a compact note
+and a narrowed `rg` fallback for partial scopes, or an exact-canonical fallback
+for ambiguous selection.
+
 #### Scenario: Phase 1 compatibility names are discoverable
 - **WHEN** an MCP client lists tools
 - **THEN** `find_reference`, `find_callers`, `find_callees`, and `impact_analysis` are registered alongside `find_references`, `list_callers`, `list_callees`, and `impact_of_change`
@@ -274,6 +286,14 @@ The server SHALL expose a `find_implementations` tool that returns every member 
 #### Scenario: Concrete implementations of an interface method
 - **WHEN** the agent invokes `find_implementations(symbol = "IGreeter.Greet")` against a graph that has two implementing classes `Greeter` and `LoudGreeter`
 - **THEN** the response lists both `Greeter.Greet` and `LoudGreeter.Greet` with their definition locations
+
+#### Scenario: Partial scope cannot silently claim every implementation
+- **WHEN** `find_implementations(symbol = "IMappedData<T>.From")` returns persisted implementation edges from a scope whose status is `partial`
+- **THEN** the returned rows remain usable, but `completeness = partial`, `absence_authoritative = false`, and the response recommends a narrowed coverage check before the list is treated as exhaustive
+
+#### Scenario: Exact FQN collision is disclosed
+- **WHEN** a relationship tool resolves an exact FQN that has two graph candidates
+- **THEN** `result = ambiguous`, `selection_mode = exact-fqn`, `candidate_count = 2`, `selection_ambiguous = true`, and the response recommends an exact canonical key instead of silently presenting the first candidate as unique
 
 ### Requirement: Semantic search tool
 The server SHALL expose a `semantic_search` tool whose intent is fuzzy intent retrieval (not name-fragment matching, which `search_symbols` covers).

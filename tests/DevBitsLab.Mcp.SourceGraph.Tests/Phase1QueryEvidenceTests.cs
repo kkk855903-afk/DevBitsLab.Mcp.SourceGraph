@@ -19,6 +19,7 @@ public sealed class Phase1QueryEvidenceTests : IAsyncLifetime
 {
     private string _tempDir = string.Empty;
     private string _databasePath = string.Empty;
+    private SqliteGraphStore? _store;
     private ScopeHost? _host;
     private ScopeRouter? _router;
 
@@ -29,15 +30,15 @@ public sealed class Phase1QueryEvidenceTests : IAsyncLifetime
             "sourcegraph-phase1-evidence-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(_tempDir);
         _databasePath = Path.Join(_tempDir, "graph.db");
-        var store = new SqliteGraphStore(_databasePath);
-        await store.EnsureSchemaAsync();
+        _store = new SqliteGraphStore(_databasePath);
+        await _store.EnsureSchemaAsync();
 
-        var a = await SeedSymbolAsync(store, "A");
-        var b = await SeedSymbolAsync(store, "B");
-        var c = await SeedSymbolAsync(store, "C");
-        var d = await SeedSymbolAsync(store, "D");
+        var a = await SeedSymbolAsync(_store, "A");
+        var b = await SeedSymbolAsync(_store, "B");
+        var c = await SeedSymbolAsync(_store, "C");
+        var d = await SeedSymbolAsync(_store, "D");
 
-        await store.BulkInsertEdgesAsync(new[]
+        await _store.BulkInsertEdgesAsync(new[]
         {
             Edge(a, b, EdgeKinds.Calls, 10, CoreEvidenceConfidence.Exact, "a-calls-b"),
             Edge(b, c, EdgeKinds.Calls, 20, CoreEvidenceConfidence.Semantic, "b-calls-c"),
@@ -69,9 +70,9 @@ public sealed class Phase1QueryEvidenceTests : IAsyncLifetime
             DateTimeOffset.UtcNow);
         _host = new ScopeHost(
             scope,
-            store,
-            store.CreateEmbeddingsStore(384),
-            new RoslynIndexer(store),
+            _store,
+            _store.CreateEmbeddingsStore(384),
+            new RoslynIndexer(_store),
             solutionPath: "");
         _host.MarkReady();
         _router = new ScopeRouter();
@@ -223,6 +224,98 @@ public sealed class Phase1QueryEvidenceTests : IAsyncLifetime
             limit: 0);
         invalidLimit.IsError.Should().BeTrue();
         CallToolResultHelpers.ProseText(invalidLimit).Should().Contain("between 1 and 1000");
+    }
+
+    [Fact]
+    public async Task ExhaustiveRelationTools_propagatePartialScopeCompleteness()
+    {
+        _host!.Status = "partial";
+        _host.StatusMessage = "fixture source file could not be parsed";
+        _host.FailedFiles =
+        [
+            new FileFailure("Protected.cs", "syntax-errors-with-no-declarations: CS1001"),
+        ];
+
+        var callersResult = await GraphTools.ListCallersAsync(
+            _router!,
+            "Graph.C",
+            kind: EdgeKinds.Calls);
+        var callers = Deserialize<ListCallersResult>(
+            callersResult,
+            ToolOutputJsonContext.Default.ListCallersResult);
+        callers.Result.Should().Be("found");
+        callers.ScopeStatus.Should().Be("partial");
+        callers.Completeness.Should().Be("partial");
+        callers.AbsenceAuthoritative.Should().BeFalse();
+        callers.Reason.Should().Be("scope-partial");
+        CallToolResultHelpers.ProseText(callersResult)
+            .Should().Contain("absence_authoritative=false")
+            .And.Contain("narrowed `rg` coverage check");
+
+        var implementationsResult = await GraphTools.FindImplementationsAsync(
+            _router!,
+            "Graph.C");
+        var implementations = Deserialize<FindImplementationsResult>(
+            implementationsResult,
+            ToolOutputJsonContext.Default.FindImplementationsResult);
+        implementations.Result.Should().Be("unknown");
+        implementations.ScopeStatus.Should().Be("partial");
+        implementations.Completeness.Should().Be("partial");
+        implementations.AbsenceAuthoritative.Should().BeFalse();
+
+        var impactResult = await GraphTools.ImpactOfChangeAsync(
+            _router!,
+            "Graph.C",
+            maxDepth: 4,
+            limit: 10);
+        var impact = Deserialize<ImpactOfChangeResult>(
+            impactResult,
+            ToolOutputJsonContext.Default.ImpactOfChangeResult);
+        impact.Result.Should().Be("found");
+        impact.ScopeStatus.Should().Be("partial");
+        impact.Completeness.Should().Be("partial");
+        impact.AbsenceAuthoritative.Should().BeFalse();
+    }
+
+    [Fact]
+    public async Task ExactFqnWithMultipleGraphCandidates_isExplicitlyAmbiguous()
+    {
+        var duplicatePath = Path.Join(_tempDir, "DuplicateC.cs");
+        var duplicateFileId = await _store!.UpsertFileAsync(
+            duplicatePath,
+            [5, 6, 7, 8],
+            DateTimeOffset.UtcNow);
+        await _store.UpsertSymbolAsync(
+            "csharp:M:Alternate.C",
+            new Symbol(
+                0,
+                "C",
+                "Graph.C",
+                SymbolKinds.Method,
+                duplicateFileId,
+                1,
+                1,
+                2,
+                1,
+                "void C()",
+                null));
+
+        var result = await GraphTools.ListCallersAsync(
+            _router!,
+            "Graph.C",
+            kind: EdgeKinds.Calls);
+        var dto = Deserialize<ListCallersResult>(
+            result,
+            ToolOutputJsonContext.Default.ListCallersResult);
+
+        dto.Result.Should().Be("ambiguous");
+        dto.SelectionMode.Should().Be("exact-fqn");
+        dto.CandidateCount.Should().Be(2);
+        dto.SelectionAmbiguous.Should().BeTrue();
+        dto.Completeness.Should().Be("partial");
+        dto.AbsenceAuthoritative.Should().BeFalse();
+        CallToolResultHelpers.ProseText(result)
+            .Should().Contain("retry with an exact canonical key");
     }
 
     private async Task<SeededSymbol> SeedSymbolAsync(

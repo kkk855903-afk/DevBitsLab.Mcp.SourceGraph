@@ -599,6 +599,7 @@ public static class GraphTools
 
                 var hits = await host.Store.FindSymbolsAsync(symbol, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
                 if (hits.Count == 0) return DiagnosticResult.Build($"No matches for '{symbol}'.");
+                var selection = DescribeSymbolSelection(symbol, hits);
                 var top = hits[0];
                 var traversal = await EvidenceTraversal.LoadInboundAsync(
                     host.Store,
@@ -607,17 +608,25 @@ public static class GraphTools
                     edgeKind,
                     ct).ConfigureAwait(false);
                 var callers = traversal.Relations;
+                var queryState = DescribeQueryState(
+                    host,
+                    traversal.Truncated,
+                    callers.Count,
+                    selection);
                 var sb = new StringBuilder();
                 sb.AppendLine($"Inbound `{label}` to **{top.Fqn}** ({KindLabel(top.Kind)}):");
                 if (callers.Count == 0)
                 {
                     sb.AppendLine("- (none)");
+                    AppendQueryStateNote(sb, queryState);
                     return BuildListCallersResult(
                         prose: sb.ToString(),
                         target: top,
                         callers: Array.Empty<AuditableRelation>(),
                         edgeKindLabel: label,
                         truncated: traversal.Truncated,
+                        queryState: queryState,
+                        selection: selection,
                         scopeId: host.Scope.Id,
                         elapsedMs: sw.ElapsedMilliseconds);
                 }
@@ -664,12 +673,15 @@ public static class GraphTools
                     sb.AppendLine();
                     sb.AppendLine("note: results were truncated by the validated relation limit.");
                 }
+                AppendQueryStateNote(sb, queryState);
                 return BuildListCallersResult(
                     prose: sb.ToString(),
                     target: top,
                     callers: callers,
                     edgeKindLabel: label,
                     truncated: traversal.Truncated,
+                    queryState: queryState,
+                    selection: selection,
                     scopeId: host.Scope.Id,
                     elapsedMs: sw.ElapsedMilliseconds);
             }, ct));
@@ -680,6 +692,8 @@ public static class GraphTools
         IReadOnlyList<AuditableRelation> callers,
         string edgeKindLabel,
         bool truncated,
+        QueryState queryState,
+        SymbolSelection selection,
         string scopeId,
         long elapsedMs)
     {
@@ -725,6 +739,15 @@ public static class GraphTools
                 PayloadJson: string.IsNullOrEmpty(relation.PayloadJson) ? null : relation.PayloadJson))
             .ToList();
         var dto = new ListCallersResult(
+            Result: queryState.Result,
+            ScopeStatus: queryState.ScopeStatus,
+            Completeness: queryState.Completeness,
+            AbsenceAuthoritative: queryState.AbsenceAuthoritative,
+            Reason: queryState.Reason,
+            SelectionMode: selection.Mode,
+            FallbackUsed: selection.FallbackUsed,
+            CandidateCount: selection.CandidateCount,
+            SelectionAmbiguous: selection.Ambiguous,
             TargetFqn: target.Fqn,
             TargetKind: target.Kind,
             TargetSymbolId: target.Id,
@@ -920,22 +943,44 @@ public static class GraphTools
             ScopedExecution.RunAsync(router, scope, async host =>
             {
                 var sw = System.Diagnostics.Stopwatch.StartNew();
+                if (limit is < 1 or > 1000)
+                {
+                    return DiagnosticResult.Error(
+                        "find_implementations `limit` must be between 1 and 1000.");
+                }
                 var hits = await host.Store.FindSymbolsAsync(symbol, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
                 if (hits.Count == 0) return DiagnosticResult.Build($"No matches for '{symbol}'.");
+                var selection = DescribeSymbolSelection(symbol, hits);
                 var top = hits[0];
-                var impls = await host.Store.ListImplementationsAsync(top.Id, limit, ct).ConfigureAwait(false);
-                var filtered = includeAbstract
+                var impls = await host.Store.ListImplementationsAsync(
+                    top.Id,
+                    limit: 1001,
+                    ct).ConfigureAwait(false);
+                var filteredCandidates = includeAbstract
                     ? impls
-                    : impls.Where(h => !(h.Signature?.Contains("abstract", StringComparison.Ordinal) ?? false)).ToList();
+                    : impls.Where(h =>
+                        !(h.Signature?.Contains(
+                            "abstract",
+                            StringComparison.Ordinal) ?? false)).ToList();
+                var truncated = filteredCandidates.Count > limit;
+                var filtered = filteredCandidates.Take(limit).ToList();
+                var queryState = DescribeQueryState(
+                    host,
+                    truncated,
+                    filtered.Count,
+                    selection);
                 var sb = new StringBuilder();
                 sb.AppendLine($"Implementations of **{top.Fqn}** ({KindLabel(top.Kind)}):");
                 if (filtered.Count == 0)
                 {
                     sb.AppendLine("- (none)");
+                    AppendQueryStateNote(sb, queryState);
                     return BuildFindImplementationsResult(
                         prose: sb.ToString(),
                         target: top,
                         impls: Array.Empty<SymbolHit>(),
+                        queryState: queryState,
+                        selection: selection,
                         scopeId: host.Scope.Id,
                         elapsedMs: sw.ElapsedMilliseconds);
                 }
@@ -960,10 +1005,13 @@ public static class GraphTools
                         sb.AppendLine($"- **{c.Fqn}** ({KindLabel(c.Kind)}) at {Format.Location(c.FilePath, c.StartLine, c.StartCol)}");
                     }
                 }
+                AppendQueryStateNote(sb, queryState);
                 return BuildFindImplementationsResult(
                     prose: sb.ToString(),
                     target: top,
                     impls: filtered,
+                    queryState: queryState,
+                    selection: selection,
                     scopeId: host.Scope.Id,
                     elapsedMs: sw.ElapsedMilliseconds);
             }, ct));
@@ -972,6 +1020,8 @@ public static class GraphTools
         string prose,
         SymbolHit target,
         IReadOnlyList<SymbolHit> impls,
+        QueryState queryState,
+        SymbolSelection selection,
         string scopeId,
         long elapsedMs)
     {
@@ -1000,6 +1050,7 @@ public static class GraphTools
         var structuredImpls = impls
             .Select(c => new FindImplementationsRow(
                 SymbolId: c.Id,
+                CanonicalKey: c.CanonicalKey,
                 Fqn: c.Fqn,
                 Kind: c.Kind,
                 FilePath: c.FilePath,
@@ -1008,9 +1059,20 @@ public static class GraphTools
                 Signature: string.IsNullOrEmpty(c.Signature) ? null : c.Signature))
             .ToList();
         var dto = new FindImplementationsResult(
+            Result: queryState.Result,
+            ScopeStatus: queryState.ScopeStatus,
+            Completeness: queryState.Completeness,
+            AbsenceAuthoritative: queryState.AbsenceAuthoritative,
+            Reason: queryState.Reason,
+            SelectionMode: selection.Mode,
+            FallbackUsed: selection.FallbackUsed,
+            CandidateCount: selection.CandidateCount,
+            SelectionAmbiguous: selection.Ambiguous,
+            Truncated: queryState.Truncated,
             TargetFqn: target.Fqn,
             TargetKind: target.Kind,
             TargetSymbolId: target.Id,
+            TargetCanonicalKey: target.CanonicalKey,
             Implementations: structuredImpls);
         return new CallToolResult
         {
@@ -1898,6 +1960,7 @@ public static class GraphTools
 
                 var hits = await host.Store.FindSymbolsAsync(symbol, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
                 if (hits.Count == 0) return DiagnosticResult.Build($"No matches for '{symbol}'.");
+                var selection = DescribeSymbolSelection(symbol, hits);
                 var top = hits[0];
                 progress?.Report(Format.Progress(0.0, "querying"));
                 var traversal = await EvidenceTraversal.TraceImpactAsync(
@@ -1908,11 +1971,17 @@ public static class GraphTools
                     edgeKind,
                     ct).ConfigureAwait(false);
                 var rows = traversal.Rows;
+                var queryState = DescribeQueryState(
+                    host,
+                    traversal.Truncated,
+                    rows.Count,
+                    selection);
                 var sb = new StringBuilder();
                 sb.AppendLine($"Upstream impact of **{top.Fqn}** ({KindLabel(top.Kind)}) [kind={label}] up to depth {maxDepth}:");
                 if (rows.Count == 0)
                 {
                     sb.AppendLine("- (no upstream callers found in graph)");
+                    AppendQueryStateNote(sb, queryState);
                     return BuildImpactOfChangeResult(
                         prose: sb.ToString(),
                         target: top,
@@ -1921,6 +1990,8 @@ public static class GraphTools
                         maxDepth: maxDepth,
                         truncated: traversal.Truncated,
                         expandedNodes: traversal.ExpandedNodes,
+                        queryState: queryState,
+                        selection: selection,
                         scopeId: host.Scope.Id,
                         elapsedMs: sw.ElapsedMilliseconds);
                 }
@@ -1956,6 +2027,7 @@ public static class GraphTools
                     sb.AppendLine();
                     sb.AppendLine("note: traversal was truncated by maxDepth or the validated result limit.");
                 }
+                AppendQueryStateNote(sb, queryState);
                 return BuildImpactOfChangeResult(
                     prose: sb.ToString(),
                     target: top,
@@ -1964,6 +2036,8 @@ public static class GraphTools
                     maxDepth: maxDepth,
                     truncated: traversal.Truncated,
                     expandedNodes: traversal.ExpandedNodes,
+                    queryState: queryState,
+                    selection: selection,
                     scopeId: host.Scope.Id,
                     elapsedMs: sw.ElapsedMilliseconds);
             }, ct, progress));
@@ -1976,6 +2050,8 @@ public static class GraphTools
         int maxDepth,
         bool truncated,
         int expandedNodes,
+        QueryState queryState,
+        SymbolSelection selection,
         string scopeId,
         long elapsedMs)
     {
@@ -2018,6 +2094,15 @@ public static class GraphTools
                 Path: r.Path))
             .ToList();
         var dto = new ImpactOfChangeResult(
+            Result: queryState.Result,
+            ScopeStatus: queryState.ScopeStatus,
+            Completeness: queryState.Completeness,
+            AbsenceAuthoritative: queryState.AbsenceAuthoritative,
+            Reason: queryState.Reason,
+            SelectionMode: selection.Mode,
+            FallbackUsed: selection.FallbackUsed,
+            CandidateCount: selection.CandidateCount,
+            SelectionAmbiguous: selection.Ambiguous,
             TargetFqn: target.Fqn,
             TargetKind: target.Kind,
             TargetSymbolId: target.Id,
@@ -2752,6 +2837,141 @@ public static class GraphTools
     };
 
     internal static string KindLabelOf(string kind) => KindLabel(kind);
+
+    private sealed record SymbolSelection(
+        string Mode,
+        bool FallbackUsed,
+        int CandidateCount,
+        bool Ambiguous);
+
+    private sealed record QueryState(
+        string Result,
+        string ScopeStatus,
+        string Completeness,
+        bool AbsenceAuthoritative,
+        string? Reason,
+        bool Truncated);
+
+    private static SymbolSelection DescribeSymbolSelection(
+        string query,
+        IReadOnlyList<SymbolHit> hits)
+    {
+        var canonical = hits.Where(hit =>
+                string.Equals(hit.CanonicalKey, query, StringComparison.Ordinal))
+            .ToList();
+        if (canonical.Count > 0)
+        {
+            return new SymbolSelection(
+                "exact-canonical",
+                FallbackUsed: false,
+                canonical.Count,
+                Ambiguous: canonical.Count > 1);
+        }
+
+        var exactFqn = hits.Where(hit =>
+                string.Equals(hit.Fqn, query, StringComparison.Ordinal))
+            .ToList();
+        if (exactFqn.Count > 0)
+        {
+            return new SymbolSelection(
+                "exact-fqn",
+                FallbackUsed: false,
+                exactFqn.Count,
+                Ambiguous: exactFqn.Count > 1);
+        }
+
+        var exactName = hits.Where(hit =>
+                string.Equals(hit.Name, query, StringComparison.Ordinal))
+            .ToList();
+        if (exactName.Count > 0)
+        {
+            return new SymbolSelection(
+                "exact-name",
+                FallbackUsed: true,
+                exactName.Count,
+                Ambiguous: exactName.Count > 1);
+        }
+
+        var suffix = hits.Where(hit =>
+                hit.Fqn.EndsWith(query, StringComparison.Ordinal))
+            .ToList();
+        if (suffix.Count > 0)
+        {
+            return new SymbolSelection(
+                "fqn-suffix",
+                FallbackUsed: true,
+                suffix.Count,
+                Ambiguous: suffix.Count > 1);
+        }
+
+        return new SymbolSelection(
+            "fuzzy",
+            FallbackUsed: true,
+            hits.Count,
+            Ambiguous: hits.Count > 1);
+    }
+
+    private static QueryState DescribeQueryState(
+        ScopeHost host,
+        bool truncated,
+        int resultCount,
+        SymbolSelection selection)
+    {
+        var scopeIncomplete = !string.Equals(
+            host.Status,
+            "ok",
+            StringComparison.OrdinalIgnoreCase);
+        var incomplete = scopeIncomplete || truncated || selection.Ambiguous;
+        var result = selection.Ambiguous
+            ? "ambiguous"
+            : resultCount > 0
+                ? "found"
+                : incomplete
+                    ? "unknown"
+                    : "absent";
+        var reason = selection.Ambiguous
+            ? "ambiguous-selection"
+            : truncated
+                ? "scan-cap"
+                : scopeIncomplete
+                    ? "scope-" + host.Status.ToLowerInvariant()
+                    : null;
+        return new QueryState(
+            result,
+            host.Status,
+            incomplete ? "partial" : "complete",
+            AbsenceAuthoritative: resultCount == 0 && !incomplete,
+            reason,
+            truncated);
+    }
+
+    private static void AppendQueryStateNote(
+        StringBuilder sb,
+        QueryState state)
+    {
+        if (state.Completeness == "complete") return;
+        sb.AppendLine();
+        sb.Append("note: result=`").Append(state.Result)
+            .Append("`, completeness=`").Append(state.Completeness)
+            .Append("`, scope_status=`").Append(state.ScopeStatus)
+            .Append("`, absence_authoritative=")
+            .Append(state.AbsenceAuthoritative ? "true" : "false");
+        if (state.Reason is not null)
+        {
+            sb.Append(", reason=`").Append(state.Reason).Append('`');
+        }
+        sb.AppendLine(".");
+        if (state.Reason?.StartsWith("scope-", StringComparison.Ordinal) == true)
+        {
+            sb.AppendLine(
+                "fallback: use a narrowed `rg` coverage check before treating this relation set as exhaustive.");
+        }
+        else if (state.Reason == "ambiguous-selection")
+        {
+            sb.AppendLine(
+                "fallback: retry with an exact canonical key or a narrower file/project scope.");
+        }
+    }
 
     /// <summary>
     /// Normalise the user-supplied kebab-case kind filter for storage queries. Empty or whitespace

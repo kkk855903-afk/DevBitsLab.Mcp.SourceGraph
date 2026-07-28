@@ -205,6 +205,22 @@ public sealed class PartialIndexResultTests
                 public sealed class InheritedLookup : LookupBase, ILookup
                 {
                 }
+
+                public interface IMappedData<T>
+                {
+                    void From(T source);
+                }
+
+                public interface IPatientInfo : IMappedData<IPatientInfo>
+                {
+                }
+
+                public sealed class DbPatientInfo : IPatientInfo
+                {
+                    public void From(IPatientInfo source)
+                    {
+                    }
+                }
                 """);
 
             await using var store = new SqliteGraphStore(Path.Combine(root, "graph.db"));
@@ -224,6 +240,78 @@ public sealed class PartialIndexResultTests
                 hit.Fqn.Contains("ExplicitFixture.LookupBase.Find")
                 && hit.CanonicalKey != null,
                 "a derived type may introduce an interface while inheriting its implementation");
+
+            var mappedFrom = (await store.FindSymbolsAsync("IMappedData<T>.From"))
+                .Should().ContainSingle(hit =>
+                    hit.Fqn.Contains("ExplicitFixture.IMappedData<T>.From"))
+                .Which;
+            var mappedImplementations = await store.ListImplementationsAsync(
+                mappedFrom.Id);
+            mappedImplementations.Should().ContainSingle(hit =>
+                hit.Fqn.Contains("ExplicitFixture.DbPatientInfo.From")
+                && hit.CanonicalKey != null,
+                "a member inherited through a closed generic interface must retain its implements-member edge");
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch { /* best-effort */ }
+        }
+    }
+
+    [Fact]
+    public async Task ColdIndex_syntaxErrorsWithNoDeclarations_areFailedFilesOnEveryRun()
+    {
+        var root = Path.Combine(
+            Path.GetTempPath(),
+            "syntax-failure-tests-" + Guid.NewGuid().ToString("N"));
+        var projectDir = Path.Combine(root, "App");
+        Directory.CreateDirectory(projectDir);
+        var solutionPath = Path.Combine(root, "SyntaxFailure.slnx");
+        var projectPath = Path.Combine(projectDir, "App.csproj");
+        var sourcePath = Path.Combine(projectDir, "Protected.cs");
+
+        try
+        {
+            await File.WriteAllTextAsync(
+                solutionPath,
+                """
+                <Solution>
+                  <Project Path="App/App.csproj" />
+                </Solution>
+                """);
+            await File.WriteAllTextAsync(
+                projectPath,
+                """
+                <Project Sdk="Microsoft.NET.Sdk">
+                  <PropertyGroup>
+                    <TargetFramework>net10.0</TargetFramework>
+                  </PropertyGroup>
+                </Project>
+                """);
+            await File.WriteAllTextAsync(
+                sourcePath,
+                "HSKey.Co.SZ WYDZLJ protected payload");
+
+            await using var store = new SqliteGraphStore(
+                Path.Combine(root, "graph.db"));
+            var first = await RoslynIndexer.IndexSolutionOnceAsync(
+                solutionPath,
+                store);
+            first.FailedFiles.Should().ContainSingle(failure =>
+                failure.Path.EndsWith("Protected.cs", StringComparison.Ordinal)
+                && failure.Reason.Contains(
+                    "protected-hskey",
+                    StringComparison.Ordinal));
+
+            var second = await RoslynIndexer.IndexSolutionOnceAsync(
+                solutionPath,
+                store);
+            second.FailedFiles.Should().ContainSingle(failure =>
+                failure.Path.EndsWith("Protected.cs", StringComparison.Ordinal)
+                && failure.Reason.Contains(
+                    "protected-hskey",
+                    StringComparison.Ordinal),
+                "an unchanged zero-symbol parse failure must be retried and remain visible");
         }
         finally
         {
