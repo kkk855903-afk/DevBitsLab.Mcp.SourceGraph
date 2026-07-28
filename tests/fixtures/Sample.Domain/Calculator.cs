@@ -41,6 +41,14 @@ public class Calculator
     /// </summary>
     [System.Obsolete("Use Add(a, b) directly")]
     public int LegacyAdd(int a, int b) => Add(a, b);
+
+    public T Execute<T>(System.Func<T> operation) => operation();
+
+    public int ExecuteInferred()
+    {
+        System.Func<int> operation = () => 42;
+        return Execute(operation);
+    }
 }
 
 public sealed class DivisionByZero : System.Exception

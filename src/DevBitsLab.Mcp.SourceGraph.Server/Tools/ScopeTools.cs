@@ -549,6 +549,21 @@ public static class ScopeTools
                 AddedCount: diff.Added.Count,
                 RemovedCount: diff.Removed.Count,
                 UnchangedCount: diff.Unchanged,
+                SourceCandidateCount: diff.SourceCandidates.Count,
+                NativeNotConfiguredCount: diff.NativeNotConfigured.Count,
+                UnsupportedOrAssetCount: diff.UnsupportedOrAssets.Count,
+                SourceCandidateExamples:
+                    RelativeExamples(
+                        host.Scope.Root,
+                        diff.SourceCandidates),
+                NativeNotConfiguredExamples:
+                    RelativeExamples(
+                        host.Scope.Root,
+                        diff.NativeNotConfigured),
+                UnsupportedOrAssetExamples:
+                    RelativeExamples(
+                        host.Scope.Root,
+                        diff.UnsupportedOrAssets),
                 Partial: diff.Partial,
                 DryRun: dry_run,
                 ElapsedMs: sw.ElapsedMilliseconds);
@@ -559,6 +574,12 @@ public static class ScopeTools
                 .AppendLine($"- scanned: {diff.Scanned}{(diff.Partial ? $" (partial — capped at max_files={clampedMax})" : "")}")
                 .AppendLine($"- reindexed (changed SHA): {diff.Changed.Count}")
                 .AppendLine($"- added (on disk, not in DB): {diff.Added.Count}")
+                .AppendLine(
+                    $"  - source candidates: {diff.SourceCandidates.Count}")
+                .AppendLine(
+                    $"  - native indexer not configured: {diff.NativeNotConfigured.Count}")
+                .AppendLine(
+                    $"  - unsupported or assets: {diff.UnsupportedOrAssets.Count}")
                 .AppendLine($"- removed (in DB, not on disk): {diff.Removed.Count}")
                 .AppendLine($"- unchanged: {diff.Unchanged}")
                 .AppendLine($"- elapsed: {sw.ElapsedMilliseconds} ms");
@@ -569,4 +590,13 @@ public static class ScopeTools
                 StructuredContent = JsonSerializer.SerializeToElement(dto, ToolOutputJsonContext.Default.ReconcileDriftResult),
             };
         });
+
+    private static IReadOnlyList<string> RelativeExamples(
+        string root,
+        IReadOnlyList<string> paths) =>
+        paths
+            .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
+            .Take(20)
+            .Select(path => Path.GetRelativePath(root, path))
+            .ToArray();
 }

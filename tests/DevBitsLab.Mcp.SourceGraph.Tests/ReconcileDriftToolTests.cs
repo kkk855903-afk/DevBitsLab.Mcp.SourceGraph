@@ -94,6 +94,9 @@ public sealed class ReconcileDriftToolTests : IAsyncLifetime
         diff.Scanned.Should().Be(4); // A + B + C + E
         diff.Changed.Should().ContainSingle().Which.Should().Be(aPath);
         diff.Added.Should().ContainSingle().Which.Should().Be(ePath);
+        diff.SourceCandidates.Should().Equal(ePath);
+        diff.NativeNotConfigured.Should().BeEmpty();
+        diff.UnsupportedOrAssets.Should().BeEmpty();
         diff.Removed.Should().ContainSingle().Which.Should().Be(dPath);
         diff.Unchanged.Should().Be(2); // B + C
         diff.Partial.Should().BeFalse();
@@ -145,6 +148,27 @@ public sealed class ReconcileDriftToolTests : IAsyncLifetime
         diff.Added.Should().BeEmpty();
         diff.Removed.Should().BeEmpty();
         diff.Unchanged.Should().Be(0);
+    }
+
+    [Fact]
+    public async Task ComputeAsync_classifies_untracked_files_by_indexing_expectation()
+    {
+        var source = Path.Join(_root, "src", "Missing.cs");
+        var native = Path.Join(_root, "native", "algorithm.cpp");
+        var asset = Path.Join(_root, "assets", "settings.json");
+        await PlantFile(source, "class Missing {}");
+        await PlantFile(native, "void run() {}");
+        await PlantFile(asset, "{}");
+
+        var diff = await DriftReconciler.ComputeAsync(
+            _host!,
+            maxFiles: 100,
+            CancellationToken.None);
+
+        diff.Added.Should().HaveCount(3);
+        diff.SourceCandidates.Should().Equal(source);
+        diff.NativeNotConfigured.Should().Equal(native);
+        diff.UnsupportedOrAssets.Should().Equal(asset);
     }
 
     [Fact]

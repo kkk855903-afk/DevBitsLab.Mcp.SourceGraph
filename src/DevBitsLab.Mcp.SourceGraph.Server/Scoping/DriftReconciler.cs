@@ -89,21 +89,52 @@ internal static class DriftReconciler
             }
         }
 
-        return new DriftDiff(scanned, changed, added, removed, unchanged, partial);
+        var sourceCandidates = new List<string>();
+        var nativeNotConfigured = new List<string>();
+        var unsupportedOrAssets = new List<string>();
+        foreach (var path in added)
+        {
+            if (host.ProjectByFilePath.ContainsKey(path)
+                || IsManagedSourceCandidate(path))
+            {
+                sourceCandidates.Add(path);
+            }
+            else if (IsNativeSource(path))
+            {
+                nativeNotConfigured.Add(path);
+            }
+            else
+            {
+                unsupportedOrAssets.Add(path);
+            }
+        }
+
+        return new DriftDiff(
+            scanned,
+            changed,
+            added,
+            removed,
+            unchanged,
+            partial,
+            sourceCandidates,
+            nativeNotConfigured,
+            unsupportedOrAssets);
     }
 
     /// <summary>
-    /// Apply <paramref name="diff"/> by feeding the union of changed + added + removed paths to
+    /// Apply <paramref name="diff"/> by feeding changed + source-candidate + removed paths to
     /// <see cref="RoslynIndexer.IndexChangedFilesAsync"/> — the same path the watcher uses for
-    /// incremental updates. The indexer handles each kind correctly internally: changed files are
-    /// re-indexed, removed files (File.Exists == false) trigger the per-file delete path, added
-    /// files (if part of the workspace) are indexed.
+    /// incremental updates. Unsupported assets and native files without a discovered language
+    /// project are reported but never sent through the Roslyn incremental path.
     /// </summary>
     public static async Task ApplyAsync(ScopeHost host, DriftDiff diff, CancellationToken ct)
     {
-        var union = new List<string>(diff.Changed.Count + diff.Added.Count + diff.Removed.Count);
+        var union = new List<string>(
+            diff.Changed.Count
+            + diff.SourceCandidates.Count
+            + diff.Removed.Count);
         union.AddRange(diff.Changed);
-        union.AddRange(diff.Added);
+        union.AddRange(diff.SourceCandidates);
         union.AddRange(diff.Removed);
         if (union.Count == 0) return;
         await host.Indexer.IndexChangedFilesAsync(union, ct).ConfigureAwait(false);
@@ -115,6 +146,15 @@ internal static class DriftReconciler
         for (var i = 0; i < a.Length; i++) if (a[i] != b[i]) return false;
         return true;
     }
+
+    private static bool IsManagedSourceCandidate(string path) =>
+        Path.GetExtension(path).ToLowerInvariant() is
+            ".cs" or ".xaml" or ".proto";
+
+    private static bool IsNativeSource(string path) =>
+        Path.GetExtension(path).ToLowerInvariant() is
+            ".c" or ".cc" or ".cpp" or ".cxx"
+            or ".h" or ".hh" or ".hpp" or ".hxx";
 }
 
 /// <summary>
@@ -127,4 +167,7 @@ internal sealed record DriftDiff(
     IReadOnlyList<string> Added,
     IReadOnlyList<string> Removed,
     int Unchanged,
-    bool Partial);
+    bool Partial,
+    IReadOnlyList<string> SourceCandidates,
+    IReadOnlyList<string> NativeNotConfigured,
+    IReadOnlyList<string> UnsupportedOrAssets);

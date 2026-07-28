@@ -259,7 +259,7 @@ public sealed class PartialIndexResultTests
     }
 
     [Fact]
-    public async Task ColdIndex_syntaxErrorsWithNoDeclarations_areFailedFilesOnEveryRun()
+    public async Task Protected_source_with_prior_symbols_isFailedOnEveryRun_withoutDiagnosticCascades()
     {
         var root = Path.Combine(
             Path.GetTempPath(),
@@ -269,6 +269,7 @@ public sealed class PartialIndexResultTests
         var solutionPath = Path.Combine(root, "SyntaxFailure.slnx");
         var projectPath = Path.Combine(projectDir, "App.csproj");
         var sourcePath = Path.Combine(projectDir, "Protected.cs");
+        var healthyPath = Path.Combine(projectDir, "Healthy.cs");
 
         try
         {
@@ -290,10 +291,21 @@ public sealed class PartialIndexResultTests
                 """);
             await File.WriteAllTextAsync(
                 sourcePath,
-                "HSKey.Co.SZ WYDZLJ protected payload");
+                "public sealed class Protected { }");
+            await File.WriteAllTextAsync(
+                healthyPath,
+                "public sealed class Healthy { Protected Value = new(); }");
 
             await using var store = new SqliteGraphStore(
                 Path.Combine(root, "graph.db"));
+            var baseline = await RoslynIndexer.IndexSolutionOnceAsync(
+                solutionPath,
+                store);
+            baseline.FailedFiles.Should().BeEmpty();
+
+            await File.WriteAllTextAsync(
+                sourcePath,
+                "HSKey.Co.SZ WYDZLJ protected payload");
             var first = await RoslynIndexer.IndexSolutionOnceAsync(
                 solutionPath,
                 store);
@@ -302,6 +314,19 @@ public sealed class PartialIndexResultTests
                 && failure.Reason.Contains(
                     "protected-hskey",
                     StringComparison.Ordinal));
+            var firstDiagnostics = await store.FindDiagnosticsAsync(
+                severity: null,
+                code: null,
+                symbolId: null,
+                limit: 100);
+            firstDiagnostics.Should().ContainSingle(diagnostic =>
+                diagnostic.Code == "SG0001"
+                && diagnostic.FilePath.EndsWith(
+                    "Protected.cs",
+                    StringComparison.Ordinal));
+            firstDiagnostics.Should().NotContain(diagnostic =>
+                diagnostic.Code.StartsWith("CS", StringComparison.Ordinal),
+                "compiler cascades are not reliable while a project input is protected");
 
             var second = await RoslynIndexer.IndexSolutionOnceAsync(
                 solutionPath,
@@ -312,6 +337,15 @@ public sealed class PartialIndexResultTests
                     "protected-hskey",
                     StringComparison.Ordinal),
                 "an unchanged zero-symbol parse failure must be retried and remain visible");
+            var secondDiagnostics = await store.FindDiagnosticsAsync(
+                severity: null,
+                code: null,
+                symbolId: null,
+                limit: 100);
+            secondDiagnostics.Should().ContainSingle(diagnostic =>
+                diagnostic.Code == "SG0001");
+            secondDiagnostics.Should().NotContain(diagnostic =>
+                diagnostic.Code.StartsWith("CS", StringComparison.Ordinal));
         }
         finally
         {

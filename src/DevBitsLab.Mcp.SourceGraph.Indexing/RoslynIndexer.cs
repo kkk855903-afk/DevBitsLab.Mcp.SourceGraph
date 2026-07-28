@@ -2707,6 +2707,8 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                         ct)
                     .ConfigureAwait(false)
                 : new HashSet<string>(_pathComparer);
+        var protectedFileIds = new HashSet<long>();
+        var protectedProjectIds = new HashSet<ProjectId>();
 
         foreach (var documentsForOwner in documentGroups)
         {
@@ -2770,6 +2772,22 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                 {
                     fileIdBySyntaxTree[syntaxTree] = fileId;
                 }
+            }
+            if (!isGenerated && HasHsKeyPrefix(bytes))
+            {
+                protectedFileIds.Add(fileId);
+                foreach (var document in groupedDocuments)
+                {
+                    protectedProjectIds.Add(document.Project.Id);
+                }
+                AddFileFailure(
+                    failedFiles,
+                    path,
+                    "protected-hskey: semantic indexing skipped");
+                _logger.LogWarning(
+                    "Skipping {Path}: protected-hskey",
+                    path);
+                continue;
             }
 
             // A matching source hash does not prove that this file's independently stored
@@ -3140,6 +3158,16 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                     "Pass 1 skipped {Path}: {Reason}",
                     path,
                     ex.Message);
+                if (ex.Message.StartsWith(
+                        "protected-hskey",
+                        StringComparison.Ordinal))
+                {
+                    protectedFileIds.Add(fileId);
+                    foreach (var document in docs)
+                    {
+                        protectedProjectIds.Add(document.Project.Id);
+                    }
+                }
                 AddFileFailure(failedFiles, path, ex.Message);
             }
             catch (Exception ex)
@@ -3689,6 +3717,7 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         {
             foreach (var d in docs) projectsTouched.Add(d.Project.Id);
         }
+        projectsTouched.UnionWith(protectedProjectIds);
         var diagnosticsByFile = new Dictionary<long, List<DiagnosticRecord>>();
         // Pre-create empty buckets for every successfully-walked file so files with zero
         // diagnostics still get an Upsert call to clear out stale rows from a prior index.
@@ -3697,6 +3726,21 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         foreach (var fid in changedFileIds)
         {
             if (walkedFileIds.Contains(fid)) diagnosticsByFile[fid] = new List<DiagnosticRecord>();
+        }
+        foreach (var fileId in protectedFileIds)
+        {
+            diagnosticsByFile[fileId] =
+            [
+                new DiagnosticRecord(
+                    SymbolId: null,
+                    FileId: fileId,
+                    Severity: (int)DiagnosticSeverity.Error,
+                    Code: "SG0001",
+                    Message:
+                        "Source file is HSKey-protected; semantic indexing and compiler diagnostics were skipped.",
+                    Line: 1,
+                    Col: 1),
+            ];
         }
         var priorWpfDiagnosticFileIds =
             (await _store.ListDiagnosticFileIdsByCodesAsync(
@@ -3828,10 +3872,14 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                 continue;
             }
 
-            ImmutableArray<Diagnostic> diags;
+            var hasProtectedInput = protectedProjectIds.Contains(pid);
+            ImmutableArray<Diagnostic> diags = [];
             try
             {
-                diags = compilation.GetDiagnostics(ct);
+                if (!hasProtectedInput)
+                {
+                    diags = compilation.GetDiagnostics(ct);
+                }
             }
             catch (OperationCanceledException) { throw; }
             catch (Exception ex)
@@ -3874,12 +3922,22 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                         new List<DiagnosticRecord>());
                 }
             }
+            if (hasProtectedInput)
+            {
+                foreach (var projectFileId in projectFileIds)
+                {
+                    diagnosticsByFile.TryAdd(
+                        projectFileId,
+                        new List<DiagnosticRecord>());
+                }
+            }
 
             var project = _sanitizedSolution!.GetProject(pid);
             var compilationContainsErrors = diags.Any(diagnostic =>
                 diagnostic.Severity == DiagnosticSeverity.Error);
             var semanticInputComplete =
-                project?.FilePath is { Length: > 0 } projectFilePath
+                !hasProtectedInput
+                && project?.FilePath is { Length: > 0 } projectFilePath
                 && IsProjectSemanticInputComplete(
                     _workspace!.CurrentSolution,
                     _sanitizedSolution,
@@ -4616,6 +4674,14 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
             }
         }
     }
+
+    private static bool HasHsKeyPrefix(ReadOnlySpan<byte> bytes) =>
+        bytes.Length >= 5
+        && bytes[0] == (byte)'H'
+        && bytes[1] == (byte)'S'
+        && bytes[2] == (byte)'K'
+        && bytes[3] == (byte)'e'
+        && bytes[4] == (byte)'y';
 
     private sealed class SourceSyntaxFailureException(string message)
         : Exception(message);

@@ -149,6 +149,25 @@ public sealed class IndexFixtureTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task Inferred_generic_call_targets_open_method_definition()
+    {
+        var caller = (await _store!.FindSymbolsAsync("ExecuteInferred"))
+            .Should().ContainSingle(hit => hit.Name == "ExecuteInferred")
+            .Which;
+        var target = (await _store.FindSymbolsAsync("Calculator.Execute"))
+            .Should().ContainSingle(hit => hit.Name == "Execute")
+            .Which;
+
+        var evidence = await _store.ListEdgeEvidenceAsync(
+            caller.Id,
+            target.Id,
+            EdgeKinds.Calls);
+
+        evidence.Should().ContainSingle();
+        evidence[0].Confidence.Should().Be(CoreEvidenceConfidence.Exact);
+    }
+
+    [Fact]
     public async Task RoslynTypeRelations_preserveExactBaseTypeEvidence()
     {
         await AssertTypeRelationEvidenceAsync(
