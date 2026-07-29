@@ -193,7 +193,30 @@ public sealed class NativeWorkerClient
     public async Task<NativeWorkerClientResult> ExtractAsync(
         string repositoryRoot,
         ClangNativeExtractionRequest request,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default) =>
+        await ExtractCoreAsync(
+                repositoryRoot,
+                request,
+                prepareProtectedInputs: true,
+                cancellationToken)
+            .ConfigureAwait(false);
+
+    internal async Task<NativeWorkerClientResult> ExtractPreparedAsync(
+        string repositoryRoot,
+        ClangNativeExtractionRequest request,
+        CancellationToken cancellationToken = default) =>
+        await ExtractCoreAsync(
+                repositoryRoot,
+                request,
+                prepareProtectedInputs: false,
+                cancellationToken)
+            .ConfigureAwait(false);
+
+    private async Task<NativeWorkerClientResult> ExtractCoreAsync(
+        string repositoryRoot,
+        ClangNativeExtractionRequest request,
+        bool prepareProtectedInputs,
+        CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(request);
 
@@ -219,6 +242,23 @@ public sealed class NativeWorkerClient
             return Failed(
                 "trust-denied",
                 $"Native parsing was denied ({trust.ReasonCode}).");
+        }
+
+        if (prepareProtectedInputs)
+        {
+            var protectedInputs =
+                await ProtectedNativeInputPreparer.PrepareAsync(
+                        repositoryRoot,
+                        request,
+                        cancellationToken)
+                    .ConfigureAwait(false);
+            if (!protectedInputs.IsSuccess)
+            {
+                return Failed(
+                    protectedInputs.FailureCode!,
+                    protectedInputs.FailureMessage!);
+            }
+            request = protectedInputs.Request;
         }
 
         var isolationFailure = CheckIsolationRequirements();

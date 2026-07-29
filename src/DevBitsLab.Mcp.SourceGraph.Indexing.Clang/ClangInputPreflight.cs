@@ -65,12 +65,27 @@ internal static class ClangInputPreflight
     public static bool TryNormalizeCompilerArguments(
         IReadOnlyList<string> arguments,
         ScopePathPolicy pathPolicy,
+        IReadOnlyList<string> systemIncludeDirectories,
         out string[] normalizedArguments,
         out IReadOnlyList<string> includeDirectories,
+        out IReadOnlyList<string> normalizedSystemIncludeDirectories,
         out string rejectionReason)
     {
         ArgumentNullException.ThrowIfNull(arguments);
         ArgumentNullException.ThrowIfNull(pathPolicy);
+        ArgumentNullException.ThrowIfNull(systemIncludeDirectories);
+
+        if (!TryNormalizeSystemIncludeDirectories(
+                systemIncludeDirectories,
+                out var systemIncludes))
+        {
+            normalizedArguments = [];
+            includeDirectories = [];
+            normalizedSystemIncludeDirectories = [];
+            rejectionReason =
+                "A runtime compiler/SDK include directory is missing or invalid.";
+            return false;
+        }
 
         var normalized = new List<string>(arguments.Count);
         var includes = new List<string>();
@@ -81,6 +96,7 @@ internal static class ClangInputPreflight
             {
                 normalizedArguments = [];
                 includeDirectories = [];
+                normalizedSystemIncludeDirectories = [];
                 rejectionReason = "A blank compiler argument cannot be validated.";
                 return false;
             }
@@ -89,6 +105,7 @@ internal static class ClangInputPreflight
             {
                 normalizedArguments = [];
                 includeDirectories = [];
+                normalizedSystemIncludeDirectories = [];
                 rejectionReason =
                     "A compiler-controlled file input is not supported by in-process parsing.";
                 return false;
@@ -100,12 +117,14 @@ internal static class ClangInputPreflight
                     || !TryNormalizeIncludeDirectory(
                         arguments[index],
                         pathPolicy,
+                        systemIncludes,
                         out var includeDirectory))
                 {
                     normalizedArguments = [];
                     includeDirectories = [];
+                    normalizedSystemIncludeDirectories = [];
                     rejectionReason =
-                        "An explicit include directory is missing or outside the approved scope.";
+                        "An explicit include directory is missing or outside the approved source/toolchain roots.";
                     return false;
                 }
 
@@ -123,12 +142,14 @@ internal static class ClangInputPreflight
                 if (!TryNormalizeIncludeDirectory(
                     attachedPath,
                     pathPolicy,
+                    systemIncludes,
                     out var includeDirectory))
                 {
                     normalizedArguments = [];
                     includeDirectories = [];
+                    normalizedSystemIncludeDirectories = [];
                     rejectionReason =
-                        "An explicit include directory is missing or outside the approved scope.";
+                        "An explicit include directory is missing or outside the approved source/toolchain roots.";
                     return false;
                 }
 
@@ -141,6 +162,7 @@ internal static class ClangInputPreflight
             {
                 normalizedArguments = [];
                 includeDirectories = [];
+                normalizedSystemIncludeDirectories = [];
                 rejectionReason =
                     "A standalone compiler path cannot be validated as an approved input.";
                 return false;
@@ -153,6 +175,7 @@ internal static class ClangInputPreflight
         includeDirectories = includes
             .Distinct(_pathComparer)
             .ToArray();
+        normalizedSystemIncludeDirectories = systemIncludes;
         rejectionReason = string.Empty;
         return true;
     }
@@ -160,11 +183,14 @@ internal static class ClangInputPreflight
     public static bool TryValidateExplicitIncludeGraph(
         string sourceFilePath,
         IReadOnlyList<string> includeDirectories,
+        IReadOnlyList<string> systemIncludeDirectories,
         ScopePathPolicy pathPolicy,
+        out IReadOnlyList<string> approvedInputFiles,
         out string rejectionReason)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(sourceFilePath);
         ArgumentNullException.ThrowIfNull(includeDirectories);
+        ArgumentNullException.ThrowIfNull(systemIncludeDirectories);
         ArgumentNullException.ThrowIfNull(pathPolicy);
 
         var visited = new HashSet<string>(_pathComparer);
@@ -189,6 +215,7 @@ internal static class ClangInputPreflight
                     or UnauthorizedAccessException
                     or NotSupportedException)
             {
+                approvedInputFiles = [];
                 rejectionReason =
                     "An approved native source input could not be read during include preflight.";
                 return false;
@@ -206,6 +233,7 @@ internal static class ClangInputPreflight
                     }
                     if (directive.Value.Name == "include_next")
                     {
+                        approvedInputFiles = [];
                         rejectionReason =
                             "include_next cannot be resolved safely before parsing.";
                         return false;
@@ -219,6 +247,7 @@ internal static class ClangInputPreflight
                         out var headerName,
                         out var quoted))
                     {
+                        approvedInputFiles = [];
                         rejectionReason =
                             "A non-literal or malformed include cannot be resolved safely.";
                         return false;
@@ -228,14 +257,29 @@ internal static class ClangInputPreflight
                         headerName,
                         quoted,
                         includeDirectories,
+                        systemIncludeDirectories,
                         pathPolicy,
-                        out var includedFilePath))
+                        out var includedFilePath,
+                        out var isSystemHeader,
+                        out var rejectedExistingHeader))
                     {
-                        rejectionReason =
-                            "An include could not be proven to resolve inside the approved scope.";
-                        return false;
+                        if (rejectedExistingHeader)
+                        {
+                            approvedInputFiles = [];
+                            rejectionReason =
+                                "A literal include resolves outside the approved source/toolchain roots.";
+                            return false;
+                        }
+                        // Conditional branches cannot be evaluated soundly without Clang. A
+                        // literal header that is absent from every approved search root may be
+                        // inactive; if it is active, Clang emits an error. Any file Clang does
+                        // open is validated again by TryReadIncludedFiles before facts escape.
+                        continue;
                     }
-                    pending.Push(includedFilePath);
+                    if (!isSystemHeader)
+                    {
+                        pending.Push(includedFilePath);
+                    }
                 }
             }
             catch (Exception ex) when (
@@ -243,12 +287,17 @@ internal static class ClangInputPreflight
                     or UnauthorizedAccessException
                     or NotSupportedException)
             {
+                approvedInputFiles = [];
                 rejectionReason =
                     "An approved native source input could not be read during include preflight.";
                 return false;
             }
         }
 
+        approvedInputFiles = visited
+            .OrderBy(path => path, _pathComparer)
+            .ThenBy(path => path, StringComparer.Ordinal)
+            .ToArray();
         rejectionReason = string.Empty;
         return true;
     }
@@ -285,6 +334,7 @@ internal static class ClangInputPreflight
     private static bool TryNormalizeIncludeDirectory(
         string path,
         ScopePathPolicy pathPolicy,
+        IReadOnlyList<string> systemIncludeDirectories,
         out string physicalPath)
     {
         physicalPath = string.Empty;
@@ -295,13 +345,28 @@ internal static class ClangInputPreflight
 
         try
         {
-            if (pathPolicy.IsExcludedForDiscovery(path, out var resolvedPath)
+            if (Path.IsPathFullyQualified(path))
+            {
+                var candidate = Path.TrimEndingDirectorySeparator(
+                    Path.GetFullPath(path));
+                if (Directory.Exists(candidate)
+                    && IsSameOrDescendantOfAny(
+                        candidate,
+                        systemIncludeDirectories))
+                {
+                    physicalPath = candidate;
+                    return true;
+                }
+            }
+            if (pathPolicy.IsExcludedForDiscovery(
+                    path,
+                    out var resolvedPath)
                 || resolvedPath is null
                 || !Directory.Exists(resolvedPath))
             {
+                physicalPath = string.Empty;
                 return false;
             }
-
             physicalPath = Path.TrimEndingDirectorySeparator(
                 Path.GetFullPath(resolvedPath));
             return true;
@@ -322,19 +387,37 @@ internal static class ClangInputPreflight
         string headerName,
         bool quoted,
         IReadOnlyList<string> includeDirectories,
+        IReadOnlyList<string> systemIncludeDirectories,
         ScopePathPolicy pathPolicy,
-        out string physicalPath)
+        out string physicalPath,
+        out bool isSystemHeader,
+        out bool rejectedExistingHeader)
     {
         physicalPath = string.Empty;
+        isSystemHeader = false;
+        rejectedExistingHeader = false;
         var normalizedHeaderName = headerName
             .Replace('\\', Path.DirectorySeparatorChar)
             .Replace('/', Path.DirectorySeparatorChar);
         if (Path.IsPathFullyQualified(normalizedHeaderName))
         {
-            return TryResolveAllowedFile(
-                normalizedHeaderName,
-                pathPolicy,
-                out physicalPath);
+            if (TryResolveAllowedFile(
+                    normalizedHeaderName,
+                    pathPolicy,
+                    out physicalPath))
+            {
+                return true;
+            }
+            if (TryResolveSystemFile(
+                    normalizedHeaderName,
+                    systemIncludeDirectories,
+                    out physicalPath))
+            {
+                isSystemHeader = true;
+                return true;
+            }
+            rejectedExistingHeader = File.Exists(normalizedHeaderName);
+            return false;
         }
 
         var searchDirectories = quoted
@@ -348,10 +431,23 @@ internal static class ClangInputPreflight
             {
                 candidate = Path.GetFullPath(
                     Path.Combine(directory, normalizedHeaderName));
+                if (!File.Exists(candidate))
+                {
+                    continue;
+                }
+                if (TryResolveSystemFile(
+                        candidate,
+                        systemIncludeDirectories,
+                        out physicalPath))
+                {
+                    isSystemHeader = true;
+                    return true;
+                }
                 if (pathPolicy.IsExcludedForDiscovery(
                     candidate,
                     out var resolvedCandidate))
                 {
+                    rejectedExistingHeader = true;
                     return false;
                 }
                 if (resolvedCandidate is null
@@ -374,6 +470,95 @@ internal static class ClangInputPreflight
             }
         }
 
+        return false;
+    }
+
+    public static bool TryResolveSystemFile(
+        string path,
+        IReadOnlyList<string> systemIncludeDirectories,
+        out string physicalPath)
+    {
+        physicalPath = string.Empty;
+        try
+        {
+            var candidate = Path.GetFullPath(path);
+            if (!File.Exists(candidate)
+                || !IsSameOrDescendantOfAny(
+                    candidate,
+                    systemIncludeDirectories))
+            {
+                return false;
+            }
+            physicalPath = candidate;
+            return true;
+        }
+        catch (Exception ex) when (
+            ex is IOException
+                or UnauthorizedAccessException
+                or ArgumentException
+                or NotSupportedException
+                or PathTooLongException)
+        {
+            return false;
+        }
+    }
+
+    private static bool TryNormalizeSystemIncludeDirectories(
+        IReadOnlyList<string> directories,
+        out string[] normalized)
+    {
+        var result = new HashSet<string>(_pathComparer);
+        foreach (var directory in directories)
+        {
+            try
+            {
+                if (string.IsNullOrWhiteSpace(directory)
+                    || !Path.IsPathFullyQualified(directory)
+                    || !Directory.Exists(directory))
+                {
+                    normalized = [];
+                    return false;
+                }
+                result.Add(Path.TrimEndingDirectorySeparator(
+                    Path.GetFullPath(directory)));
+            }
+            catch (Exception ex) when (
+                ex is IOException
+                    or UnauthorizedAccessException
+                    or ArgumentException
+                    or NotSupportedException
+                    or PathTooLongException)
+            {
+                normalized = [];
+                return false;
+            }
+        }
+        normalized = result
+            .OrderBy(path => path, _pathComparer)
+            .ThenBy(path => path, StringComparer.Ordinal)
+            .ToArray();
+        return true;
+    }
+
+    private static bool IsSameOrDescendantOfAny(
+        string path,
+        IReadOnlyList<string> roots)
+    {
+        var fullPath = Path.GetFullPath(path);
+        foreach (var root in roots)
+        {
+            var fullRoot = Path.TrimEndingDirectorySeparator(
+                Path.GetFullPath(root));
+            if (_pathComparer.Equals(fullPath, fullRoot)
+                || fullPath.StartsWith(
+                    fullRoot + Path.DirectorySeparatorChar,
+                    OperatingSystem.IsWindows()
+                        ? StringComparison.OrdinalIgnoreCase
+                        : StringComparison.Ordinal))
+            {
+                return true;
+            }
+        }
         return false;
     }
 

@@ -102,7 +102,24 @@ public sealed record ClangNativeExtractionRequest(
     InteropTarget Target,
     IReadOnlyList<string> CompilerArguments,
     string? LibraryName = null,
-    IReadOnlyList<string>? ExcludePatterns = null);
+    IReadOnlyList<string>? ExcludePatterns = null)
+{
+    /// <summary>
+    /// Runtime-discovered compiler and platform-SDK include roots. Files below these roots may
+    /// satisfy system includes, but are omitted from repository evidence and content hashes.
+    /// </summary>
+    public IReadOnlyList<string> SystemIncludeDirectories { get; init; } = [];
+
+    /// <summary>
+    /// Optional, bounded logical file views prepared by the trusted parent process. This is used
+    /// only when an endpoint-protection filter exposes protected physical bytes to the isolated
+    /// native worker. Paths remain subject to the same scope and exclusion checks, and contents
+    /// are consumed in memory through libclang unsaved files.
+    /// </summary>
+    public IReadOnlyList<ClangInMemoryInput> InMemoryInputs { get; init; } = [];
+}
+
+public sealed record ClangInMemoryInput(string Path, byte[] Contents);
 
 /// <summary>Pure extraction result. No graph or persistence side effects are performed.</summary>
 public sealed record ClangNativeExtractionResult(

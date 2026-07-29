@@ -2,10 +2,13 @@ using System;
 using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
+using DevBitsLab.Mcp.SourceGraph.Core;
 using DevBitsLab.Mcp.SourceGraph.Indexing;
+using DevBitsLab.Mcp.SourceGraph.Interop;
 using DevBitsLab.Mcp.SourceGraph.Storage;
 using FluentAssertions;
 using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.CSharp;
 using Xunit;
 
 namespace DevBitsLab.Mcp.SourceGraph.Tests;
@@ -148,6 +151,104 @@ public sealed class PartialIndexResultTests
         finally
         {
             try { Directory.Delete(tmp, recursive: true); } catch { /* best-effort */ }
+        }
+    }
+
+    [Fact]
+    public async Task ColdIndex_failedSolutionMember_usesSafeCSharpFallbackForPositivePInvokeFact()
+    {
+        var root = Path.Combine(
+            Path.GetTempPath(),
+            "partial-fallback-tests-" + Guid.NewGuid().ToString("N"));
+        var projectDirectory = Path.Combine(root, "Broken");
+        Directory.CreateDirectory(projectDirectory);
+        var projectPath = Path.Combine(projectDirectory, "Broken.csproj");
+        var sourcePath = Path.Combine(projectDirectory, "Native.cs");
+        var solutionPath = Path.Combine(root, "Fallback.sln");
+        await File.WriteAllTextAsync(
+            projectPath,
+            """<Project Sdk="Missing.SourceGraph.Test.Sdk/1.0.0" />""");
+        await File.WriteAllTextAsync(
+            sourcePath,
+            """
+            using System.Runtime.InteropServices;
+            namespace Fallback;
+            internal static class Native
+            {
+                [DllImport("native.dll", CallingConvention = CallingConvention.Cdecl)]
+                internal static extern uint AB_GetAPIVersion();
+            }
+            """);
+        await File.WriteAllTextAsync(
+            solutionPath,
+            """
+            Microsoft Visual Studio Solution File, Format Version 12.00
+            Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Broken", "Broken\Broken.csproj", "{11111111-1111-1111-1111-111111111111}"
+            EndProject
+            Global
+            EndGlobal
+            """);
+
+        try
+        {
+            await using var store = new SqliteGraphStore(
+                Path.Combine(root, "graph.db"));
+            var hooks = new RoslynIndexer.TestHooks(
+                OpenWorkspaceAsync: (workspace, _, _) =>
+                {
+                    var projectId = ProjectId.CreateNewId("Broken");
+                    var solution = workspace.CurrentSolution.AddProject(
+                        ProjectInfo.Create(
+                            projectId,
+                            VersionStamp.Create(),
+                            "Broken",
+                            "Broken",
+                            LanguageNames.CSharp,
+                            filePath: projectPath,
+                            compilationOptions: new CSharpCompilationOptions(
+                                OutputKind.DynamicallyLinkedLibrary)));
+                    return Task.FromResult(
+                        new RoslynIndexer.WorkspaceOpenResult(
+                            solution,
+                            [
+                                new WorkspaceDiagnostic(
+                                    WorkspaceDiagnosticKind.Failure,
+                                    "simulated project load failure"),
+                            ]));
+                });
+            await using var indexer = new RoslynIndexer(
+                store,
+                logger: null,
+                embeddingsSink: null,
+                privacyRoot: root,
+                excludePatterns: [],
+                testHooks: hooks,
+                interopTarget: InteropTarget.WindowsX64Msvc);
+
+            await indexer.OpenAsync(solutionPath);
+            var result = await indexer.IndexAllAsync();
+            var imports =
+                await InteropFactStoreReader.ReadManagedImportsAsync(store);
+
+            result.FailedProjects.Should().Contain(failure =>
+                failure.Reason.Contains(
+                    "simulated project load failure",
+                    StringComparison.Ordinal));
+            imports.IsComplete.Should().BeTrue();
+            imports.Facts.Should().ContainSingle(stored =>
+                stored.Fact.EntryPoint == "AB_GetAPIVersion"
+                && stored.Fact.Evidence.Location.FilePath == sourcePath);
+        }
+        finally
+        {
+            try
+            {
+                Directory.Delete(root, recursive: true);
+            }
+            catch
+            {
+                // Best effort for Windows test-host handles.
+            }
         }
     }
 

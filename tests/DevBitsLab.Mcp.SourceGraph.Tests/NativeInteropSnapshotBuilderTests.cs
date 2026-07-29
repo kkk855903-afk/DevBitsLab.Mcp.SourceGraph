@@ -552,6 +552,61 @@ public sealed class NativeInteropSnapshotBuilderTests : IDisposable
     }
 
     [Fact]
+    public async Task Matching_export_declaration_and_definition_prefer_definition_evidence()
+    {
+        var definitionPath = Write("native/api.cpp");
+        var consumerPath = Write("native/consumer.cpp");
+        var headerPath = Write("include/api.h");
+        var config = Config(
+            Tu("native/api.cpp", "medical", "artifacts/medical.dll"),
+            Tu("native/consumer.cpp", "medical", "artifacts/medical.dll"));
+        var builder = new NativeInteropSnapshotBuilder(
+            (request, _) =>
+            {
+                var evidencePath = string.Equals(
+                    request.SourceFilePath,
+                    definitionPath,
+                    PathComparison)
+                    ? definitionPath
+                    : headerPath;
+                var canonicalKey = string.Equals(
+                    evidencePath,
+                    definitionPath,
+                    PathComparison)
+                    ? "c:E:native/api.cpp::medical"
+                    : "c:E:include/api.h::medical";
+                return Task.FromResult(Extraction(
+                    request,
+                    [
+                        Export(
+                            request,
+                            canonicalKey,
+                            "medical",
+                            evidencePath)
+                    ],
+                    includedFiles:
+                    [
+                        request.SourceFilePath,
+                        headerPath,
+                    ]));
+            },
+            (_, _, _) => Task.FromResult(
+                CompleteBinary("medical.dll", "medical")));
+
+        var snapshot = await builder.BuildAsync(
+            _root,
+            config,
+            new ScopePathPolicy(_root),
+            CancellationToken.None);
+
+        File.Exists(consumerPath).Should().BeTrue();
+        snapshot.SourceExports.Should().ContainSingle()
+            .Which.Evidence.Location.FilePath.Should().Be(definitionPath);
+        snapshot.Failures.Should().NotContain(failure =>
+            failure.Kind == NativeInteropSnapshotFailureKind.ExportConflict);
+    }
+
+    [Fact]
     public async Task Identical_header_fact_deduplicates_and_fans_out_to_every_owner()
     {
         var firstPath = Write("native/one.cpp");
@@ -2110,6 +2165,70 @@ public sealed class NativeInteropSnapshotBuilderTests : IDisposable
         snapshot.IsComplete.Should().BeFalse();
         snapshot.Failures.Should().ContainSingle(failure =>
             failure.Kind == NativeInteropSnapshotFailureKind.FactSetChanged);
+    }
+
+    [Fact]
+    public async Task Incomplete_call_graph_retains_stable_positive_facts()
+    {
+        Write("native/api.cpp");
+        var builder = new NativeInteropSnapshotBuilder(
+            (request, _) =>
+            {
+                var caller = Function(
+                    request,
+                    "cpp:F:native/api.cpp::initialize()",
+                    "c:@F@initialize#",
+                    "initialize",
+                    "initialize",
+                    graphKey: null,
+                    isMethod: false);
+                var callee = Function(
+                    request,
+                    "cpp:F:native/api.cpp::shutdown()",
+                    "c:@F@shutdown#",
+                    "shutdown",
+                    "shutdown",
+                    graphKey: null,
+                    isMethod: false);
+                return Task.FromResult(Extraction(
+                    request,
+                    exports:
+                    [
+                        Export(
+                            request,
+                            "c:E:native/api.cpp::initialize",
+                            "initialize"),
+                    ],
+                    functions: [caller, callee],
+                    calls:
+                    [
+                        DirectCall(
+                            request,
+                            caller.SymbolCanonicalKey,
+                            callee.DeclarationUsr,
+                            callee.SymbolCanonicalKey,
+                            line: 2),
+                    ],
+                    callGraphComplete: false));
+            });
+
+        var snapshot = await builder.BuildAsync(
+            _root,
+            Config(new InteropTranslationUnitConfig(
+                "native/api.cpp",
+                "native.dll",
+                ["-x", "c++"],
+                BinaryPath: null)),
+            new ScopePathPolicy(_root),
+            CancellationToken.None);
+
+        snapshot.IsComplete.Should().BeFalse();
+        snapshot.HasPublishableFacts.Should().BeTrue();
+        snapshot.SourceExports.Should().ContainSingle();
+        snapshot.Functions.Should().HaveCount(2);
+        snapshot.Calls.Should().ContainSingle();
+        snapshot.Failures.Should().ContainSingle(failure =>
+            failure.Kind == NativeInteropSnapshotFailureKind.CallGraphIncomplete);
     }
 
     private ScopeInteropConfig Config(params InteropTranslationUnitConfig[] units) =>

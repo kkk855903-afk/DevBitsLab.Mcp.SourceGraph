@@ -248,13 +248,14 @@ public sealed class InteropToolsTests : IAsyncLifetime, IDisposable
     }
 
     [Fact]
-    public async Task Partial_run_discloses_retained_last_good_without_stale_native_answer()
+    public async Task Partial_run_returns_current_exact_positive_match()
     {
         var host = await RegisterConfiguredScopeAsync("interop");
         var partial = await host.NativeInteropCoordinator!.RunAsync(
             isManagedUniverseComplete: false);
         partial.State.Status.Should().Be(NativeInteropRuntimeStatus.Partial);
-        partial.State.RetainedLastGood.Should().BeTrue();
+        partial.State.HasCurrentProjection.Should().BeTrue();
+        partial.State.RetainedLastGood.Should().BeFalse();
 
         var call = await InteropTools.MatchPInvokeAsync(
             _router,
@@ -266,15 +267,15 @@ public sealed class InteropToolsTests : IAsyncLifetime, IDisposable
 
         result.Scopes.Should().ContainSingle();
         var scope = result.Scopes[0];
-        scope.Status.Should().Be("partial");
+        scope.Status.Should().Be("ok");
         scope.Partial.Should().BeTrue();
-        scope.RetainedLastGood.Should().BeTrue();
+        scope.RetainedLastGood.Should().BeFalse();
         scope.Matches.Should().ContainSingle();
-        scope.Matches[0].Status.Should().Be("unknown");
-        scope.Matches[0].NativeSymbol.Should().BeNull();
+        scope.Matches[0].Status.Should().Be("matched");
+        scope.Matches[0].NativeSymbol.Should().Be(NativeKey);
         scope.Findings.Should().BeEmpty();
         call.StructuredContent!.Value.GetRawText()
-            .Should().NotContain(NativeKey);
+            .Should().Contain(NativeKey);
     }
 
     [Fact]

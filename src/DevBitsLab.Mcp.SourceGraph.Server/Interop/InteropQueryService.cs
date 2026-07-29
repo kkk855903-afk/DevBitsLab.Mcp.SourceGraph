@@ -95,10 +95,11 @@ internal sealed class InteropQueryService
             && native.IsComplete
             && matches.IsComplete
             && (findings?.IsComplete ?? true);
-        var runtimeComplete =
-            runtimeState.Status == NativeInteropRuntimeStatus.Complete
+        var currentProjectionAvailable = runtimeState.HasCurrentProjection;
+        var absenceProven = currentProjectionAvailable
+            && factsComplete
+            && runtimeState.Status == NativeInteropRuntimeStatus.Complete
             && runtimeState.IsExportUniverseComplete;
-        var currentProjectionAvailable = runtimeComplete && factsComplete;
 
         if (runtimeState.Status != NativeInteropRuntimeStatus.Complete)
         {
@@ -132,7 +133,6 @@ internal sealed class InteropQueryService
 
         if (selection.Status == SelectionStatus.NotFound)
         {
-            var absenceProven = currentProjectionAvailable;
             var result = EmptyResult(
                 scopeId,
                 query,
@@ -229,6 +229,58 @@ internal sealed class InteropQueryService
             item => item.Fact.ManagedSymbolCanonicalKey,
             StringComparer.Ordinal);
 
+        if (selected.Managed is not null
+            && !matchByManaged.ContainsKey(
+                selected.Managed.Fact.SymbolCanonicalKey))
+        {
+            var liveMatch = new InteropMatcher().Match(
+                selected.Managed.Fact,
+                native.Facts.Select(item => item.Fact).ToArray(),
+                isExportUniverseComplete:
+                    runtimeState.IsExportUniverseComplete);
+            if (liveMatch.Status is
+                InteropMatchStatus.Matched
+                or InteropMatchStatus.SourceMatched)
+            {
+                if (includeFindings)
+                {
+                    failures.Add(new InteropQueryFailureRow(
+                        "projection",
+                        "findings-projection-unavailable",
+                        "The exact current boundary match was derived from current facts, "
+                        + "but the persisted findings projection is unavailable."));
+                }
+                var projection = new InteropMatchProjection(
+                    liveMatch.ManagedSymbolCanonicalKey,
+                    liveMatch.NativeSymbolCanonicalKey,
+                    liveMatch.Status,
+                    liveMatch.Confidence,
+                    liveMatch.Reasons,
+                    runtimeState.Target,
+                    liveMatch.CandidateCount,
+                    SnapshotComplete:
+                        runtimeState.IsExportUniverseComplete,
+                    liveMatch.Evidence.Select(item =>
+                        new InteropEvidenceProjection(
+                            item.Location,
+                            item.Confidence,
+                            item.Producer,
+                            item.Metadata))
+                        .ToArray());
+                return InteropQueryBudget.Apply(Result(
+                    scopeId,
+                    query,
+                    runtimeState,
+                    status: "ok",
+                    selectionStatus: "selected",
+                    partial: true,
+                    selection.Candidates,
+                    [ProjectMatch(projection)],
+                    [],
+                    failures));
+            }
+        }
+
         var selectedMatches = selected.Managed is not null
             ? SelectManagedMatch(
                 selected,
@@ -306,7 +358,8 @@ internal sealed class InteropQueryService
             runtimeState,
             status: "ok",
             selectionStatus: "selected",
-            partial: false,
+            partial: runtimeState.Status != NativeInteropRuntimeStatus.Complete
+                || !runtimeState.IsExportUniverseComplete,
             selection.Candidates,
             matchRows,
             findingRows.Rows,
@@ -339,6 +392,27 @@ internal sealed class InteropQueryService
         if (exact.Length > 0)
         {
             return SelectionOutcome.From(exact);
+        }
+
+        // Boundary facts are authoritative selection inputs even when the owning managed
+        // project could not be loaded into the general symbol index. This is particularly
+        // important for the safe source fallback used by legacy solution members: the
+        // DllImport fact can be current and exact while no FTS symbol row is available.
+        // Runtime entry-point spellings are case-sensitive, so keep ordinal comparison.
+        var byBoundaryName = selectables
+            .Where(item => item.Managed is not null
+                ? string.Equals(
+                    item.Managed.Fact.EntryPoint,
+                    query,
+                    StringComparison.Ordinal)
+                : string.Equals(
+                    item.Native!.Fact.ExportName,
+                    query,
+                    StringComparison.Ordinal))
+            .ToArray();
+        if (byBoundaryName.Length > 0)
+        {
+            return SelectionOutcome.From(byBoundaryName);
         }
 
         var byKeyAndType = selectables.ToDictionary(
@@ -504,13 +578,6 @@ internal sealed class InteropQueryService
                 match.ManagedSymbolCanonicalKey,
                 "orphan-match",
                 "The persisted match projection has no current managed import.");
-        }
-        if (!match.SnapshotComplete)
-        {
-            return ProjectionFailure(
-                match.ManagedSymbolCanonicalKey,
-                "incomplete-match-snapshot",
-                "The persisted match projection was not produced from a complete snapshot.");
         }
         if (!match.Target.IsAbiEquivalentTo(currentTarget))
         {

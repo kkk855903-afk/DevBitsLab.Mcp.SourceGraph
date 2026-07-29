@@ -42,6 +42,12 @@ public sealed record NativeInteropRuntimeState(
     int PendingStaleSymbols,
     IReadOnlyList<NativeInteropRuntimeFailure> Failures)
 {
+    public bool HasCurrentProjection { get; init; }
+    public int DiscoveredProjects { get; init; }
+    public int AttemptedProjects { get; init; }
+    public int SucceededProjects { get; init; }
+    public int FailedProjects { get; init; }
+
     public static NativeInteropRuntimeState NotStarted(InteropTarget target) =>
         new(
             NativeInteropRuntimeStatus.NotStarted,
@@ -103,6 +109,9 @@ internal sealed class NativeInteropCoordinator : IAsyncDisposable
     private readonly string[] _watchExtensions;
     private readonly HashSet<string> _pendingStaleKeys =
         new(StringComparer.Ordinal);
+    private readonly int _discoveredProjects;
+    private readonly IReadOnlyList<SolutionNativeInteropResolutionFailure>
+        _resolutionFailures;
 
     private NativeInteropRuntimeState _state;
     private IReadOnlyDictionary<string, IReadOnlyList<string>>
@@ -116,7 +125,10 @@ internal sealed class NativeInteropCoordinator : IAsyncDisposable
         ScopePathPolicy pathPolicy,
         IGraphStore store,
         IExecutionTrustPolicy trustPolicy,
-        NativeWorkerClient? workerClient = null)
+        NativeWorkerClient? workerClient = null,
+        int discoveredProjects = 0,
+        IReadOnlyList<SolutionNativeInteropResolutionFailure>?
+            resolutionFailures = null)
         : this(
             scopeRoot,
             configuration,
@@ -125,7 +137,9 @@ internal sealed class NativeInteropCoordinator : IAsyncDisposable
             trustPolicy,
             workerClient ?? new NativeWorkerClient(trustPolicy),
             testExtractor: null,
-            BinaryExportVerifier.VerifyAsync)
+            BinaryExportVerifier.VerifyAsync,
+            discoveredProjects,
+            resolutionFailures)
     {
     }
 
@@ -145,7 +159,9 @@ internal sealed class NativeInteropCoordinator : IAsyncDisposable
             trustPolicy,
             workerClient: null,
             extractor,
-            binaryVerifier ?? BinaryExportVerifier.VerifyAsync)
+            binaryVerifier ?? BinaryExportVerifier.VerifyAsync,
+            discoveredProjects: configuration.VcxProjects.Count,
+            resolutionFailures: null)
     {
     }
 
@@ -157,7 +173,10 @@ internal sealed class NativeInteropCoordinator : IAsyncDisposable
         IExecutionTrustPolicy trustPolicy,
         NativeWorkerClient? workerClient,
         NativeInteropExtractor? testExtractor,
-        NativeInteropBinaryVerifier binaryVerifier)
+        NativeInteropBinaryVerifier binaryVerifier,
+        int discoveredProjects,
+        IReadOnlyList<SolutionNativeInteropResolutionFailure>?
+            resolutionFailures)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(scopeRoot);
         ArgumentNullException.ThrowIfNull(configuration);
@@ -187,7 +206,15 @@ internal sealed class NativeInteropCoordinator : IAsyncDisposable
             scopeRoot,
             configuration);
         _watchExtensions = ResolveWatchExtensions(configuration);
-        _state = NativeInteropRuntimeState.NotStarted(configuration.Target);
+        _discoveredProjects = Math.Max(
+            discoveredProjects,
+            configuration.VcxProjects.Count);
+        _resolutionFailures = resolutionFailures ?? [];
+        _state = NativeInteropRuntimeState.NotStarted(configuration.Target)
+            with
+            {
+                DiscoveredProjects = _discoveredProjects,
+            };
     }
 
     public NativeInteropRuntimeState State
@@ -269,6 +296,13 @@ internal sealed class NativeInteropCoordinator : IAsyncDisposable
         try
         {
             var attemptedAt = DateTimeOffset.UtcNow;
+            var currentFailures = _resolutionFailures
+                .Select(failure => RuntimeFailure(
+                    "solution-membership",
+                    failure.Code,
+                    failure.Message,
+                    configuredPath: failure.Path))
+                .ToList();
             SetState(State with
             {
                 Status = NativeInteropRuntimeStatus.Indexing,
@@ -306,6 +340,43 @@ internal sealed class NativeInteropCoordinator : IAsyncDisposable
                     ]);
             }
 
+            VcxProjectImportResult imported;
+            try
+            {
+                imported = VcxProjectImporter.Import(
+                    _scopeRoot,
+                    _configuration,
+                    _pathPolicy);
+            }
+            catch (Exception ex)
+            {
+                return Failed(
+                    attemptedAt,
+                    [
+                        RuntimeFailure(
+                            "vcxproj-import",
+                            "vcxproj-import-failed",
+                            $"Visual C++ project import failed ({ex.GetType().Name})."),
+                    ]);
+            }
+            if (!imported.IsComplete)
+            {
+                currentFailures.AddRange(
+                    imported.Failures.Select(failure =>
+                        RuntimeFailure(
+                            "vcxproj-import",
+                            failure.Code,
+                            failure.Message,
+                            configuredPath: failure.ConfiguredPath)));
+            }
+            if (imported.TranslationUnits.Count == 0)
+            {
+                return Failed(attemptedAt, currentFailures);
+            }
+            var effectiveConfiguration = new ScopeInteropConfig(
+                _configuration.Target,
+                imported.TranslationUnits);
+
             var workerFailures = new List<NativeWorkerFailure>();
             var builder = new NativeInteropSnapshotBuilder(
                 CreateExtractor(workerFailures),
@@ -315,7 +386,7 @@ internal sealed class NativeInteropCoordinator : IAsyncDisposable
             {
                 snapshot = await builder.BuildAsync(
                         _scopeRoot,
-                        _configuration,
+                        effectiveConfiguration,
                         _pathPolicy,
                         cancellationToken)
                     .ConfigureAwait(false);
@@ -336,11 +407,13 @@ internal sealed class NativeInteropCoordinator : IAsyncDisposable
                     ]);
             }
 
-            if (!snapshot.IsComplete)
+            currentFailures.AddRange(
+                SnapshotFailures(snapshot, workerFailures));
+            if (!snapshot.HasPublishableFacts)
             {
                 return Failed(
                     attemptedAt,
-                    SnapshotFailures(snapshot, workerFailures),
+                    currentFailures,
                     snapshot);
             }
 
@@ -387,16 +460,10 @@ internal sealed class NativeInteropCoordinator : IAsyncDisposable
 
             if (!isManagedUniverseComplete)
             {
-                return Failed(
-                    attemptedAt,
-                    [
-                        RuntimeFailure(
-                            "managed-snapshot",
-                            "managed-snapshot-incomplete",
-                            "The managed import universe is incomplete; the last successful analysis projection was retained."),
-                    ],
-                    snapshot,
-                    nativePublication);
+                currentFailures.Add(RuntimeFailure(
+                    "managed-snapshot",
+                    "managed-snapshot-incomplete",
+                    "The managed import universe is incomplete; exact positive boundary facts were retained, but absence remains unknown."));
             }
 
             InteropAnalysisPublicationResult analysisPublication;
@@ -427,12 +494,18 @@ internal sealed class NativeInteropCoordinator : IAsyncDisposable
             }
             if (!analysisPublication.IsComplete)
             {
-                return Failed(
-                    attemptedAt,
-                    AnalysisFailures(analysisPublication),
-                    snapshot,
-                    nativePublication,
-                    analysisPublication);
+                var analysisFailures =
+                    AnalysisFailures(analysisPublication);
+                if (analysisPublication.FilesPublished == 0)
+                {
+                    return Failed(
+                        attemptedAt,
+                        analysisFailures,
+                        snapshot,
+                        nativePublication,
+                        analysisPublication);
+                }
+                currentFailures.AddRange(analysisFailures);
             }
 
             var cleanupFailures = new List<NativeInteropRuntimeFailure>();
@@ -479,15 +552,27 @@ internal sealed class NativeInteropCoordinator : IAsyncDisposable
 
             var completedAt = DateTimeOffset.UtcNow;
             NativeInteropRuntimeState completed;
+            currentFailures.AddRange(cleanupFailures);
+            var projectCounts = CountProjectOutcomes(
+                imported,
+                snapshot);
+            var currentIsComplete =
+                currentFailures.Count == 0
+                && snapshot.IsComplete
+                && snapshot.IsExportUniverseComplete;
             lock (_stateGate)
             {
                 _lastGoodDependencyFanout =
                     CloneDependencyFanout(snapshot.DependencyFanout);
                 completed = new NativeInteropRuntimeState(
-                    NativeInteropRuntimeStatus.Complete,
+                    currentIsComplete
+                        ? NativeInteropRuntimeStatus.Complete
+                        : NativeInteropRuntimeStatus.Partial,
                     snapshot.Target,
                     attemptedAt,
-                    completedAt,
+                    currentIsComplete
+                        ? completedAt
+                        : _state.LastSuccessfulAt,
                     RetainedLastGood: false,
                     snapshot.IsExportUniverseComplete,
                     snapshot.Contributions.Count,
@@ -497,7 +582,14 @@ internal sealed class NativeInteropCoordinator : IAsyncDisposable
                     analysisPublication.FindingsPublished,
                     analysisPublication.EdgesPublished,
                     _pendingStaleKeys.Count,
-                    Failures: OrderFailures(cleanupFailures));
+                    Failures: OrderFailures(currentFailures))
+                {
+                    HasCurrentProjection = true,
+                    DiscoveredProjects = _discoveredProjects,
+                    AttemptedProjects = imported.AttemptedProjects,
+                    SucceededProjects = projectCounts.Succeeded,
+                    FailedProjects = projectCounts.Failed,
+                };
                 _state = completed;
             }
             return new NativeInteropRunResult(
@@ -525,9 +617,58 @@ internal sealed class NativeInteropCoordinator : IAsyncDisposable
             return _testExtractor;
         }
 
+        var preparationGate = new SemaphoreSlim(1, 1);
+        IReadOnlyList<ClangInMemoryInput>? preparedInputs = null;
+        NativeWorkerFailure? preparationFailure = null;
+        var preparationFinished = false;
+
         return async (request, cancellationToken) =>
         {
-            var result = await _workerClient!.ExtractAsync(
+            if (!preparationFinished)
+            {
+                await preparationGate.WaitAsync(cancellationToken)
+                    .ConfigureAwait(false);
+                try
+                {
+                    if (!preparationFinished)
+                    {
+                        var preparation =
+                            await ProtectedNativeInputPreparer.PrepareAsync(
+                                    _scopeRoot,
+                                    request,
+                                    cancellationToken)
+                                .ConfigureAwait(false);
+                        if (preparation.IsSuccess)
+                        {
+                            preparedInputs =
+                                preparation.Request.InMemoryInputs.ToArray();
+                        }
+                        else
+                        {
+                            preparationFailure = new NativeWorkerFailure(
+                                preparation.FailureCode!,
+                                preparation.FailureMessage!);
+                        }
+                        preparationFinished = true;
+                    }
+                }
+                finally
+                {
+                    preparationGate.Release();
+                }
+            }
+
+            if (preparationFailure is not null)
+            {
+                workerFailures.Add(preparationFailure);
+                throw new NativeWorkerInvocationException(preparationFailure);
+            }
+
+            request = request with
+            {
+                InMemoryInputs = preparedInputs ?? [],
+            };
+            var result = await _workerClient!.ExtractPreparedAsync(
                     _scopeRoot,
                     request,
                     cancellationToken)
@@ -566,14 +707,28 @@ internal sealed class NativeInteropCoordinator : IAsyncDisposable
                 RetainedLastGood: lastSuccess is not null,
                 IsExportUniverseComplete: false,
                 snapshot?.Contributions.Count
-                    ?? _configuration.TranslationUnits.Count,
+                    ?? checked(
+                        _configuration.TranslationUnits.Count
+                        + _configuration.VcxProjects.Count),
                 snapshot?.IncludedFiles.Count ?? 0,
                 nativePublication?.SymbolsPublished ?? 0,
                 analysisPublication?.MatchesPublished ?? 0,
                 analysisPublication?.FindingsPublished ?? 0,
                 analysisPublication?.EdgesPublished ?? 0,
                 _pendingStaleKeys.Count,
-                OrderFailures(failures));
+                OrderFailures(failures))
+            {
+                HasCurrentProjection =
+                    nativePublication is
+                    {
+                        IsComplete: true,
+                        SymbolsPublished: > 0,
+                    },
+                DiscoveredProjects = _discoveredProjects,
+                AttemptedProjects = _configuration.VcxProjects.Count,
+                SucceededProjects = 0,
+                FailedProjects = _configuration.VcxProjects.Count,
+            };
             _state = failed;
         }
         return new NativeInteropRunResult(
@@ -581,6 +736,40 @@ internal sealed class NativeInteropCoordinator : IAsyncDisposable
             snapshot,
             nativePublication,
             analysisPublication);
+    }
+
+    private static (int Succeeded, int Failed) CountProjectOutcomes(
+        VcxProjectImportResult imported,
+        NativeInteropSnapshot snapshot)
+    {
+        var succeeded = 0;
+        foreach (var project in imported.ImportedProjects)
+        {
+            var directory = Path.GetDirectoryName(
+                    project.Replace('/', Path.DirectorySeparatorChar))
+                ?.Replace('\\', '/')
+                .Trim('/');
+            var projectContributions = snapshot.Contributions
+                .Where(contribution =>
+                {
+                    var path = contribution.Configuration.Path
+                        .Replace('\\', '/');
+                    return string.IsNullOrEmpty(directory)
+                        || path.StartsWith(
+                            directory + "/",
+                            StringComparison.OrdinalIgnoreCase);
+                })
+                .ToArray();
+            if (projectContributions.Length > 0
+                && projectContributions.All(contribution =>
+                    contribution.IsComplete))
+            {
+                succeeded++;
+            }
+        }
+        return (
+            succeeded,
+            Math.Max(imported.AttemptedProjects - succeeded, 0));
     }
 
     private static IReadOnlyList<NativeInteropRuntimeFailure>
@@ -731,6 +920,25 @@ internal sealed class NativeInteropCoordinator : IAsyncDisposable
                 AddConfiguredPath(paths, scopeRoot, unit.BinaryPath);
             }
         }
+        foreach (var project in configuration.VcxProjects)
+        {
+            AddConfiguredPath(paths, scopeRoot, project.Path);
+            if (project.BinaryPath is not null)
+            {
+                AddConfiguredPath(paths, scopeRoot, project.BinaryPath);
+            }
+
+            var projectDirectory = Path.GetDirectoryName(project.Path);
+            foreach (var source in project.SourceFiles)
+            {
+                AddConfiguredPath(
+                    paths,
+                    scopeRoot,
+                    string.IsNullOrEmpty(projectDirectory)
+                        ? source
+                        : Path.Join(projectDirectory, source));
+            }
+        }
         return paths;
     }
 
@@ -777,6 +985,7 @@ internal sealed class NativeInteropCoordinator : IAsyncDisposable
             ".dylib",
             ".a",
             ".lib",
+            ".vcxproj",
         };
         foreach (var unit in configuration.TranslationUnits)
         {
@@ -784,6 +993,18 @@ internal sealed class NativeInteropCoordinator : IAsyncDisposable
             if (unit.BinaryPath is not null)
             {
                 AddExtension(extensions, unit.BinaryPath);
+            }
+        }
+        foreach (var project in configuration.VcxProjects)
+        {
+            AddExtension(extensions, project.Path);
+            if (project.BinaryPath is not null)
+            {
+                AddExtension(extensions, project.BinaryPath);
+            }
+            foreach (var source in project.SourceFiles)
+            {
+                AddExtension(extensions, source);
             }
         }
         return extensions

@@ -113,7 +113,7 @@ public sealed class NativeInteropCoordinatorTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task Incomplete_managed_universe_publishes_native_facts_but_not_analysis()
+    public async Task Incomplete_managed_universe_publishes_current_positive_projection()
     {
         Write("native/api.cpp");
         await using var coordinator = Coordinator(
@@ -127,11 +127,12 @@ public sealed class NativeInteropCoordinatorTests : IAsyncLifetime
 
         result.State.Status.Should().Be(
             NativeInteropRuntimeStatus.Partial);
-        result.State.IsExportUniverseComplete.Should().BeFalse();
+        result.State.IsExportUniverseComplete.Should().BeTrue();
+        result.State.HasCurrentProjection.Should().BeTrue();
         result.State.Failures.Should().ContainSingle()
             .Which.Code.Should().Be("managed-snapshot-incomplete");
         result.NativePublication.Should().NotBeNull();
-        result.AnalysisPublication.Should().BeNull();
+        result.AnalysisPublication.Should().NotBeNull();
         (await InteropFactStoreReader.ReadNativeExportsAsync(_store!))
             .Facts.Should().ContainSingle();
     }
@@ -255,6 +256,124 @@ public sealed class NativeInteropCoordinatorTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task Vcxproj_import_expands_into_the_existing_snapshot_pipeline()
+    {
+        Write("native/api.c");
+        File.WriteAllText(
+            Path.Join(_root, "native", "native.vcxproj"),
+            """
+            <Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+              <ItemGroup Label="ProjectConfigurations">
+                <ProjectConfiguration Include="Release|x64">
+                  <Configuration>Release</Configuration>
+                  <Platform>x64</Platform>
+                </ProjectConfiguration>
+              </ItemGroup>
+              <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+                <ClCompile>
+                  <PreprocessorDefinitions>NATIVE_EXPORTS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+                </ClCompile>
+              </ItemDefinitionGroup>
+              <ItemGroup>
+                <ClCompile Include="api.c" />
+              </ItemGroup>
+            </Project>
+            """);
+        var configuration = new ScopeInteropConfig(Target, [])
+        {
+            VcxProjects =
+            [
+                new InteropVcxProjectConfig(
+                    "native/native.vcxproj",
+                    "Release",
+                    "x64",
+                    "native.dll",
+                    ["api.c"],
+                    [],
+                    null),
+            ],
+        };
+        var extractionCalls = 0;
+        await using var coordinator = Coordinator(
+            configuration,
+            new FixedTrustPolicy(allowed: true),
+            (request, _) =>
+            {
+                extractionCalls++;
+                request.SourceFilePath.Should().EndWith("api.c");
+                request.CompilerArguments.Should().Contain(
+                    "-DNATIVE_EXPORTS");
+                return Task.FromResult(Extraction(
+                    request,
+                    Export(request, "c:E:native/api.c::run")));
+            });
+
+        var result = await coordinator.RunAsync();
+
+        result.State.Status.Should().Be(
+            NativeInteropRuntimeStatus.Complete);
+        result.State.TranslationUnits.Should().Be(1);
+        extractionCalls.Should().Be(2);
+        coordinator.WatchExtensions.Should().Contain(".vcxproj");
+        coordinator.IsRelevantPath(
+                Path.Join(_root, "native", "native.vcxproj"))
+            .Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task Failed_translationUnit_doesNotDiscardCurrentSuccessfulFacts()
+    {
+        Write("native/good.cpp");
+        Write("native/bad.cpp");
+        var configuration = new ScopeInteropConfig(
+            Target,
+            [
+                new InteropTranslationUnitConfig(
+                    "native/good.cpp",
+                    "native.dll",
+                    ["-x", "c++"],
+                    BinaryPath: null),
+                new InteropTranslationUnitConfig(
+                    "native/bad.cpp",
+                    "native.dll",
+                    ["-x", "c++"],
+                    BinaryPath: null),
+            ]);
+        await using var coordinator = Coordinator(
+            configuration,
+            new FixedTrustPolicy(allowed: true),
+            (request, _) =>
+            {
+                if (request.SourceFilePath.EndsWith(
+                        "bad.cpp",
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new IOException("injected bad translation unit");
+                }
+                return Task.FromResult(Extraction(
+                    request,
+                    Export(request, "c:E:native/good.cpp::run")));
+            });
+
+        var result = await coordinator.RunAsync();
+
+        result.State.Status.Should().Be(
+            NativeInteropRuntimeStatus.Partial);
+        result.State.HasCurrentProjection.Should().BeTrue(
+            string.Join(
+                " | ",
+                result.State.Failures.Select(failure =>
+                    $"{failure.Stage}/{failure.Code}: {failure.Message}")));
+        result.State.IsExportUniverseComplete.Should().BeFalse();
+        result.State.Failures.Should().Contain(failure =>
+            failure.Code == "extraction-failed");
+        (await InteropFactStoreReader.ReadNativeExportsAsync(_store!))
+            .Facts.Should().ContainSingle()
+            .Which.Fact.SymbolCanonicalKey.Should().Be(
+                "c:E:native/good.cpp::run");
+    }
+
+    [Fact]
     public async Task Cancellation_is_propagated_without_claiming_a_partial_result()
     {
         Write("native/api.cpp");
@@ -282,8 +401,7 @@ public sealed class NativeInteropCoordinatorTests : IAsyncLifetime
         IExecutionTrustPolicy trust,
         NativeInteropExtractor extractor,
         NativeInteropBinaryVerifier? verifier = null) =>
-        new(
-            _root,
+        Coordinator(
             new ScopeInteropConfig(
                 Target,
                 [
@@ -293,6 +411,18 @@ public sealed class NativeInteropCoordinatorTests : IAsyncLifetime
                         ["-x", "c++"],
                         BinaryPath: null),
                 ]),
+            trust,
+            extractor,
+            verifier);
+
+    private NativeInteropCoordinator Coordinator(
+        ScopeInteropConfig configuration,
+        IExecutionTrustPolicy trust,
+        NativeInteropExtractor extractor,
+        NativeInteropBinaryVerifier? verifier = null) =>
+        new(
+            _root,
+            configuration,
             new ScopePathPolicy(_root),
             _store!,
             trust,

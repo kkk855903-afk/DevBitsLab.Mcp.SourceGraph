@@ -81,6 +81,8 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
     private const int MaximumManagedAbiRecordsPerFile = 4096;
     private const int MaximumManagedInteropUsagesPerFile = 4096;
     private const int MaximumManagedImportFanoutProbeRows = 50_000;
+    private const int MaximumFallbackCSharpFiles = 20_000;
+    private const int MaximumFallbackDirectories = 50_000;
     /// <inheritdoc />
     IReadOnlyCollection<string> ILanguageIndexer.FileExtensions => _fileExtensions;
 
@@ -578,8 +580,15 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                         openResult.Diagnostics,
                         isInitialWorkspaceOpen ? "Initial" : "Re-open");
                 }
+                var rawSolution = failureDiagnostics.Count == 0
+                    ? openResult.Solution
+                    : AddFallbackCSharpDocuments(
+                        openResult.Solution,
+                        candidateSolutionPath,
+                        privacyRoot,
+                        candidatePathPolicy);
                 candidateSolution = SolutionPrivacySanitizer.SanitizeForScope(
-                    openResult.Solution,
+                    rawSolution,
                     candidatePathPolicy,
                     IsBuildGeneratedDocument);
             }
@@ -616,6 +625,275 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         {
             _lock.Release();
         }
+    }
+
+    private Solution AddFallbackCSharpDocuments(
+        Solution solution,
+        string solutionPath,
+        string privacyRoot,
+        ScopePathPolicy pathPolicy)
+    {
+        var relativeSolution = Path.GetRelativePath(
+            privacyRoot,
+            solutionPath);
+        if (Path.IsPathRooted(relativeSolution)
+            || relativeSolution.Equals("..", StringComparison.Ordinal)
+            || relativeSolution.StartsWith(
+                ".." + Path.DirectorySeparatorChar,
+                StringComparison.Ordinal))
+        {
+            return solution;
+        }
+
+        var membership = SolutionProjectMembershipResolver.Resolve(
+            privacyRoot,
+            new ScopeProjectSet.Solutions(
+                [relativeSolution.Replace('\\', '/')],
+                _configuredExcludePatterns));
+        var csharpMembers = membership.Projects
+            .Where(member => string.Equals(
+                Path.GetExtension(member.FullPath),
+                ".csproj",
+                StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+        if (csharpMembers.Length == 0)
+        {
+            return solution;
+        }
+
+        var projectDirectories = csharpMembers
+            .Select(member => Path.TrimEndingDirectorySeparator(
+                Path.GetDirectoryName(member.FullPath)!))
+            .Distinct(_pathComparer)
+            .OrderByDescending(path => path.Length)
+            .ToArray();
+        var knownPaths = solution.Projects
+            .SelectMany(project => project.Documents)
+            .Where(document => !string.IsNullOrWhiteSpace(document.FilePath))
+            .Select(document => Path.GetFullPath(document.FilePath!))
+            .ToHashSet(_pathComparer);
+        var fallbackReferences = FallbackMetadataReferences();
+        var filesAdded = 0;
+
+        foreach (var member in csharpMembers)
+        {
+            var project = solution.Projects.FirstOrDefault(candidate =>
+                candidate.FilePath is not null
+                && string.Equals(
+                    Path.GetFullPath(candidate.FilePath),
+                    Path.GetFullPath(member.FullPath),
+                    _pathComparison));
+            if (project is not null && project.Documents.Any())
+            {
+                continue;
+            }
+            if (project is null)
+            {
+                var projectId = ProjectId.CreateNewId(member.Name);
+                solution = solution.AddProject(ProjectInfo.Create(
+                    projectId,
+                    VersionStamp.Create(),
+                    member.Name,
+                    Path.GetFileNameWithoutExtension(member.FullPath),
+                    LanguageNames.CSharp,
+                    filePath: member.FullPath,
+                    compilationOptions: new CSharpCompilationOptions(
+                        OutputKind.DynamicallyLinkedLibrary),
+                    parseOptions: CSharpParseOptions.Default,
+                    metadataReferences: fallbackReferences));
+                project = solution.GetProject(projectId);
+            }
+            else
+            {
+                var references = project.MetadataReferences
+                    .Concat(fallbackReferences)
+                    .DistinctBy(reference => reference.Display, _pathComparer)
+                    .ToArray();
+                solution = solution
+                    .WithProjectMetadataReferences(project.Id, references)
+                    .WithProjectCompilationOptions(
+                        project.Id,
+                        project.CompilationOptions
+                        ?? new CSharpCompilationOptions(
+                            OutputKind.DynamicallyLinkedLibrary))
+                    .WithProjectParseOptions(
+                        project.Id,
+                        project.ParseOptions
+                        ?? CSharpParseOptions.Default);
+                project = solution.GetProject(project.Id);
+            }
+            if (project is null)
+            {
+                continue;
+            }
+
+            var projectDirectory = Path.TrimEndingDirectorySeparator(
+                Path.GetDirectoryName(member.FullPath)!);
+            foreach (var sourcePath in EnumerateFallbackCSharpFiles(
+                         projectDirectory,
+                         projectDirectories,
+                         pathPolicy))
+            {
+                if (filesAdded >= MaximumFallbackCSharpFiles)
+                {
+                    _logger.LogWarning(
+                        "C# fallback discovery reached the {Limit}-file limit",
+                        MaximumFallbackCSharpFiles);
+                    return solution;
+                }
+                if (!knownPaths.Add(sourcePath))
+                {
+                    continue;
+                }
+                solution = solution.AddDocument(
+                    DocumentId.CreateNewId(project.Id),
+                    Path.GetFileName(sourcePath),
+                    SourceText.From(string.Empty),
+                    filePath: sourcePath);
+                filesAdded++;
+            }
+        }
+
+        if (filesAdded > 0)
+        {
+            _logger.LogInformation(
+                "Added {Count} safe syntax/semantic fallback C# documents from solution-member project directories",
+                filesAdded);
+        }
+        return solution;
+    }
+
+    private static IEnumerable<string> EnumerateFallbackCSharpFiles(
+        string projectDirectory,
+        IReadOnlyList<string> projectDirectories,
+        ScopePathPolicy pathPolicy)
+    {
+        var pending = new Stack<string>();
+        pending.Push(projectDirectory);
+        var directoriesVisited = 0;
+        while (pending.Count > 0
+               && directoriesVisited < MaximumFallbackDirectories)
+        {
+            var directory = pending.Pop();
+            directoriesVisited++;
+            IEnumerable<string> files;
+            IEnumerable<string> children;
+            try
+            {
+                files = Directory.EnumerateFiles(
+                    directory,
+                    "*.cs",
+                    SearchOption.TopDirectoryOnly);
+                children = Directory.EnumerateDirectories(
+                    directory,
+                    "*",
+                    SearchOption.TopDirectoryOnly);
+            }
+            catch (Exception ex) when (
+                ex is IOException
+                    or UnauthorizedAccessException
+                    or System.Security.SecurityException)
+            {
+                continue;
+            }
+
+            foreach (var file in files)
+            {
+                if (!pathPolicy.IsExcludedForDiscovery(
+                        file,
+                        out var resolved)
+                    && resolved is not null
+                    && File.Exists(resolved)
+                    && IsContainedBy(resolved, projectDirectory)
+                    && string.Equals(
+                        OwningProjectDirectory(
+                            resolved,
+                            projectDirectories),
+                        projectDirectory,
+                        _pathComparison))
+                {
+                    yield return Path.GetFullPath(resolved);
+                }
+            }
+            foreach (var child in children)
+            {
+                var name = Path.GetFileName(child);
+                if (name.Equals("bin", StringComparison.OrdinalIgnoreCase)
+                    || name.Equals("obj", StringComparison.OrdinalIgnoreCase)
+                    || name.Equals(".git", StringComparison.OrdinalIgnoreCase)
+                    || name.Equals(
+                        ".sourcegraph",
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+                try
+                {
+                    if ((File.GetAttributes(child)
+                         & FileAttributes.ReparsePoint) != 0
+                        || pathPolicy.IsExcludedForDiscovery(
+                            child,
+                            out var resolved)
+                        || resolved is null
+                        || !IsContainedBy(resolved, projectDirectory)
+                        || (!string.Equals(
+                                resolved,
+                                projectDirectory,
+                                _pathComparison)
+                            && projectDirectories.Contains(
+                                Path.TrimEndingDirectorySeparator(resolved),
+                                _pathComparer)))
+                    {
+                        continue;
+                    }
+                    pending.Push(Path.GetFullPath(resolved));
+                }
+                catch (Exception ex) when (
+                    ex is IOException
+                        or UnauthorizedAccessException
+                        or System.Security.SecurityException)
+                {
+                    // The fallback is positive-only; unreadable directories remain unknown.
+                }
+            }
+        }
+    }
+
+    private static string? OwningProjectDirectory(
+        string path,
+        IReadOnlyList<string> projectDirectories) =>
+        projectDirectories.FirstOrDefault(directory =>
+            IsContainedBy(path, directory));
+
+    private static bool IsContainedBy(string path, string directory)
+    {
+        var relative = Path.GetRelativePath(directory, path);
+        return !Path.IsPathRooted(relative)
+            && !relative.Equals("..", StringComparison.Ordinal)
+            && !relative.StartsWith(
+                ".." + Path.DirectorySeparatorChar,
+                StringComparison.Ordinal);
+    }
+
+    private static IReadOnlyList<MetadataReference>
+        FallbackMetadataReferences()
+    {
+        var trustedPlatformAssemblies =
+            AppContext.GetData("TRUSTED_PLATFORM_ASSEMBLIES") as string;
+        if (string.IsNullOrWhiteSpace(trustedPlatformAssemblies))
+        {
+            return
+            [
+                MetadataReference.CreateFromFile(
+                    typeof(object).Assembly.Location),
+            ];
+        }
+        return trustedPlatformAssemblies
+            .Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries)
+            .Where(File.Exists)
+            .Distinct(_pathComparer)
+            .Select(path => MetadataReference.CreateFromFile(path))
+            .ToArray();
     }
 
     public async Task<IndexResult> IndexAllAsync(CancellationToken ct = default)
@@ -1998,8 +2276,13 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         IReadOnlyList<WorkspaceDiagnostic> diagnostics) =>
         diagnostics
             .Where(diagnostic =>
-                diagnostic.Kind == WorkspaceDiagnosticKind.Failure)
+                diagnostic.Kind == WorkspaceDiagnosticKind.Failure
+                && !IsVisualCppWorkspaceDiagnostic(diagnostic.Message))
             .ToArray();
+
+    internal static bool IsVisualCppWorkspaceDiagnostic(string message) =>
+        !string.IsNullOrWhiteSpace(message)
+        && message.Contains(".vcxproj", StringComparison.OrdinalIgnoreCase);
 
     private bool IsCSharpStructureChange(Solution solution, string path)
     {

@@ -1,4 +1,5 @@
 using DevBitsLab.Mcp.SourceGraph.Server.Interop;
+using DevBitsLab.Mcp.SourceGraph.Core;
 using FluentAssertions;
 using Xunit;
 
@@ -38,6 +39,43 @@ public sealed class NativeInteropDiscoveryTests : IDisposable
             .Contain("architecture=ambiguous")
             .And.Contain("configuration=ambiguous")
             .And.Contain("ambiguous targets are not selected");
+    }
+
+    [Fact]
+    public void Solution_discovery_reportsOnlyMemberVcxProjects()
+    {
+        Directory.CreateDirectory(Path.Join(_root, "member"));
+        Directory.CreateDirectory(Path.Join(_root, "outside"));
+        File.WriteAllText(
+            Path.Join(_root, "member", "Member.vcxproj"),
+            "<Project />");
+        File.WriteAllText(
+            Path.Join(_root, "outside", "Outside.vcxproj"),
+            "<Project />");
+        File.WriteAllText(
+            Path.Join(_root, "Fixture.sln"),
+            """
+            Microsoft Visual Studio Solution File, Format Version 12.00
+            Project("{BC8A1FFA-BEE3-4634-8014-F334798102B3}") = "Member", "member\Member.vcxproj", "{11111111-1111-1111-1111-111111111111}"
+            EndProject
+            Global
+            EndGlobal
+            """);
+        var scope = new Scope(
+            "fixture",
+            "Fixture",
+            _root,
+            new ScopeProjectSet.Solutions(["Fixture.sln"], []),
+            Isolated: false,
+            DateTimeOffset.MinValue);
+
+        var result = NativeInteropDiscovery.Discover(scope);
+
+        result.VcxProjects.Should().Equal("member/Member.vcxproj");
+        result.IsSolutionScoped.Should().BeTrue();
+        result.ToDiagnostic().Should()
+            .Contain("contains 1 native project")
+            .And.Contain("outside the solution are excluded");
     }
 
     public void Dispose()

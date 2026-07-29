@@ -11,6 +11,20 @@ below note which package the change applies to.
 ## [Unreleased]
 
 ### Changed
+- **Solution-bounded `.vcxproj` indexing for managed/native source tracing.**
+  `.sln` and `.slnx` membership is now the hard project boundary shared by
+  indexing and watching. SourceGraph safely reads solution configuration
+  mappings and statically expands every enabled `ClCompile` item without
+  executing MSBuild targets, tasks, props, or build events. Native
+  configuration is synthesized automatically when a solution is present;
+  explicit interop settings may enrich member projects but cannot remove
+  solution members or narrow them to one source file. Native failures are
+  isolated per project and translation unit, and stable positive definitions,
+  calls, exports, and P/Invoke matches remain queryable from a partial
+  projection. BR-01 coverage proves exactly 9 solution-member `.vcxproj`
+  projects and 66 compile items, including `AlgorithmBridge.cpp`
+  `AB_GetAPIVersion` and the
+  `AB_InitializeRefraction → AB_ShutdownRefraction` call.
 - **Reduced extension calls, WPF compiler inputs, and compact impact audits.**
   Reduced extension-method invocations now normalize through Roslyn's
   `ReducedFrom.OriginalDefinition`, so references, callers, and impact edges

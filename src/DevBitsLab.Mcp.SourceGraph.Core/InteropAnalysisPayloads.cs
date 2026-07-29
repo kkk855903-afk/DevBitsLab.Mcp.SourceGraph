@@ -142,12 +142,11 @@ public static partial class InteropFactPayloadCodec
         switch (status)
         {
             case InteropMatchStatus.Matched or InteropMatchStatus.SourceMatched
-                when !payload.SnapshotComplete
-                    || nativeKey is null
+                when nativeKey is null
                     || payload.CandidateCount < 1:
                 throw Invalid(
-                    "A matched or source-matched result requires a complete snapshot, "
-                    + "a native symbol, and at least one candidate.");
+                    "A matched or source-matched result requires a native symbol "
+                    + "and at least one candidate.");
 
             case InteropMatchStatus.Unmatched
                 when !payload.SnapshotComplete

@@ -410,17 +410,12 @@ public sealed class InteropMatcherTests
 
     [Theory]
     [InlineData("none")]
-    [InlineData("unique")]
     [InlineData("wrong-module")]
-    public void IncompleteSnapshot_cannotProveAbsenceOrUniqueness(string candidateShape)
+    public void IncompleteSnapshot_cannotProveAbsence(string candidateShape)
     {
         var exports = candidateShape switch
         {
             "none" => Array.Empty<NativeExport>(),
-            "unique" =>
-            [
-                Native("medalgo.dll", "run", "c:E:native.cpp::run"),
-            ],
             "wrong-module" =>
             [
                 Native("other.dll", "run", "c:E:other.cpp::run"),
@@ -438,6 +433,22 @@ public sealed class InteropMatcherTests
         match.Confidence.Should().Be(EvidenceConfidence.Inferred);
         match.Reasons.Should().Contain(reason => reason.Contains(
             "snapshot is incomplete",
+            StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void IncompleteSnapshot_preservesConcretePositiveMatch()
+    {
+        var match = new InteropMatcher().Match(
+            Managed("medalgo", "run"),
+            [Native("medalgo.dll", "run", "c:E:native.cpp::run")],
+            isExportUniverseComplete: false);
+
+        match.Status.Should().Be(InteropMatchStatus.Matched);
+        match.NativeSymbolCanonicalKey.Should().Be(
+            "c:E:native.cpp::run");
+        match.Reasons.Should().Contain(reason => reason.Contains(
+            "successfully indexed projects",
             StringComparison.OrdinalIgnoreCase));
     }
 

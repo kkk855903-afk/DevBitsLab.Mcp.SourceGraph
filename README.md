@@ -201,11 +201,21 @@ reparse points that escape the scope.
 
 ### Configure native interop
 
-Native indexing is opt-in per scope. Declare one explicit ABI target and the
-ordered translation units to parse; the server does not infer ABI settings
-from the host and the native pipeline does not execute a native build or import
-`compile_commands.json`. Paths are repository-relative, while `arguments` are
-the exact libclang parse arguments:
+When a scope is backed by a `.sln` or `.slnx`, SourceGraph automatically
+discovers member `.vcxproj` files and indexes every enabled `ClCompile` item.
+Solution membership is a hard boundary for every language indexer and watcher:
+projects elsewhere in the repository are excluded. SourceGraph prefers
+`Release|<host architecture>`, then `Debug|<host architecture>`, and finally
+the first uniform supported solution mapping. It never executes a native
+build, project target, task, build event, imported props/targets, or
+`compile_commands.json`.
+
+An explicit `interop` block remains available for scopes without a solution,
+or to enrich solution-member projects with a target, library, binary path, or
+additional Clang arguments. In solution scope it cannot add outside projects,
+remove member projects, or narrow a project to selected source files. The
+external `NativeParsing` trust grant is still required before any Clang worker
+is started.
 
 When an interop query is made before this block is configured, the server runs
 a bounded, read-only discovery pass and reports `.vcxproj`, `CMakeLists.txt`,
@@ -257,10 +267,49 @@ configuration below.
 }
 ```
 
+For a non-solution scope, select the MSVC project configuration and platform
+explicitly:
+
+```json
+{
+  "interop": {
+    "target": {
+      "runtime_identifier": "win-x64",
+      "architecture": "x64",
+      "compiler_abi": "msvc",
+      "pointer_size_bytes": 8,
+      "default_pack": 8
+    },
+    "vcx_projects": [
+      {
+        "path": "AlgorithmBridge/AlgorithmBridge.vcxproj",
+        "configuration": "Release",
+        "platform": "x64",
+        "library": "AlgorithmBridge.dll",
+        "source_files": ["AlgorithmBridgeHeaderCheck.c"],
+        "additional_arguments": ["-DAB_SOURCEGRAPH=1"],
+        "binary_path": "Release/AlgorithmBridge.dll"
+      }
+    ]
+  }
+}
+```
+
+The static importer reads matching `PropertyGroup`, `ItemDefinitionGroup`, and
+`ClCompile` entries, including per-item `ExcludedFromBuild`, definitions,
+include directories, `CompileAs`, character set, and C/C++ language standard.
+`source_files` is optional; omitting it selects all enabled `ClCompile` items.
+Configuration and platform are mandatory because multi-flavour projects cannot
+be indexed safely by guessing. Microsoft toolset/Windows SDK headers are
+located at runtime and admitted as read-only system inputs; they are excluded
+from repository evidence and content hashes.
+
 `binary_path` is optional. When supplied, the file must stay inside the privacy
 boundary and is used to verify that the configured library really exports the
 matched symbol. Explicit include paths and every observed repository include
-must resolve inside the approved scope. Compiler-controlled file inputs,
+must resolve inside the approved scope. Only system headers below the
+runtime-discovered MSVC/Windows SDK roots may resolve outside it.
+Compiler-controlled file inputs,
 non-literal includes, response files, plugins, PCH/module inputs, output paths,
 and other arguments that cannot be validated safely fail closed; there is no
 textual parser fallback.
@@ -938,7 +987,8 @@ A `.sourcegraph.json` at the repo root opts a project into multi-scope mode:
   `scopes info`, but no first-party plugin consumes it at this version —
   the first runtime use lands with the TypeScript indexer.
 - `interop` (object, optional) enables the native pipeline for that scope. It
-  requires an explicit `target` and non-empty ordered `translation_units`;
+  requires an explicit `target` and at least one ordered `translation_units`
+  or statically imported `vcx_projects` entry;
   see [Privacy, trust, and native configuration](#privacy-trust-and-native-configuration).
   A configured scope without an external `NativeParsing` trust grant is
   reported partial instead of falling back to textual matching.

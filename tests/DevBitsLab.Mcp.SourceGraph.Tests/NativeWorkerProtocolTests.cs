@@ -42,6 +42,81 @@ public sealed class NativeWorkerProtocolTests : IDisposable
     }
 
     [Fact]
+    public void RequestCodec_roundTrips_runtime_system_include_roots()
+    {
+        var systemIncludes = Path.Join(_root, "system-includes");
+        Directory.CreateDirectory(systemIncludes);
+        var request = Request() with
+        {
+            SystemIncludeDirectories = [systemIncludes],
+        };
+
+        var payload = NativeWorkerProtocol.EncodeRequest(request);
+        var decoded = NativeWorkerProtocol.DecodeRequest(payload);
+
+        decoded.Request.SystemIncludeDirectories
+            .Should().Equal(systemIncludes);
+    }
+
+    [Fact]
+    public void RequestCodec_roundTrips_bounded_in_memory_inputs()
+    {
+        var header = Path.Combine(_root, "protected.hpp");
+        File.WriteAllText(header, "// physical placeholder");
+        var request = Request() with
+        {
+            InMemoryInputs =
+            [
+                new ClangInMemoryInput(
+                    header,
+                    Encoding.UTF8.GetBytes("#pragma once\nint protected_api();\n")),
+            ],
+        };
+
+        var payload = NativeWorkerProtocol.EncodeRequest(request);
+        var decoded = NativeWorkerProtocol.DecodeRequest(payload);
+
+        decoded.Request.InMemoryInputs.Should().BeEquivalentTo(
+            request.InMemoryInputs);
+    }
+
+    [Fact]
+    public void RequestCodec_rejects_protected_in_memory_payload()
+    {
+        var header = Path.Combine(_root, "protected.hpp");
+        File.WriteAllText(header, "// physical placeholder");
+        var request = Request() with
+        {
+            InMemoryInputs =
+            [
+                new ClangInMemoryInput(
+                    header,
+                    Encoding.UTF8.GetBytes("HSKey\0protected")),
+            ],
+        };
+
+        var act = () => NativeWorkerProtocol.EncodeRequest(request);
+
+        act.Should().Throw<NativeWorkerProtocolException>()
+            .Which.Code.Should().Be("invalid-request");
+    }
+
+    [Fact]
+    public void RequestCodec_rejects_missing_system_include_root()
+    {
+        var request = Request() with
+        {
+            SystemIncludeDirectories =
+                [Path.Join(_root, "missing-system-includes")],
+        };
+
+        var act = () => NativeWorkerProtocol.EncodeRequest(request);
+
+        act.Should().Throw<NativeWorkerProtocolException>()
+            .Which.Code.Should().Be("invalid-request");
+    }
+
+    [Fact]
     public void RequestCodec_rejectsUnknownJsonMembers()
     {
         var json = Encoding.UTF8.GetString(
@@ -98,8 +173,8 @@ public sealed class NativeWorkerProtocolTests : IDisposable
         var request = Request() with
         {
             CompilerArguments = Enumerable.Repeat(
-                new string('a', 1024),
-                2048).ToArray(),
+                new string('a', 2048),
+                4096).ToArray(),
         };
 
         var act = () => NativeWorkerProtocol.EncodeRequest(request);
