@@ -54,7 +54,14 @@ internal static class SymbolMapping
     /// </summary>
     public static string? CanonicalKey(ISymbol symbol)
     {
-        var raw = symbol.OriginalDefinition.GetDocumentationCommentId() ?? symbol.OriginalDefinition.ToDisplayString(FqnFormat);
+        // Roslyn represents an extension-method invocation as a reduced method whose
+        // receiver parameter has been removed. Its documentation id therefore differs
+        // from the declaration unless we first return to ReducedFrom.
+        var definition = symbol is IMethodSymbol { ReducedFrom: not null } method
+            ? method.ReducedFrom.OriginalDefinition
+            : symbol.OriginalDefinition;
+        var raw = definition.GetDocumentationCommentId()
+            ?? definition.ToDisplayString(FqnFormat);
         return raw is null ? null : CanonicalKeyScheme + raw;
     }
 
@@ -75,7 +82,9 @@ internal static class SymbolMapping
             TypeKind.TypeParameter => SymbolKinds.TypeParameter,
             _ => SymbolKinds.Class,
         },
-        IMethodSymbol m => m.MethodKind == MethodKind.Constructor ? SymbolKinds.Constructor : SymbolKinds.Method,
+        IMethodSymbol m => m.MethodKind is MethodKind.Constructor or MethodKind.StaticConstructor
+            ? SymbolKinds.Constructor
+            : SymbolKinds.Method,
         IPropertySymbol => SymbolKinds.Property,
         IFieldSymbol f when f.ContainingType?.TypeKind == TypeKind.Enum => SymbolKinds.EnumMember,
         IFieldSymbol => SymbolKinds.Field,
@@ -91,6 +100,7 @@ internal static class SymbolMapping
         ITypeSymbol t => t.TypeKind is TypeKind.Class or TypeKind.Struct or TypeKind.Interface or TypeKind.Enum or TypeKind.Delegate,
         IMethodSymbol m => m.MethodKind is MethodKind.Ordinary
             or MethodKind.Constructor
+            or MethodKind.StaticConstructor
             or MethodKind.UserDefinedOperator
             or MethodKind.Conversion
             or MethodKind.ExplicitInterfaceImplementation,

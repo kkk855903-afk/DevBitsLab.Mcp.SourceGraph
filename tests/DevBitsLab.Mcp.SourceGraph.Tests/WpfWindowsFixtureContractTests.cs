@@ -108,13 +108,28 @@ public sealed class WpfWindowsFixtureContractTests
                         .Select(document => Path.GetFileName(document.FilePath));
                 })
                 .ToArray();
-            filteredGeneratedSources.Should().Contain("App.g.cs");
-            filteredGeneratedSources.Should().Contain("MainWindow.g.cs");
-            roslyn.IsProjectSemanticInputComplete(projectPath).Should().BeFalse(
-                "privacy-filtered WPF generated sources are part of the raw compiler input");
+            filteredGeneratedSources.Should().NotContain("App.g.cs");
+            filteredGeneratedSources.Should().NotContain("MainWindow.g.cs");
+            roslyn.IsProjectSemanticInputComplete(projectPath).Should().BeTrue(
+                "validated WPF compiler inputs remain compilation-only semantic input");
             roslyn.IsProjectXamlPositiveResolutionSafe(projectPath)
                 .Should().BeTrue(
                     "Roslyn build provenance permits direct positive facts without making absence authoritative");
+            (await store.FindDiagnosticsAsync(
+                    severity: null,
+                    code: "CS0103",
+                    symbolId: null,
+                    limit: 100))
+                .Should().NotContain(diagnostic =>
+                    diagnostic.Message.Contains(
+                        "InitializeComponent",
+                        StringComparison.Ordinal)
+                    || diagnostic.Message.Contains(
+                        "QueryTextBox",
+                        StringComparison.Ordinal)
+                    || diagnostic.Message.Contains(
+                        "RunButton",
+                        StringComparison.Ordinal));
 
             await DispatchXamlAsync(
                 store,
@@ -151,8 +166,10 @@ public sealed class WpfWindowsFixtureContractTests
                     runButton.Id,
                     limit: 10,
                     edgeKind: "handles-event"))
-                .Should().BeEmpty(
-                    "positive-only safety does not authorize event-handler inference");
+                .Should().ContainSingle(target =>
+                    target.CanonicalKey
+                    == "csharp:M:SampleWpfWindows.Views.MainWindow.OnRunClick(System.Object,System.Windows.RoutedEventArgs)",
+                    "the complete WPF compilation authorizes the exact event handler");
 
             var missing = (await store.FindSymbolsAsync("MissingBinding"))
                 .Single(symbol => symbol.Kind == "xaml-element");
@@ -164,12 +181,12 @@ public sealed class WpfWindowsFixtureContractTests
                     "an omitted build output never authorizes a negative binding claim");
             var outcome = (await store.GetAnnotationsForSymbolAsync(missing.Id))
                 .Should().ContainSingle(annotation =>
-                    annotation.Flavor == "xaml-binding-outcome"
-                    && annotation.FullName == "incomplete")
+                    annotation.Flavor == "xaml-binding-finding"
+                    && annotation.FullName == "XAMLBINDING001")
                 .Subject;
             using var outcomeJson = JsonDocument.Parse(outcome.ArgsJson!);
-            outcomeJson.RootElement.GetProperty("reason").GetString()
-                .Should().Be("compilation-has-errors");
+            outcomeJson.RootElement.GetProperty("status").GetString()
+                .Should().Be("missing");
         }
         finally
         {

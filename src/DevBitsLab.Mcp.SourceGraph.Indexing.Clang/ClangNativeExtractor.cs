@@ -2,6 +2,8 @@ using ClangSharp;
 using ClangSharp.Interop;
 using DevBitsLab.Mcp.SourceGraph.Core;
 using DevBitsLab.Mcp.SourceGraph.Sdk;
+using System.Runtime.InteropServices;
+using System.Text;
 using CoreEvidenceConfidence = DevBitsLab.Mcp.SourceGraph.Core.EvidenceConfidence;
 using CoreSourceLocation = DevBitsLab.Mcp.SourceGraph.Core.SourceLocation;
 
@@ -93,8 +95,10 @@ public static class ClangNativeExtractor
         if (!ClangInputPreflight.TryNormalizeCompilerArguments(
                 request.CompilerArguments,
                 lexicalScopePolicy,
+                request.SystemIncludeDirectories,
                 out var compilerArguments,
                 out var includeDirectories,
+                out var systemIncludeDirectories,
                 out var argumentRejection))
         {
             return WithDiagnostic(UnsafeInput(argumentRejection));
@@ -102,7 +106,9 @@ public static class ClangNativeExtractor
         if (!ClangInputPreflight.TryValidateExplicitIncludeGraph(
                 sourceFilePath,
                 includeDirectories,
+                systemIncludeDirectories,
                 scopePolicy,
+                out var approvedInputFiles,
                 out var includeRejection))
         {
             return WithDiagnostic(UnsafeInput(includeRejection));
@@ -110,12 +116,22 @@ public static class ClangNativeExtractor
 
         try
         {
+            if (!ClangUnsavedFileSet.TryCreate(
+                    approvedInputFiles,
+                    request.InMemoryInputs,
+                    scopePolicy,
+                    out var unsavedFiles,
+                    out var unsavedDiagnostic))
+            {
+                return WithDiagnostic(unsavedDiagnostic!);
+            }
+            using var unsavedFilesScope = unsavedFiles;
             using var index = createIndex();
             var error = CXTranslationUnit.TryParse(
                 index,
                 sourceFilePath,
                 compilerArguments,
-                ReadOnlySpan<CXUnsavedFile>.Empty,
+                unsavedFilesScope.Files,
                 CXTranslationUnit_Flags.CXTranslationUnit_KeepGoing,
                 out var handle);
             if (error != CXErrorCode.CXError_Success)
@@ -136,13 +152,17 @@ public static class ClangNativeExtractor
                             handle,
                             sourceFilePath,
                             scopePolicy,
+                            systemIncludeDirectories,
                             out var includedFiles,
                             out var inclusionDiagnostic))
                     {
                         return WithDiagnostic(inclusionDiagnostic!);
                     }
 
-                    var diagnostics = ReadDiagnostics(handle, scopePolicy);
+                    var diagnostics = ReadDiagnostics(
+                        handle,
+                        scopePolicy,
+                        systemIncludeDirectories);
                     var targetDiagnostic = ValidateTranslationUnitTarget(
                         handle,
                         request.Target);
@@ -226,6 +246,13 @@ public static class ClangNativeExtractor
         {
             return InvalidRequest("CompilerArguments must not contain null values.");
         }
+        if (request.SystemIncludeDirectories is null
+            || request.SystemIncludeDirectories.Any(directory =>
+                string.IsNullOrWhiteSpace(directory)))
+        {
+            return InvalidRequest(
+                "SystemIncludeDirectories must not contain null or blank values.");
+        }
         if (request.LibraryName is not null
             && string.IsNullOrWhiteSpace(request.LibraryName))
         {
@@ -281,24 +308,38 @@ public static class ClangNativeExtractor
 
     private static List<ClangExtractionDiagnostic> ReadDiagnostics(
         CXTranslationUnit translationUnit,
-        ScopePathPolicy scopePolicy)
+        ScopePathPolicy scopePolicy,
+        IReadOnlyList<string> systemIncludeDirectories)
     {
         var result = new List<ClangExtractionDiagnostic>(
             checked((int)translationUnit.NumDiagnostics));
         for (var index = 0U; index < translationUnit.NumDiagnostics; index++)
         {
             using var diagnostic = translationUnit.GetDiagnostic(index);
-            if (TryReadLocation(
+            var hasLocation = TryReadLocation(
                     diagnostic.Location,
                     out var diagnosticPath,
                     out _,
-                    out _)
-                && scopePolicy.IsExcluded(diagnosticPath))
+                    out _);
+            if (hasLocation
+                && scopePolicy.IsExcluded(diagnosticPath)
+                && !ClangInputPreflight.TryResolveSystemFile(
+                    diagnosticPath,
+                    systemIncludeDirectories,
+                    out _))
             {
                 continue;
             }
 
-            var location = TryCreatePointLocation(diagnostic.Location, scopePolicy);
+            var location = hasLocation
+                && !ClangInputPreflight.TryResolveSystemFile(
+                    diagnosticPath,
+                    systemIncludeDirectories,
+                    out _)
+                ? TryCreatePointLocation(
+                    diagnostic.Location,
+                    scopePolicy)
+                : null;
             result.Add(new ClangExtractionDiagnostic(
                 ClangDiagnosticCode,
                 MapDiagnosticSeverity(diagnostic.Severity),
@@ -312,6 +353,7 @@ public static class ClangNativeExtractor
         CXTranslationUnit translationUnit,
         string sourceFilePath,
         ScopePathPolicy scopePolicy,
+        IReadOnlyList<string> systemIncludeDirectories,
         out IReadOnlyList<string> includedFiles,
         out ClangExtractionDiagnostic? diagnostic)
     {
@@ -374,6 +416,13 @@ public static class ClangNativeExtractor
                     scopePolicy,
                     out var physicalPath))
             {
+                if (ClangInputPreflight.TryResolveSystemFile(
+                        observedPath,
+                        systemIncludeDirectories,
+                        out _))
+                {
+                    continue;
+                }
                 includedFiles = Array.Empty<string>();
                 diagnostic = UnsafeInput(
                     "libclang observed an inclusion outside the approved scope.");
@@ -487,6 +536,8 @@ public static class ClangNativeExtractor
         private readonly List<NativeCallCandidate> _callCandidates = [];
         private readonly Dictionary<string, string> _definitionGraphKeysByUsr =
             new(StringComparer.Ordinal);
+        private readonly HashSet<string> _exportedDeclarationUsrs =
+            new(StringComparer.Ordinal);
         private bool _isCallGraphComplete = true;
         private int _callDiagnosticCount;
         private int _visitedStatements;
@@ -530,11 +581,35 @@ public static class ClangNativeExtractor
                 .OrderBy(export => export.SymbolCanonicalKey, StringComparer.Ordinal)
                 .ToArray();
 
+            var functions = _functions
+                .GroupBy(
+                    function => function.SymbolCanonicalKey,
+                    StringComparer.Ordinal)
+                .Select(group => group
+                    .OrderByDescending(function => function.IsDefinition)
+                    .ThenBy(
+                        function => function.Evidence.Location.FilePath,
+                        PathComparer)
+                    .ThenBy(function => function.Evidence.Location.StartLine)
+                    .ThenBy(function => function.Evidence.Location.StartColumn)
+                    .First())
+                .OrderBy(
+                    function => function.SymbolCanonicalKey,
+                    StringComparer.Ordinal)
+                .ToArray();
+            var retainedDefinitionGraphKeysByUsr = functions
+                .Where(function =>
+                    function.IsDefinition
+                    && !string.IsNullOrWhiteSpace(function.DeclarationUsr))
+                .ToDictionary(
+                    function => function.DeclarationUsr,
+                    function => function.GraphCanonicalKey,
+                    StringComparer.Ordinal);
             var calls = _callCandidates
                 .Select(candidate => new NativeCallFact(
                     candidate.CallerSymbolCanonicalKey,
                     candidate.ReferencedDeclarationUsr,
-                    _definitionGraphKeysByUsr.GetValueOrDefault(
+                    retainedDefinitionGraphKeysByUsr.GetValueOrDefault(
                         candidate.ReferencedDeclarationUsr),
                     _request.Target,
                     candidate.Evidence))
@@ -560,20 +635,7 @@ public static class ClangNativeExtractor
                 .ToArray();
 
             return new ClangNativeExtractionResult(
-                _functions
-                    .GroupBy(
-                        function => function.SymbolCanonicalKey,
-                        StringComparer.Ordinal)
-                    .Select(group => group
-                        .OrderByDescending(function => function.IsDefinition)
-                        .ThenBy(
-                            function => function.Evidence.Location.FilePath,
-                            PathComparer)
-                        .ThenBy(function => function.Evidence.Location.StartLine)
-                        .ThenBy(function => function.Evidence.Location.StartColumn)
-                        .First())
-                    .OrderBy(function => function.SymbolCanonicalKey, StringComparer.Ordinal)
-                    .ToArray(),
+                functions,
                 _types
                     .GroupBy(type => type.SymbolCanonicalKey, StringComparer.Ordinal)
                     .Select(group => group
@@ -656,6 +718,7 @@ public static class ClangNativeExtractor
             FunctionDecl function,
             bool hasCLinkageContext)
         {
+            var definitionProbe = function.Definition;
             if (_functions.Count >= MaximumExtractedFunctions)
             {
                 MarkCallGraphIncomplete(
@@ -679,7 +742,15 @@ public static class ClangNativeExtractor
             var hasCLinkage = sourceScheme == "c"
                 || hasCLinkageContext
                 || HasUnmangledExternCLinkage(function);
-            var isExported = HasExportAttribute(function);
+            var usr = function.Handle.Usr.ToString();
+            var hasExportAttribute = HasExportAttribute(function);
+            if (hasExportAttribute && !string.IsNullOrWhiteSpace(usr))
+            {
+                _exportedDeclarationUsrs.Add(usr);
+            }
+            var isExported = hasExportAttribute
+                || (!string.IsNullOrWhiteSpace(usr)
+                    && _exportedDeclarationUsrs.Contains(usr));
             var parameters = function.Parameters
                 .Select((parameter, position) => new AbiParameter(
                     position,
@@ -690,15 +761,16 @@ public static class ClangNativeExtractor
                 .ToArray();
             var callingConvention = MapCallingConvention(
                 function.Type.Handle.FunctionTypeCallingConv);
-            var qualifiedName = string.IsNullOrWhiteSpace(function.QualifiedName)
-                ? function.Name
-                : function.QualifiedName;
+            var qualifiedName = NormalizeQualifiedName(
+                function.QualifiedName,
+                function.Name);
             var signature = qualifiedName
                 + "("
                 + string.Join(",", parameters.Select(
                     parameter => parameter.Type.CanonicalName))
                 + ")"
                 + MethodQualifierSuffix(function);
+            signature = signature.Replace('\\', '/');
             var scheme = hasCLinkage ? "c" : sourceScheme;
             var functionKey = NativeCanonicalKeys.ForFunction(
                 scheme,
@@ -711,7 +783,6 @@ public static class ClangNativeExtractor
                     repoRelativePath,
                     function.Name)
                 : functionKey;
-            var usr = function.Handle.Usr.ToString();
             var functionFact = new NativeFunctionFact(
                 functionKey,
                 function.Name,
@@ -798,6 +869,12 @@ public static class ClangNativeExtractor
                         : usr,
                     function.IsThisDeclarationADefinition,
                     nativeExport));
+            }
+            if (!function.IsThisDeclarationADefinition
+                && definitionProbe is FunctionDecl definition
+                && definition.IsThisDeclarationADefinition)
+            {
+                AddFunction(definition, hasCLinkageContext);
             }
         }
 
@@ -1021,7 +1098,21 @@ public static class ClangNativeExtractor
                     continue;
                 }
 
-                var children = statement.Children;
+                IReadOnlyList<Stmt> children;
+                try
+                {
+                    children = statement.Children
+                        ?? Array.Empty<Stmt>();
+                }
+                catch (NullReferenceException)
+                {
+                    MarkCallGraphIncomplete(
+                        IncompleteCallGraphCode,
+                        "Clang did not expose a stable child-statement collection for this body.",
+                        location: null);
+                    traversalComplete = false;
+                    continue;
+                }
                 if (statement is CompoundStmt)
                 {
                     var childControlFlow =
@@ -1301,10 +1392,9 @@ public static class ClangNativeExtractor
                 return false;
             }
 
-            var qualifiedName = string.IsNullOrWhiteSpace(
-                    function.QualifiedName)
-                ? function.Name
-                : function.QualifiedName;
+            var qualifiedName = NormalizeQualifiedName(
+                function.QualifiedName,
+                function.Name);
             if (function.Name is not (
                     "malloc"
                     or "calloc"
@@ -1736,9 +1826,9 @@ public static class ClangNativeExtractor
                 return;
             }
 
-            var qualifiedName = string.IsNullOrWhiteSpace(record.QualifiedName)
-                ? record.Name
-                : record.QualifiedName;
+            var qualifiedName = NormalizeQualifiedName(
+                record.QualifiedName,
+                record.Name);
             var scheme = SchemeForSource(evidence.Location.FilePath);
             var canonicalKey = NativeCanonicalKeys.ForType(
                 scheme,
@@ -1787,9 +1877,9 @@ public static class ClangNativeExtractor
                 return;
             }
 
-            var qualifiedName = string.IsNullOrWhiteSpace(enumDeclaration.QualifiedName)
-                ? enumDeclaration.Name
-                : enumDeclaration.QualifiedName;
+            var qualifiedName = NormalizeQualifiedName(
+                enumDeclaration.QualifiedName,
+                enumDeclaration.Name);
             var scheme = SchemeForSource(evidence.Location.FilePath);
             _types.Add(new NativeTypeDeclarationFact(
                 NativeCanonicalKeys.ForType(scheme, repoRelativePath, qualifiedName),
@@ -1814,9 +1904,9 @@ public static class ClangNativeExtractor
                 return;
             }
 
-            var qualifiedName = string.IsNullOrWhiteSpace(typedef.QualifiedName)
-                ? typedef.Name
-                : typedef.QualifiedName;
+            var qualifiedName = NormalizeQualifiedName(
+                typedef.QualifiedName,
+                typedef.Name);
             var scheme = SchemeForSource(evidence.Location.FilePath);
             _types.Add(new NativeTypeDeclarationFact(
                 NativeCanonicalKeys.ForTypeAlias(
@@ -1829,6 +1919,18 @@ public static class ClangNativeExtractor
                 MapType(typedef.UnderlyingType),
                 IsDefinition: true,
                 evidence));
+        }
+
+        private static string NormalizeQualifiedName(
+            string? qualifiedName,
+            string fallback)
+        {
+            var value = string.IsNullOrWhiteSpace(qualifiedName)
+                ? fallback
+                : qualifiedName;
+            return value
+                .Trim()
+                .Replace('\\', '/');
         }
 
         private AbiFieldLayout CreateFieldLayout(FieldDecl field, int order)
@@ -2256,6 +2358,228 @@ public static class ClangNativeExtractor
         value is > 0 and <= int.MaxValue
             ? checked((int)value)
             : null;
+
+    /// <summary>
+    /// Supplies the already-authorized managed-reader view of repository inputs to libclang.
+    /// This keeps parsing in memory and avoids writing plaintext shadow files when an endpoint
+    /// protection driver exposes different logical and physical byte streams to managed and
+    /// native readers.
+    /// </summary>
+    private unsafe sealed class ClangUnsavedFileSet : IDisposable
+    {
+        private const int MaximumFiles = 4096;
+        private const long MaximumFileBytes = 32L * 1024 * 1024;
+        private const long MaximumTotalBytes = 256L * 1024 * 1024;
+
+        private static readonly UTF8Encoding _strictUtf8 =
+            new(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
+
+        private readonly CXUnsavedFile[] _files;
+        private readonly List<nint> _allocations;
+
+        private ClangUnsavedFileSet(
+            CXUnsavedFile[] files,
+            List<nint> allocations)
+        {
+            _files = files;
+            _allocations = allocations;
+        }
+
+        public ReadOnlySpan<CXUnsavedFile> Files => _files;
+
+        public static bool TryCreate(
+            IReadOnlyList<string> approvedInputFiles,
+            IReadOnlyList<ClangInMemoryInput> inMemoryInputs,
+            ScopePathPolicy scopePolicy,
+            out ClangUnsavedFileSet files,
+            out ClangExtractionDiagnostic? diagnostic)
+        {
+            ArgumentNullException.ThrowIfNull(approvedInputFiles);
+            ArgumentNullException.ThrowIfNull(inMemoryInputs);
+            ArgumentNullException.ThrowIfNull(scopePolicy);
+            files = new ClangUnsavedFileSet([], []);
+            diagnostic = null;
+            var supplied = new Dictionary<string, byte[]>(
+                OperatingSystem.IsWindows()
+                    ? StringComparer.OrdinalIgnoreCase
+                    : StringComparer.Ordinal);
+            foreach (var input in inMemoryInputs)
+            {
+                if (input is null
+                    || string.IsNullOrWhiteSpace(input.Path)
+                    || input.Contents is null
+                    || !ClangInputPreflight.TryResolveAllowedFile(
+                        input.Path,
+                        scopePolicy,
+                        out var approvedPath)
+                    || !supplied.TryAdd(approvedPath, input.Contents))
+                {
+                    diagnostic = UnsafeInput(
+                        "An in-memory native input is duplicated or outside the approved scope.");
+                    return false;
+                }
+            }
+            var allInputs = approvedInputFiles
+                .Concat(supplied.Keys)
+                .Distinct(supplied.Comparer)
+                .OrderBy(path => path, PathComparer)
+                .ThenBy(path => path, StringComparer.Ordinal)
+                .ToArray();
+            if (allInputs.Length > MaximumFiles)
+            {
+                diagnostic = UnsafeInput(
+                    $"The approved native include graph exceeds the {MaximumFiles}-file in-memory input limit.");
+                return false;
+            }
+
+            var entries = new CXUnsavedFile[allInputs.Length];
+            var allocations = new List<nint>(
+                checked(allInputs.Length * 2));
+            long totalBytes = 0;
+            try
+            {
+                Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
+                var cp936 = Encoding.GetEncoding(
+                    936,
+                    EncoderFallback.ExceptionFallback,
+                    DecoderFallback.ExceptionFallback);
+                for (var index = 0; index < allInputs.Length; index++)
+                {
+                    var path = allInputs[index];
+                    var sourceBytes = supplied.TryGetValue(
+                        path,
+                        out var suppliedBytes)
+                        ? suppliedBytes
+                        : File.ReadAllBytes(path);
+                    if (sourceBytes.LongLength > MaximumFileBytes
+                        || checked(totalBytes + sourceBytes.LongLength)
+                            > MaximumTotalBytes)
+                    {
+                        diagnostic = UnsafeInput(
+                            "The approved native include graph exceeds the bounded in-memory input size.");
+                        Free(allocations);
+                        return false;
+                    }
+                    totalBytes += sourceBytes.LongLength;
+                    if (StartsWithHsKey(sourceBytes)
+                        || (sourceBytes.Contains((byte)0)
+                            && !HasUtf16Bom(sourceBytes)))
+                    {
+                        diagnostic = UnsafeInput(
+                            "An approved native source still exposes protected or NUL-containing logical bytes.");
+                        Free(allocations);
+                        return false;
+                    }
+
+                    byte[] utf8Bytes;
+                    if (HasUtf16Bom(sourceBytes))
+                    {
+                        var encoding = sourceBytes[0] == 0xff
+                            ? new UnicodeEncoding(
+                                bigEndian: false,
+                                byteOrderMark: true,
+                                throwOnInvalidBytes: true)
+                            : new UnicodeEncoding(
+                                bigEndian: true,
+                                byteOrderMark: true,
+                                throwOnInvalidBytes: true);
+                        utf8Bytes = Encoding.UTF8.GetBytes(
+                            encoding.GetString(sourceBytes));
+                    }
+                    else try
+                    {
+                        _strictUtf8.GetString(sourceBytes);
+                        utf8Bytes = sourceBytes;
+                    }
+                    catch (DecoderFallbackException)
+                    {
+                        try
+                        {
+                            utf8Bytes = Encoding.UTF8.GetBytes(
+                                cp936.GetString(sourceBytes));
+                        }
+                        catch (DecoderFallbackException)
+                        {
+                            diagnostic = UnsafeInput(
+                                "An approved native source is neither strict UTF-8 nor CP936 text.");
+                            Free(allocations);
+                            return false;
+                        }
+                    }
+
+                    var fileNameBytes = Encoding.UTF8.GetBytes(path + "\0");
+                    var fileNamePointer =
+                        Marshal.AllocHGlobal(fileNameBytes.Length);
+                    allocations.Add(fileNamePointer);
+                    Marshal.Copy(
+                        fileNameBytes,
+                        0,
+                        fileNamePointer,
+                        fileNameBytes.Length);
+                    var contentsPointer =
+                        Marshal.AllocHGlobal(checked(utf8Bytes.Length + 1));
+                    allocations.Add(contentsPointer);
+                    Marshal.Copy(
+                        utf8Bytes,
+                        0,
+                        contentsPointer,
+                        utf8Bytes.Length);
+                    Marshal.WriteByte(contentsPointer, utf8Bytes.Length, 0);
+                    entries[index] = new CXUnsavedFile
+                    {
+                        Filename = (sbyte*)fileNamePointer,
+                        Contents = (sbyte*)contentsPointer,
+                        Length = (nuint)utf8Bytes.Length,
+                    };
+                }
+            }
+            catch (Exception ex) when (
+                ex is IOException
+                    or UnauthorizedAccessException
+                    or ArgumentException
+                    or NotSupportedException
+                    or OverflowException)
+            {
+                Free(allocations);
+                diagnostic = UnsafeInput(
+                    $"An approved native input could not be prepared safely ({ex.GetType().Name}).");
+                return false;
+            }
+
+            files = new ClangUnsavedFileSet(entries, allocations);
+            return true;
+        }
+
+        public void Dispose()
+        {
+            Free(_allocations);
+            _allocations.Clear();
+        }
+
+        private static bool StartsWithHsKey(ReadOnlySpan<byte> bytes) =>
+            bytes.Length >= 5
+            && bytes[0] == (byte)'H'
+            && bytes[1] == (byte)'S'
+            && bytes[2] == (byte)'K'
+            && bytes[3] == (byte)'e'
+            && bytes[4] == (byte)'y';
+
+        private static bool HasUtf16Bom(ReadOnlySpan<byte> bytes) =>
+            bytes.Length >= 2
+            && ((bytes[0] == 0xff && bytes[1] == 0xfe)
+                || (bytes[0] == 0xfe && bytes[1] == 0xff));
+
+        private static void Free(IEnumerable<nint> allocations)
+        {
+            foreach (var allocation in allocations)
+            {
+                if (allocation != 0)
+                {
+                    Marshal.FreeHGlobal(allocation);
+                }
+            }
+        }
+    }
 
     private sealed record NativeExportCandidate(
         string Usr,

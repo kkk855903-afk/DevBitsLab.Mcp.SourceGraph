@@ -287,12 +287,10 @@ public static class ScopedExecution
     // contract identical regardless of where the short-circuit originates.
 
     /// <summary>
-    /// When a scope is mid-cold-index (registered with <c>status="indexing"</c>) the lazy-index-
-    /// on-first-query semantics call for tools to wait until the scope settles into <c>"ok"</c> or
-    /// <c>"degraded"</c> before answering rather than short-circuiting with an empty / no-scope
-    /// diagnostic. <see cref="ScopeHost.Ready"/> completes once on the first transition out of
-    /// <c>"indexing"</c>; the wait is bounded by the caller's <see cref="CancellationToken"/> so a
-    /// stuck index can't hang a tool call indefinitely. No-op when the scope already settled.
+    /// When a scope has no graph yet, wait for the first cold index to settle. If a last-good
+    /// graph already exists, queries are allowed to read it while a refresh runs; the refresh
+    /// uses generation-safe writes, so this avoids making foreground semantic queries wait
+    /// behind background indexing without exposing a half-written graph.
     /// </summary>
     private static async Task WaitUntilReadyAsync(
         ScopeHost host,
@@ -306,6 +304,8 @@ public static class ScopedExecution
         // for hosts whose lifecycle is driven by LiveIndexService.
         if (host.Status != "indexing") return;
         if (host.Ready.IsCompleted) return;
+        var existing = await host.Store.GetStatsAsync(ct).ConfigureAwait(false);
+        if (existing.FileCount > 0) return;
         if (progress is null)
         {
             // No-op forwarder: the SDK injects a non-null IProgress for every tool call (including

@@ -286,20 +286,32 @@ public static class ScopeConfigLoader
                 ex);
         }
 
-        if (dto.TranslationUnits is not { Count: > 0 })
+        if (dto.TranslationUnits is { Count: 0 })
         {
             throw new ScopeConfigException(
-                $"{FileName} scope `{scopeName}`: `interop.translation_units` must contain at least one entry.");
+                $"{FileName} scope `{scopeName}`: omit `interop.translation_units` or provide at least one entry.");
+        }
+        if (dto.VcxProjects is { Count: 0 })
+        {
+            throw new ScopeConfigException(
+                $"{FileName} scope `{scopeName}`: omit `interop.vcx_projects` or provide at least one entry.");
+        }
+        if (dto.TranslationUnits is not { Count: > 0 }
+            && dto.VcxProjects is not { Count: > 0 })
+        {
+            throw new ScopeConfigException(
+                $"{FileName} scope `{scopeName}`: `interop.translation_units` or `interop.vcx_projects` must contain at least one entry.");
         }
 
-        var translationUnits = new List<InteropTranslationUnitConfig>(dto.TranslationUnits.Count);
+        var translationUnits = new List<InteropTranslationUnitConfig>(
+            dto.TranslationUnits?.Count ?? 0);
         var translationUnitPaths = new HashSet<string>(
             OperatingSystem.IsWindows()
                 ? StringComparer.OrdinalIgnoreCase
                 : StringComparer.Ordinal);
-        for (var i = 0; i < dto.TranslationUnits.Count; i++)
+        for (var i = 0; i < (dto.TranslationUnits?.Count ?? 0); i++)
         {
-            var translationUnit = dto.TranslationUnits[i];
+            var translationUnit = dto.TranslationUnits![i];
             var prefix = $"scope `{scopeName}` `interop.translation_units[{i}]`";
             RejectUnknownKeys(scopeName, $"interop.translation_units[{i}]", translationUnit.Extra);
             ValidateRepoRelativePath(translationUnit.Path, $"{prefix}.path");
@@ -339,7 +351,103 @@ public static class ScopeConfigLoader
                 translationUnit.BinaryPath));
         }
 
-        return new ScopeInteropConfig(target, translationUnits);
+        var vcxProjects = new List<InteropVcxProjectConfig>(
+            dto.VcxProjects?.Count ?? 0);
+        var vcxProjectPaths = new HashSet<string>(
+            OperatingSystem.IsWindows()
+                ? StringComparer.OrdinalIgnoreCase
+                : StringComparer.Ordinal);
+        for (var i = 0; i < (dto.VcxProjects?.Count ?? 0); i++)
+        {
+            var project = dto.VcxProjects![i];
+            var prefix = $"scope `{scopeName}` `interop.vcx_projects[{i}]`";
+            RejectUnknownKeys(
+                scopeName,
+                $"interop.vcx_projects[{i}]",
+                project.Extra);
+            ValidateRepoRelativePath(project.Path, $"{prefix}.path");
+            var normalizedPath = project.Path!.Replace('\\', '/');
+            if (!string.Equals(
+                    Path.GetExtension(normalizedPath),
+                    ".vcxproj",
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                throw new ScopeConfigException(
+                    $"{FileName} {prefix}.path must name a `.vcxproj` file.");
+            }
+            if (!vcxProjectPaths.Add(normalizedPath))
+            {
+                throw new ScopeConfigException(
+                    $"{FileName} {prefix}.path duplicates Visual C++ project `{normalizedPath}`.");
+            }
+            if (string.IsNullOrWhiteSpace(project.Configuration))
+            {
+                throw new ScopeConfigException(
+                    $"{FileName} {prefix}.configuration must be non-empty.");
+            }
+            if (string.IsNullOrWhiteSpace(project.Platform))
+            {
+                throw new ScopeConfigException(
+                    $"{FileName} {prefix}.platform must be non-empty.");
+            }
+            if (string.IsNullOrWhiteSpace(project.Library))
+            {
+                throw new ScopeConfigException(
+                    $"{FileName} {prefix}.library must be non-empty.");
+            }
+
+            var sourceFiles = project.SourceFiles ?? [];
+            var normalizedSourceFiles = new List<string>(sourceFiles.Count);
+            var sourceFileSet = new HashSet<string>(
+                OperatingSystem.IsWindows()
+                    ? StringComparer.OrdinalIgnoreCase
+                    : StringComparer.Ordinal);
+            for (var sourceIndex = 0; sourceIndex < sourceFiles.Count; sourceIndex++)
+            {
+                ValidateRepoRelativePath(
+                    sourceFiles[sourceIndex],
+                    $"{prefix}.source_files[{sourceIndex}]");
+                var normalizedSource = sourceFiles[sourceIndex].Replace('\\', '/');
+                if (!sourceFileSet.Add(normalizedSource))
+                {
+                    throw new ScopeConfigException(
+                        $"{FileName} {prefix}.source_files[{sourceIndex}] duplicates `{normalizedSource}`.");
+                }
+                normalizedSourceFiles.Add(normalizedSource);
+            }
+
+            var additionalArguments = project.AdditionalArguments ?? [];
+            for (var argumentIndex = 0;
+                 argumentIndex < additionalArguments.Count;
+                 argumentIndex++)
+            {
+                if (string.IsNullOrWhiteSpace(additionalArguments[argumentIndex]))
+                {
+                    throw new ScopeConfigException(
+                        $"{FileName} {prefix}.additional_arguments[{argumentIndex}] must be non-empty.");
+                }
+            }
+            if (project.BinaryPath is not null)
+            {
+                ValidateRepoRelativePath(
+                    project.BinaryPath,
+                    $"{prefix}.binary_path");
+            }
+
+            vcxProjects.Add(new InteropVcxProjectConfig(
+                normalizedPath,
+                project.Configuration!,
+                project.Platform!,
+                project.Library!,
+                normalizedSourceFiles,
+                additionalArguments,
+                project.BinaryPath));
+        }
+
+        return new ScopeInteropConfig(target, translationUnits)
+        {
+            VcxProjects = vcxProjects,
+        };
     }
 
     private static void RejectUnknownKeys(
@@ -487,13 +595,34 @@ public static class ScopeConfigLoader
                             PointerSizeBytes = interop.Target.PointerSizeBytes,
                             DefaultPack = interop.Target.DefaultPack,
                         },
-                        TranslationUnits = interop.TranslationUnits.Select(unit => new InteropTranslationUnitJson
-                        {
-                            Path = unit.Path,
-                            Library = unit.Library,
-                            Arguments = unit.Arguments,
-                            BinaryPath = unit.BinaryPath,
-                        }).ToList(),
+                        TranslationUnits = interop.TranslationUnits.Count > 0
+                            ? interop.TranslationUnits.Select(unit =>
+                                new InteropTranslationUnitJson
+                                {
+                                    Path = unit.Path,
+                                    Library = unit.Library,
+                                    Arguments = unit.Arguments,
+                                    BinaryPath = unit.BinaryPath,
+                                }).ToList()
+                            : null,
+                        VcxProjects = interop.VcxProjects.Count > 0
+                            ? interop.VcxProjects.Select(project =>
+                                new InteropVcxProjectJson
+                                {
+                                    Path = project.Path,
+                                    Configuration = project.Configuration,
+                                    Platform = project.Platform,
+                                    Library = project.Library,
+                                    SourceFiles = project.SourceFiles.Count > 0
+                                        ? project.SourceFiles
+                                        : null,
+                                    AdditionalArguments =
+                                        project.AdditionalArguments.Count > 0
+                                            ? project.AdditionalArguments
+                                            : null,
+                                    BinaryPath = project.BinaryPath,
+                                }).ToList()
+                            : null,
                     }
                     : null,
             }).ToList(),
@@ -574,6 +703,7 @@ internal sealed record ScopeInteropJson
 {
     [JsonPropertyName("target")] public InteropTargetJson? Target { get; init; }
     [JsonPropertyName("translation_units")] public IReadOnlyList<InteropTranslationUnitJson>? TranslationUnits { get; init; }
+    [JsonPropertyName("vcx_projects")] public IReadOnlyList<InteropVcxProjectJson>? VcxProjects { get; init; }
     [JsonExtensionData] public Dictionary<string, JsonElement>? Extra { get; init; }
 }
 
@@ -592,6 +722,18 @@ internal sealed record InteropTranslationUnitJson
     [JsonPropertyName("path")] public string? Path { get; init; }
     [JsonPropertyName("library")] public string? Library { get; init; }
     [JsonPropertyName("arguments")] public IReadOnlyList<string>? Arguments { get; init; }
+    [JsonPropertyName("binary_path")] public string? BinaryPath { get; init; }
+    [JsonExtensionData] public Dictionary<string, JsonElement>? Extra { get; init; }
+}
+
+internal sealed record InteropVcxProjectJson
+{
+    [JsonPropertyName("path")] public string? Path { get; init; }
+    [JsonPropertyName("configuration")] public string? Configuration { get; init; }
+    [JsonPropertyName("platform")] public string? Platform { get; init; }
+    [JsonPropertyName("library")] public string? Library { get; init; }
+    [JsonPropertyName("source_files")] public IReadOnlyList<string>? SourceFiles { get; init; }
+    [JsonPropertyName("additional_arguments")] public IReadOnlyList<string>? AdditionalArguments { get; init; }
     [JsonPropertyName("binary_path")] public string? BinaryPath { get; init; }
     [JsonExtensionData] public Dictionary<string, JsonElement>? Extra { get; init; }
 }

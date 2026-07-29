@@ -44,7 +44,7 @@ internal sealed class NativeInteropSnapshotPublisher
     {
         ArgumentNullException.ThrowIfNull(snapshot);
         cancellationToken.ThrowIfCancellationRequested();
-        if (!snapshot.IsComplete)
+        if (!snapshot.IsComplete && !snapshot.HasPublishableFacts)
         {
             return new NativeInteropSnapshotPublicationResult(
                 IsComplete: false,

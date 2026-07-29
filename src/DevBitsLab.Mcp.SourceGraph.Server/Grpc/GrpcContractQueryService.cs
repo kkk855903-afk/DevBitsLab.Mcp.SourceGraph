@@ -41,7 +41,11 @@ public sealed class GrpcContractQueryService
             1,
             MaximumRelationsPerRpc);
 
-        if (runtimeState?.Status != GrpcLinkRuntimeStatus.Complete)
+        var retainedSnapshot =
+            runtimeState?.Status != GrpcLinkRuntimeStatus.Complete
+            && runtimeState?.RetainedLastGood == true;
+        if (runtimeState?.Status != GrpcLinkRuntimeStatus.Complete
+            && !retainedSnapshot)
         {
             return TraceRuntimeUnavailable(
                 scopeId,
@@ -62,32 +66,45 @@ public sealed class GrpcContractQueryService
                 .ConfigureAwait(false);
             if (selection.Rpcs.Count == 0)
             {
-                return new GrpcTraceScopeResult(
-                    scopeId,
-                    scopeStatus,
-                    "not_found",
-                    Partial: false,
-                    RetainedLastGood: false,
-                    selection.Status,
-                    selection.CanonicalKey,
-                    [],
-                    TotalRpcCount: 0,
-                    TotalClientCount: 0,
-                    TotalServerCount: 0,
-                    Failures:
-                    [
+                var runtimeFailures = retainedSnapshot
+                    ? RuntimeFailures(runtimeState)
+                    : [];
+                var failures = runtimeFailures
+                    .Append(
                         new GrpcToolFailureRow(
                             "selection",
                             selection.FailureCode
                                 ?? "rpc-not-found",
                             selection.FailureMessage
                                 ?? "No evidence-backed RPC relationship matched the exact canonical key.",
-                            selection.CanonicalKey),
-                    ],
-                    TotalFailureCount: 1,
-                    Truncated: false,
-                    OmittedCount: 0,
-                    OmittedEvidenceCount: 0);
+                            selection.CanonicalKey))
+                    .ToArray();
+                return new GrpcTraceScopeResult(
+                    scopeId,
+                    scopeStatus,
+                    retainedSnapshot ? "partial" : "not_found",
+                    Partial: retainedSnapshot,
+                    RetainedLastGood: retainedSnapshot,
+                    selection.Status,
+                    selection.CanonicalKey,
+                    [],
+                    TotalRpcCount: 0,
+                    TotalClientCount: 0,
+                    TotalServerCount: 0,
+                    failures,
+                    TotalFailureCount: retainedSnapshot
+                        ? Math.Max(
+                            failures.Length,
+                            SaturatingAdd(
+                                runtimeState!.FailureCount,
+                                1))
+                        : 1,
+                    Truncated:
+                        (runtimeState?.OmittedFailures ?? 0) > 0,
+                    OmittedCount:
+                        runtimeState?.OmittedFailures ?? 0,
+                    OmittedEvidenceCount: 0,
+                    LinkCoverage: runtimeState?.Coverage);
             }
 
             var rows = new List<GrpcRpcTraceRow>();
@@ -151,23 +168,35 @@ public sealed class GrpcContractQueryService
                         clients.OmittedCount + servers.OmittedCount));
             }
 
+            var retainedFailures = retainedSnapshot
+                ? RuntimeFailures(runtimeState)
+                : [];
+            var runtimeOmitted = retainedSnapshot
+                ? runtimeState!.OmittedFailures
+                : 0;
+            omitted = SaturatingAdd(omitted, runtimeOmitted);
             return new GrpcTraceScopeResult(
                 scopeId,
                 scopeStatus,
-                "ok",
-                Partial: omitted > 0,
-                RetainedLastGood: false,
+                retainedSnapshot || omitted > 0 ? "partial" : "ok",
+                Partial: retainedSnapshot || omitted > 0,
+                RetainedLastGood: retainedSnapshot,
                 selection.Status,
                 selection.CanonicalKey,
                 rows,
                 rows.Count,
                 totalClients,
                 totalServers,
-                [],
-                TotalFailureCount: 0,
+                retainedFailures,
+                TotalFailureCount: retainedSnapshot
+                    ? Math.Max(
+                        retainedFailures.Count,
+                        runtimeState!.FailureCount)
+                    : 0,
                 Truncated: omitted > 0,
                 OmittedCount: omitted,
-                OmittedEvidenceCount: omittedEvidence);
+                OmittedEvidenceCount: omittedEvidence,
+                LinkCoverage: runtimeState?.Coverage);
         }
         catch (OperationCanceledException)
         {
@@ -181,7 +210,7 @@ public sealed class GrpcContractQueryService
                 "partial",
                 Partial: true,
                 RetainedLastGood:
-                    runtimeState.RetainedLastGood,
+                    runtimeState?.RetainedLastGood ?? false,
                 SelectionStatus: "unknown",
                 SelectionCanonicalKey: query,
                 Rpcs: [],
@@ -199,7 +228,8 @@ public sealed class GrpcContractQueryService
                 TotalFailureCount: 1,
                 Truncated: false,
                 OmittedCount: 0,
-                OmittedEvidenceCount: 0);
+                OmittedEvidenceCount: 0,
+                LinkCoverage: runtimeState?.Coverage);
         }
     }
 
@@ -212,7 +242,11 @@ public sealed class GrpcContractQueryService
         CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(store);
-        if (runtimeState?.Status != GrpcLinkRuntimeStatus.Complete)
+        var retainedPartialSnapshot =
+            runtimeState?.Status != GrpcLinkRuntimeStatus.Complete
+            && runtimeState?.RetainedLastGood == true;
+        if (runtimeState?.Status != GrpcLinkRuntimeStatus.Complete
+            && !retainedPartialSnapshot)
         {
             return CheckRuntimeUnavailable(
                 scopeId,
@@ -231,17 +265,27 @@ public sealed class GrpcContractQueryService
                     scopeId,
                     scopeStatus,
                     "not_found",
-                    Partial: false,
-                    RetainedLastGood: false,
+                    Partial: retainedPartialSnapshot,
+                    RetainedLastGood: retainedPartialSnapshot,
                     BaselinePolicy,
                     TotalContractCount: 0,
                     Findings: [],
                     TotalFindingCount: 0,
-                    Failures: [selected.Failure],
-                    TotalFailureCount: 1,
-                    Truncated: false,
-                    OmittedCount: 0,
-                    OmittedEvidenceCount: 0);
+                    Failures: retainedPartialSnapshot
+                        ? RuntimeFailures(runtimeState).Append(selected.Failure).ToArray()
+                        : [selected.Failure],
+                    TotalFailureCount: retainedPartialSnapshot
+                        ? Math.Max(
+                            RuntimeFailures(runtimeState).Count + 1,
+                            runtimeState!.FailureCount + 1)
+                        : 1,
+                    Truncated: retainedPartialSnapshot
+                        && runtimeState!.OmittedFailures > 0,
+                    OmittedCount: retainedPartialSnapshot
+                        ? runtimeState!.OmittedFailures
+                        : 0,
+                    OmittedEvidenceCount: 0,
+                    LinkCoverage: runtimeState?.Coverage);
             }
 
             var baselines = await ReadBaselinesAsync(store, ct)
@@ -256,7 +300,10 @@ public sealed class GrpcContractQueryService
                 {
                     AddChangeFindings(current, baseline, findings);
                 }
-                if (current.Fact.Kind == ProtoContractKind.Rpc)
+                // A partial projection can prove links that were published, but cannot prove
+                // that a managed implementation is absent from the unprocessed portion.
+                if (current.Fact.Kind == ProtoContractKind.Rpc
+                    && !retainedPartialSnapshot)
                 {
                     await AddMissingImplementationFindingAsync(
                             store,
@@ -270,7 +317,7 @@ public sealed class GrpcContractQueryService
             var selectedKeys = selected.Facts
                 .Select(item => item.Fact.SymbolCanonicalKey)
                 .ToHashSet(StringComparer.Ordinal);
-            foreach (var failure in runtimeState.Failures
+            foreach (var failure in runtimeState!.Failures
                 .Where(failure =>
                     failure.Code == "grpc-signature-mismatch"
                     && failure.ProtoCanonicalKey is not null
@@ -301,11 +348,12 @@ public sealed class GrpcContractQueryService
                 .ThenBy(finding => finding.ProtoSymbol, StringComparer.Ordinal)
                 .ThenBy(finding => finding.ManagedSymbol, StringComparer.Ordinal)
                 .ToList();
-            var failures = new List<GrpcToolFailureRow>();
-            var omitted = 0;
-            if (runtimeState.OmittedFailures > 0)
+            var failures = retainedPartialSnapshot
+                ? RuntimeFailures(runtimeState).ToList()
+                : [];
+            var omitted = runtimeState.OmittedFailures;
+            if (!retainedPartialSnapshot && omitted > 0)
             {
-                omitted = runtimeState.OmittedFailures;
                 failures.Add(new GrpcToolFailureRow(
                     "linker",
                     "grpc-link-failures-omitted",
@@ -316,18 +364,21 @@ public sealed class GrpcContractQueryService
             return new GrpcContractCheckScopeResult(
                 scopeId,
                 scopeStatus,
-                omitted > 0 ? "partial" : "ok",
-                Partial: omitted > 0,
-                RetainedLastGood: false,
+                retainedPartialSnapshot || omitted > 0 ? "partial" : "ok",
+                Partial: retainedPartialSnapshot || omitted > 0,
+                RetainedLastGood: retainedPartialSnapshot,
                 BaselinePolicy,
                 selected.Facts.Count,
                 findings,
                 findings.Count,
                 failures,
-                failures.Count,
+                retainedPartialSnapshot
+                    ? Math.Max(failures.Count, runtimeState.FailureCount)
+                    : failures.Count,
                 Truncated: omitted > 0,
                 OmittedCount: omitted,
-                OmittedEvidenceCount: 0);
+                OmittedEvidenceCount: 0,
+                LinkCoverage: runtimeState.Coverage);
         }
         catch (OperationCanceledException)
         {
@@ -341,7 +392,7 @@ public sealed class GrpcContractQueryService
                 "partial",
                 Partial: true,
                 RetainedLastGood:
-                    runtimeState.RetainedLastGood,
+                    runtimeState?.RetainedLastGood ?? false,
                 BaselinePolicy,
                 TotalContractCount: 0,
                 Findings: [],
@@ -357,7 +408,8 @@ public sealed class GrpcContractQueryService
                 TotalFailureCount: 1,
                 Truncated: false,
                 OmittedCount: 0,
-                OmittedEvidenceCount: 0);
+                OmittedEvidenceCount: 0,
+                LinkCoverage: runtimeState?.Coverage);
         }
     }
 
@@ -960,7 +1012,8 @@ public sealed class GrpcContractQueryService
                     : Math.Max(failures.Count, state.FailureCount),
             Truncated: (state?.OmittedFailures ?? 0) > 0,
             OmittedCount: state?.OmittedFailures ?? 0,
-            OmittedEvidenceCount: 0);
+            OmittedEvidenceCount: 0,
+            LinkCoverage: state?.Coverage);
     }
 
     private static GrpcContractCheckScopeResult CheckRuntimeUnavailable(
@@ -986,7 +1039,8 @@ public sealed class GrpcContractQueryService
                     : Math.Max(failures.Count, state.FailureCount),
             Truncated: (state?.OmittedFailures ?? 0) > 0,
             OmittedCount: state?.OmittedFailures ?? 0,
-            OmittedEvidenceCount: 0);
+            OmittedEvidenceCount: 0,
+            LinkCoverage: state?.Coverage);
     }
 
     private static IReadOnlyList<GrpcToolFailureRow> RuntimeFailures(

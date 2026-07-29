@@ -8,6 +8,7 @@ using DevBitsLab.Mcp.SourceGraph.Storage;
 using FluentAssertions;
 using Xunit;
 using CoreEvidenceConfidence = DevBitsLab.Mcp.SourceGraph.Core.EvidenceConfidence;
+using CoreReferenceKind = DevBitsLab.Mcp.SourceGraph.Core.ReferenceKind;
 
 namespace DevBitsLab.Mcp.SourceGraph.Tests;
 
@@ -146,6 +147,95 @@ public sealed class IndexFixtureTests : IAsyncLifetime
                 item.Location.EndLine,
                 item.Location.EndColumn))
             .Should().OnlyHaveUniqueItems("separate call sites must not collapse");
+    }
+
+    [Fact]
+    public async Task Inferred_generic_call_targets_open_method_definition()
+    {
+        var caller = (await _store!.FindSymbolsAsync("ExecuteInferred"))
+            .Should().ContainSingle(hit => hit.Name == "ExecuteInferred")
+            .Which;
+        var target = (await _store.FindSymbolsAsync("Calculator.Execute"))
+            .Should().ContainSingle(hit => hit.Name == "Execute")
+            .Which;
+
+        var evidence = await _store.ListEdgeEvidenceAsync(
+            caller.Id,
+            target.Id,
+            EdgeKinds.Calls);
+
+        evidence.Should().ContainSingle();
+        evidence[0].Confidence.Should().Be(CoreEvidenceConfidence.Exact);
+    }
+
+    [Fact]
+    public async Task Reduced_extension_calls_target_original_method_definition()
+    {
+        var target = (await _store!.FindSymbolsAsync("UseProgressWaiter"))
+            .Should().ContainSingle(hit =>
+                hit.Name == "UseProgressWaiter"
+                && hit.Fqn.Contains("ServiceCollectionExtensions", StringComparison.Ordinal))
+            .Which;
+        var references = await _store.FindReferencesAsync(target.Id, limit: 20);
+
+        references.Where(reference => reference.Kind == CoreReferenceKind.Call)
+            .Should().HaveCount(2);
+        references.Select(reference => reference.Line).Distinct()
+            .Should().Equal(17, 22);
+
+        foreach (var callerName in new[] { "Configure", "ConfigureAgain" })
+        {
+            var caller = (await _store.FindSymbolsAsync(callerName))
+                .Should().ContainSingle(hit =>
+                    hit.Name == callerName
+                    && hit.Fqn.Contains("ExtensionConsumers", StringComparison.Ordinal))
+                .Which;
+            (await _store.ListEdgeEvidenceAsync(
+                    caller.Id,
+                    target.Id,
+                    EdgeKinds.Calls))
+                .Should().ContainSingle(
+                    "reduced extension invocations must produce caller and impact edges");
+        }
+    }
+
+    [Fact]
+    public async Task Sdk_implicit_global_usings_remain_in_semantic_compilation()
+    {
+        var diagnostics = await _store!.FindDiagnosticsAsync(
+            severity: null,
+            code: "CS0246",
+            symbolId: null,
+            limit: 1_000);
+
+        diagnostics.Should().NotContain(diagnostic =>
+            diagnostic.FilePath.EndsWith(
+                "ImplicitUsingsConsumer.cs",
+                StringComparison.OrdinalIgnoreCase));
+        (await _store.FindSymbolsAsync("Sample.Domain.ImplicitUsingsConsumer.Timeout"))
+            .Should().ContainSingle();
+    }
+
+    [Fact]
+    public async Task Static_constructor_is_indexed_and_owns_its_call_edge()
+    {
+        var constructor = (await _store!.FindSymbolsAsync(
+                "Sample.Domain.StaticBootstrap.StaticBootstrap"))
+            .Should().ContainSingle(hit => hit.Kind == SymbolKinds.Constructor)
+            .Which;
+        var target = (await _store.FindSymbolsAsync(
+                "Sample.Domain.StaticBootstrap.InitializeCommands"))
+            .Should().ContainSingle()
+            .Which;
+
+        var evidence = await _store.ListEdgeEvidenceAsync(
+            constructor.Id,
+            target.Id,
+            EdgeKinds.Calls);
+
+        evidence.Should().ContainSingle();
+        evidence[0].Location.StartLine.Should().Be(7);
+        evidence[0].Confidence.Should().Be(CoreEvidenceConfidence.Exact);
     }
 
     [Fact]

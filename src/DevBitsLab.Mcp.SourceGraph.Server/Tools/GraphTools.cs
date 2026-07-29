@@ -4,6 +4,7 @@ using System.Text;
 using System.Text.Json;
 using DevBitsLab.Mcp.SourceGraph.Core;
 using DevBitsLab.Mcp.SourceGraph.Embeddings;
+using DevBitsLab.Mcp.SourceGraph.Indexing;
 using DevBitsLab.Mcp.SourceGraph.Sdk;
 using DevBitsLab.Mcp.SourceGraph.Sdk.Validation;
 using DevBitsLab.Mcp.SourceGraph.Server.Observability;
@@ -303,18 +304,28 @@ public static class GraphTools
 
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(FindReferencesResult))]
     [ToolTrigger("\"who uses X?\" or \"who calls X?\"")]
-    [Description("Find every place that references a symbol. Resolves the symbol by name/FQN, then lists each occurrence with target symbol id/FQN, relation kind, semantic confidence, and file:line. By default skips refs from source-generated files; pass includeGenerated=true to surface them.")]
+    [Description("Find every place that references a symbol. Resolves the symbol by name/FQN, then lists each occurrence with target symbol id/FQN, relation kind, semantic confidence, and file:line. By default skips refs from source-generated files and renders repository-relative paths; pass includeGenerated=true or pathFormat=absolute to opt into the larger forms.")]
     public static Task<CallToolResult> FindReferencesAsync(
         ScopeRouter router,
         [Description("Symbol name or FQN, same matching rules as find_definition")] string symbol,
         [Description("Maximum number of references to return (default 50)")] int limit = 50,
         [Description("Include references from source-generated files (default false)")] bool includeGenerated = false,
         [Description(ScopeDescription)] string? scope = null,
+        [Description("Path rendering: relative (default) or absolute")] string pathFormat = "relative",
         CancellationToken ct = default) =>
-        ToolMetrics.TrackAsync("find_references", new { symbol, limit, includeGenerated, scope }, () =>
+        ToolMetrics.TrackAsync("find_references", new { symbol, limit, includeGenerated, scope, pathFormat }, () =>
             ScopedExecution.RunAsync(router, scope, async host =>
             {
                 var sw = System.Diagnostics.Stopwatch.StartNew();
+                pathFormat = NormalisePathFormat(pathFormat);
+                if (pathFormat.Length == 0)
+                {
+                    return DiagnosticResult.Error(
+                        "find_references `pathFormat` must be relative or absolute.");
+                }
+                var relativePaths = pathFormat == "relative";
+                string RenderPath(string path) =>
+                    FormatImpactPath(host.Scope.Root, path, relativePaths);
                 var hits = await host.Store.FindSymbolsAsync(symbol, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
                 if (hits.Count == 0)
                 {
@@ -336,7 +347,7 @@ public static class GraphTools
                 var top = hits[0];
                 var refs = await host.Store.FindReferencesAsync(top.Id, includeGenerated, limit, ct).ConfigureAwait(false);
                 sb.AppendLine($"References to **{top.Fqn}** ({KindLabel(top.Kind)}){GeneratedSuffix(top.IsGenerated)}:");
-                sb.AppendLine($"- definition: {Format.Location(top.FilePath, top.StartLine, top.StartCol)}");
+                sb.AppendLine($"- definition: {Format.Location(RenderPath(top.FilePath), top.StartLine, top.StartCol)}");
                 if (refs.Count == 0)
                 {
                     sb.AppendLine(includeGenerated
@@ -347,12 +358,16 @@ public static class GraphTools
                         target: top,
                         refs: Array.Empty<ReferenceHit>(),
                         scopeId: host.Scope.Id,
-                        elapsedMs: sw.ElapsedMilliseconds);
+                        elapsedMs: sw.ElapsedMilliseconds,
+                        rootPath: host.Scope.Root,
+                        pathFormat: pathFormat);
                 }
                 var (refsKept, refsOmitted) = OutputBudget.ChooseKeep(refs.Count, OutputBudget.CompactRowChars);
                 if (refsOmitted > 0) refs = refs.Take(refsKept).ToList();
+                var occurrenceCount = CountReferenceOccurrences(refs);
                 sb.AppendLine();
-                sb.AppendLine($"{refs.Count} references:");
+                sb.AppendLine(
+                    $"{occurrenceCount} source occurrences / {refs.Count} semantic relations:");
                 if (refs.Count >= 2)
                 {
                     var rows = new List<IReadOnlyList<string>>(refs.Count);
@@ -362,7 +377,7 @@ public static class GraphTools
                         {
                             RefKindLabel(r.Kind),
                             "semantic",
-                            Format.Location(r.FilePath, r.Line, r.Col) + GeneratedSuffix(r.IsGenerated),
+                            Format.Location(RenderPath(r.FilePath), r.Line, r.Col) + GeneratedSuffix(r.IsGenerated),
                         });
                     }
                     Format.AppendTable(sb, new[] { "Relation", "Confidence", "Location" }, rows);
@@ -373,7 +388,7 @@ public static class GraphTools
                     {
                         sb.AppendLine(
                             $"- {RefKindLabel(r.Kind)} at " +
-                            $"{Format.Location(r.FilePath, r.Line, r.Col)}{GeneratedSuffix(r.IsGenerated)} " +
+                            $"{Format.Location(RenderPath(r.FilePath), r.Line, r.Col)}{GeneratedSuffix(r.IsGenerated)} " +
                             "[semantic]");
                     }
                 }
@@ -383,7 +398,9 @@ public static class GraphTools
                     refs: refs,
                     scopeId: host.Scope.Id,
                     elapsedMs: sw.ElapsedMilliseconds,
-                    omittedSize: refsOmitted);
+                    omittedSize: refsOmitted,
+                    rootPath: host.Scope.Root,
+                    pathFormat: pathFormat);
             }, ct));
 
     /// <summary>
@@ -401,8 +418,14 @@ public static class GraphTools
         IReadOnlyList<ReferenceHit> refs,
         string scopeId,
         long elapsedMs,
-        int omittedSize = 0)
+        int omittedSize = 0,
+        string? rootPath = null,
+        string pathFormat = "absolute")
     {
+        var relativePaths = pathFormat == "relative"
+            && !string.IsNullOrWhiteSpace(rootPath);
+        string RenderPath(string path) =>
+            FormatImpactPath(rootPath ?? string.Empty, path, relativePaths);
         var content = new List<ContentBlock>(capacity: 2 + refs.Count)
         {
             new TextContentBlock { Text = prose },
@@ -422,15 +445,25 @@ public static class GraphTools
             {
                 Uri = GraphResourceUris.Symbol(target.Id),
                 Name = target.Fqn,
-                Title = $"{RefKindLabel(r.Kind)} at {Format.Location(r.FilePath, r.Line, r.Col)}",
-                Description = $"{KindLabel(target.Kind)} — {Format.Location(target.FilePath, target.StartLine, target.StartCol)}",
+                Title = $"{RefKindLabel(r.Kind)} at {Format.Location(RenderPath(r.FilePath), r.Line, r.Col)}",
+                Description = $"{KindLabel(target.Kind)} — {Format.Location(RenderPath(target.FilePath), target.StartLine, target.StartCol)}",
                 MimeType = "text/markdown",
             });
         }
 
+        var occurrenceCount = CountReferenceOccurrences(refs);
         var extras = omittedSize > 0
-            ? new[] { ("references", refs.Count.ToString()), ("omitted_size", omittedSize.ToString()) }
-            : new[] { ("references", refs.Count.ToString()) };
+            ? new[]
+            {
+                ("occurrences", occurrenceCount.ToString()),
+                ("relations", refs.Count.ToString()),
+                ("omitted_size", omittedSize.ToString()),
+            }
+            : new[]
+            {
+                ("occurrences", occurrenceCount.ToString()),
+                ("relations", refs.Count.ToString()),
+            };
         content.Add(AudienceMetadata.Build(scopeId, elapsedMs, extras));
 
         var structuredReferences = refs
@@ -440,7 +473,7 @@ public static class GraphTools
                 Kind: RefKindLabel(r.Kind),
                 Relation: RefKindLabel(r.Kind),
                 Confidence: "semantic",
-                FilePath: r.FilePath,
+                FilePath: RenderPath(r.FilePath),
                 Line: r.Line,
                 Column: r.Col,
                 IsGenerated: r.IsGenerated))
@@ -449,6 +482,8 @@ public static class GraphTools
             TargetFqn: target.Fqn,
             TargetKind: target.Kind,
             TargetSymbolId: target.Id,
+            OccurrenceCount: occurrenceCount,
+            RelationCount: refs.Count,
             References: structuredReferences);
 
         return new CallToolResult
@@ -574,18 +609,28 @@ public static class GraphTools
 
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(ListCallersResult))]
     [ToolTrigger("\"who calls X?\" or \"who consumes type X?\"")]
-    [Description("List evidence-backed inbound edges into a target symbol. Every row includes canonical source/target identities, actual relation, confidence, and stored occurrence file/range evidence; malformed edges without evidence are skipped. Default kind=calls; kind=all preserves each actual edge kind. Plugin-defined kebab-case kinds are accepted.")]
+    [Description("List evidence-backed inbound edges into a target symbol. Every row includes canonical source/target identities, actual relation, confidence, and stored occurrence file/range evidence; malformed edges without evidence are skipped. Default kind=calls and repository-relative paths; kind=all preserves each actual edge kind. Plugin-defined kebab-case kinds are accepted.")]
     public static Task<CallToolResult> ListCallersAsync(
         ScopeRouter router,
         [Description("Target symbol name or FQN")] string symbol,
         [Description("Maximum number of results to return (default 50)")] int limit = 50,
-        [Description("Edge kind to walk (kebab-case): calls (default) | uses-type | overrides-member | implements-member | instantiates | throws | tests | code-behind | binds-to | binds-path | binds-element | handles-event | uses-resource | instantiates-type | merges | applies-style | all. Plugin-defined kinds are accepted.")] string? kind = null,
+        [Description("Edge kind to walk (kebab-case): calls (default) | uses-type | overrides-member | implements-member | instantiates | throws | tests | code-behind | code-behind-uses-element | binds-to | binds-path | binds-element | handles-event | uses-resource | instantiates-type | merges | applies-style | all. Plugin-defined kinds are accepted.")] string? kind = null,
         [Description(ScopeDescription)] string? scope = null,
+        [Description("Path rendering: relative (default) or absolute")] string pathFormat = "relative",
         CancellationToken ct = default) =>
-        ToolMetrics.TrackAsync("list_callers", new { symbol, limit, kind, scope }, () =>
+        ToolMetrics.TrackAsync("list_callers", new { symbol, limit, kind, scope, pathFormat }, () =>
             ScopedExecution.RunAsync(router, scope, async host =>
             {
                 var sw = System.Diagnostics.Stopwatch.StartNew();
+                pathFormat = NormalisePathFormat(pathFormat);
+                if (pathFormat.Length == 0)
+                {
+                    return DiagnosticResult.Error(
+                        "list_callers `pathFormat` must be relative or absolute.");
+                }
+                var relativePaths = pathFormat == "relative";
+                string RenderPath(string path) =>
+                    FormatImpactPath(host.Scope.Root, path, relativePaths);
                 if (limit is < 1 or > 1000)
                 {
                     return DiagnosticResult.Error("list_callers `limit` must be between 1 and 1000.");
@@ -599,6 +644,7 @@ public static class GraphTools
 
                 var hits = await host.Store.FindSymbolsAsync(symbol, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
                 if (hits.Count == 0) return DiagnosticResult.Build($"No matches for '{symbol}'.");
+                var selection = DescribeSymbolSelection(symbol, hits);
                 var top = hits[0];
                 var traversal = await EvidenceTraversal.LoadInboundAsync(
                     host.Store,
@@ -607,19 +653,30 @@ public static class GraphTools
                     edgeKind,
                     ct).ConfigureAwait(false);
                 var callers = traversal.Relations;
+                var queryState = DescribeQueryState(
+                    host,
+                    traversal.Truncated,
+                    callers.Count,
+                    selection,
+                    top);
                 var sb = new StringBuilder();
                 sb.AppendLine($"Inbound `{label}` to **{top.Fqn}** ({KindLabel(top.Kind)}):");
                 if (callers.Count == 0)
                 {
                     sb.AppendLine("- (none)");
+                    AppendQueryStateNote(sb, queryState);
                     return BuildListCallersResult(
                         prose: sb.ToString(),
                         target: top,
                         callers: Array.Empty<AuditableRelation>(),
                         edgeKindLabel: label,
                         truncated: traversal.Truncated,
+                        queryState: queryState,
+                        selection: selection,
                         scopeId: host.Scope.Id,
-                        elapsedMs: sw.ElapsedMilliseconds);
+                        elapsedMs: sw.ElapsedMilliseconds,
+                        rootPath: host.Scope.Root,
+                        pathFormat: pathFormat);
                 }
                 if (callers.Count >= 2)
                 {
@@ -631,7 +688,7 @@ public static class GraphTools
                         {
                             $"**{c.Fqn}**",
                             KindLabel(c.Kind),
-                            Format.Location(c.FilePath, c.StartLine, c.StartCol),
+                            Format.Location(RenderPath(c.FilePath), c.StartLine, c.StartCol),
                         });
                     }
                     Format.AppendTable(sb, new[] { "Symbol", "Kind", "Location" }, rows);
@@ -653,25 +710,30 @@ public static class GraphTools
                     foreach (var relation in callers)
                     {
                         var c = relation.Source;
-                        sb.AppendLine($"- **{c.Fqn}** ({KindLabel(c.Kind)}) at {Format.Location(c.FilePath, c.StartLine, c.StartCol)}");
+                        sb.AppendLine($"- **{c.Fqn}** ({KindLabel(c.Kind)}) at {Format.Location(RenderPath(c.FilePath), c.StartLine, c.StartCol)}");
                         var payloadLine = Format.PayloadSubLine(c.PayloadJson);
                         if (payloadLine is not null) sb.AppendLine(payloadLine);
                     }
                 }
-                EvidenceTraversal.AppendRelations(sb, callers);
+                EvidenceTraversal.AppendRelations(sb, callers, RenderPath);
                 if (traversal.Truncated)
                 {
                     sb.AppendLine();
                     sb.AppendLine("note: results were truncated by the validated relation limit.");
                 }
+                AppendQueryStateNote(sb, queryState);
                 return BuildListCallersResult(
                     prose: sb.ToString(),
                     target: top,
                     callers: callers,
                     edgeKindLabel: label,
                     truncated: traversal.Truncated,
+                    queryState: queryState,
+                    selection: selection,
                     scopeId: host.Scope.Id,
-                    elapsedMs: sw.ElapsedMilliseconds);
+                    elapsedMs: sw.ElapsedMilliseconds,
+                    rootPath: host.Scope.Root,
+                    pathFormat: pathFormat);
             }, ct));
 
     private static CallToolResult BuildListCallersResult(
@@ -680,9 +742,16 @@ public static class GraphTools
         IReadOnlyList<AuditableRelation> callers,
         string edgeKindLabel,
         bool truncated,
+        QueryState queryState,
+        SymbolSelection selection,
         string scopeId,
-        long elapsedMs)
+        long elapsedMs,
+        string rootPath,
+        string pathFormat)
     {
+        var relativePaths = pathFormat == "relative";
+        string RenderPath(string path) =>
+            FormatImpactPath(rootPath, path, relativePaths);
         var content = new List<ContentBlock>(capacity: 2 + callers.Count)
         {
             new TextContentBlock { Text = prose },
@@ -696,7 +765,7 @@ public static class GraphTools
                 Uri = GraphResourceUris.Symbol(c.Id),
                 Name = c.Fqn,
                 Title = c.Fqn,
-                Description = $"{KindLabel(c.Kind)} — {Format.Location(c.FilePath, c.StartLine, c.StartCol)}",
+                Description = $"{KindLabel(c.Kind)} — {Format.Location(RenderPath(c.FilePath), c.StartLine, c.StartCol)}",
                 MimeType = "text/markdown",
             });
         }
@@ -713,18 +782,36 @@ public static class GraphTools
                 CanonicalKey: relation.Source.CanonicalKey,
                 Fqn: relation.Source.Fqn,
                 Kind: relation.Source.Kind,
-                FilePath: relation.Source.FilePath,
+                FilePath: RenderPath(relation.Source.FilePath),
                 Line: relation.Source.StartLine,
                 Column: relation.Source.StartCol,
-                Source: relation.Hop.From,
-                Target: relation.Hop.To,
+                Source: MapImpactSymbol(
+                    relation.Hop.From,
+                    rootPath,
+                    relativePaths),
+                Target: MapImpactSymbol(
+                    relation.Hop.To,
+                    rootPath,
+                    relativePaths),
                 Relation: relation.Hop.Relation,
                 Confidence: relation.Hop.Confidence,
-                Evidence: relation.Hop.Evidence,
+                Evidence: relation.Hop.Evidence.Select(item => item with
+                    {
+                        FilePath = RenderPath(item.FilePath),
+                    }).ToArray(),
                 EvidenceTruncated: relation.Hop.EvidenceTruncated,
                 PayloadJson: string.IsNullOrEmpty(relation.PayloadJson) ? null : relation.PayloadJson))
             .ToList();
         var dto = new ListCallersResult(
+            Result: queryState.Result,
+            ScopeStatus: queryState.ScopeStatus,
+            Completeness: queryState.Completeness,
+            AbsenceAuthoritative: queryState.AbsenceAuthoritative,
+            Reason: queryState.Reason,
+            SelectionMode: selection.Mode,
+            FallbackUsed: selection.FallbackUsed,
+            CandidateCount: selection.CandidateCount,
+            SelectionAmbiguous: selection.Ambiguous,
             TargetFqn: target.Fqn,
             TargetKind: target.Kind,
             TargetSymbolId: target.Id,
@@ -743,18 +830,28 @@ public static class GraphTools
 
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(ListCalleesResult))]
     [ToolTrigger("\"what does X call?\" or \"what types does X use?\"")]
-    [Description("List evidence-backed outbound edges from a source symbol. Every row includes canonical source/target identities, actual relation, confidence, and stored occurrence file/range evidence; malformed edges without evidence are skipped. Default kind=calls; kind=all preserves each actual edge kind. Plugin-defined kebab-case kinds are accepted.")]
+    [Description("List evidence-backed outbound edges from a source symbol. Every row includes canonical source/target identities, actual relation, confidence, and stored occurrence file/range evidence; malformed edges without evidence are skipped. Default kind=calls and repository-relative paths; kind=all preserves each actual edge kind. Plugin-defined kebab-case kinds are accepted.")]
     public static Task<CallToolResult> ListCalleesAsync(
         ScopeRouter router,
         [Description("Source symbol name or FQN")] string symbol,
         [Description("Maximum number of results to return (default 50)")] int limit = 50,
-        [Description("Edge kind to walk (kebab-case): calls (default) | uses-type | overrides-member | implements-member | instantiates | throws | tests | code-behind | binds-to | binds-path | binds-element | handles-event | uses-resource | instantiates-type | merges | applies-style | all. Plugin-defined kinds are accepted.")] string? kind = null,
+        [Description("Edge kind to walk (kebab-case): calls (default) | uses-type | overrides-member | implements-member | instantiates | throws | tests | code-behind | code-behind-uses-element | binds-to | binds-path | binds-element | handles-event | uses-resource | instantiates-type | merges | applies-style | all. Plugin-defined kinds are accepted.")] string? kind = null,
         [Description(ScopeDescription)] string? scope = null,
+        [Description("Path rendering: relative (default) or absolute")] string pathFormat = "relative",
         CancellationToken ct = default) =>
-        ToolMetrics.TrackAsync("list_callees", new { symbol, limit, kind, scope }, () =>
+        ToolMetrics.TrackAsync("list_callees", new { symbol, limit, kind, scope, pathFormat }, () =>
             ScopedExecution.RunAsync(router, scope, async host =>
             {
                 var sw = System.Diagnostics.Stopwatch.StartNew();
+                pathFormat = NormalisePathFormat(pathFormat);
+                if (pathFormat.Length == 0)
+                {
+                    return DiagnosticResult.Error(
+                        "list_callees `pathFormat` must be relative or absolute.");
+                }
+                var relativePaths = pathFormat == "relative";
+                string RenderPath(string path) =>
+                    FormatImpactPath(host.Scope.Root, path, relativePaths);
                 if (limit is < 1 or > 1000)
                 {
                     return DiagnosticResult.Error("list_callees `limit` must be between 1 and 1000.");
@@ -788,7 +885,9 @@ public static class GraphTools
                         edgeKindLabel: label,
                         truncated: traversal.Truncated,
                         scopeId: host.Scope.Id,
-                        elapsedMs: sw.ElapsedMilliseconds);
+                        elapsedMs: sw.ElapsedMilliseconds,
+                        rootPath: host.Scope.Root,
+                        pathFormat: pathFormat);
                 }
                 if (callees.Count >= 2)
                 {
@@ -800,7 +899,7 @@ public static class GraphTools
                         {
                             $"**{c.Fqn}**",
                             KindLabel(c.Kind),
-                            Format.Location(c.FilePath, c.StartLine, c.StartCol),
+                            Format.Location(RenderPath(c.FilePath), c.StartLine, c.StartCol),
                         });
                     }
                     Format.AppendTable(sb, new[] { "Symbol", "Kind", "Location" }, rows);
@@ -818,12 +917,12 @@ public static class GraphTools
                     foreach (var relation in callees)
                     {
                         var c = relation.Target;
-                        sb.AppendLine($"- **{c.Fqn}** ({KindLabel(c.Kind)}) at {Format.Location(c.FilePath, c.StartLine, c.StartCol)}");
+                        sb.AppendLine($"- **{c.Fqn}** ({KindLabel(c.Kind)}) at {Format.Location(RenderPath(c.FilePath), c.StartLine, c.StartCol)}");
                         var payloadLine = Format.PayloadSubLine(c.PayloadJson);
                         if (payloadLine is not null) sb.AppendLine(payloadLine);
                     }
                 }
-                EvidenceTraversal.AppendRelations(sb, callees);
+                EvidenceTraversal.AppendRelations(sb, callees, RenderPath);
                 if (traversal.Truncated)
                 {
                     sb.AppendLine();
@@ -836,7 +935,9 @@ public static class GraphTools
                     edgeKindLabel: label,
                     truncated: traversal.Truncated,
                     scopeId: host.Scope.Id,
-                    elapsedMs: sw.ElapsedMilliseconds);
+                    elapsedMs: sw.ElapsedMilliseconds,
+                    rootPath: host.Scope.Root,
+                    pathFormat: pathFormat);
             }, ct));
 
     private static CallToolResult BuildListCalleesResult(
@@ -846,8 +947,13 @@ public static class GraphTools
         string edgeKindLabel,
         bool truncated,
         string scopeId,
-        long elapsedMs)
+        long elapsedMs,
+        string rootPath,
+        string pathFormat)
     {
+        var relativePaths = pathFormat == "relative";
+        string RenderPath(string path) =>
+            FormatImpactPath(rootPath, path, relativePaths);
         var content = new List<ContentBlock>(capacity: 2 + callees.Count)
         {
             new TextContentBlock { Text = prose },
@@ -861,7 +967,7 @@ public static class GraphTools
                 Uri = GraphResourceUris.Symbol(c.Id),
                 Name = c.Fqn,
                 Title = c.Fqn,
-                Description = $"{KindLabel(c.Kind)} — {Format.Location(c.FilePath, c.StartLine, c.StartCol)}",
+                Description = $"{KindLabel(c.Kind)} — {Format.Location(RenderPath(c.FilePath), c.StartLine, c.StartCol)}",
                 MimeType = "text/markdown",
             });
         }
@@ -878,14 +984,23 @@ public static class GraphTools
                 CanonicalKey: relation.Target.CanonicalKey,
                 Fqn: relation.Target.Fqn,
                 Kind: relation.Target.Kind,
-                FilePath: relation.Target.FilePath,
+                FilePath: RenderPath(relation.Target.FilePath),
                 Line: relation.Target.StartLine,
                 Column: relation.Target.StartCol,
-                Source: relation.Hop.From,
-                Target: relation.Hop.To,
+                Source: MapImpactSymbol(
+                    relation.Hop.From,
+                    rootPath,
+                    relativePaths),
+                Target: MapImpactSymbol(
+                    relation.Hop.To,
+                    rootPath,
+                    relativePaths),
                 Relation: relation.Hop.Relation,
                 Confidence: relation.Hop.Confidence,
-                Evidence: relation.Hop.Evidence,
+                Evidence: relation.Hop.Evidence.Select(item => item with
+                    {
+                        FilePath = RenderPath(item.FilePath),
+                    }).ToArray(),
                 EvidenceTruncated: relation.Hop.EvidenceTruncated,
                 PayloadJson: string.IsNullOrEmpty(relation.PayloadJson) ? null : relation.PayloadJson))
             .ToList();
@@ -920,22 +1035,45 @@ public static class GraphTools
             ScopedExecution.RunAsync(router, scope, async host =>
             {
                 var sw = System.Diagnostics.Stopwatch.StartNew();
+                if (limit is < 1 or > 1000)
+                {
+                    return DiagnosticResult.Error(
+                        "find_implementations `limit` must be between 1 and 1000.");
+                }
                 var hits = await host.Store.FindSymbolsAsync(symbol, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
                 if (hits.Count == 0) return DiagnosticResult.Build($"No matches for '{symbol}'.");
+                var selection = DescribeSymbolSelection(symbol, hits);
                 var top = hits[0];
-                var impls = await host.Store.ListImplementationsAsync(top.Id, limit, ct).ConfigureAwait(false);
-                var filtered = includeAbstract
+                var impls = await host.Store.ListImplementationsAsync(
+                    top.Id,
+                    limit: 1001,
+                    ct).ConfigureAwait(false);
+                var filteredCandidates = includeAbstract
                     ? impls
-                    : impls.Where(h => !(h.Signature?.Contains("abstract", StringComparison.Ordinal) ?? false)).ToList();
+                    : impls.Where(h =>
+                        !(h.Signature?.Contains(
+                            "abstract",
+                            StringComparison.Ordinal) ?? false)).ToList();
+                var truncated = filteredCandidates.Count > limit;
+                var filtered = filteredCandidates.Take(limit).ToList();
+                var queryState = DescribeQueryState(
+                    host,
+                    truncated,
+                    filtered.Count,
+                    selection,
+                    top);
                 var sb = new StringBuilder();
                 sb.AppendLine($"Implementations of **{top.Fqn}** ({KindLabel(top.Kind)}):");
                 if (filtered.Count == 0)
                 {
                     sb.AppendLine("- (none)");
+                    AppendQueryStateNote(sb, queryState);
                     return BuildFindImplementationsResult(
                         prose: sb.ToString(),
                         target: top,
                         impls: Array.Empty<SymbolHit>(),
+                        queryState: queryState,
+                        selection: selection,
                         scopeId: host.Scope.Id,
                         elapsedMs: sw.ElapsedMilliseconds);
                 }
@@ -960,10 +1098,13 @@ public static class GraphTools
                         sb.AppendLine($"- **{c.Fqn}** ({KindLabel(c.Kind)}) at {Format.Location(c.FilePath, c.StartLine, c.StartCol)}");
                     }
                 }
+                AppendQueryStateNote(sb, queryState);
                 return BuildFindImplementationsResult(
                     prose: sb.ToString(),
                     target: top,
                     impls: filtered,
+                    queryState: queryState,
+                    selection: selection,
                     scopeId: host.Scope.Id,
                     elapsedMs: sw.ElapsedMilliseconds);
             }, ct));
@@ -972,6 +1113,8 @@ public static class GraphTools
         string prose,
         SymbolHit target,
         IReadOnlyList<SymbolHit> impls,
+        QueryState queryState,
+        SymbolSelection selection,
         string scopeId,
         long elapsedMs)
     {
@@ -1000,6 +1143,7 @@ public static class GraphTools
         var structuredImpls = impls
             .Select(c => new FindImplementationsRow(
                 SymbolId: c.Id,
+                CanonicalKey: c.CanonicalKey,
                 Fqn: c.Fqn,
                 Kind: c.Kind,
                 FilePath: c.FilePath,
@@ -1008,9 +1152,20 @@ public static class GraphTools
                 Signature: string.IsNullOrEmpty(c.Signature) ? null : c.Signature))
             .ToList();
         var dto = new FindImplementationsResult(
+            Result: queryState.Result,
+            ScopeStatus: queryState.ScopeStatus,
+            Completeness: queryState.Completeness,
+            AbsenceAuthoritative: queryState.AbsenceAuthoritative,
+            Reason: queryState.Reason,
+            SelectionMode: selection.Mode,
+            FallbackUsed: selection.FallbackUsed,
+            CandidateCount: selection.CandidateCount,
+            SelectionAmbiguous: selection.Ambiguous,
+            Truncated: queryState.Truncated,
             TargetFqn: target.Fqn,
             TargetKind: target.Kind,
             TargetSymbolId: target.Id,
+            TargetCanonicalKey: target.CanonicalKey,
             Implementations: structuredImpls);
         return new CallToolResult
         {
@@ -1542,12 +1697,12 @@ public static class GraphTools
 
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(NeighborhoodResult))]
     [ToolTrigger("\"give me a quick overview around X\" — orient before diving in")]
-    [Description("Get the immediate graph neighborhood of a symbol: callers, callees, and inheritance/implements edges. Default kind=calls; pass kind=uses-type, overrides-member, implements-member, instantiates, throws, tests, all, any XAML edge kind (code-behind, binds-to, binds-path, binds-element, handles-event, uses-resource, instantiates-type, merges, applies-style) on a scope that loaded the XAML indexer, or any plugin-defined kebab-case kind to inspect other edge layers.")]
+    [Description("Get the immediate graph neighborhood of a symbol: callers, callees, and inheritance/implements edges. Default kind=calls; pass kind=uses-type, overrides-member, implements-member, instantiates, throws, tests, all, any XAML edge kind (code-behind, code-behind-uses-element, binds-to, binds-path, binds-element, handles-event, uses-resource, instantiates-type, merges, applies-style) on a scope that loaded the XAML indexer, or any plugin-defined kebab-case kind to inspect other edge layers.")]
     public static Task<CallToolResult> NeighborhoodAsync(
         ScopeRouter router,
         [Description("Symbol name or FQN")] string symbol,
         [Description("Max items per category (default 20)")] int perCategory = 20,
-        [Description("Edge kind to walk (kebab-case): calls (default) | uses-type | overrides-member | implements-member | instantiates | throws | tests | code-behind | binds-to | binds-path | binds-element | handles-event | uses-resource | instantiates-type | merges | applies-style | all. Plugin-defined kinds are accepted.")] string? kind = null,
+        [Description("Edge kind to walk (kebab-case): calls (default) | uses-type | overrides-member | implements-member | instantiates | throws | tests | code-behind | code-behind-uses-element | binds-to | binds-path | binds-element | handles-event | uses-resource | instantiates-type | merges | applies-style | all. Plugin-defined kinds are accepted.")] string? kind = null,
         [Description(ScopeDescription)] string? scope = null,
         CancellationToken ct = default) =>
         ToolMetrics.TrackAsync("neighborhood", new { symbol, perCategory, kind, scope }, () =>
@@ -1867,17 +2022,20 @@ public static class GraphTools
 
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(ImpactOfChangeResult))]
     [ToolTrigger("\"what would change if I edit X?\" — transitive callers")]
-    [Description("Compute bounded evidence-backed upstream impact with breadth-first, cycle-safe traversal. Every row includes its canonical identity, BFS predecessor, path confidence, and a source-to-target path whose hops carry real occurrence evidence. maxDepth is 1-12 and limit is 1-1000; truncation is explicit.")]
+    [Description("Compute bounded evidence-backed upstream impact with breadth-first, cycle-safe traversal. The default evidence=summary omits repeated hop paths; use evidence=full for audit output. maxDepth is 1-12 and limit is 1-1000; truncation is explicit.")]
     public static Task<CallToolResult> ImpactOfChangeAsync(
         ScopeRouter router,
         [Description("Symbol name or FQN")] string symbol,
         [Description("Maximum traversal depth (default 4)")] int maxDepth = 4,
         [Description("Maximum results (default 100)")] int limit = 100,
-        [Description("Edge kind to walk (kebab-case): calls (default) | uses-type | overrides-member | implements-member | instantiates | throws | tests | code-behind | binds-to | binds-path | binds-element | handles-event | uses-resource | instantiates-type | merges | applies-style | all. Plugin-defined kinds are accepted.")] string? kind = null,
+        [Description("Edge kind to walk (kebab-case): calls (default) | uses-type | overrides-member | implements-member | instantiates | throws | tests | code-behind | code-behind-uses-element | binds-to | binds-path | binds-element | handles-event | uses-resource | instantiates-type | merges | applies-style | all. Plugin-defined kinds are accepted.")] string? kind = null,
         [Description(ScopeDescription)] string? scope = null,
         IProgress<ProgressNotificationValue>? progress = null,
+        [Description("Evidence detail: summary (default) or full")] string evidence = "summary",
+        [Description("Include predecessor hop paths in summary mode (default false); full evidence always includes paths")] bool includePaths = false,
+        [Description("Path rendering: relative (default) or absolute")] string pathFormat = "relative",
         CancellationToken ct = default) =>
-        ToolMetrics.TrackAsync("impact_of_change", new { symbol, maxDepth, limit, kind, scope }, () =>
+        ToolMetrics.TrackAsync("impact_of_change", new { symbol, maxDepth, limit, kind, scope, evidence, includePaths, pathFormat }, () =>
             ScopedExecution.RunAsync(router, scope, async host =>
             {
                 var sw = System.Diagnostics.Stopwatch.StartNew();
@@ -1889,6 +2047,19 @@ public static class GraphTools
                 {
                     return DiagnosticResult.Error("impact_of_change `limit` must be between 1 and 1000.");
                 }
+                evidence = evidence.Trim().ToLowerInvariant();
+                if (evidence is not ("summary" or "full"))
+                {
+                    return DiagnosticResult.Error("impact_of_change `evidence` must be summary or full.");
+                }
+                pathFormat = pathFormat.Trim().ToLowerInvariant();
+                if (pathFormat is not ("relative" or "absolute"))
+                {
+                    return DiagnosticResult.Error("impact_of_change `pathFormat` must be relative or absolute.");
+                }
+                var relativePaths = pathFormat == "relative";
+                string RenderPath(string path) =>
+                    FormatImpactPath(host.Scope.Root, path, relativePaths);
                 var (edgeKind, label, isAll) = NormaliseEdgeKindParam(kind);
                 if (!isAll && edgeKind is not null)
                 {
@@ -1898,6 +2069,7 @@ public static class GraphTools
 
                 var hits = await host.Store.FindSymbolsAsync(symbol, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
                 if (hits.Count == 0) return DiagnosticResult.Build($"No matches for '{symbol}'.");
+                var selection = DescribeSymbolSelection(symbol, hits);
                 var top = hits[0];
                 progress?.Report(Format.Progress(0.0, "querying"));
                 var traversal = await EvidenceTraversal.TraceImpactAsync(
@@ -1908,11 +2080,18 @@ public static class GraphTools
                     edgeKind,
                     ct).ConfigureAwait(false);
                 var rows = traversal.Rows;
+                var queryState = DescribeQueryState(
+                    host,
+                    traversal.Truncated,
+                    rows.Count,
+                    selection,
+                    top);
                 var sb = new StringBuilder();
                 sb.AppendLine($"Upstream impact of **{top.Fqn}** ({KindLabel(top.Kind)}) [kind={label}] up to depth {maxDepth}:");
                 if (rows.Count == 0)
                 {
                     sb.AppendLine("- (no upstream callers found in graph)");
+                    AppendQueryStateNote(sb, queryState);
                     return BuildImpactOfChangeResult(
                         prose: sb.ToString(),
                         target: top,
@@ -1921,8 +2100,14 @@ public static class GraphTools
                         maxDepth: maxDepth,
                         truncated: traversal.Truncated,
                         expandedNodes: traversal.ExpandedNodes,
+                        queryState: queryState,
+                        selection: selection,
                         scopeId: host.Scope.Id,
-                        elapsedMs: sw.ElapsedMilliseconds);
+                        elapsedMs: sw.ElapsedMilliseconds,
+                        rootPath: host.Scope.Root,
+                        evidence: evidence,
+                        includePaths: includePaths,
+                        pathFormat: pathFormat);
                 }
                 if (rows.Count >= 2)
                 {
@@ -1934,7 +2119,7 @@ public static class GraphTools
                             r.Depth.ToString(),
                             $"**{r.Symbol.Fqn}**",
                             KindLabel(r.Symbol.Kind),
-                            Format.Location(r.Symbol.FilePath, r.Symbol.StartLine, r.Symbol.StartCol),
+                            Format.Location(RenderPath(r.Symbol.FilePath), r.Symbol.StartLine, r.Symbol.StartCol),
                         });
                     }
                     Format.AppendTable(
@@ -1947,15 +2132,19 @@ public static class GraphTools
                 {
                     foreach (var r in rows)
                     {
-                        sb.AppendLine($"- d{r.Depth}: **{r.Symbol.Fqn}** ({KindLabel(r.Symbol.Kind)}) at {Format.Location(r.Symbol.FilePath, r.Symbol.StartLine, r.Symbol.StartCol)}");
+                        sb.AppendLine($"- d{r.Depth}: **{r.Symbol.Fqn}** ({KindLabel(r.Symbol.Kind)}) at {Format.Location(RenderPath(r.Symbol.FilePath), r.Symbol.StartLine, r.Symbol.StartCol)}");
                     }
                 }
-                EvidenceTraversal.AppendImpactPaths(sb, rows);
+                if (evidence == "full")
+                {
+                    EvidenceTraversal.AppendImpactPaths(sb, rows, RenderPath);
+                }
                 if (traversal.Truncated)
                 {
                     sb.AppendLine();
                     sb.AppendLine("note: traversal was truncated by maxDepth or the validated result limit.");
                 }
+                AppendQueryStateNote(sb, queryState);
                 return BuildImpactOfChangeResult(
                     prose: sb.ToString(),
                     target: top,
@@ -1964,8 +2153,14 @@ public static class GraphTools
                     maxDepth: maxDepth,
                     truncated: traversal.Truncated,
                     expandedNodes: traversal.ExpandedNodes,
+                    queryState: queryState,
+                    selection: selection,
                     scopeId: host.Scope.Id,
-                    elapsedMs: sw.ElapsedMilliseconds);
+                    elapsedMs: sw.ElapsedMilliseconds,
+                    rootPath: host.Scope.Root,
+                    evidence: evidence,
+                    includePaths: includePaths,
+                    pathFormat: pathFormat);
             }, ct, progress));
 
     private static CallToolResult BuildImpactOfChangeResult(
@@ -1976,9 +2171,16 @@ public static class GraphTools
         int maxDepth,
         bool truncated,
         int expandedNodes,
+        QueryState queryState,
+        SymbolSelection selection,
         string scopeId,
-        long elapsedMs)
+        long elapsedMs,
+        string rootPath,
+        string evidence,
+        bool includePaths,
+        string pathFormat)
     {
+        var relativePaths = pathFormat == "relative";
         var content = new List<ContentBlock>(capacity: 2 + rows.Count)
         {
             new TextContentBlock { Text = prose },
@@ -1991,7 +2193,7 @@ public static class GraphTools
                 Uri = GraphResourceUris.Symbol(r.Symbol.Id),
                 Name = r.Symbol.Fqn,
                 Title = $"d{r.Depth}: {r.Symbol.Fqn}",
-                Description = $"{KindLabel(r.Symbol.Kind)} — {Format.Location(r.Symbol.FilePath, r.Symbol.StartLine, r.Symbol.StartCol)}",
+                Description = $"{KindLabel(r.Symbol.Kind)} — {Format.Location(FormatImpactPath(rootPath, r.Symbol.FilePath, relativePaths), r.Symbol.StartLine, r.Symbol.StartCol)}",
                 MimeType = "text/markdown",
             });
         }
@@ -2003,6 +2205,8 @@ public static class GraphTools
             ("max_depth", maxDepth.ToString()),
             ("upstream", rows.Count.ToString())));
 
+        var includeStructuredPaths = evidence == "full" || includePaths;
+        var includeFullEvidence = evidence == "full";
         var structuredRows = rows
             .Select(r => new ImpactOfChangeRow(
                 Depth: r.Depth,
@@ -2010,20 +2214,42 @@ public static class GraphTools
                 CanonicalKey: r.Symbol.CanonicalKey,
                 Fqn: r.Symbol.Fqn,
                 Kind: r.Symbol.Kind,
-                FilePath: r.Symbol.FilePath,
+                FilePath: FormatImpactPath(rootPath, r.Symbol.FilePath, relativePaths),
                 Line: r.Symbol.StartLine,
                 Column: r.Symbol.StartCol,
-                Predecessor: TraceCallPathTools.MapSymbol(r.Predecessor),
+                Predecessor: MapImpactSymbol(
+                    TraceCallPathTools.MapSymbol(r.Predecessor),
+                    rootPath,
+                    relativePaths),
                 Confidence: r.Confidence,
-                Path: r.Path))
+                Path: includeStructuredPaths
+                    ? r.Path.Select(hop => MapImpactHop(
+                            hop,
+                            rootPath,
+                            relativePaths,
+                            includeFullEvidence))
+                        .ToArray()
+                    : []))
             .ToList();
         var dto = new ImpactOfChangeResult(
+            Result: queryState.Result,
+            ScopeStatus: queryState.ScopeStatus,
+            Completeness: queryState.Completeness,
+            AbsenceAuthoritative: queryState.AbsenceAuthoritative,
+            Reason: queryState.Reason,
+            SelectionMode: selection.Mode,
+            FallbackUsed: selection.FallbackUsed,
+            CandidateCount: selection.CandidateCount,
+            SelectionAmbiguous: selection.Ambiguous,
             TargetFqn: target.Fqn,
             TargetKind: target.Kind,
             TargetSymbolId: target.Id,
             TargetCanonicalKey: target.CanonicalKey,
             EdgeKind: edgeKindLabel,
             MaxDepth: maxDepth,
+            Evidence: evidence,
+            IncludePaths: includeStructuredPaths,
+            PathFormat: pathFormat,
             Truncated: truncated,
             ExpandedNodes: expandedNodes,
             Upstream: structuredRows);
@@ -2034,6 +2260,111 @@ public static class GraphTools
                 dto,
                 ToolOutputJsonContext.Default.ImpactOfChangeResult),
         };
+    }
+
+    private static int CountReferenceOccurrences(
+        IReadOnlyList<ReferenceHit> references) =>
+        references
+            .Select(reference => (
+                Path: reference.FilePath,
+                reference.Line,
+                reference.Col,
+                reference.IsGenerated))
+            .Distinct()
+            .Count();
+
+    private static TraceCallPathHop MapImpactHop(
+        TraceCallPathHop hop,
+        string rootPath,
+        bool relativePaths,
+        bool includeEvidence) =>
+        hop with
+        {
+            From = MapImpactSymbol(hop.From, rootPath, relativePaths),
+            To = MapImpactSymbol(hop.To, rootPath, relativePaths),
+            Evidence = includeEvidence
+                ? hop.Evidence.Select(item => item with
+                    {
+                        FilePath = FormatImpactPath(
+                            rootPath,
+                            item.FilePath,
+                            relativePaths),
+                    }).ToArray()
+                : [],
+        };
+
+    private static TraceCallPathSymbol MapImpactSymbol(
+        TraceCallPathSymbol symbol,
+        string rootPath,
+        bool relativePaths) =>
+        symbol with
+        {
+            FilePath = FormatImpactPath(
+                rootPath,
+                symbol.FilePath,
+                relativePaths),
+        };
+
+    private static string NormalisePathFormat(string? pathFormat)
+    {
+        var normalized = pathFormat?.Trim().ToLowerInvariant();
+        return normalized is "relative" or "absolute"
+            ? normalized
+            : string.Empty;
+    }
+
+    private static bool IsQueryGraphPathColumn(string columnName)
+    {
+        var normalized = columnName.Trim().ToLowerInvariant();
+        return normalized is "path" or "file_path"
+            || normalized.EndsWith("_path", StringComparison.Ordinal);
+    }
+
+    private static string FormatQueryGraphPath(
+        IReadOnlyList<string> roots,
+        string filePath)
+    {
+        foreach (var root in roots)
+        {
+            var rendered = FormatImpactPath(
+                root,
+                filePath,
+                relative: true);
+            if (!string.Equals(
+                    rendered,
+                    filePath,
+                    StringComparison.Ordinal))
+            {
+                return rendered;
+            }
+        }
+        return filePath;
+    }
+
+    private static string FormatImpactPath(
+        string rootPath,
+        string filePath,
+        bool relative)
+    {
+        if (!relative || string.IsNullOrWhiteSpace(filePath))
+        {
+            return filePath;
+        }
+        try
+        {
+            var result = Path.GetRelativePath(rootPath, filePath);
+            return result.StartsWith(".." + Path.DirectorySeparatorChar, StringComparison.Ordinal)
+                || string.Equals(result, "..", StringComparison.Ordinal)
+                    ? filePath
+                    : result.Replace(Path.DirectorySeparatorChar, '/');
+        }
+        catch (Exception ex) when (
+            ex is ArgumentException
+                or NotSupportedException
+                or PathTooLongException)
+        {
+            return filePath;
+        }
     }
 
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(ListMembersResult))]
@@ -2210,7 +2541,7 @@ public static class GraphTools
                 // on first use, so the first `EmbedAsync` call after server start carries the ONNX
                 // model load (3-5s). Subsequent calls reuse the loaded model and are sub-second.
                 progress?.Report(Format.Progress(0.0, "encoding query"));
-                var queryEmbeddings = await generator.EmbedAsync(new[] { query }, ct).ConfigureAwait(false);
+                var queryEmbeddings = await generator.EmbedQueryAsync(new[] { query }, ct).ConfigureAwait(false);
                 if (queryEmbeddings.Count == 0)
                 {
                     return DiagnosticResult.Error("semantic_search: encoder produced no vector for the query.");
@@ -2380,7 +2711,7 @@ public static class GraphTools
 
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(FindDiagnosticsResult))]
     [ToolTrigger("\"what does this codebase warn about?\" or \"is X being warned on?\"")]
-    [Description("Find Roslyn diagnostics (analyzer warnings, compiler errors, etc.) captured during indexing. Filter by severity (default 'warning' = severity >= 2), diagnostic code (e.g. 'CS0618'), and/or symbol.")]
+    [Description("Find Roslyn diagnostics (analyzer warnings, compiler errors, etc.) captured during indexing. Filter by severity (default 'warning' = severity >= 2), diagnostic code (e.g. 'CS0618'), and/or symbol. Paths are repository-relative by default.")]
     public static Task<CallToolResult> FindDiagnosticsAsync(
         ScopeRouter router,
         [Description("Severity floor: hidden | info | warning (default) | error | all. Numeric values 0-3 also accepted.")] string? severity = "warning",
@@ -2388,11 +2719,21 @@ public static class GraphTools
         [Description("Optional symbol name/FQN to scope the lookup to a single symbol's diagnostics")] string? symbol = null,
         [Description("Maximum rows to return (default 100)")] int limit = 100,
         [Description(ScopeDescription)] string? scope = null,
+        [Description("Path rendering: relative (default) or absolute")] string pathFormat = "relative",
         CancellationToken ct = default) =>
-        ToolMetrics.TrackAsync("find_diagnostics", new { severity, code, symbol, limit, scope }, () =>
+        ToolMetrics.TrackAsync("find_diagnostics", new { severity, code, symbol, limit, scope, pathFormat }, () =>
             ScopedExecution.RunAsync(router, scope, async host =>
             {
                 var sw = System.Diagnostics.Stopwatch.StartNew();
+                pathFormat = NormalisePathFormat(pathFormat);
+                if (pathFormat.Length == 0)
+                {
+                    return DiagnosticResult.Error(
+                        "find_diagnostics `pathFormat` must be relative or absolute.");
+                }
+                var relativePaths = pathFormat == "relative";
+                string RenderPath(string path) =>
+                    FormatImpactPath(host.Scope.Root, path, relativePaths);
                 var sev = ParseSeverity(severity);
                 if (sev == -1)
                 {
@@ -2428,7 +2769,7 @@ public static class GraphTools
                             d.SymbolFqn ?? "(file)",
                             DiagnosticRelation(d),
                             "semantic",
-                            Format.Location(d.FilePath, d.Line, d.Col),
+                            Format.Location(RenderPath(d.FilePath), d.Line, d.Col),
                             d.Message,
                         });
                     }
@@ -2454,7 +2795,7 @@ public static class GraphTools
                             $"- **{SeverityLabel(d.Severity)} {d.Code}** "
                             + $"on `{d.SymbolFqn ?? "(file)"}` "
                             + $"({DiagnosticRelation(d)}, semantic) at "
-                            + $"{Format.Location(d.FilePath, d.Line, d.Col)} "
+                            + $"{Format.Location(RenderPath(d.FilePath), d.Line, d.Col)} "
                             + $"— {d.Message}");
                     }
                 }
@@ -2466,7 +2807,9 @@ public static class GraphTools
                     symbolId: symbolId,
                     rows: rows,
                     scopeId: host.Scope.Id,
-                    elapsedMs: sw.ElapsedMilliseconds);
+                    elapsedMs: sw.ElapsedMilliseconds,
+                    rootPath: host.Scope.Root,
+                    pathFormat: pathFormat);
             }, ct));
 
     private static CallToolResult BuildFindDiagnosticsResult(
@@ -2477,8 +2820,11 @@ public static class GraphTools
         long? symbolId,
         IReadOnlyList<DiagnosticHit> rows,
         string scopeId,
-        long elapsedMs)
+        long elapsedMs,
+        string rootPath,
+        string pathFormat)
     {
+        var relativePaths = pathFormat == "relative";
         // Per spec: no resource link per row — diagnostics aren't first-class graph entities yet.
         // Just the leading prose + trailing audience-restricted metadata + structured payload.
         var content = new List<ContentBlock>(capacity: 2)
@@ -2502,7 +2848,10 @@ public static class GraphTools
                 Relation: DiagnosticRelation(d),
                 Confidence: "semantic",
                 Producer: DiagnosticProducer(d.Code),
-                FilePath: d.FilePath,
+                FilePath: FormatImpactPath(
+                    rootPath,
+                    d.FilePath,
+                    relativePaths),
                 Line: d.Line,
                 Column: d.Col))
             .ToList();
@@ -2752,6 +3101,281 @@ public static class GraphTools
     };
 
     internal static string KindLabelOf(string kind) => KindLabel(kind);
+
+    private sealed record SymbolSelection(
+        string Mode,
+        bool FallbackUsed,
+        int CandidateCount,
+        bool Ambiguous);
+
+    private sealed record QueryState(
+        string Result,
+        string ScopeStatus,
+        string Completeness,
+        bool AbsenceAuthoritative,
+        string? Reason,
+        bool Truncated);
+
+    private static SymbolSelection DescribeSymbolSelection(
+        string query,
+        IReadOnlyList<SymbolHit> hits)
+    {
+        var canonical = hits.Where(hit =>
+                string.Equals(hit.CanonicalKey, query, StringComparison.Ordinal))
+            .ToList();
+        if (canonical.Count > 0)
+        {
+            return new SymbolSelection(
+                "exact-canonical",
+                FallbackUsed: false,
+                canonical.Count,
+                Ambiguous: canonical.Count > 1);
+        }
+
+        var exactFqn = hits.Where(hit =>
+                string.Equals(hit.Fqn, query, StringComparison.Ordinal))
+            .ToList();
+        if (exactFqn.Count > 0)
+        {
+            return new SymbolSelection(
+                "exact-fqn",
+                FallbackUsed: false,
+                exactFqn.Count,
+                Ambiguous: exactFqn.Count > 1);
+        }
+
+        var exactName = hits.Where(hit =>
+                string.Equals(hit.Name, query, StringComparison.Ordinal))
+            .ToList();
+        if (exactName.Count > 0)
+        {
+            return new SymbolSelection(
+                "exact-name",
+                FallbackUsed: true,
+                exactName.Count,
+                Ambiguous: exactName.Count > 1);
+        }
+
+        var suffix = hits.Where(hit =>
+                hit.Fqn.EndsWith(query, StringComparison.Ordinal))
+            .ToList();
+        if (suffix.Count > 0)
+        {
+            return new SymbolSelection(
+                "fqn-suffix",
+                FallbackUsed: true,
+                suffix.Count,
+                Ambiguous: suffix.Count > 1);
+        }
+
+        return new SymbolSelection(
+            "fuzzy",
+            FallbackUsed: true,
+            hits.Count,
+            Ambiguous: hits.Count > 1);
+    }
+
+    private static QueryState DescribeQueryState(
+        ScopeHost host,
+        bool truncated,
+        int resultCount,
+        SymbolSelection selection,
+        SymbolHit target)
+    {
+        var scopeIncomplete = !string.Equals(
+            host.Status,
+            "ok",
+            StringComparison.OrdinalIgnoreCase);
+        if (scopeIncomplete && IsTargetRelationUniverseComplete(host, target))
+        {
+            scopeIncomplete = false;
+        }
+        var incomplete = scopeIncomplete || truncated || selection.Ambiguous;
+        var result = selection.Ambiguous
+            ? "ambiguous"
+            : resultCount > 0
+                ? "found"
+                : incomplete
+                    ? "unknown"
+                    : "absent";
+        var reason = selection.Ambiguous
+            ? "ambiguous-selection"
+            : truncated
+                ? "scan-cap"
+                : scopeIncomplete
+                    ? "scope-" + host.Status.ToLowerInvariant()
+                    : null;
+        return new QueryState(
+            result,
+            host.Status,
+            incomplete ? "partial" : "complete",
+            AbsenceAuthoritative: resultCount == 0 && !incomplete,
+            reason,
+            truncated);
+    }
+
+    private static bool IsTargetRelationUniverseComplete(
+        ScopeHost host,
+        SymbolHit target)
+    {
+        if (!host.ProjectMapReady
+            || !host.ProjectByFilePath.TryGetValue(target.FilePath, out var owner))
+        {
+            return false;
+        }
+
+        if (target.Accessibility == 1)
+        {
+            // A private member's inbound relations cannot originate in another project.
+            return ProjectSetHasNoFailures(host, [owner]);
+        }
+
+        if (owner is not MSBuildLanguageProject msbuildOwner
+            || host.Indexer.Workspace is null)
+        {
+            return false;
+        }
+
+        // Public/internal inbound references can only originate in the owning Roslyn project
+        // or projects that transitively reference it. Failures in unrelated projects no longer
+        // downgrade an exact target's relation universe.
+        var solution = host.Indexer.Workspace.CurrentSolution;
+        var relevantIds = new HashSet<Microsoft.CodeAnalysis.ProjectId>
+        {
+            msbuildOwner.RoslynProject.Id,
+        };
+        var changed = true;
+        while (changed)
+        {
+            changed = false;
+            foreach (var project in solution.Projects)
+            {
+                if (relevantIds.Contains(project.Id)
+                    || !project.ProjectReferences.Any(reference =>
+                        relevantIds.Contains(reference.ProjectId)))
+                {
+                    continue;
+                }
+                changed |= relevantIds.Add(project.Id);
+            }
+        }
+
+        var relevantProjects = host.LanguageProjects
+            .OfType<MSBuildLanguageProject>()
+            .Where(project => relevantIds.Contains(project.RoslynProject.Id))
+            .Cast<ILanguageProject>()
+            .ToArray();
+        return relevantProjects.Length == relevantIds.Count
+            && ProjectSetHasNoFailures(host, relevantProjects);
+    }
+
+    private static bool ProjectSetHasNoFailures(
+        ScopeHost host,
+        IReadOnlyCollection<ILanguageProject> projects)
+    {
+        var projectNames = projects
+            .SelectMany(project => new[]
+            {
+                Path.GetFileNameWithoutExtension(project.Id),
+                project is MSBuildLanguageProject msbuild
+                    ? msbuild.RoslynProject.Name
+                    : null,
+            })
+            .Where(name => !string.IsNullOrWhiteSpace(name))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        if (host.FailedProjects.Any(failure =>
+                projectNames.Contains(failure.Name)))
+        {
+            return false;
+        }
+
+        var projectFiles = projects
+            .SelectMany(project => project.FilePaths)
+            .Select(NormalizeCoveragePath)
+            .Where(path => path is not null)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var projectDirectories = projects
+            .Select(project => NormalizeCoveragePath(project.Id))
+            .Where(path => path is not null)
+            .Select(path => Path.GetDirectoryName(path!))
+            .Where(path => !string.IsNullOrWhiteSpace(path))
+            .Cast<string>()
+            .ToArray();
+        return !host.FailedFiles.Any(failure =>
+        {
+            var failedPath = NormalizeCoveragePath(failure.Path);
+            return failedPath is not null
+                && (projectFiles.Contains(failedPath)
+                    || projectDirectories.Any(directory =>
+                        IsPathWithin(directory, failedPath)));
+        });
+    }
+
+    private static bool IsPathWithin(string directory, string path)
+    {
+        var relative = Path.GetRelativePath(directory, path);
+        return !Path.IsPathRooted(relative)
+            && !relative.Equals("..", StringComparison.Ordinal)
+            && !relative.StartsWith(
+                ".." + Path.DirectorySeparatorChar,
+                StringComparison.Ordinal);
+    }
+
+    private static string? NormalizeCoveragePath(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path)) return null;
+        try
+        {
+            return Path.GetFullPath(path);
+        }
+        catch
+        {
+            return path;
+        }
+    }
+
+    private static void AppendQueryStateNote(
+        StringBuilder sb,
+        QueryState state)
+    {
+        if (state.Completeness == "complete") return;
+        sb.AppendLine();
+        if (state.Result == "found")
+        {
+            sb.Append("note: result=`found`, completeness=`")
+                .Append(state.Completeness)
+                .Append("`, scope_status=`")
+                .Append(state.ScopeStatus)
+                .Append('`');
+            if (state.Reason is not null)
+            {
+                sb.Append(", reason=`").Append(state.Reason).Append('`');
+            }
+            sb.AppendLine(
+                "; positive matches are valid, but the returned relation set may be non-exhaustive.");
+            return;
+        }
+        sb.Append("note: result=`").Append(state.Result)
+            .Append("`, completeness=`").Append(state.Completeness)
+            .Append("`, scope_status=`").Append(state.ScopeStatus)
+            .Append("`, absence_authoritative=")
+            .Append(state.AbsenceAuthoritative ? "true" : "false");
+        if (state.Reason is not null)
+        {
+            sb.Append(", reason=`").Append(state.Reason).Append('`');
+        }
+        sb.AppendLine(".");
+        if (state.Reason?.StartsWith("scope-", StringComparison.Ordinal) == true)
+        {
+            sb.AppendLine(
+                "fallback: use a narrowed `rg` coverage check before treating this relation set as exhaustive.");
+        }
+        else if (state.Reason == "ambiguous-selection")
+        {
+            sb.AppendLine(
+                "fallback: retry with an exact canonical key or a narrower file/project scope.");
+        }
+    }
 
     /// <summary>
     /// Normalise the user-supplied kebab-case kind filter for storage queries. Empty or whitespace
@@ -3015,7 +3639,7 @@ public static class GraphTools
 
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(QueryGraphResult))]
     [ToolTrigger("\"how many public types use this type?\", \"which classes implement IDisposable but lack Dispose?\", \"which types have > 50 methods?\" — anything that needs aggregation/join/grouping over the graph that no curated tool exposes")]
-    [Description("Run a read-only SQL SELECT or WITH statement against the stable view layer (v_symbols, v_edges, v_edge_evidence, v_files, v_references, v_scopes, v_annotations, v_diagnostics, v_history). Call describe_schema first to learn the view shapes. Parameters bind via @name placeholders; scope filter follows the standard convention. Returns tabular {columns, rows} structured content. The `Use when` line below (auto-appended from the ToolTrigger attribute) is the canonical guidance.")]
+    [Description("Run a read-only SQL SELECT or WITH statement against the stable view layer (v_symbols, v_edges, v_edge_evidence, v_files, v_references, v_scopes, v_annotations, v_diagnostics, v_history). Call describe_schema first to learn the view shapes. Parameters bind via @name placeholders; scope filter follows the standard convention. Path/file_path columns are repository-relative by default. Returns tabular {columns, rows} structured content. The `Use when` line below (auto-appended from the ToolTrigger attribute) is the canonical guidance.")]
     public static Task<CallToolResult> QueryGraphAsync(
         IScopeRegistry registry,
         RepoRootInfo repoInfo,
@@ -3023,11 +3647,20 @@ public static class GraphTools
         [Description("Read-only SQL — single SELECT or WITH statement against v_* views. See describe_schema for the schema.")] string sql,
         [Description("Named bindings for @name placeholders in the SQL. Values are bound by Microsoft.Data.Sqlite.")] IReadOnlyDictionary<string, JsonElement>? parameters = null,
         [Description(ScopeDescription)] string? scope = null,
+        [Description("Path rendering for path/file_path columns: relative (default) or absolute")] string pathFormat = "relative",
         CancellationToken ct = default) =>
         ToolMetrics.TrackAsync(
             "query_graph",
-            new { sql, scope, paramCount = parameters?.Count ?? 0 },
-            () => QueryGraphImpl(registry, repoInfo, queryOptions, sql, parameters, scope ?? "*", ct));
+            new { sql, scope, pathFormat, paramCount = parameters?.Count ?? 0 },
+            () => QueryGraphImpl(
+                registry,
+                repoInfo,
+                queryOptions,
+                sql,
+                parameters,
+                scope ?? "*",
+                pathFormat,
+                ct));
 
     private static async Task<CallToolResult> QueryGraphImpl(
         IScopeRegistry registry,
@@ -3036,9 +3669,26 @@ public static class GraphTools
         string sql,
         IReadOnlyDictionary<string, JsonElement>? parameters,
         string scope,
+        string pathFormat,
         CancellationToken ct)
     {
         var sw = Stopwatch.StartNew();
+        pathFormat = NormalisePathFormat(pathFormat);
+        if (pathFormat.Length == 0)
+        {
+            return DiagnosticResult.Error(
+                "query_graph `pathFormat` must be relative or absolute.");
+        }
+        var relativePaths = pathFormat == "relative";
+        IReadOnlyList<string> scopeRoots = relativePaths
+            ? (await registry.ListAsync(ct).ConfigureAwait(false))
+                .Select(row => row.Root)
+                .Append(repoInfo.Path)
+                .Where(root => !string.IsNullOrWhiteSpace(root))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .OrderByDescending(root => root.Length)
+                .ToArray()
+            : [];
 
         // Step 1 — open the multi-scope connection. Three OpenAsync errors surface before we
         // even build the SqliteCommand; everything else falls into the SQL execute try/catch
@@ -3176,7 +3826,12 @@ public static class GraphTools
                 var values = new object?[reader.FieldCount];
                 for (var i = 0; i < reader.FieldCount; i++)
                 {
-                    values[i] = reader.IsDBNull(i) ? null : reader.GetValue(i);
+                    var value = reader.IsDBNull(i) ? null : reader.GetValue(i);
+                    values[i] = relativePaths
+                        && value is string text
+                        && IsQueryGraphPathColumn(columns[i].Name)
+                            ? FormatQueryGraphPath(scopeRoots, text)
+                            : value;
                 }
                 // Pre-serialize each row to a JsonElement (a JSON array). The reflection-based
                 // serializer is acceptable here because (a) it's the only path that handles the

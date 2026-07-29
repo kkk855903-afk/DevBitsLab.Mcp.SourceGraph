@@ -8,6 +8,15 @@ namespace DevBitsLab.Mcp.SourceGraph.Server.Tools.Output;
 /// <see cref="TargetSymbolId"/> without re-resolving the symbol.
 /// </summary>
 public sealed record ListCallersResult(
+    string Result,
+    [property: JsonPropertyName("scope_status")] string ScopeStatus,
+    string Completeness,
+    [property: JsonPropertyName("absence_authoritative")] bool AbsenceAuthoritative,
+    string? Reason,
+    [property: JsonPropertyName("selection_mode")] string SelectionMode,
+    [property: JsonPropertyName("fallback_used")] bool FallbackUsed,
+    [property: JsonPropertyName("candidate_count")] int CandidateCount,
+    [property: JsonPropertyName("selection_ambiguous")] bool SelectionAmbiguous,
     [property: JsonPropertyName("target_fqn")] string TargetFqn,
     [property: JsonPropertyName("target_kind")] string TargetKind,
     [property: JsonPropertyName("target_symbol_id")] long TargetSymbolId,

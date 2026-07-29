@@ -1,4 +1,8 @@
+using DevBitsLab.Mcp.SourceGraph.Core;
+using DevBitsLab.Mcp.SourceGraph.Indexing;
 using DevBitsLab.Mcp.SourceGraph.Server.Scoping;
+using DevBitsLab.Mcp.SourceGraph.Server.Tools;
+using DevBitsLab.Mcp.SourceGraph.Storage;
 using FluentAssertions;
 using ModelContextProtocol;
 using Xunit;
@@ -84,5 +88,59 @@ public sealed class ColdStartProgressTests
         await Task.Delay(20);
         captured.Should().HaveCount(1);
         captured[0].Message.Should().Be("opening workspace");
+    }
+
+    [Fact]
+    public async Task Refreshing_scope_serves_existing_graph_without_waiting_for_ready()
+    {
+        var root = Path.Join(
+            Path.GetTempPath(),
+            "sourcegraph-refresh-query-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var store = new SqliteGraphStore(Path.Join(root, "graph.db"));
+            await store.EnsureSchemaAsync();
+            await store.UpsertFileAsync(
+                Path.Join(root, "Existing.cs"),
+                [1, 2, 3],
+                DateTimeOffset.UtcNow);
+            var scope = new Scope(
+                "default",
+                "default",
+                root,
+                new ScopeProjectSet.Paths(["**/*.cs"], []),
+                Isolated: false,
+                DateTimeOffset.UtcNow);
+            var host = new ScopeHost(
+                scope,
+                store,
+                store.CreateEmbeddingsStore(384),
+                new RoslynIndexer(store),
+                solutionPath: "")
+            {
+                Status = "indexing",
+            };
+            var router = new ScopeRouter();
+            router.Register(host);
+            router.SetDefaultScope("default");
+
+            var call = GraphTools.ListCallersAsync(router, "Missing.Symbol");
+            var completed = await Task.WhenAny(
+                call,
+                Task.Delay(TimeSpan.FromSeconds(2)));
+
+            completed.Should().Be(call,
+                "a last-good graph must remain queryable during a background refresh");
+            await host.DisposeAsync();
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); }
+            catch (Exception ex) when (
+                ex is IOException or UnauthorizedAccessException)
+            {
+            }
+        }
     }
 }

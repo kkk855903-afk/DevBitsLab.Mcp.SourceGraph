@@ -33,6 +33,9 @@ public static class EdgeKinds
     /// <summary>A declarative UI event is handled by the target symbol.</summary>
     public const string HandlesEvent = "handles-event";
 
+    /// <summary>A code-behind member accesses a generated field for a named XAML element.</summary>
+    public const string CodeBehindUsesElement = "code-behind-uses-element";
+
     /// <summary>An ICommand property dispatches execution to a source method.</summary>
     public const string CommandExecutes = "command-executes";
 

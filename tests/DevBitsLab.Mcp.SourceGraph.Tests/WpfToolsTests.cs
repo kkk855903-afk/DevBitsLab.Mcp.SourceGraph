@@ -66,6 +66,33 @@ public sealed class WpfToolCatalogTests
                     && !annotation.DestructiveHint);
         }
     }
+
+    [Fact]
+    public void BindingResult_withUnmaterializedLowerLevelEvidence_isNotAuthoritativeAbsence()
+    {
+        var result = new TraceBindingResult(
+            Status: "not-found",
+            ScopeId: "default",
+            ScopeStatus: "ok",
+            Note: null,
+            ElementQuery: "xaml:element:View.xaml#__anon_12",
+            BindingQuery: "ActualWidth",
+            ElementStatus: "resolved",
+            Candidates: Array.Empty<WpfSymbolIdentity>(),
+            Partial: false,
+            Truncated: false,
+            OmittedCount: 0,
+            Matches: Array.Empty<WpfTraceMatch>(),
+            Scopes: Array.Empty<WpfScopeSummary>())
+        {
+            LowerLevelEvidencePresent = true,
+        };
+
+        result.Result.Should().Be("unknown");
+        result.Completeness.Should().Be("partial");
+        result.AbsenceAuthoritative.Should().BeFalse();
+        result.Reason.Should().Be("lower-level-evidence-unresolved");
+    }
 }
 
 [Collection("LeafFormatterState")]
@@ -162,20 +189,34 @@ public sealed class WpfToolBehaviorTests : IAsyncLifetime, IDisposable
             "xaml-element",
             xamlFileId,
             29);
+        var elementOnlyWidthOwnerId = await SeedSymbolAsync(
+            "xaml:element:View.xaml#__anon_12",
+            "__anon_12",
+            "View.xaml#__anon_12",
+            "xaml-element",
+            xamlFileId,
+            30);
+        var imageViewTargetId = await SeedSymbolAsync(
+            "xaml:element:View.xaml#imageview",
+            "imageview",
+            "View.xaml#imageview",
+            "xaml-element",
+            xamlFileId,
+            31);
         await SeedSymbolAsync(
             "xaml:element:View.xaml#DuplicateA",
             "Duplicate",
             "View.xaml#DuplicateA",
             "xaml-element",
             xamlFileId,
-            30);
+            32);
         await SeedSymbolAsync(
             "xaml:element:View.xaml#DuplicateB",
             "Duplicate",
             "View.xaml#DuplicateB",
             "xaml-element",
             xamlFileId,
-            31);
+            33);
         var propertyId = await SeedSymbolAsync(
             PropertyKey,
             "Name",
@@ -332,6 +373,17 @@ public sealed class WpfToolBehaviorTests : IAsyncLifetime, IDisposable
                 new Evidence(
                     xamlFileId,
                     new CoreSourceLocation("/repo/View.xaml", 24, 18, 24, 68),
+                    CoreEvidenceConfidence.Semantic,
+                    "xaml-semantic",
+                    elementNameMetadata)),
+            new Edge(
+                elementOnlyWidthOwnerId,
+                imageViewTargetId,
+                "binds-element",
+                elementNameMetadata,
+                new Evidence(
+                    xamlFileId,
+                    new CoreSourceLocation("/repo/View.xaml", 30, 18, 30, 68),
                     CoreEvidenceConfidence.Semantic,
                     "xaml-semantic",
                     elementNameMetadata)),
@@ -560,10 +612,16 @@ public sealed class WpfToolBehaviorTests : IAsyncLifetime, IDisposable
         call.IsError.Should().NotBe(true);
         var dto = Deserialize<TraceBindingResult>(call);
         dto.Status.Should().Be("resolved");
-        var match = dto.Matches.Should().ContainSingle().Subject;
-        match.Source.Name.Should().Be("WidthLabel");
-        match.Target!.CanonicalKey.Should().Be(ActualWidthKey);
-        match.Path.Should().Be("ActualWidth");
+        dto.Matches.Should().Contain(match =>
+            match.Source.Name == "WidthLabel"
+            && match.Target != null
+            && match.Target.CanonicalKey == ActualWidthKey
+            && match.Path == "ActualWidth");
+        dto.Matches.Should().Contain(match =>
+            match.Source.Name == "__anon_12"
+            && match.Relation == "binds-element"
+            && match.Target != null
+            && match.Target.CanonicalKey == ActualWidthKey);
     }
 
     [Fact]
@@ -584,6 +642,31 @@ public sealed class WpfToolBehaviorTests : IAsyncLifetime, IDisposable
         match.Target!.CanonicalKey.Should()
             .Be("csharp:P:System.Windows.FrameworkElement.ActualWidth");
         match.Target.FilePath.Should().Be("(WPF framework metadata)");
+    }
+
+    [Fact]
+    public async Task TraceBinding_canonicalOwnerFollowsBindsElementToFrameworkProperty()
+    {
+        var call = await WpfTools.TraceBindingAsync(
+            _router!,
+            element: "xaml:element:View.xaml#__anon_12",
+            binding: "ActualWidth",
+            scope: null,
+            limit: 50,
+            detail: "evidence");
+
+        var dto = Deserialize<TraceBindingResult>(call);
+        dto.Status.Should().Be("resolved");
+        dto.Result.Should().Be("found");
+        dto.AbsenceAuthoritative.Should().BeFalse();
+        var match = dto.Matches.Should().ContainSingle().Subject;
+        match.Relation.Should().Be("binds-element");
+        match.Source.CanonicalKey.Should().Be("xaml:element:View.xaml#__anon_12");
+        match.Target!.CanonicalKey.Should().Be(ActualWidthKey);
+        match.Reason.Should().Be("resolved-by-wpf-framework-metadata");
+        match.Evidence.Should().ContainSingle(item =>
+            item.StartLine == 30
+            && item.Producer == "xaml-semantic");
     }
 
     [Fact]

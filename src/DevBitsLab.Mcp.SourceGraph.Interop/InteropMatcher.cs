@@ -16,8 +16,9 @@ public sealed class InteropMatcher
 
     /// <summary>
     /// Matches against one target-specific export snapshot. A partial snapshot may still prove
-    /// ambiguity, but it cannot prove absence or uniqueness because an unavailable translation
-    /// unit or artifact could contain another runtime-legal candidate.
+    /// a concrete source/binary match or ambiguity, but it cannot prove absence. Callers must
+    /// retain the partial-state marker because unavailable translation units can contain
+    /// additional candidates.
     /// </summary>
     public InteropMatch Match(
         ManagedImport managed,
@@ -26,10 +27,20 @@ public sealed class InteropMatcher
     {
         var result = MatchCompleteSnapshot(managed, nativeExports);
         if (isExportUniverseComplete
-            || result.Status is InteropMatchStatus.Ambiguous
+            || result.Status is InteropMatchStatus.Matched
+                or InteropMatchStatus.SourceMatched
+                or InteropMatchStatus.Ambiguous
                 or InteropMatchStatus.Unknown)
         {
-            return result;
+            return isExportUniverseComplete
+                ? result
+                : result with
+                {
+                    Reasons = result.Reasons
+                        .Append(
+                            "The native export snapshot is incomplete; this positive result covers only the successfully indexed projects.")
+                        .ToArray(),
+                };
         }
 
         return result with

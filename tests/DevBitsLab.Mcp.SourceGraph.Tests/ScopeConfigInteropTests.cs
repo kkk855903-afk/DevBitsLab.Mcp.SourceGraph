@@ -118,6 +118,103 @@ public sealed class ScopeConfigInteropTests : IDisposable
     }
 
     [Fact]
+    public void Load_and_save_round_trips_static_vcxproj_import()
+    {
+        WriteConfig("""
+            {
+              "scopes": [
+                {
+                  "name": "native",
+                  "paths": ["src/**/*.csproj"],
+                  "interop": {
+                    "target": {
+                      "runtime_identifier": "win-x64",
+                      "architecture": "x64",
+                      "compiler_abi": "msvc",
+                      "pointer_size_bytes": 8,
+                      "default_pack": 8
+                    },
+                    "vcx_projects": [
+                      {
+                        "path": "AlgorithmBridge/AlgorithmBridge.vcxproj",
+                        "configuration": "Release",
+                        "platform": "x64",
+                        "library": "AlgorithmBridge.dll",
+                        "source_files": ["AlgorithmBridgeHeaderCheck.c"],
+                        "additional_arguments": ["-DAB_SOURCEGRAPH=1"],
+                        "binary_path": "Release/AlgorithmBridge.dll"
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+            """);
+
+        var loaded = ScopeConfigLoader.Load(_tempDir);
+        var interop = loaded.Scopes.Single().Interop!;
+
+        interop.TranslationUnits.Should().BeEmpty();
+        interop.VcxProjects.Should().ContainSingle();
+        interop.VcxProjects[0].Should().BeEquivalentTo(
+            new InteropVcxProjectConfig(
+                "AlgorithmBridge/AlgorithmBridge.vcxproj",
+                "Release",
+                "x64",
+                "AlgorithmBridge.dll",
+                ["AlgorithmBridgeHeaderCheck.c"],
+                ["-DAB_SOURCEGRAPH=1"],
+                "Release/AlgorithmBridge.dll"));
+
+        ScopeConfigLoader.Save(_tempDir, loaded);
+        var serialized = File.ReadAllText(
+            Path.Join(_tempDir, ScopeConfigLoader.FileName));
+        var roundTripped = ScopeConfigLoader.Load(_tempDir)
+            .Scopes.Single().Interop!;
+
+        serialized.Should().Contain("\"vcx_projects\"");
+        serialized.Should().NotContain("\"translation_units\"");
+        roundTripped.VcxProjects[0].Should().BeEquivalentTo(
+            interop.VcxProjects[0]);
+    }
+
+    [Fact]
+    public void Load_rejects_vcxproj_without_explicit_configuration()
+    {
+        WriteConfig("""
+            {
+              "scopes": [
+                {
+                  "name": "native",
+                  "paths": ["src/**/*.csproj"],
+                  "interop": {
+                    "target": {
+                      "runtime_identifier": "win-x64",
+                      "architecture": "x64",
+                      "compiler_abi": "msvc",
+                      "pointer_size_bytes": 8,
+                      "default_pack": 8
+                    },
+                    "vcx_projects": [
+                      {
+                        "path": "AlgorithmBridge/AlgorithmBridge.vcxproj",
+                        "platform": "x64",
+                        "library": "AlgorithmBridge.dll"
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+            """);
+
+        var act = () => ScopeConfigLoader.Load(_tempDir);
+
+        act.Should().Throw<ScopeConfigException>()
+            .WithMessage("*configuration*non-empty*");
+    }
+
+    [Fact]
     public void Legacy_scope_without_interop_remains_supported_and_serialises_without_block()
     {
         WriteConfig("""

@@ -25,6 +25,53 @@ public sealed class SchemaVersionRebuildTest
     private const long PatientImageSymbolId = 1002;
 
     [Fact]
+    public async Task EnsureSchema_dropsV15SemanticProjection_soFixedBindingsAreReindexed()
+    {
+        var tmp = CreateTempDirectory("semantic-reprojection");
+        var dbPath = Path.Join(tmp, "graph.db");
+        const string stalePath = "C:/repo/Startup.cs";
+        try
+        {
+            await using (var store = new SqliteGraphStore(dbPath))
+            {
+                await store.EnsureSchemaAsync();
+            }
+
+            await using (var conn = new SqliteConnection($"Data Source={dbPath}"))
+            {
+                await conn.OpenAsync();
+                await conn.ExecuteAsync(
+                    """
+                    DELETE FROM schema_version;
+                    INSERT INTO schema_version(version) VALUES (15);
+                    INSERT INTO files(
+                        id, path, content_sha256, last_indexed_at, is_generated)
+                    VALUES (1, @Path, X'01020304', 1700000000000, 0);
+                    """,
+                    new { Path = stalePath });
+            }
+
+            await using (var store = new SqliteGraphStore(dbPath))
+            {
+                await store.EnsureSchemaAsync();
+                (await store.GetFileContentHashAsync(stalePath)).Should().BeNull(
+                    "v15's SHA fast path could otherwise retain stale extension-method and WPF projections");
+                (await store.GetStatsAsync()).Should().Be(new GraphStats(0, 0, 0, 0));
+            }
+
+            await using var verify = new SqliteConnection($"Data Source={dbPath}");
+            await verify.OpenAsync();
+            (await verify.ExecuteScalarAsync<int?>(
+                    "SELECT MAX(version) FROM schema_version;"))
+                .Should().Be(Schema.Version);
+        }
+        finally
+        {
+            DeleteTempDirectory(tmp);
+        }
+    }
+
+    [Fact]
     public async Task EnsureSchema_dropsV11PatientCanaries_andRebuildsCurrentSchema()
     {
         var tmp = CreateTempDirectory("privacy-purge");

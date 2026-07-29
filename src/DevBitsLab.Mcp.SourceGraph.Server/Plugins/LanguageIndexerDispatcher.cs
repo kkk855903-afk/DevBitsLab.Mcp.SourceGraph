@@ -334,6 +334,14 @@ public sealed class LanguageIndexerDispatcher
                 }
             }
         }
+        if (failedFiles.Count == 0)
+        {
+            await RefreshXamlCodeBehindProjectionAsync(
+                store,
+                repoRoot,
+                GetXamlProjects(projectMap, projects),
+                ct).ConfigureAwait(false);
+        }
         return new LanguageDispatchResult(
             indexedPaths.Count,
             usableOutputPaths.Count,
@@ -447,6 +455,14 @@ public sealed class LanguageIndexerDispatcher
                     record.StatusMessage = $"IndexAsync threw on `{file}`: {ex.Message}";
                 }
             }
+        }
+        if (failedFiles.Count == 0)
+        {
+            await RefreshXamlCodeBehindProjectionAsync(
+                host.Store,
+                host.Scope.Root,
+                GetXamlProjects(host),
+                ct).ConfigureAwait(false);
         }
         return new LanguageDispatchResult(
             indexedPaths.Count,
@@ -829,6 +845,14 @@ public sealed class LanguageIndexerDispatcher
 
         if (existingCandidates.Length == 0)
         {
+            if (failedFiles.Count == 0)
+            {
+                await RefreshXamlCodeBehindProjectionAsync(
+                    host.Store,
+                    host.Scope.Root,
+                    GetXamlProjects(host),
+                    ct).ConfigureAwait(false);
+            }
             return new LanguageDispatchResult(
                 IndexedFiles: 0,
                 UsableOutputFiles: 0,
@@ -907,6 +931,14 @@ public sealed class LanguageIndexerDispatcher
             }
         }
 
+        if (failedFiles.Count == 0)
+        {
+            await RefreshXamlCodeBehindProjectionAsync(
+                host.Store,
+                host.Scope.Root,
+                GetXamlProjects(host),
+                ct).ConfigureAwait(false);
+        }
         return new LanguageDispatchResult(
             indexedPaths.Count,
             usableOutputPaths.Count,
@@ -1383,6 +1415,127 @@ public sealed class LanguageIndexerDispatcher
             .GroupBy(project => project.Id, StringComparer.OrdinalIgnoreCase)
             .Select(group => group.First())
             .ToArray();
+    }
+
+    private static IReadOnlyList<XamlLanguageProject> GetXamlProjects(
+        IReadOnlyDictionary<string, ILanguageProject> projectMap,
+        IReadOnlyList<ILanguageProject>? projects)
+    {
+        var source = projects is { Count: > 0 }
+            ? projects
+            : projectMap.Values.ToArray();
+        return source
+            .OfType<XamlLanguageProject>()
+            .GroupBy(project => project.Id, StringComparer.OrdinalIgnoreCase)
+            .Select(group => group.First())
+            .ToArray();
+    }
+
+    private async Task RefreshXamlCodeBehindProjectionAsync(
+        IGraphStore store,
+        string repoRoot,
+        IReadOnlyList<XamlLanguageProject> projects,
+        CancellationToken ct)
+    {
+        try
+        {
+            var candidates = new List<ProducerEdgeEvidenceFact>();
+            var producingFilePaths = new HashSet<string>(
+                StringComparer.OrdinalIgnoreCase);
+            foreach (var project in projects)
+            {
+                ct.ThrowIfCancellationRequested();
+                var projection = await XamlCodeBehindProjection.BuildAsync(
+                        project,
+                        repoRoot,
+                        ct)
+                    .ConfigureAwait(false);
+                if (!projection.IsComplete)
+                {
+                    _logger.LogDebug(
+                        "Retaining prior XAML code-behind evidence for unavailable project {Project}",
+                        project.Id);
+                    continue;
+                }
+                candidates.AddRange(projection.Edges);
+                producingFilePaths.UnionWith(
+                    projection.ProducingFilePaths);
+            }
+
+            if (projects.Count == 0)
+            {
+                await store.ReplaceProducerEdgeEvidenceProjectionAsync(
+                        XamlCodeBehindProjection.Producer,
+                        [],
+                        ct)
+                    .ConfigureAwait(false);
+                return;
+            }
+
+            var endpointCache = new Dictionary<string, bool>(
+                StringComparer.Ordinal);
+            async Task<bool> EndpointExistsAsync(string canonicalKey)
+            {
+                if (endpointCache.TryGetValue(canonicalKey, out var exists))
+                {
+                    return exists;
+                }
+                exists = await store.GetSymbolByCanonicalKeyAsync(
+                        canonicalKey,
+                        ct)
+                    .ConfigureAwait(false) is not null;
+                endpointCache[canonicalKey] = exists;
+                return exists;
+            }
+
+            var valid = new List<ProducerEdgeEvidenceFact>(candidates.Count);
+            foreach (var candidate in candidates)
+            {
+                if (await EndpointExistsAsync(candidate.SourceCanonicalKey)
+                        .ConfigureAwait(false)
+                    && await EndpointExistsAsync(candidate.TargetCanonicalKey)
+                        .ConfigureAwait(false))
+                {
+                    valid.Add(candidate);
+                }
+            }
+            var edgesByFile = valid
+                .GroupBy(
+                    edge => Path.GetFullPath(
+                        edge.Evidence.Location.FilePath),
+                    StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(
+                    group => group.Key,
+                    group => (IReadOnlyList<ProducerEdgeEvidenceFact>)
+                        group.ToArray(),
+                    StringComparer.OrdinalIgnoreCase);
+            foreach (var producingFilePath in producingFilePaths
+                         .OrderBy(
+                             path => path,
+                             StringComparer.OrdinalIgnoreCase))
+            {
+                await store.ReplaceProducerEdgeEvidenceAsync(
+                        producingFilePath,
+                        XamlCodeBehindProjection.Producer,
+                        edgesByFile.TryGetValue(
+                            producingFilePath,
+                            out var fileEdges)
+                            ? fileEdges
+                            : [],
+                        ct)
+                    .ConfigureAwait(false);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                ex,
+                "Failed to refresh the XAML code-behind element projection; retaining prior evidence");
+        }
     }
 
     private static bool IsDeclarationPath(

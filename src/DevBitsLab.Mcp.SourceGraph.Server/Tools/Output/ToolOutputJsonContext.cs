@@ -43,6 +43,8 @@ namespace DevBitsLab.Mcp.SourceGraph.Server.Tools.Output;
 [JsonSerializable(typeof(DescribeSchemaResult))]
 [JsonSerializable(typeof(QueryGraphResult))]
 [JsonSerializable(typeof(EmbeddingsStatusResult))]
+[JsonSerializable(typeof(EmbeddingsQueueRow))]
+[JsonSerializable(typeof(EmbeddingsInferenceRow))]
 [JsonSerializable(typeof(EmbeddingsRemoveResult))]
 [JsonSerializable(typeof(TraceBindingResult))]
 [JsonSerializable(typeof(TraceCommandResult))]

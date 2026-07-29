@@ -165,6 +165,7 @@ public sealed class InteropQueryServiceTests : IAsyncLifetime
             Status = NativeInteropRuntimeStatus.Partial,
             RetainedLastGood = true,
             IsExportUniverseComplete = false,
+            HasCurrentProjection = false,
             Failures =
             [
                 new NativeInteropRuntimeFailure(
@@ -198,6 +199,92 @@ public sealed class InteropQueryServiceTests : IAsyncLifetime
         query.Result.Failures.Should().Contain(failure =>
             failure.Code == "timeout"
             && failure.TranslationUnitIndex == 2);
+    }
+
+    [Fact]
+    public async Task Partial_current_projection_keeps_exact_positiveMatch()
+    {
+        var managed = await SeedManagedAsync(
+            "managed/NativeMethods.cs",
+            "csharp:M:Fixture.NativeMethods.Run",
+            "Run");
+        var native = await SeedNativeAsync(
+            "native/export.h",
+            "c:E:native/export.h::run",
+            "run");
+        await SeedMatchAsync(managed, native, InteropMatchStatus.Matched);
+        var state = CompleteState() with
+        {
+            Status = NativeInteropRuntimeStatus.Partial,
+            IsExportUniverseComplete = false,
+            HasCurrentProjection = true,
+            Failures =
+            [
+                new NativeInteropRuntimeFailure(
+                    "snapshot",
+                    "unrelated-tu-failed",
+                    "Another translation unit failed.",
+                    TranslationUnitIndex: 3,
+                    ConfiguredPath: "native/other.cpp"),
+            ],
+        };
+
+        var query = await Service().QueryAsync(
+            "scope-a",
+            _store!,
+            state,
+            managed.Key,
+            InteropQuerySelectionMode.ManagedImportOnly,
+            includeFindings: false);
+
+        query.Result.Status.Should().Be("ok");
+        query.Result.Partial.Should().BeTrue();
+        query.Result.Matches.Should().ContainSingle();
+        query.Result.Matches[0].Status.Should().Be("matched");
+        query.Result.Matches[0].NativeSymbol.Should().Be(native.Key);
+        query.Result.Failures.Should().Contain(failure =>
+            failure.Code == "unrelated-tu-failed");
+    }
+
+    [Fact]
+    public async Task Partial_current_native_projection_derives_exact_positiveMatch_when_analysis_is_missing()
+    {
+        var managed = await SeedManagedAsync(
+            "managed/NativeMethods.cs",
+            "csharp:M:Fixture.NativeMethods.Invoke",
+            "Invoke");
+        var native = await SeedNativeAsync(
+            "native/export.cpp",
+            "c:E:native/export.cpp::run",
+            "run");
+        var state = CompleteState() with
+        {
+            Status = NativeInteropRuntimeStatus.Partial,
+            IsExportUniverseComplete = false,
+            HasCurrentProjection = true,
+            ManagedMatches = 0,
+            Failures =
+            [
+                new NativeInteropRuntimeFailure(
+                    "analysis-storage",
+                    "analysis-projection-missing",
+                    "The derived analysis projection is unavailable."),
+            ],
+        };
+
+        var query = await Service().QueryAsync(
+            "scope-a",
+            _store!,
+            state,
+            "run",
+            InteropQuerySelectionMode.ManagedImportOnly,
+            includeFindings: false);
+
+        query.Result.Status.Should().Be("ok");
+        query.Result.Partial.Should().BeTrue();
+        query.Result.Matches.Should().ContainSingle();
+        query.Result.Matches[0].Status.Should().Be("matched");
+        query.Result.Matches[0].NativeSymbol.Should().Be(native.Key);
     }
 
     [Fact]
@@ -286,6 +373,7 @@ public sealed class InteropQueryServiceTests : IAsyncLifetime
             Status = NativeInteropRuntimeStatus.Indexing,
             RetainedLastGood = true,
             IsExportUniverseComplete = false,
+            HasCurrentProjection = false,
         };
 
         var query = await Service().QueryAsync(
@@ -621,7 +709,7 @@ public sealed class InteropQueryServiceTests : IAsyncLifetime
             producer);
 
     private static NativeInteropRuntimeState CompleteState() =>
-        new(
+        new NativeInteropRuntimeState(
             NativeInteropRuntimeStatus.Complete,
             Target,
             DateTimeOffset.UtcNow,
@@ -635,7 +723,10 @@ public sealed class InteropQueryServiceTests : IAsyncLifetime
             Findings: 1,
             BoundaryEdges: 1,
             PendingStaleSymbols: 0,
-            Failures: []);
+            Failures: [])
+        {
+            HasCurrentProjection = true,
+        };
 
     private static AbiTypeRef VoidType { get; } =
         new("void", AbiTypeCategory.Void);

@@ -1081,6 +1081,57 @@ public sealed class ClangNativeExtractorTests
     }
 
     [Fact]
+    public void Template_specializations_colliding_on_graph_key_do_not_emit_dangling_call_targets()
+    {
+        using var workspace = new NativeTestWorkspace();
+        var sourcePath = workspace.Write(
+            "native/template-specializations.cpp",
+            """
+            template<typename T> T convert(int value);
+            template<> short convert<short>(int value) {
+                return static_cast<short>(value);
+            }
+            template<> unsigned short convert<unsigned short>(int value) {
+                return static_cast<unsigned short>(value);
+            }
+            short call_short() { return convert<short>(1); }
+            unsigned short call_unsigned_short() {
+                return convert<unsigned short>(2);
+            }
+            """);
+
+        var result = ExtractWindows(workspace.Root, sourcePath);
+
+        var definitionsByUsr = result.Functions
+            .Where(function => function.IsDefinition)
+            .ToDictionary(
+                function => function.DeclarationUsr,
+                function => function.GraphCanonicalKey,
+                StringComparer.Ordinal);
+        result.Calls.All(call =>
+                call.CalleeSymbolCanonicalKey is null
+                || (definitionsByUsr.TryGetValue(
+                        call.ReferencedDeclarationUsr,
+                        out var retainedKey)
+                    && string.Equals(
+                        call.CalleeSymbolCanonicalKey,
+                        retainedKey,
+                        StringComparison.Ordinal)))
+            .Should().BeTrue();
+        result.Calls.Count(call =>
+                call.ReferencedDeclarationUsr.Contains(
+                    "convert",
+                    StringComparison.Ordinal))
+            .Should().Be(2);
+        result.Calls.Any(call =>
+                call.ReferencedDeclarationUsr.Contains(
+                    "convert",
+                    StringComparison.Ordinal)
+                && call.CalleeSymbolCanonicalKey is null)
+            .Should().BeTrue();
+    }
+
+    [Fact]
     public void VisibilityDefault_isExported_butVisibilityHiddenIsNot()
     {
         using var workspace = new NativeTestWorkspace();
@@ -1186,6 +1237,51 @@ public sealed class ClangNativeExtractorTests
 
         result.HasErrors.Should().BeFalse();
         result.IncludedFiles.Should().Contain(Path.GetFullPath(headerPath));
+    }
+
+    [Fact]
+    public void RuntimeSystemInclude_isReadable_but_not_repository_evidence()
+    {
+        using var scope = new NativeTestWorkspace();
+        using var system = new NativeTestWorkspace();
+        var systemHeader = system.Write(
+            "sdk.h",
+            """
+            #pragma once
+            typedef unsigned int SDK_UINT32;
+            """);
+        var sourcePath = scope.Write(
+            "native/main.cpp",
+            """
+            #include <sdk.h>
+            extern "C" __declspec(dllexport) SDK_UINT32 allowed_api();
+            """);
+        var request = new ClangNativeExtractionRequest(
+            sourcePath,
+            scope.Root,
+            ProducingFileId: 81,
+            InteropTarget.WindowsX64Msvc,
+            WindowsX64Arguments(system.Root),
+            LibraryName: "medical.dll")
+        {
+            SystemIncludeDirectories = [system.Root],
+        };
+
+        var result = ClangNativeExtractor.Extract(request);
+
+        result.HasErrors.Should().BeFalse();
+        result.Exports.Should().ContainSingle(export =>
+            export.ExportName == "allowed_api");
+        result.IncludedFiles.Should().Equal(
+            Path.GetFullPath(sourcePath));
+        result.IncludedFiles.Should().NotContain(
+            Path.GetFullPath(systemHeader));
+        result.Types.Should().NotContain(type =>
+            type.Evidence.Location.FilePath.StartsWith(
+                system.Root,
+                OperatingSystem.IsWindows()
+                    ? StringComparison.OrdinalIgnoreCase
+                    : StringComparison.Ordinal));
     }
 
     [Fact]

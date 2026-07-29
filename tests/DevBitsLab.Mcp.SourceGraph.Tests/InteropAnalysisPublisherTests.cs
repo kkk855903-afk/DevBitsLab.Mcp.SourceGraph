@@ -324,7 +324,7 @@ public sealed class InteropAnalysisPublisherTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task Incomplete_snapshot_retains_last_successful_projection()
+    public async Task Incomplete_snapshot_publishes_positive_match_as_partial()
     {
         var managed = await SeedManagedAsync();
         var native = await SeedNativeAsync(
@@ -338,13 +338,17 @@ public sealed class InteropAnalysisPublisherTests : IAsyncLifetime
 
         var partial = await Publisher().PublishAsync(Target, false);
 
-        partial.IsComplete.Should().BeFalse();
-        partial.FilesPublished.Should().Be(0);
-        partial.Failures.Should().ContainSingle(failure =>
-            failure.Stage == "native-snapshot");
+        partial.IsComplete.Should().BeTrue(
+            string.Join(
+                "; ",
+                partial.Failures.Select(failure =>
+                    $"{failure.Stage}: {failure.Message}")));
+        partial.FilesPublished.Should().Be(1);
+        partial.Failures.Should().BeEmpty();
         var retained = (await InteropFactStoreReader.ReadMatchesAsync(_store!))
             .Facts.Should().ContainSingle().Subject.Fact;
         retained.Status.Should().Be(InteropMatchStatus.Matched);
+        retained.SnapshotComplete.Should().BeFalse();
         (await _store!.ListCalleesAsync(
             managed.SymbolId,
             edgeKind: EdgeKinds.PInvokeMapsTo))
@@ -1160,7 +1164,10 @@ public sealed class InteropAnalysisPublisherTests : IAsyncLifetime
             Findings: 2,
             BoundaryEdges: 2,
             PendingStaleSymbols: 0,
-            Failures: []);
+            Failures: [])
+        {
+            HasCurrentProjection = true,
+        };
 
     private static InteropTarget Target { get; } =
         InteropTarget.WindowsX86Msvc;

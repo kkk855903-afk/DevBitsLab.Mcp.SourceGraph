@@ -67,7 +67,7 @@
         },
         "interop": {
           "$ref": "#/$defs/interop",
-          "description": "Explicit native-interop target and translation units for this scope."
+          "description": "Explicit native-interop target plus translation units and/or statically imported Visual C++ projects for this scope."
         }
       },
       "oneOf": [
@@ -80,7 +80,7 @@
     },
     "interop": {
       "type": "object",
-      "required": ["target", "translation_units"],
+      "required": ["target"],
       "additionalProperties": false,
       "properties": {
         "target": { "$ref": "#/$defs/interopTarget" },
@@ -89,8 +89,18 @@
           "minItems": 1,
           "description": "Ordered native translation units and the exact compiler arguments used to parse them.",
           "items": { "$ref": "#/$defs/interopTranslationUnit" }
+        },
+        "vcx_projects": {
+          "type": "array",
+          "minItems": 1,
+          "description": "Visual C++ projects imported statically for an explicit configuration/platform pair. Project targets and imported props are never executed.",
+          "items": { "$ref": "#/$defs/interopVcxProject" }
         }
-      }
+      },
+      "anyOf": [
+        { "required": ["translation_units"] },
+        { "required": ["vcx_projects"] }
+      ]
     },
     "interopTarget": {
       "type": "object",
@@ -144,6 +154,50 @@
           "type": "array",
           "minItems": 1,
           "description": "Exact compiler arguments used to parse this translation unit.",
+          "items": {
+            "type": "string",
+            "pattern": ".*\\S.*"
+          }
+        },
+        "binary_path": {
+          "$ref": "#/$defs/repoRelativePath",
+          "description": "Optional repository-relative native binary used to verify export identity."
+        }
+      }
+    },
+    "interopVcxProject": {
+      "type": "object",
+      "required": ["path", "configuration", "platform", "library"],
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "$ref": "#/$defs/repoRelativePath",
+          "description": "Repository-relative path to a .vcxproj file."
+        },
+        "configuration": {
+          "type": "string",
+          "pattern": ".*\\S.*",
+          "description": "Exact Visual C++ configuration, for example Release."
+        },
+        "platform": {
+          "type": "string",
+          "pattern": ".*\\S.*",
+          "description": "Exact Visual C++ platform, for example x64 or Win32."
+        },
+        "library": {
+          "type": "string",
+          "pattern": ".*\\S.*",
+          "description": "Native library identity associated with exports from imported translation units."
+        },
+        "source_files": {
+          "type": "array",
+          "uniqueItems": true,
+          "description": "Optional project-relative ClCompile paths to select. Omit to select every enabled source.",
+          "items": { "$ref": "#/$defs/repoRelativePath" }
+        },
+        "additional_arguments": {
+          "type": "array",
+          "description": "Additional Clang arguments appended after project-derived arguments.",
           "items": {
             "type": "string",
             "pattern": ".*\\S.*"

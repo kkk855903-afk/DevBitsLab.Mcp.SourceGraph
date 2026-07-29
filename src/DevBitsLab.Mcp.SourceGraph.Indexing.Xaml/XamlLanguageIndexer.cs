@@ -13,9 +13,10 @@ namespace DevBitsLab.Mcp.SourceGraph.Indexing.Xaml;
 
 /// <summary>
 /// Built-in XAML <see cref="ILanguageIndexer"/>. Registered for the <c>.xaml</c> extension; emits
-/// the five XAML symbol kinds, the nine cross-language edge kinds (<c>code-behind</c>,
+/// the five XAML symbol kinds, the ten cross-language edge kinds (<c>code-behind</c>,
 /// <c>binds-to</c>, <c>binds-path</c>, <c>binds-element</c>, <c>handles-event</c>,
-/// <c>uses-resource</c>, <c>instantiates-type</c>, <c>merges</c>, <c>applies-style</c>), and the
+/// <c>code-behind-uses-element</c>, <c>uses-resource</c>, <c>instantiates-type</c>,
+/// <c>merges</c>, <c>applies-style</c>), and the
 /// <c>xaml-attached-property</c> annotation flavor documented in
 /// <c>openspec/changes/xaml-language-indexer/specs/extensibility/spec.md</c>. The indexer is
 /// profile-aware: it detects the framework profile per file via

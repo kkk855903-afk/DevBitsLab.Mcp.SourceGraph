@@ -75,6 +75,14 @@ internal sealed record NativeInteropTranslationUnitContribution(
     public IReadOnlyList<NativeTypeDeclarationFact> Types { get; init; } = [];
     public IReadOnlyList<NativeFunctionFact> Functions { get; init; } = [];
     public IReadOnlyList<NativeCallFact> Calls { get; init; } = [];
+    public bool HasPublishableFacts =>
+        ContentHashes.Count > 0
+        && (SourceExports.Count > 0
+            || VerifiedExports.Count > 0
+            || RecordLayouts.Count > 0
+            || Types.Count > 0
+            || Functions.Count > 0
+            || Calls.Count > 0);
 }
 
 internal sealed record NativeInteropSnapshot(
@@ -95,6 +103,9 @@ internal sealed record NativeInteropSnapshot(
     public IReadOnlyList<NativeTypeDeclarationFact> Types { get; init; } = [];
     public IReadOnlyList<NativeFunctionFact> Functions { get; init; } = [];
     public IReadOnlyList<NativeCallFact> Calls { get; init; } = [];
+    public bool HasPublishableFacts =>
+        Contributions.Any(contribution => contribution.HasPublishableFacts)
+        && ContentHashes.Count > 0;
 }
 
 internal delegate Task<ClangNativeExtractionResult> NativeInteropExtractor(
@@ -152,7 +163,8 @@ internal sealed class NativeInteropSnapshotBuilder
     private sealed record PreparedExtraction(
         IReadOnlyList<string> IncludedFiles,
         IReadOnlyList<ClangExtractionDiagnostic> Diagnostics,
-        NativeInteropSnapshotFailure? Failure);
+        NativeInteropSnapshotFailure? Failure,
+        NativeInteropSnapshotFailure? PartialFailure = null);
 
     private sealed record ContentHashBatch(
         IReadOnlyList<NativeInteropFileContentHash> Hashes,
@@ -512,7 +524,11 @@ internal sealed class NativeInteropSnapshotBuilder
             target,
             translationUnit.Arguments,
             translationUnit.Library,
-            pathPolicy.ConfiguredExcludePatterns);
+            pathPolicy.ConfiguredExcludePatterns)
+        {
+            SystemIncludeDirectories =
+                translationUnit.SystemIncludeDirectories,
+        };
         var sourceHashBeforeDiscovery = await HashApprovedFilesAsync(
                 [sourceFilePath],
                 pathPolicy,
@@ -627,6 +643,12 @@ internal sealed class NativeInteropSnapshotBuilder
                 sourceFilePath,
                 binaryFilePath,
                 reparse);
+        }
+        var partialExtractionFailure =
+            discovery.PartialFailure ?? reparse.PartialFailure;
+        if (partialExtractionFailure is not null)
+        {
+            failures.Add(partialExtractionFailure);
         }
         if (!PathSetsEqual(
                 discovery.IncludedFiles,
@@ -1132,11 +1154,12 @@ internal sealed class NativeInteropSnapshotBuilder
             return new PreparedExtraction(
                 includedFiles,
                 diagnostics,
+                null,
                 Failure(
                     NativeInteropSnapshotFailureKind.CallGraphIncomplete,
                     index,
                     configuredPath,
-                    "Native call extraction is partial; the prior complete snapshot was retained."));
+                    "Native call extraction is partial; verified positive facts were retained."));
         }
         if (diagnostics.Any(diagnostic =>
                 diagnostic.Severity is ClangExtractionDiagnosticSeverity.Error
@@ -2816,27 +2839,24 @@ internal sealed class NativeInteropSnapshotBuilder
         var failures = contributions
             .SelectMany(contribution => contribution.Failures)
             .ToList();
-        var sourceExports = AggregateFacts(
-            contributions.SelectMany(contribution => contribution.SourceExports),
-            export => export.SymbolCanonicalKey,
-            InteropFactPayloadCodec.EncodeNativeExport,
-            NativeInteropSnapshotFailureKind.ExportConflict,
+        var factContributions = contributions
+            .Where(contribution => contribution.HasPublishableFacts)
+            .ToArray();
+        var sourceExports = AggregateExports(
+            factContributions.SelectMany(contribution => contribution.SourceExports),
             failures,
             cancellationToken,
-            out var rejectedSourceExportKeys);
-        var verifiedExports = AggregateFacts(
-            contributions.SelectMany(contribution => contribution.VerifiedExports),
-            export => export.SymbolCanonicalKey,
-            InteropFactPayloadCodec.EncodeNativeExport,
-            NativeInteropSnapshotFailureKind.ExportConflict,
+            out var rejectedSourceExportIdentities);
+        var verifiedExports = AggregateExports(
+            factContributions.SelectMany(contribution => contribution.VerifiedExports),
             failures,
             cancellationToken,
             out _)
-            .Where(export => !rejectedSourceExportKeys.Contains(
-                export.SymbolCanonicalKey))
+            .Where(export => !rejectedSourceExportIdentities.Contains(
+                ExportIdentity(export)))
             .ToArray();
         var records = AggregateFacts(
-            contributions.SelectMany(contribution => contribution.RecordLayouts),
+            factContributions.SelectMany(contribution => contribution.RecordLayouts),
             record => record.SymbolCanonicalKey,
             InteropFactPayloadCodec.EncodeAbiRecord,
             NativeInteropSnapshotFailureKind.RecordConflict,
@@ -2844,7 +2864,7 @@ internal sealed class NativeInteropSnapshotBuilder
             cancellationToken,
             out _);
         var types = AggregateFacts(
-            contributions.SelectMany(contribution => contribution.Types),
+            factContributions.SelectMany(contribution => contribution.Types),
             type => type.SymbolCanonicalKey,
             TypeFingerprint,
             NativeInteropSnapshotFailureKind.TypeConflict,
@@ -2852,7 +2872,7 @@ internal sealed class NativeInteropSnapshotBuilder
             cancellationToken,
             out _);
         var functions = AggregateFacts(
-            contributions.SelectMany(contribution => contribution.Functions),
+            factContributions.SelectMany(contribution => contribution.Functions),
             function => function.SymbolCanonicalKey,
             FunctionFingerprint,
             NativeInteropSnapshotFailureKind.FunctionConflict,
@@ -2887,7 +2907,7 @@ internal sealed class NativeInteropSnapshotBuilder
         }
 
         var resolvedCalls = new List<NativeCallFact>();
-        foreach (var rawCall in contributions
+        foreach (var rawCall in factContributions
                      .SelectMany(contribution => contribution.Calls)
                      .OrderBy(
                          call => call.CallerSymbolCanonicalKey,
@@ -2959,7 +2979,7 @@ internal sealed class NativeInteropSnapshotBuilder
         var contentHashes =
             new Dictionary<string, NativeInteropFileContentHash>(_pathComparer);
         var rejectedHashPaths = new HashSet<string>(_pathComparer);
-        foreach (var contribution in contributions)
+        foreach (var contribution in factContributions)
         {
             cancellationToken.ThrowIfCancellationRequested();
             foreach (var hash in contribution.ContentHashes)
@@ -3000,7 +3020,7 @@ internal sealed class NativeInteropSnapshotBuilder
         }
 
         var fanoutSets = new Dictionary<string, HashSet<string>>(_pathComparer);
-        foreach (var contribution in contributions)
+        foreach (var contribution in factContributions)
         {
             cancellationToken.ThrowIfCancellationRequested();
             if (contribution.SourceFilePath is null)
@@ -3111,7 +3131,8 @@ internal sealed class NativeInteropSnapshotBuilder
         NativeInteropSnapshotFailureKind conflictKind,
         List<NativeInteropSnapshotFailure> failures,
         CancellationToken cancellationToken,
-        out HashSet<string> rejectedKeys)
+        out HashSet<string> rejectedKeys,
+        Func<T, int>? preferenceSelector = null)
     {
         var result = new List<T>();
         rejectedKeys = new HashSet<string>(StringComparer.Ordinal);
@@ -3122,7 +3143,14 @@ internal sealed class NativeInteropSnapshotBuilder
             cancellationToken.ThrowIfCancellationRequested();
             var payloads = new List<(T Fact, string Payload)>();
             var invalid = false;
-            foreach (var fact in group)
+            var preferredRank = preferenceSelector is null
+                ? 0
+                : group.Max(preferenceSelector);
+            var candidates = preferenceSelector is null
+                ? group
+                : group.Where(fact =>
+                    preferenceSelector(fact) == preferredRank);
+            foreach (var fact in candidates)
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 try
@@ -3168,6 +3196,128 @@ internal sealed class NativeInteropSnapshotBuilder
             result.Add(payloads[0].Fact);
         }
         return result.ToArray();
+    }
+
+    private static string ExportFingerprint(NativeExport export) =>
+        JsonSerializer.Serialize(export with
+        {
+            SymbolCanonicalKey = string.Empty,
+            Evidence = export.Evidence with
+            {
+                ProducingFileId = 0,
+                Location = new SourceLocation(
+                    string.Empty,
+                    0,
+                    0,
+                    0,
+                    0),
+            },
+        });
+
+    private static NativeExport[] AggregateExports(
+        IEnumerable<NativeExport> exports,
+        List<NativeInteropSnapshotFailure> failures,
+        CancellationToken cancellationToken,
+        out HashSet<string> rejectedIdentities)
+    {
+        var result = new List<NativeExport>();
+        rejectedIdentities = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var group in exports
+                     .GroupBy(ExportIdentity, StringComparer.Ordinal)
+                     .OrderBy(group => group.Key, StringComparer.Ordinal))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var preferredRank = group.Max(ExportPreference);
+            var candidates = group
+                .Where(export => ExportPreference(export) == preferredRank)
+                .OrderBy(
+                    export => export.Evidence.Location.FilePath,
+                    _pathComparer)
+                .ThenBy(
+                    export => export.Evidence.Location.StartLine)
+                .ToArray();
+            var payloads = new List<(NativeExport Export, string Payload)>();
+            var invalid = false;
+            foreach (var export in candidates)
+            {
+                try
+                {
+                    payloads.Add((export, ExportFingerprint(export)));
+                }
+                catch (Exception ex) when (
+                    ex is ArgumentException
+                        or FormatException
+                        or InvalidOperationException
+                        or NotSupportedException)
+                {
+                    invalid = true;
+                }
+            }
+            var canonicalKeys = group
+                .Select(export => export.SymbolCanonicalKey)
+                .Distinct(StringComparer.Ordinal)
+                .ToArray();
+            var diagnosticKey = canonicalKeys.Length == 1
+                ? canonicalKeys[0]
+                : group.Key;
+            if (invalid || payloads.Count == 0)
+            {
+                rejectedIdentities.Add(group.Key);
+                failures.Add(Failure(
+                    NativeInteropSnapshotFailureKind.InvalidFact,
+                    null,
+                    null,
+                    "A native export could not be normalized.",
+                    diagnosticKey));
+                continue;
+            }
+            if (payloads
+                    .Select(item => item.Payload)
+                    .Distinct(StringComparer.Ordinal)
+                    .Skip(1)
+                    .Any())
+            {
+                rejectedIdentities.Add(group.Key);
+                failures.Add(Failure(
+                    NativeInteropSnapshotFailureKind.ExportConflict,
+                    null,
+                    null,
+                    "One module export identity has conflicting normalized payloads.",
+                    diagnosticKey));
+                continue;
+            }
+            result.Add(payloads[0].Export);
+        }
+        return result.ToArray();
+    }
+
+    private static string ExportIdentity(NativeExport export)
+    {
+        if (string.IsNullOrWhiteSpace(export.LibraryName))
+        {
+            return export.SymbolCanonicalKey;
+        }
+        var library = export.Target.RuntimeIdentifier.StartsWith(
+            "win-",
+            StringComparison.OrdinalIgnoreCase)
+            ? Path.GetFileName(export.LibraryName).ToUpperInvariant()
+            : Path.GetFileName(export.LibraryName);
+        return string.Join(
+            "\n",
+            export.Target.RuntimeIdentifier,
+            library,
+            export.ExportName);
+    }
+
+    private static int ExportPreference(NativeExport export)
+    {
+        var extension = Path.GetExtension(export.Evidence.Location.FilePath);
+        return extension.Equals(".c", StringComparison.OrdinalIgnoreCase)
+            || extension.Equals(".cc", StringComparison.OrdinalIgnoreCase)
+            || extension.Equals(".cpp", StringComparison.OrdinalIgnoreCase)
+            || extension.Equals(".cxx", StringComparison.OrdinalIgnoreCase)
+            ? 1
+            : 0;
     }
 
     private static bool TryAuthorizeDependencies(

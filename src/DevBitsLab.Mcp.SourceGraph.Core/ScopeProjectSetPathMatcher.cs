@@ -7,7 +7,7 @@ namespace DevBitsLab.Mcp.SourceGraph.Core;
 /// <see cref="ScopePathPolicy"/> remains the mandatory privacy/physical/exclude boundary.
 /// This matcher only narrows that allowed set:
 /// <list type="bullet">
-/// <item><c>solutions</c> scopes retain repository-wide cross-language discovery.</item>
+/// <item><c>solutions</c> scopes include only directories rooted at solution member projects.</item>
 /// <item><c>projects</c> scopes include files below each configured project anchor.</item>
 /// <item>
 /// <c>paths</c> globs select project anchors; files below those matched projects are included.
@@ -28,6 +28,8 @@ public sealed class ScopeProjectSetPathMatcher
     private readonly IReadOnlyList<ProjectRoot>? _projectRoots;
     private readonly IReadOnlyList<ScopePathPolicy.GlobPattern> _pathPatterns;
     private readonly IReadOnlySet<string> _explicitProjectAnchors;
+    private readonly IReadOnlySet<string> _solutionAnchors;
+    private readonly IReadOnlySet<string> _solutionProjectAnchors;
 
     public ScopeProjectSetPathMatcher(string repoRoot, ScopeProjectSet projectSet)
     {
@@ -46,8 +48,41 @@ public sealed class ScopeProjectSetPathMatcher
                 .Select(path => path!)
                 .ToHashSet(PathComparer)
             : new HashSet<string>(PathComparer);
+        _solutionAnchors = projectSet is ScopeProjectSet.Solutions configuredSolutions
+            ? configuredSolutions.Items
+                .Select(TryResolveConfiguredAnchor)
+                .Where(path => path is not null)
+                .Select(path => path!)
+                .ToHashSet(PathComparer)
+            : new HashSet<string>(PathComparer);
+        _solutionProjectAnchors = new HashSet<string>(PathComparer);
         switch (projectSet)
         {
+            case ScopeProjectSet.Solutions solutions:
+                if (solutions.Items.Count == 0)
+                {
+                    // Empty solution lists are used by in-memory and synthetic project discovery.
+                    // Preserve the historical repository-wide boundary in that explicit mode.
+                    _projectRoots = null;
+                    break;
+                }
+                var membership = SolutionProjectMembershipResolver.Resolve(
+                    _root,
+                    solutions);
+                _solutionProjectAnchors = membership.Projects
+                    .Select(project => project.FullPath)
+                    .ToHashSet(PathComparer);
+                _projectRoots = membership.Projects
+                    .Select(project => ResolveProjectRoot(
+                        project.FullPath,
+                        solutions.Exclude,
+                        requireCSharpProject: false))
+                    .Where(path => path is not null)
+                    .Select(path => path!)
+                    .DistinctBy(path => path.Lexical, PathComparer)
+                    .ToArray();
+                break;
+
             case ScopeProjectSet.Paths paths:
                 _projectRoots = ResolveGlobbedProjectRoots(paths);
                 break;
@@ -107,8 +142,6 @@ public sealed class ScopeProjectSetPathMatcher
                 && IsSameOrDescendant(projectRoot.Physical, physicalPath));
         }
 
-        // A solutions scope deliberately permits registered cross-language sources anywhere
-        // below the scope root; the privacy/physical/exclude policy still narrows this set.
         return true;
     }
 
@@ -147,19 +180,22 @@ public sealed class ScopeProjectSetPathMatcher
     /// </summary>
     public bool IsProjectAnchorCandidate(string? path)
     {
-        if (!TryGetFullPath(path, includeRoot: false, out var fullPath)
-            || !string.Equals(
-                Path.GetExtension(fullPath),
-                ".csproj",
-                StringComparison.OrdinalIgnoreCase))
+        if (!TryGetFullPath(path, includeRoot: false, out var fullPath))
         {
             return false;
         }
 
         return _projectSet switch
         {
-            ScopeProjectSet.Solutions => true,
-            ScopeProjectSet.Projects => _explicitProjectAnchors.Contains(fullPath),
+            ScopeProjectSet.Solutions =>
+                _solutionAnchors.Contains(fullPath)
+                || _solutionProjectAnchors.Contains(fullPath),
+            ScopeProjectSet.Projects =>
+                string.Equals(
+                    Path.GetExtension(fullPath),
+                    ".csproj",
+                    StringComparison.OrdinalIgnoreCase)
+                && _explicitProjectAnchors.Contains(fullPath),
             ScopeProjectSet.Paths =>
                 _pathPatterns.Any(pattern => pattern.IsMatch(
                     Path.GetRelativePath(_root, fullPath).Replace('\\', '/'))),
@@ -316,7 +352,8 @@ public sealed class ScopeProjectSetPathMatcher
 
     private ProjectRoot? ResolveProjectRoot(
         string configuredPath,
-        IReadOnlyList<string> excludePatterns)
+        IReadOnlyList<string> excludePatterns,
+        bool requireCSharpProject = true)
     {
         if (string.IsNullOrWhiteSpace(configuredPath))
         {
@@ -338,10 +375,11 @@ public sealed class ScopeProjectSetPathMatcher
             return null;
         }
         if (!IsSameOrDescendant(_root, fullPath)
-            || !string.Equals(
-                Path.GetExtension(fullPath),
-                ".csproj",
-                StringComparison.OrdinalIgnoreCase)
+            || (requireCSharpProject
+                && !string.Equals(
+                    Path.GetExtension(fullPath),
+                    ".csproj",
+                    StringComparison.OrdinalIgnoreCase))
             || !File.Exists(fullPath)
             || new ScopePathPolicy(_root, excludePatterns).IsExcluded(fullPath))
         {

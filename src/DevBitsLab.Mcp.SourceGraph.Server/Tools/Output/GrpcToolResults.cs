@@ -1,4 +1,5 @@
 using System.Text.Json.Serialization;
+using DevBitsLab.Mcp.SourceGraph.Server.Grpc;
 
 namespace DevBitsLab.Mcp.SourceGraph.Server.Tools.Output;
 
@@ -38,7 +39,9 @@ public sealed record GrpcTraceScopeResult(
     bool Truncated,
     [property: JsonPropertyName("omitted_count")] int OmittedCount,
     [property: JsonPropertyName("omitted_evidence_count")]
-        int OmittedEvidenceCount);
+        int OmittedEvidenceCount,
+    [property: JsonPropertyName("link_coverage")]
+        GrpcLinkCoverage? LinkCoverage = null);
 
 public sealed record GrpcRpcTraceRow(
     [property: JsonPropertyName("canonical_key")] string CanonicalKey,
@@ -144,7 +147,9 @@ public sealed record GrpcContractCheckScopeResult(
     bool Truncated,
     [property: JsonPropertyName("omitted_count")] int OmittedCount,
     [property: JsonPropertyName("omitted_evidence_count")]
-        int OmittedEvidenceCount);
+        int OmittedEvidenceCount,
+    [property: JsonPropertyName("link_coverage")]
+        GrpcLinkCoverage? LinkCoverage = null);
 
 public sealed record GrpcContractFindingRow(
     [property: JsonPropertyName("rule_id")] string RuleId,

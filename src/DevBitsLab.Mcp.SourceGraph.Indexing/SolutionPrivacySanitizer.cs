@@ -1,5 +1,6 @@
 using DevBitsLab.Mcp.SourceGraph.Core;
 using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.CSharp;
 
 namespace DevBitsLab.Mcp.SourceGraph.Indexing;
 
@@ -19,13 +20,22 @@ internal static class SolutionPrivacySanitizer
     }
 
     public static Solution SanitizeForScope(Solution solution, ScopePathPolicy pathPolicy)
+        => SanitizeForScope(solution, pathPolicy, isBuildGenerated: null);
+
+    internal static Solution SanitizeForScope(
+        Solution solution,
+        ScopePathPolicy pathPolicy,
+        Func<Document, bool>? isBuildGenerated)
     {
         ArgumentNullException.ThrowIfNull(solution);
         ArgumentNullException.ThrowIfNull(pathPolicy);
-        return Sanitize(solution, pathPolicy.IsExcluded);
+        return Sanitize(solution, pathPolicy.IsExcluded, isBuildGenerated);
     }
 
-    private static Solution Sanitize(Solution solution, Func<string?, bool> isExcluded)
+    private static Solution Sanitize(
+        Solution solution,
+        Func<string?, bool> isExcluded,
+        Func<Document, bool>? isBuildGenerated = null)
     {
         var sanitized = solution;
         foreach (var project in solution.Projects)
@@ -40,6 +50,27 @@ internal static class SolutionPrivacySanitizer
             {
                 if (isExcluded(document.FilePath))
                 {
+                    // MSBuildWorkspace does not consistently preserve Roslyn's internal
+                    // IsGenerated bit for SDK-authored *.GlobalUsings.g.cs documents. This is
+                    // especially visible for Microsoft.NET.Sdk.Web, whose ASP.NET Core imports
+                    // can arrive as an ordinary Document under obj/. Retaining that document is
+                    // safe without trusting its path or generated-looking name because the
+                    // syntax gate below accepts only global-using directives: no declarations,
+                    // attributes, statements, or other excluded source can enter compilation.
+                    //
+                    // WPF markup output is different: it contains generated declarations and
+                    // fields, so it still requires Roslyn build provenance before it can remain
+                    // in the compilation-only snapshot.
+                    if (TryExtractGlobalUsings(document)
+                        || (isBuildGenerated?.Invoke(document) == true
+                            && IsWpfMarkupGeneratedSource(document)))
+                    {
+                        // Keep the original Roslyn DocumentId so source-generator ownership
+                        // remains stable across reloads. Regular-document discovery excludes
+                        // its obj/ path, so it contributes only to compilation and is never
+                        // persisted as user source.
+                        continue;
+                    }
                     sanitized = sanitized.RemoveDocument(document.Id);
                 }
             }
@@ -59,8 +90,39 @@ internal static class SolutionPrivacySanitizer
                     sanitized = sanitized.RemoveAnalyzerConfigDocument(document.Id);
                 }
             }
+
         }
 
         return sanitized;
+    }
+
+    private static bool TryExtractGlobalUsings(Document document)
+    {
+        if (!document.Name.EndsWith(
+                ".GlobalUsings.g.cs",
+                StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var text = document.GetTextAsync(CancellationToken.None)
+            .GetAwaiter()
+            .GetResult();
+        var root = CSharpSyntaxTree.ParseText(text).GetCompilationUnitRoot();
+        if (root.ContainsDiagnostics || root.Members.Count != 0)
+        {
+            return false;
+        }
+
+        return root.Usings.Count > 0
+            && root.Usings.All(directive =>
+                !directive.GlobalKeyword.IsKind(SyntaxKind.None));
+    }
+
+    private static bool IsWpfMarkupGeneratedSource(Document document)
+    {
+        var name = document.Name;
+        return name.EndsWith(".g.cs", StringComparison.OrdinalIgnoreCase)
+            || name.EndsWith(".g.i.cs", StringComparison.OrdinalIgnoreCase);
     }
 }

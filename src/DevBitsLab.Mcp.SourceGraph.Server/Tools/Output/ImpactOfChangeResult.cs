@@ -8,12 +8,24 @@ namespace DevBitsLab.Mcp.SourceGraph.Server.Tools.Output;
 /// edges backwards up to <see cref="MaxDepth"/>.
 /// </summary>
 public sealed record ImpactOfChangeResult(
+    string Result,
+    [property: JsonPropertyName("scope_status")] string ScopeStatus,
+    string Completeness,
+    [property: JsonPropertyName("absence_authoritative")] bool AbsenceAuthoritative,
+    string? Reason,
+    [property: JsonPropertyName("selection_mode")] string SelectionMode,
+    [property: JsonPropertyName("fallback_used")] bool FallbackUsed,
+    [property: JsonPropertyName("candidate_count")] int CandidateCount,
+    [property: JsonPropertyName("selection_ambiguous")] bool SelectionAmbiguous,
     [property: JsonPropertyName("target_fqn")] string TargetFqn,
     [property: JsonPropertyName("target_kind")] string TargetKind,
     [property: JsonPropertyName("target_symbol_id")] long TargetSymbolId,
     [property: JsonPropertyName("target_canonical_key")] string? TargetCanonicalKey,
     [property: JsonPropertyName("edge_kind")] string EdgeKind,
     [property: JsonPropertyName("max_depth")] int MaxDepth,
+    string Evidence,
+    [property: JsonPropertyName("include_paths")] bool IncludePaths,
+    [property: JsonPropertyName("path_format")] string PathFormat,
     bool Truncated,
     [property: JsonPropertyName("expanded_nodes")] int ExpandedNodes,
     IReadOnlyList<ImpactOfChangeRow> Upstream);

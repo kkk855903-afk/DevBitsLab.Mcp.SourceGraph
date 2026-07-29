@@ -201,11 +201,21 @@ reparse points that escape the scope.
 
 ### Configure native interop
 
-Native indexing is opt-in per scope. Declare one explicit ABI target and the
-ordered translation units to parse; the server does not infer ABI settings
-from the host and the native pipeline does not execute a native build or import
-`compile_commands.json`. Paths are repository-relative, while `arguments` are
-the exact libclang parse arguments:
+When a scope is backed by a `.sln` or `.slnx`, SourceGraph automatically
+discovers member `.vcxproj` files and indexes every enabled `ClCompile` item.
+Solution membership is a hard boundary for every language indexer and watcher:
+projects elsewhere in the repository are excluded. SourceGraph prefers
+`Release|<host architecture>`, then `Debug|<host architecture>`, and finally
+the first uniform supported solution mapping. It never executes a native
+build, project target, task, build event, imported props/targets, or
+`compile_commands.json`.
+
+An explicit `interop` block remains available for scopes without a solution,
+or to enrich solution-member projects with a target, library, binary path, or
+additional Clang arguments. In solution scope it cannot add outside projects,
+remove member projects, or narrow a project to selected source files. The
+external `NativeParsing` trust grant is still required before any Clang worker
+is started.
 
 When an interop query is made before this block is configured, the server runs
 a bounded, read-only discovery pass and reports `.vcxproj`, `CMakeLists.txt`,
@@ -257,10 +267,49 @@ configuration below.
 }
 ```
 
+For a non-solution scope, select the MSVC project configuration and platform
+explicitly:
+
+```json
+{
+  "interop": {
+    "target": {
+      "runtime_identifier": "win-x64",
+      "architecture": "x64",
+      "compiler_abi": "msvc",
+      "pointer_size_bytes": 8,
+      "default_pack": 8
+    },
+    "vcx_projects": [
+      {
+        "path": "AlgorithmBridge/AlgorithmBridge.vcxproj",
+        "configuration": "Release",
+        "platform": "x64",
+        "library": "AlgorithmBridge.dll",
+        "source_files": ["AlgorithmBridgeHeaderCheck.c"],
+        "additional_arguments": ["-DAB_SOURCEGRAPH=1"],
+        "binary_path": "Release/AlgorithmBridge.dll"
+      }
+    ]
+  }
+}
+```
+
+The static importer reads matching `PropertyGroup`, `ItemDefinitionGroup`, and
+`ClCompile` entries, including per-item `ExcludedFromBuild`, definitions,
+include directories, `CompileAs`, character set, and C/C++ language standard.
+`source_files` is optional; omitting it selects all enabled `ClCompile` items.
+Configuration and platform are mandatory because multi-flavour projects cannot
+be indexed safely by guessing. Microsoft toolset/Windows SDK headers are
+located at runtime and admitted as read-only system inputs; they are excluded
+from repository evidence and content hashes.
+
 `binary_path` is optional. When supplied, the file must stay inside the privacy
 boundary and is used to verify that the configured library really exports the
 matched symbol. Explicit include paths and every observed repository include
-must resolve inside the approved scope. Compiler-controlled file inputs,
+must resolve inside the approved scope. Only system headers below the
+runtime-discovered MSVC/Windows SDK roots may resolve outside it.
+Compiler-controlled file inputs,
 non-literal includes, response files, plugins, PCH/module inputs, output paths,
 and other arguments that cannot be validated safely fail closed; there is no
 textual parser fallback.
@@ -624,15 +673,15 @@ node, or path truncation makes terminal absence non-authoritative.
 | `find_definition` | Where is X defined? Each hit carries the symbol id/FQN, exact declaration range, `defines` relation, and confidence. |
 | `find_references` | Who uses or calls X? Each occurrence carries its resolved target symbol, relation kind, semantic confidence, and file:line (optionally including source-generated files). |
 | `find_reference` | Phase 1 compatibility name for `find_references` (same structured result and limits). |
-| `list_callers` | Inbound edges into X — default `kind=calls`; also `uses_type`, `overrides`, `implements_member`, `instantiates`, `throws`, `all`. When an edge carries per-edge metadata (e.g. a future XAML `binds-path` edge with `path`, `mode`, `converter` fields), the markdown shows an indented `payload: { … }` sub-line under the row, capped at 5 keys with `(N more)` if elided. |
+| `list_callers` | Inbound edges into X — default `kind=calls`; also `uses_type`, `overrides`, `implements_member`, `instantiates`, `throws`, `all`. The structured result discloses scope completeness, authoritative absence, symbol-selection mode/candidate count, and truncation. When an edge carries per-edge metadata (e.g. a future XAML `binds-path` edge with `path`, `mode`, `converter` fields), the markdown shows an indented `payload: { … }` sub-line under the row, capped at 5 keys with `(N more)` if elided. |
 | `list_callees` | Outbound edges from X (same `kind` taxonomy; same `payload:` sub-line behaviour as `list_callers`). |
 | `find_callers` / `find_callees` | Phase 1 compatibility names for `list_callers` / `list_callees`. |
 | `list_symbols_in_file` | What's in this file? (kind, accessibility, modifiers, XML summary) |
 | `list_members` | Direct members of a class / struct / interface / namespace by FQN, optionally filtered by accessibility |
-| `find_implementations` | Concrete members satisfying an interface member |
+| `find_implementations` | Concrete members satisfying an interface member, including canonical keys and explicit scope/selection completeness. A partial scope returns `absence_authoritative=false`; use the suggested narrowed text check before treating the list as exhaustive. |
 | `neighborhood` | Inbound + outbound edges around X for one `kind` layer at a time (default `calls`; pass `kind=uses_type`, `overrides`, `implements_member`, `instantiates`, `throws`, or `all` to inspect other layers) |
 | `module_summary` | Top symbols in a namespace or directory by inbound call count |
-| `impact_of_change` | Transitive upstream callers of X up to `maxDepth` |
+| `impact_of_change` | Transitive upstream callers of X up to `maxDepth`, with scope completeness, authoritative-absence, selection, and truncation metadata. Defaults to compact `evidence=summary` with relative paths and no repeated hop paths; use `evidence=full` for occurrence-level audit evidence. |
 | `impact_analysis` | Phase 1 compatibility name for `impact_of_change`. |
 | `trace_call_path` | Bounded, cycle-safe directed paths from one symbol to another. Defaults to one `calls` relation; set `profile="execution"` for the ordered cross-domain state machine and `execution_state` completeness disclosure. Execution mode may omit `to` for exact-canonical terminal discovery. Every hop includes source/target canonical identities, relation, confidence, and occurrence-level evidence; configurable depth, path, and node caps report truncation explicitly. |
 | `find_data_bindings` | Walks `binds-path` edges with payload-aware filters (`path`, `mode`, `converter`, plus optional `target` / `source` canonical keys). Answers "where does this property bind?", "find every TwoWay binding", "which views use this converter?". Soft-empty `note:` when the active scope hasn't loaded an indexer that emits `binds-path`. |
@@ -673,7 +722,7 @@ The WPF risk codes intentionally cover only statically proven shapes:
 | `reconcile_drift` | Walk a scope's source tree, compare each file's on-disk SHA-256 to the DB, and apply the symmetric difference (reindex changed + index added + remove vanished). Use when results look stale or after a long offline period. `dry_run` previews without applying. |
 | `graph_stats` | Counts of files / symbols / references / edges — confirm the index is populated |
 | `usage_stats` | Per-tool call count, error count, latency, average response size, last-called time for the current process |
-| `embeddings_status` | Inspect the embedding model cache (read-only): cache directory, model id + dimension, per-file presence/size/SHA, free disk |
+| `embeddings_status` | Inspect the embedding model cache and live pipeline (read-only): cache files, free disk, per-scope `pending` / `completed` / `dropped`, plus query/background inference wait time |
 | `embeddings_pull` | Synchronously download the embedding model manifest into the cache (idempotent; mutating tool — host should confirm) |
 | `embeddings_remove` | Delete the cache directory for the active model (default), one specific model, or every cached model with `all=true` (**destructive** — host should confirm) |
 | `embeddings_verify` | Recompute SHAs of every cached file and compare against the manifest. Default model has pinned SHAs (mismatch → `isError=true`); override `--model` paths report `match=null` (informational only) |
@@ -938,7 +987,8 @@ A `.sourcegraph.json` at the repo root opts a project into multi-scope mode:
   `scopes info`, but no first-party plugin consumes it at this version —
   the first runtime use lands with the TypeScript indexer.
 - `interop` (object, optional) enables the native pipeline for that scope. It
-  requires an explicit `target` and non-empty ordered `translation_units`;
+  requires an explicit `target` and at least one ordered `translation_units`
+  or statically imported `vcx_projects` entry;
   see [Privacy, trust, and native configuration](#privacy-trust-and-native-configuration).
   A configured scope without an external `NativeParsing` trust grant is
   reported partial instead of falling back to textual matching.
@@ -1196,6 +1246,23 @@ database per scope. The current limits are:
 | Default `SearchSymbols` / `find_references` / `list_members` result limit | 25 / 50 / 100 rows | Pass `limit` on the MCP tool call. A soft serialized-size cap (~50K chars) trims further if a larger `limit` would exceed Claude Code's per-call ceiling; trim is signalled via `omitted_size=N` in the audience-restricted `_meta:` block. |
 | `impact_of_change` max depth | 4 hops | Pass `maxDepth` on the tool call. |
 | `semantic_search` top-k default | 10 | Pass `k` on the tool call. |
+
+### Reproducible cold/warm query probe
+
+Do not compare cumulative `usage_stats` averages from different server processes. Run the
+same operation with identical arguments against one open store so first-call, warm-call, and
+managed lock wait remain separate:
+
+```powershell
+dotnet build .\bench\DevBitsLab.Mcp.SourceGraph.Benchmarks -c Release
+dotnet .\bench\DevBitsLab.Mcp.SourceGraph.Benchmarks\bin\Release\net10.0\DevBitsLab.Mcp.SourceGraph.Benchmarks.dll `
+  --same-process-query .\.sourcegraph\scopes\default.db Calculator 20
+```
+
+The JSON result reports `cold_ms`, warm min/median/max, and `lock_wait_ms`. Symbol search uses
+independent read-only readers, so its managed lock wait is explicitly zero. For semantic
+search, use `embeddings_status`: `inference.query_wait_ms` and
+`inference.background_wait_ms` report contention at the shared ONNX gate.
 | Embedding model download | ~640 MB, automatic download disabled by default | Populate deliberately with `embeddings pull`, or opt in with `--allow-model-download`; use `--no-embeddings` to disable the pipeline. |
 | Per-symbol `git blame` shellout | enabled | Disable with `--no-history`. |
 | MCP `initialize` instructions payload | enabled | Disable with `--no-instructions` or `SOURCEGRAPH_NO_INSTRUCTIONS=1`. |

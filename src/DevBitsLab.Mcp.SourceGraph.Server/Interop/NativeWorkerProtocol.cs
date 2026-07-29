@@ -80,10 +80,10 @@ internal sealed class NativeWorkerProtocolException : Exception
 /// </summary>
 internal static class NativeWorkerProtocol
 {
-    public const int CurrentVersion = 2;
+    public const int CurrentVersion = 4;
     public const string RequestKind = "native-extraction-request";
     public const string ResponseKind = "native-extraction-response";
-    public const int MaximumRequestBytes = 1024 * 1024;
+    public const int MaximumRequestBytes = 8 * 1024 * 1024;
     public const int MaximumResponseBytes = 16 * 1024 * 1024;
     public const int MaximumStandardErrorBytes = 64 * 1024;
 
@@ -93,6 +93,9 @@ internal static class NativeWorkerProtocol
     private const int MaximumRetainedCallbacks = 4096;
     private const int MaximumCompilerArguments = 4096;
     private const int MaximumExcludePatterns = 1024;
+    private const int MaximumSystemIncludeDirectories = 64;
+    private const int MaximumInMemoryInputs = 256;
+    private const int MaximumInMemoryInputBytes = 4 * 1024 * 1024;
     private const int MaximumMetadataEntries = 256;
     private const int MaximumStringCharacters = 32 * 1024;
     private const int MaximumTypeDepth = 32;
@@ -504,6 +507,55 @@ internal static class NativeWorkerProtocol
                 ValidateNonBlankString(pattern, "ExcludePatterns item");
             }
         }
+        ValidateCollection(
+            request.SystemIncludeDirectories,
+            MaximumSystemIncludeDirectories,
+            "SystemIncludeDirectories");
+        foreach (var directory in request.SystemIncludeDirectories)
+        {
+            ValidateNonBlankString(
+                directory,
+                "SystemIncludeDirectories item");
+            if (!Path.IsPathFullyQualified(directory)
+                || !Directory.Exists(directory))
+            {
+                throw new NativeWorkerProtocolException(
+                    "invalid-request",
+                    "SystemIncludeDirectories items must be existing absolute directories.");
+            }
+        }
+        ValidateCollection(
+            request.InMemoryInputs,
+            MaximumInMemoryInputs,
+            "InMemoryInputs");
+        var inMemoryPaths = new HashSet<string>(
+            OperatingSystem.IsWindows()
+                ? StringComparer.OrdinalIgnoreCase
+                : StringComparer.Ordinal);
+        var inMemoryBytes = 0;
+        foreach (var input in request.InMemoryInputs)
+        {
+            if (input is null || input.Contents is null)
+            {
+                throw new NativeWorkerProtocolException(
+                    "invalid-request",
+                    "InMemoryInputs cannot contain null values.");
+            }
+            ValidateNonBlankString(input.Path, "InMemoryInputs item path");
+            inMemoryBytes = checked(inMemoryBytes + input.Contents.Length);
+            if (inMemoryBytes > MaximumInMemoryInputBytes
+                || (input.Contents.Contains((byte)0)
+                    && !HasUtf16Bom(input.Contents))
+                || StartsWithHsKey(input.Contents)
+                || !Path.IsPathFullyQualified(input.Path)
+                || !File.Exists(input.Path)
+                || !inMemoryPaths.Add(Path.GetFullPath(input.Path)))
+            {
+                throw new NativeWorkerProtocolException(
+                    "invalid-request",
+                    "InMemoryInputs are duplicated, protected, missing, or exceed the fixed byte limit.");
+            }
+        }
 
         try
         {
@@ -515,6 +567,13 @@ internal static class NativeWorkerProtocol
                 throw new NativeWorkerProtocolException(
                     "invalid-request",
                     "SourceFilePath must be inside ScopeRoot.");
+            }
+            if (inMemoryPaths.Any(path =>
+                    !IsSameOrDescendant(scope, path)))
+            {
+                throw new NativeWorkerProtocolException(
+                    "invalid-request",
+                    "InMemoryInputs must be inside ScopeRoot.");
             }
         }
         catch (NativeWorkerProtocolException)
@@ -531,6 +590,19 @@ internal static class NativeWorkerProtocol
                 "The native extraction paths are invalid.");
         }
     }
+
+    private static bool StartsWithHsKey(ReadOnlySpan<byte> bytes) =>
+        bytes.Length >= 5
+        && bytes[0] == (byte)'H'
+        && bytes[1] == (byte)'S'
+        && bytes[2] == (byte)'K'
+        && bytes[3] == (byte)'e'
+        && bytes[4] == (byte)'y';
+
+    private static bool HasUtf16Bom(ReadOnlySpan<byte> bytes) =>
+        bytes.Length >= 2
+        && ((bytes[0] == 0xff && bytes[1] == 0xfe)
+            || (bytes[0] == 0xfe && bytes[1] == 0xff));
 
     private static void ValidateExtractionResult(
         ClangNativeExtractionResult result,

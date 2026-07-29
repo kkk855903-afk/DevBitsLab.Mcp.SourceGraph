@@ -1,7 +1,9 @@
 using System.ComponentModel;
 using System.Text;
 using System.Text.Json;
+using DevBitsLab.Mcp.SourceGraph.Embeddings;
 using DevBitsLab.Mcp.SourceGraph.Server.Observability;
+using DevBitsLab.Mcp.SourceGraph.Server.Scoping;
 using DevBitsLab.Mcp.SourceGraph.Server.Tools.Output;
 using ModelContextProtocol.Protocol;
 using ModelContextProtocol.Server;
@@ -26,9 +28,11 @@ public static class EmbeddingsTools
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(EmbeddingsStatusResult))]
     [ToolAnnotation(ReadOnlyHint = true, IdempotentHint = true)]
     [ToolTrigger("\"is semantic search working?\" or \"where does the embedding model live on disk?\" — call before suggesting a manual cache fix")]
-    [Description("Inspect the embedding model cache: cache directory, active model id and dimension, per-file presence/size/SHA, free disk on the cache volume.")]
+    [Description("Inspect the embedding model cache and live pipeline: cache files, free disk, per-scope pending/completed/dropped queue counts, and query/background inference wait time.")]
     public static Task<CallToolResult> EmbeddingsStatusAsync(
         EmbeddingsManager manager,
+        ScopeRouter router,
+        ICodeEmbeddingGenerator generator,
         string? modelId = null) =>
         ToolMetrics.TrackAsync("embeddings_status", null, async () =>
         {
@@ -40,7 +44,13 @@ public static class EmbeddingsTools
             try
             {
                 var status = await manager.GetStatusAsync(modelId).ConfigureAwait(false);
-                return BuildStatusResult(status, verifying: false, prefix: null, sw);
+                return BuildStatusResult(
+                    status,
+                    verifying: false,
+                    prefix: null,
+                    sw,
+                    QueueRows(router),
+                    generator.InferenceStatistics);
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
@@ -132,7 +142,13 @@ public static class EmbeddingsTools
             }
         });
 
-    private static CallToolResult BuildStatusResult(EmbeddingsStatus status, bool verifying, string? prefix, System.Diagnostics.Stopwatch sw)
+    private static CallToolResult BuildStatusResult(
+        EmbeddingsStatus status,
+        bool verifying,
+        string? prefix,
+        System.Diagnostics.Stopwatch sw,
+        IReadOnlyList<EmbeddingsQueueRow>? queues = null,
+        EmbeddingInferenceStatistics? inference = null)
     {
         var prose = new StringBuilder();
         if (!string.IsNullOrEmpty(prefix)) prose.AppendLine(prefix);
@@ -171,6 +187,23 @@ public static class EmbeddingsTools
                 prose.AppendLine("_note: no pinned SHA in manifest — informational only._");
             }
         }
+        if (queues is { Count: > 0 })
+        {
+            prose.AppendLine();
+            prose.AppendLine("| Scope | Pending | Completed | Dropped |");
+            prose.AppendLine("|-------|--------:|----------:|--------:|");
+            foreach (var queue in queues)
+            {
+                prose.AppendLine($"| `{queue.ScopeId}` | {queue.Pending} | {queue.Completed} | {queue.Dropped} |");
+            }
+        }
+        if (inference is not null)
+        {
+            prose.AppendLine();
+            prose.AppendLine(
+                $"**inference wait**: query={inference.QueryWaitMs:F1} ms/{inference.QueryCalls} calls; "
+                + $"background={inference.BackgroundWaitMs:F1} ms/{inference.BackgroundCalls} calls");
+        }
 
         var dto = new EmbeddingsStatusResult(
             ModelId: status.ModelId,
@@ -184,7 +217,15 @@ public static class EmbeddingsTools
                 ComputedSha: f.ComputedSha,
                 PinnedSha: f.PinnedSha,
                 Match: f.Match)).ToList(),
-            FreeDiskBytes: status.FreeDiskBytes);
+            FreeDiskBytes: status.FreeDiskBytes,
+            Queues: queues,
+            Inference: inference is null
+                ? null
+                : new EmbeddingsInferenceRow(
+                    inference.QueryCalls,
+                    inference.QueryWaitMs,
+                    inference.BackgroundCalls,
+                    inference.BackgroundWaitMs));
 
         var anyMismatch = verifying && status.Files.Any(f => f.Match == false);
 
@@ -204,6 +245,20 @@ public static class EmbeddingsTools
             IsError = anyMismatch,
         };
     }
+
+    private static IReadOnlyList<EmbeddingsQueueRow> QueueRows(ScopeRouter router) =>
+        router.All()
+            .Where(host => host.EmbeddingsSink is not null)
+            .Select(host =>
+            {
+                var stats = host.EmbeddingsSink!.Statistics;
+                return new EmbeddingsQueueRow(
+                    host.Scope.Id,
+                    stats.Pending,
+                    stats.Completed,
+                    stats.Dropped);
+            })
+            .ToArray();
 
     private static CallToolResult BuildRemoveResult(RemoveResult result, System.Diagnostics.Stopwatch sw)
     {

@@ -1,3 +1,5 @@
+using DevBitsLab.Mcp.SourceGraph.Core;
+
 namespace DevBitsLab.Mcp.SourceGraph.Server.Interop;
 
 internal sealed record NativeInteropDiscoveryResult(
@@ -9,6 +11,8 @@ internal sealed record NativeInteropDiscoveryResult(
     IReadOnlyList<string> Configurations,
     bool Truncated)
 {
+    public bool IsSolutionScoped { get; init; }
+
     public string ToDiagnostic()
     {
         var inputs = VcxProjects
@@ -34,10 +38,17 @@ internal sealed record NativeInteropDiscoveryResult(
             _ => $"configuration=ambiguous({string.Join(",", Configurations)})",
         };
         var suffix = Truncated ? "; scan=truncated" : "";
-        return $" Discovered native inputs=[{string.Join(", ", inputs)}]; "
+        var boundary = IsSolutionScoped
+            ? $" Solution membership contains {VcxProjects.Count} native project(s)."
+            : "";
+        return boundary
+            + $" Discovered native inputs=[{string.Join(", ", inputs)}]; "
             + $"binaries=[{string.Join(", ", Binaries)}]; {architecture}; "
-            + $"{configuration}{suffix}. Configure `interop.target` and "
-            + "`interop.translation_units` explicitly; ambiguous targets are not selected.";
+            + $"{configuration}{suffix}."
+            + (IsSolutionScoped
+                ? " Native inputs outside the solution are excluded."
+                : " Configure `interop.target` and `interop.translation_units` explicitly; "
+                    + "ambiguous targets are not selected.");
     }
 }
 
@@ -45,6 +56,32 @@ internal static class NativeInteropDiscovery
 {
     private const int MaximumVisitedFiles = 20_000;
     private const int MaximumCandidatesPerKind = 8;
+
+    public static NativeInteropDiscoveryResult Discover(Scope scope)
+    {
+        ArgumentNullException.ThrowIfNull(scope);
+        if (scope.ProjectSet is not ScopeProjectSet.Solutions solutions)
+        {
+            return Discover(scope.Root);
+        }
+
+        var membership = SolutionProjectMembershipResolver.Resolve(
+            scope.Root,
+            solutions);
+        return new NativeInteropDiscoveryResult(
+            membership.VisualCppProjects
+                .Select(project => project.ProjectPath.Replace('\\', '/'))
+                .ToArray(),
+            CMakeProjects: [],
+            CompilationDatabases: [],
+            Binaries: [],
+            Architectures: [],
+            Configurations: [],
+            Truncated: membership.Failures.Count > 0)
+        {
+            IsSolutionScoped = true,
+        };
+    }
 
     public static NativeInteropDiscoveryResult Discover(string repositoryRoot)
     {

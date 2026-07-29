@@ -2,7 +2,7 @@ namespace DevBitsLab.Mcp.SourceGraph.Embeddings;
 
 /// <summary>
 /// One-way producer surface used by the indexer to enqueue per-symbol embedding work.
-/// The default implementation (registered by the host) wraps a bounded
+/// The default implementation (registered by the host) wraps an unbounded
 /// <see cref="System.Threading.Channels.Channel{T}"/> drained by a single background worker.
 /// When <c>--no-embeddings</c> is set, a no-op implementation is registered so the indexer
 /// path stays the same shape.
@@ -13,8 +13,8 @@ public interface IEmbeddingsRequestSink
     bool IsEnabled { get; }
 
     /// <summary>
-    /// Enqueue a request. Implementations MUST NOT block the indexer; if the queue is full,
-    /// they SHOULD drop the oldest pending entry rather than wait.
+    /// Enqueue a request. Implementations MUST NOT block the indexer and MUST NOT silently
+    /// discard cold-index work because the consumer is temporarily slower than the producer.
     /// </summary>
     void Enqueue(EmbedRequest request);
 }

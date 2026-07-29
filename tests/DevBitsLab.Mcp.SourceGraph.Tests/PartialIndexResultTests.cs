@@ -2,10 +2,13 @@ using System;
 using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
+using DevBitsLab.Mcp.SourceGraph.Core;
 using DevBitsLab.Mcp.SourceGraph.Indexing;
+using DevBitsLab.Mcp.SourceGraph.Interop;
 using DevBitsLab.Mcp.SourceGraph.Storage;
 using FluentAssertions;
 using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.CSharp;
 using Xunit;
 
 namespace DevBitsLab.Mcp.SourceGraph.Tests;
@@ -152,6 +155,104 @@ public sealed class PartialIndexResultTests
     }
 
     [Fact]
+    public async Task ColdIndex_failedSolutionMember_usesSafeCSharpFallbackForPositivePInvokeFact()
+    {
+        var root = Path.Combine(
+            Path.GetTempPath(),
+            "partial-fallback-tests-" + Guid.NewGuid().ToString("N"));
+        var projectDirectory = Path.Combine(root, "Broken");
+        Directory.CreateDirectory(projectDirectory);
+        var projectPath = Path.Combine(projectDirectory, "Broken.csproj");
+        var sourcePath = Path.Combine(projectDirectory, "Native.cs");
+        var solutionPath = Path.Combine(root, "Fallback.sln");
+        await File.WriteAllTextAsync(
+            projectPath,
+            """<Project Sdk="Missing.SourceGraph.Test.Sdk/1.0.0" />""");
+        await File.WriteAllTextAsync(
+            sourcePath,
+            """
+            using System.Runtime.InteropServices;
+            namespace Fallback;
+            internal static class Native
+            {
+                [DllImport("native.dll", CallingConvention = CallingConvention.Cdecl)]
+                internal static extern uint AB_GetAPIVersion();
+            }
+            """);
+        await File.WriteAllTextAsync(
+            solutionPath,
+            """
+            Microsoft Visual Studio Solution File, Format Version 12.00
+            Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Broken", "Broken\Broken.csproj", "{11111111-1111-1111-1111-111111111111}"
+            EndProject
+            Global
+            EndGlobal
+            """);
+
+        try
+        {
+            await using var store = new SqliteGraphStore(
+                Path.Combine(root, "graph.db"));
+            var hooks = new RoslynIndexer.TestHooks(
+                OpenWorkspaceAsync: (workspace, _, _) =>
+                {
+                    var projectId = ProjectId.CreateNewId("Broken");
+                    var solution = workspace.CurrentSolution.AddProject(
+                        ProjectInfo.Create(
+                            projectId,
+                            VersionStamp.Create(),
+                            "Broken",
+                            "Broken",
+                            LanguageNames.CSharp,
+                            filePath: projectPath,
+                            compilationOptions: new CSharpCompilationOptions(
+                                OutputKind.DynamicallyLinkedLibrary)));
+                    return Task.FromResult(
+                        new RoslynIndexer.WorkspaceOpenResult(
+                            solution,
+                            [
+                                new WorkspaceDiagnostic(
+                                    WorkspaceDiagnosticKind.Failure,
+                                    "simulated project load failure"),
+                            ]));
+                });
+            await using var indexer = new RoslynIndexer(
+                store,
+                logger: null,
+                embeddingsSink: null,
+                privacyRoot: root,
+                excludePatterns: [],
+                testHooks: hooks,
+                interopTarget: InteropTarget.WindowsX64Msvc);
+
+            await indexer.OpenAsync(solutionPath);
+            var result = await indexer.IndexAllAsync();
+            var imports =
+                await InteropFactStoreReader.ReadManagedImportsAsync(store);
+
+            result.FailedProjects.Should().Contain(failure =>
+                failure.Reason.Contains(
+                    "simulated project load failure",
+                    StringComparison.Ordinal));
+            imports.IsComplete.Should().BeTrue();
+            imports.Facts.Should().ContainSingle(stored =>
+                stored.Fact.EntryPoint == "AB_GetAPIVersion"
+                && stored.Fact.Evidence.Location.FilePath == sourcePath);
+        }
+        finally
+        {
+            try
+            {
+                Directory.Delete(root, recursive: true);
+            }
+            catch
+            {
+                // Best effort for Windows test-host handles.
+            }
+        }
+    }
+
+    [Fact]
     public async Task ColdIndex_explicitInterfaceImplementation_emitsImplementationEdge()
     {
         var root = Path.Combine(
@@ -205,6 +306,22 @@ public sealed class PartialIndexResultTests
                 public sealed class InheritedLookup : LookupBase, ILookup
                 {
                 }
+
+                public interface IMappedData<T>
+                {
+                    void From(T source);
+                }
+
+                public interface IPatientInfo : IMappedData<IPatientInfo>
+                {
+                }
+
+                public sealed class DbPatientInfo : IPatientInfo
+                {
+                    public void From(IPatientInfo source)
+                    {
+                    }
+                }
                 """);
 
             await using var store = new SqliteGraphStore(Path.Combine(root, "graph.db"));
@@ -224,6 +341,206 @@ public sealed class PartialIndexResultTests
                 hit.Fqn.Contains("ExplicitFixture.LookupBase.Find")
                 && hit.CanonicalKey != null,
                 "a derived type may introduce an interface while inheriting its implementation");
+
+            var mappedFrom = (await store.FindSymbolsAsync("IMappedData<T>.From"))
+                .Should().ContainSingle(hit =>
+                    hit.Fqn.Contains("ExplicitFixture.IMappedData<T>.From"))
+                .Which;
+            var mappedImplementations = await store.ListImplementationsAsync(
+                mappedFrom.Id);
+            mappedImplementations.Should().ContainSingle(hit =>
+                hit.Fqn.Contains("ExplicitFixture.DbPatientInfo.From")
+                && hit.CanonicalKey != null,
+                "a member inherited through a closed generic interface must retain its implements-member edge");
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch { /* best-effort */ }
+        }
+    }
+
+    [Fact]
+    public async Task Protected_source_with_prior_symbols_isFailedOnEveryRun_withoutDiagnosticCascades()
+    {
+        var root = Path.Combine(
+            Path.GetTempPath(),
+            "syntax-failure-tests-" + Guid.NewGuid().ToString("N"));
+        var projectDir = Path.Combine(root, "App");
+        Directory.CreateDirectory(projectDir);
+        var solutionPath = Path.Combine(root, "SyntaxFailure.slnx");
+        var projectPath = Path.Combine(projectDir, "App.csproj");
+        var sourcePath = Path.Combine(projectDir, "Protected.cs");
+        var healthyPath = Path.Combine(projectDir, "Healthy.cs");
+
+        try
+        {
+            await File.WriteAllTextAsync(
+                solutionPath,
+                """
+                <Solution>
+                  <Project Path="App/App.csproj" />
+                </Solution>
+                """);
+            await File.WriteAllTextAsync(
+                projectPath,
+                """
+                <Project Sdk="Microsoft.NET.Sdk">
+                  <PropertyGroup>
+                    <TargetFramework>net10.0</TargetFramework>
+                  </PropertyGroup>
+                </Project>
+                """);
+            await File.WriteAllTextAsync(
+                sourcePath,
+                "public sealed class Protected { }");
+            await File.WriteAllTextAsync(
+                healthyPath,
+                "public sealed class Healthy { Protected Value = new(); }");
+
+            await using var store = new SqliteGraphStore(
+                Path.Combine(root, "graph.db"));
+            var baseline = await RoslynIndexer.IndexSolutionOnceAsync(
+                solutionPath,
+                store);
+            baseline.FailedFiles.Should().BeEmpty();
+
+            await File.WriteAllTextAsync(
+                sourcePath,
+                "HSKey.Co.SZ WYDZLJ protected payload");
+            var first = await RoslynIndexer.IndexSolutionOnceAsync(
+                solutionPath,
+                store);
+            first.FailedFiles.Should().ContainSingle(failure =>
+                failure.Path.EndsWith("Protected.cs", StringComparison.Ordinal)
+                && failure.Reason.Contains(
+                    "protected-hskey",
+                    StringComparison.Ordinal));
+            var firstDiagnostics = await store.FindDiagnosticsAsync(
+                severity: null,
+                code: null,
+                symbolId: null,
+                limit: 100);
+            firstDiagnostics.Should().ContainSingle(diagnostic =>
+                diagnostic.Code == "SG0001"
+                && diagnostic.Severity == 2
+                && diagnostic.FilePath.EndsWith(
+                    "Protected.cs",
+                    StringComparison.Ordinal));
+            firstDiagnostics.Should().NotContain(diagnostic =>
+                diagnostic.Code.StartsWith("CS", StringComparison.Ordinal),
+                "compiler cascades are not reliable while a project input is protected");
+
+            var second = await RoslynIndexer.IndexSolutionOnceAsync(
+                solutionPath,
+                store);
+            second.FailedFiles.Should().ContainSingle(failure =>
+                failure.Path.EndsWith("Protected.cs", StringComparison.Ordinal)
+                && failure.Reason.Contains(
+                    "protected-hskey",
+                    StringComparison.Ordinal),
+                "an unchanged zero-symbol parse failure must be retried and remain visible");
+            var secondDiagnostics = await store.FindDiagnosticsAsync(
+                severity: null,
+                code: null,
+                symbolId: null,
+                limit: 100);
+            secondDiagnostics.Should().ContainSingle(diagnostic =>
+                diagnostic.Code == "SG0001");
+            secondDiagnostics.Should().NotContain(diagnostic =>
+                diagnostic.Code.StartsWith("CS", StringComparison.Ordinal));
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch { /* best-effort */ }
+        }
+    }
+
+    [Fact]
+    public async Task Protected_project_dependency_isClassifiedAsSg0002Warning()
+    {
+        var root = Path.Combine(
+            Path.GetTempPath(),
+            "protected-dependency-tests-" + Guid.NewGuid().ToString("N"));
+        var libraryDir = Path.Combine(root, "ProtectedLibrary");
+        var appDir = Path.Combine(root, "App");
+        Directory.CreateDirectory(libraryDir);
+        Directory.CreateDirectory(appDir);
+        var solutionPath = Path.Combine(root, "ProtectedDependency.slnx");
+        var protectedPath = Path.Combine(libraryDir, "Protected.cs");
+        var consumerPath = Path.Combine(appDir, "Consumer.cs");
+
+        try
+        {
+            await File.WriteAllTextAsync(
+                solutionPath,
+                """
+                <Solution>
+                  <Project Path="ProtectedLibrary/ProtectedLibrary.csproj" />
+                  <Project Path="App/App.csproj" />
+                </Solution>
+                """);
+            await File.WriteAllTextAsync(
+                Path.Combine(libraryDir, "ProtectedLibrary.csproj"),
+                """
+                <Project Sdk="Microsoft.NET.Sdk">
+                  <PropertyGroup>
+                    <TargetFramework>net10.0</TargetFramework>
+                  </PropertyGroup>
+                </Project>
+                """);
+            await File.WriteAllTextAsync(
+                Path.Combine(appDir, "App.csproj"),
+                """
+                <Project Sdk="Microsoft.NET.Sdk">
+                  <PropertyGroup>
+                    <TargetFramework>net10.0</TargetFramework>
+                  </PropertyGroup>
+                  <ItemGroup>
+                    <ProjectReference Include="../ProtectedLibrary/ProtectedLibrary.csproj" />
+                  </ItemGroup>
+                </Project>
+                """);
+            await File.WriteAllTextAsync(
+                protectedPath,
+                "HSKey.Co.SZ WYDZLJ protected payload");
+            await File.WriteAllTextAsync(
+                consumerPath,
+                """
+                internal sealed class Consumer
+                {
+                    private ProtectedType? _value;
+                }
+                """);
+
+            await using var store = new SqliteGraphStore(
+                Path.Combine(root, "graph.db"));
+            await RoslynIndexer.IndexSolutionOnceAsync(solutionPath, store);
+
+            var diagnostics = await store.FindDiagnosticsAsync(
+                severity: null,
+                code: null,
+                symbolId: null,
+                limit: 100);
+            diagnostics.Should().ContainSingle(diagnostic =>
+                diagnostic.Code == "SG0001"
+                && diagnostic.Severity == (int)DiagnosticSeverity.Warning
+                && diagnostic.FilePath.EndsWith(
+                    "Protected.cs",
+                    StringComparison.Ordinal));
+            diagnostics.Should().Contain(diagnostic =>
+                diagnostic.Code == "SG0002"
+                && diagnostic.Severity == (int)DiagnosticSeverity.Warning
+                && diagnostic.FilePath.EndsWith(
+                    "Consumer.cs",
+                    StringComparison.Ordinal)
+                && diagnostic.Message.Contains(
+                    "original Roslyn diagnostic CS0246",
+                    StringComparison.Ordinal));
+            diagnostics.Should().NotContain(diagnostic =>
+                diagnostic.Severity == (int)DiagnosticSeverity.Error
+                && diagnostic.FilePath.EndsWith(
+                    "Consumer.cs",
+                    StringComparison.Ordinal));
         }
         finally
         {

@@ -11,6 +11,48 @@ below note which package the change applies to.
 ## [Unreleased]
 
 ### Changed
+- **Solution-bounded `.vcxproj` indexing for managed/native source tracing.**
+  `.sln` and `.slnx` membership is now the hard project boundary shared by
+  indexing and watching. SourceGraph safely reads solution configuration
+  mappings and statically expands every enabled `ClCompile` item without
+  executing MSBuild targets, tasks, props, or build events. Native
+  configuration is synthesized automatically when a solution is present;
+  explicit interop settings may enrich member projects but cannot remove
+  solution members or narrow them to one source file. Native failures are
+  isolated per project and translation unit, and stable positive definitions,
+  calls, exports, and P/Invoke matches remain queryable from a partial
+  projection. BR-01 coverage proves exactly 9 solution-member `.vcxproj`
+  projects and 66 compile items, including `AlgorithmBridge.cpp`
+  `AB_GetAPIVersion` and the
+  `AB_InitializeRefraction → AB_ShutdownRefraction` call.
+- **Reduced extension calls, WPF compiler inputs, and compact impact audits.**
+  Reduced extension-method invocations now normalize through Roslyn's
+  `ReducedFrom.OriginalDefinition`, so references, callers, and impact edges
+  target the declared extension method. Validated WPF markup-compiler
+  `*.g.cs` inputs remain compilation-only documents, restoring
+  `InitializeComponent` and `x:Name` members without indexing arbitrary
+  `obj` sources. HSKey `SG0001` is an incomplete-input warning rather than a
+  compiler error. gRPC partial state includes per-RPC link coverage and
+  affected proto files. `impact_of_change` defaults to compact
+  `evidence=summary`; `evidence=full` restores complete per-hop audit paths.
+- **Lossless and observable semantic indexing.** Cold indexing now retains every
+  accepted embedding request instead of dropping the oldest work above a
+  4096-item queue cap. Interactive semantic-query inference receives priority
+  over queued background batches, while `embeddings_status` reports per-scope
+  pending/completed/dropped counts and query/background inference wait time.
+  `trace_binding` also joins `binds-element` evidence to known WPF framework
+  properties, and never reports authoritative absence when relevant
+  lower-level evidence could not be materialized. A same-process benchmark
+  probe separates first-call, warm, and managed-lock wait measurements.
+- **Exhaustive relationship queries disclose incomplete coverage.**
+  `list_callers`/`find_callers`, `find_implementations`, and
+  `impact_of_change` now return `result`, `scope_status`, `completeness`,
+  `absence_authoritative`, selection mode, candidate count, and canonical
+  identities. Partial scopes can no longer silently present a shortened
+  relation set as exhaustive, and exact-FQN collisions are explicitly
+  ambiguous. Source files that produce syntax errors and zero declarations
+  are retained in `FailedFiles` and retried after restart instead of being
+  mistaken for valid symbol-free files.
 - **WPF semantic chains and compact query results.** Command traces now continue
   from the bound `ICommand` property through persisted `command-executes`
   evidence to the handler. Element-name bindings resolve inherited WPF

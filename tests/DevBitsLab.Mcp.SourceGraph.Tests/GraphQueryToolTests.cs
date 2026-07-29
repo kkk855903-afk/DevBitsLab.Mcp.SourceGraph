@@ -179,6 +179,53 @@ public sealed class GraphQueryToolTests : IAsyncLifetime, IDisposable
     }
 
     [Fact]
+    public async Task QueryGraph_pathColumns_defaultToRelative_withAbsoluteOptIn()
+    {
+        var opts = new GraphQueryOptions(TimeoutSeconds: 5, RowLimit: 5000);
+        const string sql =
+            """
+            SELECT f.path
+            FROM v_symbols s
+            JOIN v_files f ON f.scope = s.scope AND f.id = s.file_id
+            WHERE s.name = 'Calculator'
+            ORDER BY s.scope
+            LIMIT 1
+            """;
+
+        var compact = await GraphTools.QueryGraphAsync(
+            _registry!,
+            new RepoRootInfo(_repoRoot),
+            opts,
+            sql,
+            parameters: null,
+            scope: "*",
+            pathFormat: "relative",
+            ct: CancellationToken.None);
+        var compactDto = compact.StructuredContent!.Value
+            .Deserialize<QueryGraphResult>(
+                ToolOutputJsonContext.Default.QueryGraphResult)!;
+        Path.IsPathRooted(compactDto.Rows[0][0].GetString())
+            .Should().BeFalse();
+        CallToolResultHelpers.ProseText(compact)
+            .Should().NotContain(_repoRoot);
+
+        var audit = await GraphTools.QueryGraphAsync(
+            _registry!,
+            new RepoRootInfo(_repoRoot),
+            opts,
+            sql,
+            parameters: null,
+            scope: "*",
+            pathFormat: "absolute",
+            ct: CancellationToken.None);
+        var auditDto = audit.StructuredContent!.Value
+            .Deserialize<QueryGraphResult>(
+                ToolOutputJsonContext.Default.QueryGraphResult)!;
+        Path.IsPathRooted(auditDto.Rows[0][0].GetString())
+            .Should().BeTrue();
+    }
+
+    [Fact]
     public async Task QueryGraph_emitsBrandedProseTableAndAudienceMetadata()
     {
         var opts = new GraphQueryOptions(TimeoutSeconds: 5, RowLimit: 5000);
@@ -613,7 +660,7 @@ public sealed class GraphQueryToolTests : IAsyncLifetime, IDisposable
             await store.EnsureSchemaAsync();
 
             var fileId = await store.UpsertFileAsync(
-                path: $"/virtual/{scopeId}/Calculator.cs",
+                path: Path.Join(_repoRoot, scopeId, "Calculator.cs"),
                 contentSha256: new byte[32],
                 indexedAt: DateTimeOffset.UtcNow,
                 isGenerated: false);
@@ -716,7 +763,7 @@ public sealed class GraphQueryToolTests : IAsyncLifetime, IDisposable
         await using var store = new SqliteGraphStore(dbPath);
         await store.EnsureSchemaAsync();
         var fileId = await store.UpsertFileAsync(
-            path: $"/virtual/{scopeId}/{name}.cs",
+            path: Path.Join(_repoRoot, scopeId, $"{name}.cs"),
             contentSha256: new byte[32],
             indexedAt: DateTimeOffset.UtcNow,
             isGenerated: false);

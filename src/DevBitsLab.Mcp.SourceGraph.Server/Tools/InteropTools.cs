@@ -170,7 +170,7 @@ public static class InteropTools
     {
         if (host.NativeInteropState is null)
         {
-            var discovery = NativeInteropDiscovery.Discover(host.Scope.Root);
+            var discovery = NativeInteropDiscovery.Discover(host.Scope);
             var notConfigured = ScopeFailure(
                 host.Scope.Id,
                 query,
@@ -223,26 +223,25 @@ public static class InteropTools
         var state = host.NativeInteropState
             ?? throw new InvalidOperationException(
                 "An interop-configured scope has no runtime state.");
-        if (host.Status == "ok" && host.ManagedInteropInputComplete)
+        if (host.ManagedInteropInputComplete)
         {
             return state;
         }
 
         var failure = new NativeInteropRuntimeFailure(
             "scope",
-            host.ManagedInteropInputComplete
-                ? "scope-not-complete"
-                : "managed-import-universe-incomplete",
-            host.ManagedInteropInputComplete
-                ? $"Scope status is {host.Status}; current interop conclusions are unavailable."
-                : "The managed import universe is incomplete; current interop conclusions "
-                  + "are unavailable.");
+            "managed-import-universe-incomplete",
+            "The managed import universe is incomplete; current interop conclusions "
+            + "are unavailable.");
         return state with
         {
             Status = NativeInteropRuntimeStatus.Partial,
             RetainedLastGood =
-                state.RetainedLastGood || state.LastSuccessfulAt is not null,
+                state.RetainedLastGood
+                || (!state.HasCurrentProjection
+                    && state.LastSuccessfulAt is not null),
             IsExportUniverseComplete = false,
+            HasCurrentProjection = state.HasCurrentProjection,
             Failures = state.Failures
                 .Append(failure)
                 .OrderBy(item => item.Stage, StringComparer.Ordinal)

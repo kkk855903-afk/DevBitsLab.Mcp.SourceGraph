@@ -56,11 +56,38 @@ public sealed class ScopeProjectSetPathMatcherTests : IDisposable
     }
 
     [Fact]
-    public void Solutions_scope_retainsCrossLanguageDiscoveryBelowScopeRoot()
+    public async Task Solutions_scope_includesOnlySolutionProjectDirectories()
+    {
+        await PlantAsync(Path.Join(_root, "src", "App", "App.csproj"));
+        await PlantAsync(Path.Join(_root, "src", "Other", "Other.csproj"));
+        var solution = Path.Join(_root, "App.sln");
+        await File.WriteAllTextAsync(
+            solution,
+            """
+            Microsoft Visual Studio Solution File, Format Version 12.00
+            Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "App", "src\App\App.csproj", "{11111111-1111-1111-1111-111111111111}"
+            EndProject
+            Global
+            EndGlobal
+            """);
+        var matcher = new ScopeProjectSetPathMatcher(
+            _root,
+            new ScopeProjectSet.Solutions(["App.sln"], Array.Empty<string>()));
+
+        matcher.Includes(Path.Join(_root, "src", "App", "app.ts")).Should().BeTrue();
+        matcher.Includes(Path.Join(_root, "src", "Other", "other.ts")).Should().BeFalse();
+        matcher.Includes(Path.Join(Path.GetTempPath(), "outside.cpp")).Should().BeFalse();
+        matcher.IsProjectAnchorCandidate(solution).Should().BeTrue();
+        matcher.IsProjectAnchorCandidate(
+            Path.Join(_root, "src", "App", "App.csproj")).Should().BeTrue();
+    }
+
+    [Fact]
+    public void Empty_solutions_scope_retains_synthetic_repository_discovery()
     {
         var matcher = new ScopeProjectSetPathMatcher(
             _root,
-            new ScopeProjectSet.Solutions(["src/App.sln"], Array.Empty<string>()));
+            new ScopeProjectSet.Solutions([], []));
 
         matcher.Includes(Path.Join(_root, "native", "Bridge.cpp")).Should().BeTrue();
         matcher.Includes(Path.Join(Path.GetTempPath(), "outside.cpp")).Should().BeFalse();

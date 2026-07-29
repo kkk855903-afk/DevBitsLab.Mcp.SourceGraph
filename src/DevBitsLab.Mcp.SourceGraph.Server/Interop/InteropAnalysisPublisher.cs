@@ -20,8 +20,8 @@ internal sealed record InteropAnalysisPublicationResult(
 
 /// <summary>
 /// Rebuilds the persisted managed/native boundary projection from strict stored facts. Every
-/// managed file is replaced through one annotation-and-edge transaction. Incomplete inputs cause
-/// no writes, preserving the prior successful projection instead of publishing an absence claim.
+/// managed file is replaced through one annotation-and-edge transaction. An incomplete native
+/// universe publishes only concrete positive matches and clears claims that require completeness.
 /// </summary>
 internal sealed class InteropAnalysisPublisher
 {
@@ -99,20 +99,10 @@ internal sealed class InteropAnalysisPublisher
                 abiRecords,
                 previousMatches,
                 previousFindings);
-            if (!isExportUniverseComplete)
-            {
-                inputFailures.Add(new InteropAnalysisPublicationFailure(
-                    FilePath: null,
-                    Stage: "native-snapshot",
-                    Message:
-                        "The native export universe is incomplete; the last successful "
-                        + "analysis projection was retained."));
-            }
             if (inputFailures.Count > 0)
             {
                 return Failed(inputFailures);
             }
-
             var targetFailures = ValidateTargets(
                 target,
                 managed.Facts,
@@ -136,7 +126,8 @@ internal sealed class InteropAnalysisPublisher
                     native.Facts,
                     abiRecords.Facts,
                     previousMatches.Facts,
-                    previousFindings.Facts);
+                    previousFindings.Facts,
+                    isExportUniverseComplete);
             }
             catch (OperationCanceledException)
             {
@@ -353,7 +344,8 @@ internal sealed class InteropAnalysisPublisher
         IReadOnlyList<StoredInteropFact<NativeExport>> nativeFacts,
         IReadOnlyList<StoredInteropFact<AbiRecordLayout>> abiRecordFacts,
         IReadOnlyList<StoredInteropFact<InteropMatchProjection>> previousMatches,
-        IReadOnlyList<StoredInteropFact<InteropFindingProjection>> previousFindings)
+        IReadOnlyList<StoredInteropFact<InteropFindingProjection>> previousFindings,
+        bool isExportUniverseComplete)
     {
         var nativeExports = nativeFacts
             .Select(item => item.Fact)
@@ -427,7 +419,14 @@ internal sealed class InteropAnalysisPublisher
             var match = _matcher.Match(
                 managed,
                 nativeExports,
-                isExportUniverseComplete: true);
+                isExportUniverseComplete);
+            if (!isExportUniverseComplete
+                && match.Status is not (
+                    InteropMatchStatus.Matched
+                    or InteropMatchStatus.SourceMatched))
+            {
+                continue;
+            }
             var matchProjection = new InteropMatchProjection(
                 match.ManagedSymbolCanonicalKey,
                 match.NativeSymbolCanonicalKey,
@@ -436,7 +435,7 @@ internal sealed class InteropAnalysisPublisher
                 match.Reasons,
                 target,
                 match.CandidateCount,
-                SnapshotComplete: true,
+                SnapshotComplete: isExportUniverseComplete,
                 ProjectEvidence(match.Evidence));
             annotationsByPath[importFilePath].Add(new FileAnnotationFact(
                 managed.SymbolCanonicalKey,

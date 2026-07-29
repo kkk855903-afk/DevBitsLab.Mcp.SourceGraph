@@ -51,9 +51,9 @@ public sealed record Scope(
     public ScopeEnrichmentConfig? Enrichment { get; init; }
 
     /// <summary>
-    /// Optional native-interop indexing configuration. A scope has one explicit ABI target and
-    /// one or more translation units so managed/native matching never depends on host-machine
-    /// defaults.
+    /// Optional native-interop indexing configuration. Solution scopes derive Visual C++ members
+    /// and their host-compatible ABI target automatically; authored values can enrich those
+    /// members. Non-solution scopes retain the explicit target/translation-unit behavior.
     /// </summary>
     public ScopeInteropConfig? Interop { get; init; }
 }
@@ -64,7 +64,14 @@ public sealed record Scope(
 /// </summary>
 public sealed record ScopeInteropConfig(
     InteropTarget Target,
-    IReadOnlyList<InteropTranslationUnitConfig> TranslationUnits);
+    IReadOnlyList<InteropTranslationUnitConfig> TranslationUnits)
+{
+    /// <summary>
+    /// Optional, explicitly selected Visual C++ projects. These are imported with a bounded
+    /// static XML reader; SourceGraph never executes project targets, tasks, or imported props.
+    /// </summary>
+    public IReadOnlyList<InteropVcxProjectConfig> VcxProjects { get; init; } = [];
+}
 
 /// <summary>
 /// One native translation unit and the exact compiler arguments used to parse it. Paths are
@@ -74,6 +81,29 @@ public sealed record InteropTranslationUnitConfig(
     string Path,
     string Library,
     IReadOnlyList<string> Arguments,
+    string? BinaryPath)
+{
+    /// <summary>
+    /// Runtime-resolved compiler/SDK include roots that may be read by Clang but never become
+    /// repository evidence or content-hash inputs. Authored translation-unit configuration
+    /// cannot set this field; the controlled Visual C++ importer owns it.
+    /// </summary>
+    public IReadOnlyList<string> SystemIncludeDirectories { get; init; } = [];
+}
+
+/// <summary>
+/// One statically imported Visual C++ project and an explicit configuration/platform pair.
+/// <see cref="SourceFiles"/> is project-relative; an empty list selects every enabled
+/// <c>ClCompile</c> item. <see cref="AdditionalArguments"/> is appended after project-derived
+/// language, target, include, definition, and standard arguments.
+/// </summary>
+public sealed record InteropVcxProjectConfig(
+    string Path,
+    string Configuration,
+    string Platform,
+    string Library,
+    IReadOnlyList<string> SourceFiles,
+    IReadOnlyList<string> AdditionalArguments,
     string? BinaryPath);
 
 /// <summary>

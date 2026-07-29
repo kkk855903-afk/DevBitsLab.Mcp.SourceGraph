@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Text;
+using System.Runtime.InteropServices;
 using DevBitsLab.Mcp.SourceGraph.Core;
 using DevBitsLab.Mcp.SourceGraph.Core.Security;
 using DevBitsLab.Mcp.SourceGraph.Indexing.Clang;
@@ -77,18 +78,20 @@ public sealed class NativeWorkerClientTests : IDisposable
     {
         var serverDirectory = Path.GetDirectoryName(
             typeof(NativeWorkerClient).Assembly.Location)!;
-        var executable = Path.Combine(
-            serverDirectory,
-            OperatingSystem.IsWindows()
-                ? "sourcegraph-mcp.exe"
-                : "sourcegraph-mcp");
+        var serverAssembly = typeof(NativeWorkerClient).Assembly.Location;
+        var executable = Path.GetFullPath(Path.Combine(
+            RuntimeEnvironment.GetRuntimeDirectory(),
+            "..",
+            "..",
+            "..",
+            OperatingSystem.IsWindows() ? "dotnet.exe" : "dotnet"));
         File.Exists(executable).Should().BeTrue();
         var client = new NativeWorkerClient(
             new FakeTrustPolicy(allowed: true),
             new NativeWorkerClientOptions(TimeSpan.FromSeconds(10)),
             new NativeWorkerLaunchCommand(
                 executable,
-                Array.Empty<string>(),
+                [serverAssembly],
                 serverDirectory),
             new SystemNativeWorkerProcessLauncher());
 
@@ -96,7 +99,13 @@ public sealed class NativeWorkerClientTests : IDisposable
 
         if (!result.IsSuccess)
         {
-            result.Failure!.Code.Should().Be("native-runtime-unavailable");
+            var standardError = result.Failure!.StandardError;
+            var boundedStandardError = standardError is { Length: > 1000 }
+                ? standardError[..1000]
+                : standardError;
+            result.Failure!.Code.Should().Be(
+                "native-runtime-unavailable",
+                boundedStandardError);
             result.Failure.ExitCode.Should().Be(3);
             return;
         }

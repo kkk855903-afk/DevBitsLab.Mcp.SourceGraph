@@ -14,6 +14,18 @@ public sealed record ReconcileDriftResult(
     [property: JsonPropertyName("added_count")] int AddedCount,
     [property: JsonPropertyName("removed_count")] int RemovedCount,
     [property: JsonPropertyName("unchanged_count")] int UnchangedCount,
+    [property: JsonPropertyName("source_candidate_count")]
+        int SourceCandidateCount,
+    [property: JsonPropertyName("native_not_configured_count")]
+        int NativeNotConfiguredCount,
+    [property: JsonPropertyName("unsupported_or_asset_count")]
+        int UnsupportedOrAssetCount,
+    [property: JsonPropertyName("source_candidate_examples")]
+        IReadOnlyList<string> SourceCandidateExamples,
+    [property: JsonPropertyName("native_not_configured_examples")]
+        IReadOnlyList<string> NativeNotConfiguredExamples,
+    [property: JsonPropertyName("unsupported_or_asset_examples")]
+        IReadOnlyList<string> UnsupportedOrAssetExamples,
     bool Partial,
     [property: JsonPropertyName("dry_run")] bool DryRun,
     [property: JsonPropertyName("elapsed_ms")] long ElapsedMs);

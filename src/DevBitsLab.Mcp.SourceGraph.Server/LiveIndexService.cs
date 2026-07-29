@@ -432,6 +432,8 @@ public sealed class LiveIndexService : BackgroundService
     private async Task<ScopeHost?> PrepareScopeAsync(Scope scope, CancellationToken ct, bool registerWithRouter = true)
     {
         var solutionPath = ResolvePrimarySolution(scope);
+        var resolvedNativeInterop = SolutionNativeInteropResolver.Resolve(scope);
+        var effectiveInterop = resolvedNativeInterop.Configuration;
         var dbPath = ScopeLayout.ScopeDbPath(scope.Root, scope.Id);
         Directory.CreateDirectory(Path.GetDirectoryName(dbPath)!);
 
@@ -488,7 +490,7 @@ public sealed class LiveIndexService : BackgroundService
                 indexerSink,
                 scope.Root,
                 scope.ProjectSet.Exclude,
-                scope.Interop?.Target);
+                effectiveInterop?.Target);
             if (!_historyOptions.Disabled)
             {
                 indexer.OnFileIndexed = (fileId, path, sha) =>
@@ -500,16 +502,20 @@ public sealed class LiveIndexService : BackgroundService
                 EmbeddingsSink = scopeSink,
                 EmbeddingsService = scopeEmbeddings,
             };
-            if (scope.Interop is not null)
+            if (effectiveInterop is not null)
             {
                 host.NativeInteropCoordinator = new NativeInteropCoordinator(
                     scope.Root,
-                    scope.Interop,
+                    effectiveInterop,
                     new ScopePathPolicy(
                         scope.Root,
                         scope.ProjectSet.Exclude),
                     store,
-                    _executionTrustPolicy);
+                    _executionTrustPolicy,
+                    discoveredProjects:
+                        resolvedNativeInterop.DiscoveredProjects,
+                    resolutionFailures:
+                        resolvedNativeInterop.Failures);
             }
             host.Status = "indexing";
             // Persist the registry row BEFORE registering with the router. If the registry

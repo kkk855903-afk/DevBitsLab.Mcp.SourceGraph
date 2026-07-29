@@ -1803,7 +1803,7 @@ public sealed partial class SqliteGraphStore : IGraphStore
                     await ResolveSymbolIdAsync(reference.TargetCanonicalKey).ConfigureAwait(false);
                 await _connection.ExecuteAsync(new CommandDefinition(
                     """
-                    INSERT INTO refs(symbol_id, file_id, line, col, kind)
+                    INSERT OR IGNORE INTO refs(symbol_id, file_id, line, col, kind)
                     VALUES (@SymbolId, @FileId, @Line, @Col, @Kind);
                     """,
                     new
@@ -2089,7 +2089,7 @@ public sealed partial class SqliteGraphStore : IGraphStore
     public async Task BulkInsertReferencesAsync(IEnumerable<SymbolReference> references, CancellationToken ct = default)
     {
         const string sql = """
-            INSERT INTO refs(symbol_id, file_id, line, col, kind)
+            INSERT OR IGNORE INTO refs(symbol_id, file_id, line, col, kind)
             VALUES (@SymbolId, @FileId, @Line, @Col, @Kind);
             """;
         await _writeLock.WaitAsync(ct).ConfigureAwait(false);

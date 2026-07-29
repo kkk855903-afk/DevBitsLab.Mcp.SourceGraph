@@ -297,7 +297,6 @@ public sealed class InteropAnalysisPayloadCodecTests
     [InlineData("negative_candidates")]
     [InlineData("empty_reasons")]
     [InlineData("empty_evidence")]
-    [InlineData("matched_incomplete")]
     [InlineData("matched_without_native")]
     [InlineData("matched_without_candidates")]
     [InlineData("unmatched_incomplete")]
@@ -306,7 +305,6 @@ public sealed class InteropAnalysisPayloadCodecTests
     [InlineData("ambiguous_with_native")]
     [InlineData("ambiguous_without_multiple_candidates")]
     [InlineData("unknown_with_native")]
-    [InlineData("source_matched_incomplete")]
     [InlineData("source_matched_without_native")]
     [InlineData("source_matched_without_candidates")]
     public void Match_rejectsInvalidSemanticStates(string invalidCase)
@@ -317,7 +315,6 @@ public sealed class InteropAnalysisPayloadCodecTests
             "negative_candidates" => match with { CandidateCount = -1 },
             "empty_reasons" => match with { Reasons = [] },
             "empty_evidence" => match with { Evidence = [] },
-            "matched_incomplete" => match with { SnapshotComplete = false },
             "matched_without_native" => match with
             {
                 NativeSymbolCanonicalKey = null,
@@ -355,11 +352,6 @@ public sealed class InteropAnalysisPayloadCodecTests
             "unknown_with_native" => match with
             {
                 Status = InteropMatchStatus.Unknown,
-            },
-            "source_matched_incomplete" => match with
-            {
-                Status = InteropMatchStatus.SourceMatched,
-                SnapshotComplete = false,
             },
             "source_matched_without_native" => match with
             {

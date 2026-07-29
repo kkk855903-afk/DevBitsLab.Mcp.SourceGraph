@@ -84,7 +84,8 @@ public static class ScopeDiff
             || a.Target.CompilerAbi != b.Target.CompilerAbi
             || a.Target.PointerSizeBytes != b.Target.PointerSizeBytes
             || a.Target.DefaultPack != b.Target.DefaultPack
-            || a.TranslationUnits.Count != b.TranslationUnits.Count)
+            || a.TranslationUnits.Count != b.TranslationUnits.Count
+            || a.VcxProjects.Count != b.VcxProjects.Count)
         {
             return false;
         }
@@ -97,6 +98,36 @@ public static class ScopeDiff
                 || !string.Equals(x.Library, y.Library, StringComparison.Ordinal)
                 || !string.Equals(x.BinaryPath, y.BinaryPath, StringComparison.Ordinal)
                 || !ListsEqual(x.Arguments, y.Arguments))
+            {
+                return false;
+            }
+        }
+
+        for (var i = 0; i < a.VcxProjects.Count; i++)
+        {
+            var x = a.VcxProjects[i];
+            var y = b.VcxProjects[i];
+            if (!string.Equals(x.Path, y.Path, StringComparison.Ordinal)
+                || !string.Equals(
+                    x.Configuration,
+                    y.Configuration,
+                    StringComparison.Ordinal)
+                || !string.Equals(
+                    x.Platform,
+                    y.Platform,
+                    StringComparison.Ordinal)
+                || !string.Equals(
+                    x.Library,
+                    y.Library,
+                    StringComparison.Ordinal)
+                || !string.Equals(
+                    x.BinaryPath,
+                    y.BinaryPath,
+                    StringComparison.Ordinal)
+                || !ListsEqual(x.SourceFiles, y.SourceFiles)
+                || !ListsEqual(
+                    x.AdditionalArguments,
+                    y.AdditionalArguments))
             {
                 return false;
             }

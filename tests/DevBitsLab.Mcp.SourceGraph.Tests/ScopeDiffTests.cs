@@ -26,7 +26,8 @@ public sealed class ScopeDiffTests
 
     private static Scope InteropScope(
         InteropTarget? target = null,
-        IReadOnlyList<InteropTranslationUnitConfig>? translationUnits = null) =>
+        IReadOnlyList<InteropTranslationUnitConfig>? translationUnits = null,
+        IReadOnlyList<InteropVcxProjectConfig>? vcxProjects = null) =>
         SolutionsScope("foo", "foo.sln") with
         {
             Interop = new ScopeInteropConfig(
@@ -38,7 +39,10 @@ public sealed class ScopeDiffTests
                         "medalgo",
                         ["-std=c++20"],
                         "artifacts/medalgo.dll"),
-                ]),
+                ])
+            {
+                VcxProjects = vcxProjects ?? [],
+            },
         };
 
     [Fact]
@@ -256,6 +260,38 @@ public sealed class ScopeDiffTests
 
         ComputeScopeOnlyDiff(oldScope, unitsReordered).Modified.Should().ContainSingle();
         ComputeScopeOnlyDiff(oldScope, argumentsReordered).Modified.Should().ContainSingle();
+    }
+
+    [Fact]
+    public void AnyVcxProjectImportChange_isModified()
+    {
+        var project = new InteropVcxProjectConfig(
+            "AlgorithmBridge/AlgorithmBridge.vcxproj",
+            "Release",
+            "x64",
+            "AlgorithmBridge.dll",
+            ["AlgorithmBridgeHeaderCheck.c"],
+            [],
+            null);
+        var oldScope = InteropScope(vcxProjects: [project]);
+        var equivalent = InteropScope(vcxProjects: [project with { }]);
+        var changed = new[]
+        {
+            InteropScope(vcxProjects: [project with { Path = "Native/Other.vcxproj" }]),
+            InteropScope(vcxProjects: [project with { Configuration = "Debug" }]),
+            InteropScope(vcxProjects: [project with { Platform = "Win32" }]),
+            InteropScope(vcxProjects: [project with { Library = "Other.dll" }]),
+            InteropScope(vcxProjects: [project with { SourceFiles = ["AlgorithmBridge.cpp"] }]),
+            InteropScope(vcxProjects: [project with { AdditionalArguments = ["-DOTHER"] }]),
+            InteropScope(vcxProjects: [project with { BinaryPath = "Release/AlgorithmBridge.dll" }]),
+        };
+
+        ComputeScopeOnlyDiff(oldScope, equivalent).Modified.Should().BeEmpty();
+        foreach (var changedScope in changed)
+        {
+            ComputeScopeOnlyDiff(oldScope, changedScope)
+                .Modified.Should().ContainSingle();
+        }
     }
 
     [Fact]

@@ -235,8 +235,193 @@ public sealed class GrpcToolsTests : IAsyncLifetime
 
         scope.Failures.Should().HaveCount(failures.Length);
         scope.TotalFailureCount.Should().Be(failures.Length);
+        scope.Status.Should().Be("partial");
+        scope.Partial.Should().BeTrue();
+        scope.RetainedLastGood.Should().BeTrue();
+        scope.Rpcs.Should().ContainSingle(rpc =>
+            rpc.CanonicalKey == RpcKey);
+        scope.TotalRpcCount.Should().Be(1);
+        scope.TotalClientCount.Should().Be(1);
+        scope.TotalServerCount.Should().Be(1);
         scope.Truncated.Should().BeFalse();
         scope.OmittedCount.Should().Be(0);
+    }
+
+    [Fact]
+    public async Task Contract_check_reads_positive_links_from_partial_projection_without_claiming_absence()
+    {
+        var fixture = await CreateHostAsync(
+            "default",
+            includeServer: true);
+        var state = new GrpcLinkRuntimeState(
+            GrpcLinkRuntimeStatus.Partial,
+            ProtoContracts: 1,
+            ClientLinks: 1,
+            ServerLinks: 1,
+            RetainedLastGood: true,
+            FailureCount: 1,
+            OmittedFailures: 0,
+            Failures:
+            [
+                new GrpcLinkFailure(
+                    "grpc-input-incomplete",
+                    "One unrelated managed project failed to load.",
+                    null),
+            ],
+            Coverage: new GrpcLinkCoverage(
+                CompleteRpcContracts: 1,
+                IncompleteRpcContracts: 0,
+                MissingGeneratedClients: 0,
+                MissingGeneratedServers: 0,
+                UnlinkedManagedMembers: 0,
+                AffectedProtoFiles: []));
+
+        var scope = await new GrpcContractQueryService().CheckAsync(
+            "default",
+            "partial",
+            fixture.Host.Store,
+            state,
+            RpcKey);
+
+        scope.Status.Should().Be("partial");
+        scope.Partial.Should().BeTrue();
+        scope.RetainedLastGood.Should().BeTrue();
+        scope.TotalContractCount.Should().Be(1);
+        scope.TotalFindingCount.Should().Be(0,
+            "a partial projection cannot prove that an implementation is absent");
+        scope.LinkCoverage.Should().BeEquivalentTo(state.Coverage);
+        scope.Failures.Should().ContainSingle(failure =>
+            failure.Code == "grpc-input-incomplete");
+    }
+
+    [Fact]
+    public async Task Partial_results_explain_the_concrete_rpc_role_that_is_missing()
+    {
+        var fixture = await CreateHostAsync(
+            "default",
+            includeServer: true);
+        var router = new ScopeRouter();
+        router.Register(fixture.Host);
+        router.SetDefaultScope("default");
+        fixture.Host.GrpcLinkState = new GrpcLinkRuntimeState(
+            GrpcLinkRuntimeStatus.Partial,
+            ProtoContracts: 1,
+            ClientLinks: 0,
+            ServerLinks: 1,
+            RetainedLastGood: false,
+            FailureCount: 1,
+            OmittedFailures: 0,
+            Failures:
+            [
+                new GrpcLinkFailure(
+                    "grpc-input-incomplete",
+                    "Generated client input was unavailable.",
+                    RpcKey),
+            ],
+            Coverage: new GrpcLinkCoverage(
+                CompleteRpcContracts: 0,
+                IncompleteRpcContracts: 1,
+                MissingGeneratedClients: 1,
+                MissingGeneratedServers: 0,
+                UnlinkedManagedMembers: 0,
+                AffectedProtoFiles: [fixture.ProtoPath])
+            {
+                IncompleteRpcs =
+                [
+                    new GrpcIncompleteRpcDetail(
+                        RpcKey,
+                        fixture.ProtoPath,
+                        MissingGeneratedClient: true,
+                        MissingGeneratedServer: false),
+                ],
+                IncompleteRpcDetailTotal = 1,
+                IncompleteRpcDetailLimit = 1,
+                IncompleteRpcDetailReturned = 1,
+            });
+
+        var call = await GrpcTools.CheckProtoContractAsync(router);
+        var prose = CallToolResultHelpers.ProseText(call);
+        var result = ReadCheck(call);
+
+        prose.Should().Contain(
+                "incomplete_rpc_summary: total=1, missing_client=1, missing_server=0")
+            .And.Contain("incomplete_rpcs:")
+            .And.Contain($"rpc=`{RpcKey}`")
+            .And.Contain("missing_client=true")
+            .And.Contain("missing_server=false");
+        result.Scopes.Should().ContainSingle()
+            .Which.LinkCoverage!.IncompleteRpcs.Should().ContainSingle()
+            .Which.RpcCanonicalKey.Should().Be(RpcKey);
+    }
+
+    [Fact]
+    public async Task Incomplete_rpc_details_support_filtering_and_per_scope_paging()
+    {
+        var fixture = await CreateHostAsync(
+            "default",
+            includeServer: true);
+        var router = new ScopeRouter();
+        router.Register(fixture.Host);
+        router.SetDefaultScope("default");
+        var secondRpc = RpcKey + ".Second";
+        fixture.Host.GrpcLinkState = new GrpcLinkRuntimeState(
+            GrpcLinkRuntimeStatus.Partial,
+            ProtoContracts: 2,
+            ClientLinks: 0,
+            ServerLinks: 1,
+            RetainedLastGood: false,
+            FailureCount: 1,
+            OmittedFailures: 0,
+            Failures:
+            [
+                new GrpcLinkFailure(
+                    "grpc-input-incomplete",
+                    "Generated input was unavailable.",
+                    RpcKey),
+            ],
+            Coverage: new GrpcLinkCoverage(
+                CompleteRpcContracts: 0,
+                IncompleteRpcContracts: 2,
+                MissingGeneratedClients: 2,
+                MissingGeneratedServers: 1,
+                UnlinkedManagedMembers: 0,
+                AffectedProtoFiles: [fixture.ProtoPath])
+            {
+                IncompleteRpcs =
+                [
+                    new GrpcIncompleteRpcDetail(
+                        RpcKey,
+                        fixture.ProtoPath,
+                        MissingGeneratedClient: true,
+                        MissingGeneratedServer: false),
+                    new GrpcIncompleteRpcDetail(
+                        secondRpc,
+                        fixture.ProtoPath,
+                        MissingGeneratedClient: true,
+                        MissingGeneratedServer: true),
+                ],
+                IncompleteRpcDetailTotal = 2,
+                IncompleteRpcDetailLimit = 2,
+                IncompleteRpcDetailReturned = 2,
+            });
+
+        var result = ReadCheck(await GrpcTools.CheckProtoContractAsync(
+            router,
+            missing: "client",
+            incompleteOffset: 1,
+            incompleteLimit: 1));
+        var scopeResult = result.Scopes.Should().ContainSingle().Which;
+        scopeResult.LinkCoverage.Should().NotBeNull();
+        var coverage = scopeResult.LinkCoverage!;
+
+        coverage.IncompleteRpcMissingFilter.Should().Be("client");
+        coverage.IncompleteRpcDetailTotal.Should().Be(2);
+        coverage.IncompleteRpcDetailOffset.Should().Be(1);
+        coverage.IncompleteRpcDetailReturned.Should().Be(1);
+        coverage.IncompleteRpcDetailHasMore.Should().BeFalse();
+        coverage.IncompleteRpcDetailNextOffset.Should().BeNull();
+        coverage.IncompleteRpcs.Should().ContainSingle()
+            .Which.RpcCanonicalKey.Should().Be(secondRpc);
     }
 
     [Fact]

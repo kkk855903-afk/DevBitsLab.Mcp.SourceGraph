@@ -74,8 +74,16 @@ public static class Phase1CompatibilityTools
         [Description("Maximum number of references to return (default 50)")] int limit = 50,
         [Description("Include references from source-generated files (default false)")] bool includeGenerated = false,
         [Description(ScopeDescription)] string? scope = null,
+        [Description("Path rendering: relative (default) or absolute")] string pathFormat = "relative",
         CancellationToken ct = default) =>
-        GraphTools.FindReferencesAsync(router, symbol, limit, includeGenerated, scope, ct);
+        GraphTools.FindReferencesAsync(
+            router,
+            symbol,
+            limit,
+            includeGenerated,
+            scope,
+            pathFormat,
+            ct: ct);
 
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(ListCallersResult))]
     [ToolAnnotation(ReadOnlyHint = true, IdempotentHint = true)]
@@ -87,8 +95,16 @@ public static class Phase1CompatibilityTools
         [Description("Maximum number of results to return (default 50)")] int limit = 50,
         [Description("Edge kind to walk (default calls); pass all to walk every indexed edge kind")] string? kind = null,
         [Description(ScopeDescription)] string? scope = null,
+        [Description("Path rendering: relative (default) or absolute")] string pathFormat = "relative",
         CancellationToken ct = default) =>
-        GraphTools.ListCallersAsync(router, symbol, limit, kind, scope, ct);
+        GraphTools.ListCallersAsync(
+            router,
+            symbol,
+            limit,
+            kind,
+            scope,
+            pathFormat,
+            ct);
 
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(ListCalleesResult))]
     [ToolAnnotation(ReadOnlyHint = true, IdempotentHint = true)]
@@ -100,8 +116,16 @@ public static class Phase1CompatibilityTools
         [Description("Maximum number of results to return (default 50)")] int limit = 50,
         [Description("Edge kind to walk (default calls); pass all to walk every indexed edge kind")] string? kind = null,
         [Description(ScopeDescription)] string? scope = null,
+        [Description("Path rendering: relative (default) or absolute")] string pathFormat = "relative",
         CancellationToken ct = default) =>
-        GraphTools.ListCalleesAsync(router, symbol, limit, kind, scope, ct);
+        GraphTools.ListCalleesAsync(
+            router,
+            symbol,
+            limit,
+            kind,
+            scope,
+            pathFormat,
+            ct);
 
     /// <summary>
     /// Source-compatible entry point for the original Phase 1 alias signature.
@@ -169,7 +193,7 @@ public static class Phase1CompatibilityTools
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(ImpactOfChangeResult))]
     [ToolAnnotation(ReadOnlyHint = true, IdempotentHint = true)]
     [ToolTrigger("\"analyze the impact of changing X\"")]
-    [Description("Compute bounded evidence-backed upstream impact. Compatibility name for impact_of_change; every row includes its BFS predecessor and a source-to-target path whose hops carry real occurrence evidence.")]
+    [Description("Compute bounded evidence-backed upstream impact. Compatibility name for impact_of_change; summary evidence is compact by default.")]
     public static Task<CallToolResult> ImpactAnalysisAsync(
         ScopeRouter router,
         [Description("Symbol name or FQN")] string symbol,
@@ -178,6 +202,20 @@ public static class Phase1CompatibilityTools
         [Description("Edge kind to walk (default calls); pass all to walk every indexed edge kind")] string? kind = null,
         [Description(ScopeDescription)] string? scope = null,
         IProgress<ProgressNotificationValue>? progress = null,
+        [Description("Evidence detail: summary (default) or full")] string evidence = "summary",
+        [Description("Include predecessor paths in summary mode")] bool includePaths = false,
+        [Description("Path rendering: relative (default) or absolute")] string pathFormat = "relative",
         CancellationToken ct = default) =>
-        GraphTools.ImpactOfChangeAsync(router, symbol, maxDepth, limit, kind, scope, progress, ct);
+        GraphTools.ImpactOfChangeAsync(
+            router,
+            symbol,
+            maxDepth,
+            limit,
+            kind,
+            scope,
+            progress,
+            evidence,
+            includePaths,
+            pathFormat,
+            ct);
 }

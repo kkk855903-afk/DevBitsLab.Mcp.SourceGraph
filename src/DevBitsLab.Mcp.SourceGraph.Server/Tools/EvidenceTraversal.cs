@@ -158,20 +158,22 @@ internal static class EvidenceTraversal
 
     internal static void AppendRelations(
         StringBuilder sb,
-        IReadOnlyList<AuditableRelation> relations)
+        IReadOnlyList<AuditableRelation> relations,
+        Func<string, string>? renderPath = null)
     {
         if (relations.Count == 0) return;
         sb.AppendLine();
         sb.AppendLine("Evidence:");
         foreach (var relation in relations)
         {
-            AppendHop(sb, relation.Hop, prefix: "- ");
+            AppendHop(sb, relation.Hop, prefix: "- ", renderPath);
         }
     }
 
     internal static void AppendImpactPaths(
         StringBuilder sb,
-        IReadOnlyList<AuditableImpact> rows)
+        IReadOnlyList<AuditableImpact> rows,
+        Func<string, string>? renderPath = null)
     {
         if (rows.Count == 0) return;
         sb.AppendLine();
@@ -189,7 +191,7 @@ internal static class EvidenceTraversal
               .AppendLine("]");
             foreach (var hop in row.Path)
             {
-                AppendHop(sb, hop, prefix: "  - ");
+                AppendHop(sb, hop, prefix: "  - ", renderPath);
             }
         }
     }
@@ -197,7 +199,8 @@ internal static class EvidenceTraversal
     private static void AppendHop(
         StringBuilder sb,
         TraceCallPathHop hop,
-        string prefix)
+        string prefix,
+        Func<string, string>? renderPath)
     {
         sb.Append(prefix)
           .Append('`')
@@ -212,7 +215,8 @@ internal static class EvidenceTraversal
         foreach (var evidence in hop.Evidence)
         {
             sb.Append("    - `")
-              .Append(evidence.FilePath)
+              .Append(renderPath?.Invoke(evidence.FilePath)
+                  ?? evidence.FilePath)
               .Append(':')
               .Append(evidence.StartLine)
               .Append(':')
