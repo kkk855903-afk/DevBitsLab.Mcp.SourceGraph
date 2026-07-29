@@ -272,17 +272,25 @@ public sealed class StructuredContentInvariantTests : IAsyncLifetime, IDisposabl
         var result = await GraphTools.FindReferencesAsync(_router!, "Calculator.Add");
         result.StructuredContent.Should().NotBeNull("find_references opts into structuredContent");
 
-        // find_references prose declares "<n> references:" before the table. Pull n from prose,
-        // assert the structured array length matches.
+        // Prose distinguishes physical occurrences from semantic relation rows.
         var prose = CallToolResultHelpers.ProseText(result);
-        var match = System.Text.RegularExpressions.Regex.Match(prose, @"(\d+) references:");
-        match.Success.Should().BeTrue($"prose should declare a reference count; got first line: {prose.Split('\n')[0]}");
-        var proseCount = int.Parse(match.Groups[1].Value);
+        var match = System.Text.RegularExpressions.Regex.Match(
+            prose,
+            @"(\d+) source occurrences / (\d+) semantic relations:");
+        match.Success.Should().BeTrue(
+            $"prose should declare occurrence and relation counts; got first line: {prose.Split('\n')[0]}");
+        var proseOccurrenceCount = int.Parse(match.Groups[1].Value);
+        var proseRelationCount = int.Parse(match.Groups[2].Value);
 
         var json = result.StructuredContent!.Value.GetRawText();
         var dto = JsonSerializer.Deserialize(json, ToolOutputJsonContext.Default.FindReferencesResult);
         dto.Should().NotBeNull();
-        dto!.References.Count.Should().Be(proseCount, "structured array length equals prose row count");
+        dto!.OccurrenceCount.Should().Be(proseOccurrenceCount);
+        dto.RelationCount.Should().Be(proseRelationCount);
+        dto.References.Count.Should().Be(
+            proseRelationCount,
+            "structured array length equals the semantic relation row count");
+        dto.OccurrenceCount.Should().BeLessThanOrEqualTo(dto.RelationCount);
         dto.References.Should().OnlyContain(reference =>
             reference.SymbolId == dto.TargetSymbolId
             && reference.TargetFqn == dto.TargetFqn

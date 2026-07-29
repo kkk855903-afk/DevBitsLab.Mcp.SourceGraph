@@ -49,6 +49,27 @@ public sealed record GrpcLinkCoverage(
 
     [JsonPropertyName("omitted_incomplete_rpc_details")]
     public int OmittedIncompleteRpcDetails { get; init; }
+
+    [JsonPropertyName("incomplete_rpc_detail_total")]
+    public int IncompleteRpcDetailTotal { get; init; }
+
+    [JsonPropertyName("incomplete_rpc_detail_offset")]
+    public int IncompleteRpcDetailOffset { get; init; }
+
+    [JsonPropertyName("incomplete_rpc_detail_limit")]
+    public int IncompleteRpcDetailLimit { get; init; }
+
+    [JsonPropertyName("incomplete_rpc_detail_returned")]
+    public int IncompleteRpcDetailReturned { get; init; }
+
+    [JsonPropertyName("incomplete_rpc_detail_has_more")]
+    public bool IncompleteRpcDetailHasMore { get; init; }
+
+    [JsonPropertyName("incomplete_rpc_detail_next_offset")]
+    public int? IncompleteRpcDetailNextOffset { get; init; }
+
+    [JsonPropertyName("incomplete_rpc_missing_filter")]
+    public string IncompleteRpcMissingFilter { get; init; } = "any";
 }
 
 public sealed record GrpcLinkRuntimeState(
@@ -83,7 +104,7 @@ public sealed class GrpcContractLinker
 
     private const int AnnotationPageSize = 1_000;
     private const int MaximumFailures = 64;
-    private const int MaximumIncompleteRpcDetails = 64;
+    private const int MaximumIncompleteRpcDetails = 10_000;
     private const int MaximumFailureMessageCharacters = 512;
 
     private readonly IGraphStore _store;
@@ -722,6 +743,16 @@ public sealed class GrpcContractLinker
             OmittedIncompleteRpcDetails = Math.Max(
                 0,
                 incompleteKeys.Count - incompleteRpcDetails.Length),
+            IncompleteRpcDetailTotal = incompleteKeys.Count,
+            IncompleteRpcDetailOffset = 0,
+            IncompleteRpcDetailLimit = incompleteRpcDetails.Length,
+            IncompleteRpcDetailReturned = incompleteRpcDetails.Length,
+            IncompleteRpcDetailHasMore =
+                incompleteRpcDetails.Length < incompleteKeys.Count,
+            IncompleteRpcDetailNextOffset =
+                incompleteRpcDetails.Length < incompleteKeys.Count
+                    ? incompleteRpcDetails.Length
+                    : null,
         };
         return new CandidateProjection(
             orderedProjection,

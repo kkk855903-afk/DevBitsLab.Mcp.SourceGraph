@@ -159,6 +159,18 @@ public sealed class XamlLanguageProject : IDeclarationFirstLanguageProject
     public XamlResourceSnapshot ResourceSnapshot =>
         Volatile.Read(ref _resourceSnapshot);
 
+    internal IReadOnlyList<Project>? GetRoslynProjects()
+    {
+        try
+        {
+            return _roslynProjectsProvider?.Invoke();
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
     /// <summary>
     /// Resolves <paramref name="key"/> against the current project snapshot. Duplicate visible
     /// declarations are reported as ambiguous; discovery order never silently selects a winner.
@@ -378,7 +390,7 @@ public sealed class XamlLanguageProject : IDeclarationFirstLanguageProject
         "Design",
         "CA1031:DoNotCatchGeneralExceptionTypes",
         Justification = "Referenced project compilation and generator failures make the XAML semantic universe incomplete; they must not abort unrelated indexing.")]
-    private static async Task<XamlProjectSemanticCheck> CheckProjectSemanticStateAsync(
+    internal static async Task<XamlProjectSemanticCheck> CheckProjectSemanticStateAsync(
         Project project,
         CancellationToken ct)
     {

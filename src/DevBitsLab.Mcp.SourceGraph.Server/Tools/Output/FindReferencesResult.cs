@@ -14,6 +14,8 @@ public sealed record FindReferencesResult(
     [property: JsonPropertyName("target_fqn")] string TargetFqn,
     [property: JsonPropertyName("target_kind")] string TargetKind,
     [property: JsonPropertyName("target_symbol_id")] long TargetSymbolId,
+    [property: JsonPropertyName("occurrence_count")] int OccurrenceCount,
+    [property: JsonPropertyName("relation_count")] int RelationCount,
     IReadOnlyList<FindReferenceHit> References);
 
 /// <summary>

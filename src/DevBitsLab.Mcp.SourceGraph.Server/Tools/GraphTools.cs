@@ -364,8 +364,10 @@ public static class GraphTools
                 }
                 var (refsKept, refsOmitted) = OutputBudget.ChooseKeep(refs.Count, OutputBudget.CompactRowChars);
                 if (refsOmitted > 0) refs = refs.Take(refsKept).ToList();
+                var occurrenceCount = CountReferenceOccurrences(refs);
                 sb.AppendLine();
-                sb.AppendLine($"{refs.Count} references:");
+                sb.AppendLine(
+                    $"{occurrenceCount} source occurrences / {refs.Count} semantic relations:");
                 if (refs.Count >= 2)
                 {
                     var rows = new List<IReadOnlyList<string>>(refs.Count);
@@ -449,9 +451,19 @@ public static class GraphTools
             });
         }
 
+        var occurrenceCount = CountReferenceOccurrences(refs);
         var extras = omittedSize > 0
-            ? new[] { ("references", refs.Count.ToString()), ("omitted_size", omittedSize.ToString()) }
-            : new[] { ("references", refs.Count.ToString()) };
+            ? new[]
+            {
+                ("occurrences", occurrenceCount.ToString()),
+                ("relations", refs.Count.ToString()),
+                ("omitted_size", omittedSize.ToString()),
+            }
+            : new[]
+            {
+                ("occurrences", occurrenceCount.ToString()),
+                ("relations", refs.Count.ToString()),
+            };
         content.Add(AudienceMetadata.Build(scopeId, elapsedMs, extras));
 
         var structuredReferences = refs
@@ -470,6 +482,8 @@ public static class GraphTools
             TargetFqn: target.Fqn,
             TargetKind: target.Kind,
             TargetSymbolId: target.Id,
+            OccurrenceCount: occurrenceCount,
+            RelationCount: refs.Count,
             References: structuredReferences);
 
         return new CallToolResult
@@ -600,7 +614,7 @@ public static class GraphTools
         ScopeRouter router,
         [Description("Target symbol name or FQN")] string symbol,
         [Description("Maximum number of results to return (default 50)")] int limit = 50,
-        [Description("Edge kind to walk (kebab-case): calls (default) | uses-type | overrides-member | implements-member | instantiates | throws | tests | code-behind | binds-to | binds-path | binds-element | handles-event | uses-resource | instantiates-type | merges | applies-style | all. Plugin-defined kinds are accepted.")] string? kind = null,
+        [Description("Edge kind to walk (kebab-case): calls (default) | uses-type | overrides-member | implements-member | instantiates | throws | tests | code-behind | code-behind-uses-element | binds-to | binds-path | binds-element | handles-event | uses-resource | instantiates-type | merges | applies-style | all. Plugin-defined kinds are accepted.")] string? kind = null,
         [Description(ScopeDescription)] string? scope = null,
         [Description("Path rendering: relative (default) or absolute")] string pathFormat = "relative",
         CancellationToken ct = default) =>
@@ -821,7 +835,7 @@ public static class GraphTools
         ScopeRouter router,
         [Description("Source symbol name or FQN")] string symbol,
         [Description("Maximum number of results to return (default 50)")] int limit = 50,
-        [Description("Edge kind to walk (kebab-case): calls (default) | uses-type | overrides-member | implements-member | instantiates | throws | tests | code-behind | binds-to | binds-path | binds-element | handles-event | uses-resource | instantiates-type | merges | applies-style | all. Plugin-defined kinds are accepted.")] string? kind = null,
+        [Description("Edge kind to walk (kebab-case): calls (default) | uses-type | overrides-member | implements-member | instantiates | throws | tests | code-behind | code-behind-uses-element | binds-to | binds-path | binds-element | handles-event | uses-resource | instantiates-type | merges | applies-style | all. Plugin-defined kinds are accepted.")] string? kind = null,
         [Description(ScopeDescription)] string? scope = null,
         [Description("Path rendering: relative (default) or absolute")] string pathFormat = "relative",
         CancellationToken ct = default) =>
@@ -1683,12 +1697,12 @@ public static class GraphTools
 
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(NeighborhoodResult))]
     [ToolTrigger("\"give me a quick overview around X\" — orient before diving in")]
-    [Description("Get the immediate graph neighborhood of a symbol: callers, callees, and inheritance/implements edges. Default kind=calls; pass kind=uses-type, overrides-member, implements-member, instantiates, throws, tests, all, any XAML edge kind (code-behind, binds-to, binds-path, binds-element, handles-event, uses-resource, instantiates-type, merges, applies-style) on a scope that loaded the XAML indexer, or any plugin-defined kebab-case kind to inspect other edge layers.")]
+    [Description("Get the immediate graph neighborhood of a symbol: callers, callees, and inheritance/implements edges. Default kind=calls; pass kind=uses-type, overrides-member, implements-member, instantiates, throws, tests, all, any XAML edge kind (code-behind, code-behind-uses-element, binds-to, binds-path, binds-element, handles-event, uses-resource, instantiates-type, merges, applies-style) on a scope that loaded the XAML indexer, or any plugin-defined kebab-case kind to inspect other edge layers.")]
     public static Task<CallToolResult> NeighborhoodAsync(
         ScopeRouter router,
         [Description("Symbol name or FQN")] string symbol,
         [Description("Max items per category (default 20)")] int perCategory = 20,
-        [Description("Edge kind to walk (kebab-case): calls (default) | uses-type | overrides-member | implements-member | instantiates | throws | tests | code-behind | binds-to | binds-path | binds-element | handles-event | uses-resource | instantiates-type | merges | applies-style | all. Plugin-defined kinds are accepted.")] string? kind = null,
+        [Description("Edge kind to walk (kebab-case): calls (default) | uses-type | overrides-member | implements-member | instantiates | throws | tests | code-behind | code-behind-uses-element | binds-to | binds-path | binds-element | handles-event | uses-resource | instantiates-type | merges | applies-style | all. Plugin-defined kinds are accepted.")] string? kind = null,
         [Description(ScopeDescription)] string? scope = null,
         CancellationToken ct = default) =>
         ToolMetrics.TrackAsync("neighborhood", new { symbol, perCategory, kind, scope }, () =>
@@ -2014,7 +2028,7 @@ public static class GraphTools
         [Description("Symbol name or FQN")] string symbol,
         [Description("Maximum traversal depth (default 4)")] int maxDepth = 4,
         [Description("Maximum results (default 100)")] int limit = 100,
-        [Description("Edge kind to walk (kebab-case): calls (default) | uses-type | overrides-member | implements-member | instantiates | throws | tests | code-behind | binds-to | binds-path | binds-element | handles-event | uses-resource | instantiates-type | merges | applies-style | all. Plugin-defined kinds are accepted.")] string? kind = null,
+        [Description("Edge kind to walk (kebab-case): calls (default) | uses-type | overrides-member | implements-member | instantiates | throws | tests | code-behind | code-behind-uses-element | binds-to | binds-path | binds-element | handles-event | uses-resource | instantiates-type | merges | applies-style | all. Plugin-defined kinds are accepted.")] string? kind = null,
         [Description(ScopeDescription)] string? scope = null,
         IProgress<ProgressNotificationValue>? progress = null,
         [Description("Evidence detail: summary (default) or full")] string evidence = "summary",
@@ -2247,6 +2261,17 @@ public static class GraphTools
                 ToolOutputJsonContext.Default.ImpactOfChangeResult),
         };
     }
+
+    private static int CountReferenceOccurrences(
+        IReadOnlyList<ReferenceHit> references) =>
+        references
+            .Select(reference => (
+                Path: reference.FilePath,
+                reference.Line,
+                reference.Col,
+                reference.IsGenerated))
+            .Distinct()
+            .Count();
 
     private static TraceCallPathHop MapImpactHop(
         TraceCallPathHop hop,
@@ -3315,6 +3340,21 @@ public static class GraphTools
     {
         if (state.Completeness == "complete") return;
         sb.AppendLine();
+        if (state.Result == "found")
+        {
+            sb.Append("note: result=`found`, completeness=`")
+                .Append(state.Completeness)
+                .Append("`, scope_status=`")
+                .Append(state.ScopeStatus)
+                .Append('`');
+            if (state.Reason is not null)
+            {
+                sb.Append(", reason=`").Append(state.Reason).Append('`');
+            }
+            sb.AppendLine(
+                "; positive matches are valid, but the returned relation set may be non-exhaustive.");
+            return;
+        }
         sb.Append("note: result=`").Append(state.Result)
             .Append("`, completeness=`").Append(state.Completeness)
             .Append("`, scope_status=`").Append(state.ScopeStatus)

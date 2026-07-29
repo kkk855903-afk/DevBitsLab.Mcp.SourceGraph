@@ -15,6 +15,7 @@ namespace DevBitsLab.Mcp.SourceGraph.Server.Tools;
 public static class GrpcTools
 {
     private const int MaximumScopeFanout = 16;
+    private const int MaximumIncompleteRpcPageSize = 100;
     private const int OutputBudgetSafetyMargin = 256;
     private static readonly GrpcContractQueryService QueryService = new();
 
@@ -67,14 +68,33 @@ public static class GrpcTools
         [Description(
             "Optional scope id, '*', or comma-separated scope ids (maximum 16 scopes).")]
         string? scope = null,
+        [Description(
+            "Filter incomplete RPC details by missing generated side: any, client, server, or both (default any).")]
+        string missing = "any",
+        [Description(
+            "Zero-based per-scope offset into the filtered incomplete RPC detail list (default 0).")]
+        int incompleteOffset = 0,
+        [Description(
+            "Maximum incomplete RPC details per scope (default 20, maximum 100).")]
+        int incompleteLimit = 20,
         CancellationToken ct = default) =>
         ToolMetrics.TrackAsync(
             "check_proto_contract",
-            new { symbol, scope },
+            new
+            {
+                symbol,
+                scope,
+                missing,
+                incompleteOffset,
+                incompleteLimit,
+            },
             () => CheckProtoContractImplAsync(
                 router,
                 symbol,
                 scope,
+                missing,
+                incompleteOffset,
+                incompleteLimit,
                 ct));
 
     private static Task<CallToolResult> TraceRpcImplAsync(
@@ -130,6 +150,9 @@ public static class GrpcTools
         ScopeRouter router,
         string? symbol,
         object? scope,
+        string missing,
+        int incompleteOffset,
+        int incompleteLimit,
         CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(router);
@@ -143,6 +166,25 @@ public static class GrpcTools
                 DiagnosticResult.Error(
                     $"check_proto_contract canonical keys must not exceed {GrpcContractQueryService.MaximumQueryCharacters} characters."));
         }
+        var missingFilter = NormalizeMissingFilter(missing);
+        if (missingFilter is null)
+        {
+            return Task.FromResult(
+                DiagnosticResult.Error(
+                    "check_proto_contract missing must be one of: any, client, server, both."));
+        }
+        if (incompleteOffset < 0)
+        {
+            return Task.FromResult(
+                DiagnosticResult.Error(
+                    "check_proto_contract incompleteOffset must be zero or greater."));
+        }
+        if (incompleteLimit is < 1 or > MaximumIncompleteRpcPageSize)
+        {
+            return Task.FromResult(
+                DiagnosticResult.Error(
+                    $"check_proto_contract incompleteLimit must be between 1 and {MaximumIncompleteRpcPageSize}."));
+        }
 
         return ScopedExecution.RunAsync(
             router,
@@ -150,13 +192,18 @@ public static class GrpcTools
             async (host, _, _) =>
             {
                 var result = await QueryService.CheckAsync(
-                        host.Scope.Id,
+                         host.Scope.Id,
                         host.Status,
                         host.Store,
                         host.GrpcLinkState,
                         selection,
-                        ct)
-                    .ConfigureAwait(false);
+                         ct)
+                     .ConfigureAwait(false);
+                result = PageIncompleteRpcDetails(
+                    result,
+                    missingFilter,
+                    incompleteOffset,
+                    incompleteLimit);
                 return BuildBoundedCheck(
                     selection,
                     [result],
@@ -351,12 +398,42 @@ public static class GrpcTools
                 _ => 0,
             })
             .Sum();
-        if (rows.Length == 0 && omittedByCoverage == 0)
+        var coverages = scopes
+            .Select(scope => scope switch
+            {
+                GrpcTraceScopeResult trace => trace.LinkCoverage,
+                GrpcContractCheckScopeResult check => check.LinkCoverage,
+                _ => null,
+            })
+            .Where(coverage => coverage is not null)
+            .Cast<GrpcLinkCoverage>()
+            .ToArray();
+        if (coverages.Length == 0)
         {
             return;
         }
 
-        prose.AppendLine().AppendLine("incomplete_rpcs:");
+        prose.AppendLine()
+            .Append("incomplete_rpc_summary: total=")
+            .Append(SaturatingSum(coverages.Select(
+                coverage => coverage.IncompleteRpcContracts)))
+            .Append(", missing_client=")
+            .Append(SaturatingSum(coverages.Select(
+                coverage => coverage.MissingGeneratedClients)))
+            .Append(", missing_server=")
+            .Append(SaturatingSum(coverages.Select(
+                coverage => coverage.MissingGeneratedServers)))
+            .Append(", detail_total=")
+            .Append(SaturatingSum(coverages.Select(
+                coverage => coverage.IncompleteRpcDetailTotal)))
+            .Append(", detail_returned=")
+            .Append(rows.Length)
+            .AppendLine();
+        if (rows.Length == 0 && omittedByCoverage == 0)
+        {
+            return;
+        }
+        prose.AppendLine("incomplete_rpcs:");
         foreach (var row in rows.Take(maximumRows))
         {
             prose.Append("- scope=`")
@@ -498,6 +575,9 @@ public static class GrpcTools
             + Math.Max(0, scope.Failures.Count - failures.Count);
         omitted = SaturatingAdd(omitted, omittedEvidence);
         omitted = Math.Max(scope.OmittedCount, omitted);
+        var coverage = LimitIncompleteRpcCoverage(
+            scope.LinkCoverage,
+            limits.Rpcs);
         return scope with
         {
             ScopeId = Bound(scope.ScopeId, 64),
@@ -507,7 +587,85 @@ public static class GrpcTools
             Truncated = scope.Truncated || omitted > 0,
             OmittedCount = omitted,
             OmittedEvidenceCount = omittedEvidence,
+            LinkCoverage = coverage,
         };
+    }
+
+    private static GrpcContractCheckScopeResult PageIncompleteRpcDetails(
+        GrpcContractCheckScopeResult scope,
+        string missingFilter,
+        int offset,
+        int limit)
+    {
+        if (scope.LinkCoverage is not { } coverage)
+        {
+            return scope;
+        }
+
+        var filtered = coverage.IncompleteRpcs
+            .Where(detail => missingFilter switch
+            {
+                "client" => detail.MissingGeneratedClient,
+                "server" => detail.MissingGeneratedServer,
+                "both" => detail.MissingGeneratedClient
+                    && detail.MissingGeneratedServer,
+                _ => true,
+            })
+            .ToArray();
+        var page = filtered
+            .Skip(offset)
+            .Take(limit)
+            .ToArray();
+        var nextOffset = offset + page.Length;
+        return scope with
+        {
+            LinkCoverage = coverage with
+            {
+                IncompleteRpcs = page,
+                IncompleteRpcDetailTotal = filtered.Length,
+                IncompleteRpcDetailOffset = offset,
+                IncompleteRpcDetailLimit = limit,
+                IncompleteRpcDetailReturned = page.Length,
+                IncompleteRpcDetailHasMore = nextOffset < filtered.Length,
+                IncompleteRpcDetailNextOffset =
+                    nextOffset < filtered.Length ? nextOffset : null,
+                IncompleteRpcMissingFilter = missingFilter,
+            },
+        };
+    }
+
+    private static GrpcLinkCoverage? LimitIncompleteRpcCoverage(
+        GrpcLinkCoverage? coverage,
+        int limit)
+    {
+        if (coverage is null || coverage.IncompleteRpcs.Count <= limit)
+        {
+            return coverage;
+        }
+
+        var rows = coverage.IncompleteRpcs.Take(limit).ToArray();
+        var nextOffset = coverage.IncompleteRpcDetailOffset + rows.Length;
+        return coverage with
+        {
+            IncompleteRpcs = rows,
+            IncompleteRpcDetailReturned = rows.Length,
+            IncompleteRpcDetailHasMore =
+                nextOffset < coverage.IncompleteRpcDetailTotal,
+            IncompleteRpcDetailNextOffset =
+                nextOffset < coverage.IncompleteRpcDetailTotal
+                    ? nextOffset
+                    : null,
+        };
+    }
+
+    private static string? NormalizeMissingFilter(string? missing)
+    {
+        var value = string.IsNullOrWhiteSpace(missing)
+            ? "any"
+            : missing.Trim().ToLowerInvariant();
+        return value is "any" or "client" or "server" or "both"
+            ? value
+            : null;
     }
 
     private static GrpcContractFindingRow LimitFinding(

@@ -281,8 +281,9 @@ public sealed class Phase1QueryEvidenceTests : IAsyncLifetime
         callers.AbsenceAuthoritative.Should().BeFalse();
         callers.Reason.Should().Be("scope-partial");
         CallToolResultHelpers.ProseText(callersResult)
-            .Should().Contain("absence_authoritative=false")
-            .And.Contain("narrowed `rg` coverage check");
+            .Should().Contain("positive matches are valid")
+            .And.NotContain("absence_authoritative=false")
+            .And.NotContain("narrowed `rg` coverage check");
 
         var implementationsResult = await GraphTools.FindImplementationsAsync(
             _router!,
