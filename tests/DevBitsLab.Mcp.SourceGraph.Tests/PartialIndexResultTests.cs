@@ -321,6 +321,7 @@ public sealed class PartialIndexResultTests
                 limit: 100);
             firstDiagnostics.Should().ContainSingle(diagnostic =>
                 diagnostic.Code == "SG0001"
+                && diagnostic.Severity == 2
                 && diagnostic.FilePath.EndsWith(
                     "Protected.cs",
                     StringComparison.Ordinal));

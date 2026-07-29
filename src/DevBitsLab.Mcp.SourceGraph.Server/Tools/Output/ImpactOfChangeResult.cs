@@ -23,6 +23,9 @@ public sealed record ImpactOfChangeResult(
     [property: JsonPropertyName("target_canonical_key")] string? TargetCanonicalKey,
     [property: JsonPropertyName("edge_kind")] string EdgeKind,
     [property: JsonPropertyName("max_depth")] int MaxDepth,
+    string Evidence,
+    [property: JsonPropertyName("include_paths")] bool IncludePaths,
+    [property: JsonPropertyName("path_format")] string PathFormat,
     bool Truncated,
     [property: JsonPropertyName("expanded_nodes")] int ExpandedNodes,
     IReadOnlyList<ImpactOfChangeRow> Upstream);

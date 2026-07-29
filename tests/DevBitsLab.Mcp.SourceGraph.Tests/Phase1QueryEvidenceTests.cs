@@ -155,7 +155,8 @@ public sealed class Phase1QueryEvidenceTests : IAsyncLifetime
             "Graph.C",
             maxDepth: 4,
             limit: 10,
-            kind: EdgeKinds.Calls);
+            kind: EdgeKinds.Calls,
+            evidence: "full");
         var dto = Deserialize<ImpactOfChangeResult>(
             result,
             ToolOutputJsonContext.Default.ImpactOfChangeResult);
@@ -209,6 +210,10 @@ public sealed class Phase1QueryEvidenceTests : IAsyncLifetime
             limited,
             ToolOutputJsonContext.Default.ImpactOfChangeResult);
         limitedDto.Upstream.Should().ContainSingle();
+        limitedDto.Evidence.Should().Be("summary");
+        limitedDto.IncludePaths.Should().BeFalse();
+        limitedDto.PathFormat.Should().Be("relative");
+        limitedDto.Upstream.Should().OnlyContain(row => row.Path.Count == 0);
         limitedDto.Truncated.Should().BeTrue();
 
         var invalidDepth = await GraphTools.ImpactOfChangeAsync(
@@ -224,6 +229,33 @@ public sealed class Phase1QueryEvidenceTests : IAsyncLifetime
             limit: 0);
         invalidLimit.IsError.Should().BeTrue();
         CallToolResultHelpers.ProseText(invalidLimit).Should().Contain("between 1 and 1000");
+    }
+
+    [Fact]
+    public async Task Impact_summary_omits_repeated_paths_until_full_audit_is_requested()
+    {
+        var summaryResult = await GraphTools.ImpactOfChangeAsync(
+            _router!,
+            "Graph.C",
+            maxDepth: 4,
+            limit: 10);
+        var fullResult = await GraphTools.ImpactOfChangeAsync(
+            _router!,
+            "Graph.C",
+            maxDepth: 4,
+            limit: 10,
+            evidence: "full");
+        var summary = Deserialize<ImpactOfChangeResult>(
+            summaryResult,
+            ToolOutputJsonContext.Default.ImpactOfChangeResult);
+        var full = Deserialize<ImpactOfChangeResult>(
+            fullResult,
+            ToolOutputJsonContext.Default.ImpactOfChangeResult);
+
+        summary.Upstream.Should().OnlyContain(row => row.Path.Count == 0);
+        full.Upstream.Should().OnlyContain(row => row.Path.Count > 0);
+        summaryResult.StructuredContent!.Value.GetRawText().Length.Should().BeLessThan(
+            fullResult.StructuredContent!.Value.GetRawText().Length);
     }
 
     [Fact]
@@ -278,6 +310,40 @@ public sealed class Phase1QueryEvidenceTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task Unrelated_project_failure_does_not_pollute_private_target_completeness()
+    {
+        var target = await SeedSymbolAsync(
+            _store!,
+            "PrivateTarget",
+            accessibility: (int)Microsoft.CodeAnalysis.Accessibility.Private);
+        _host!.Status = "partial";
+        _host.FailedFiles =
+        [
+            new FileFailure(
+                Path.Join(_tempDir, "UnrelatedProject", "Broken.cs"),
+                "fixture failure"),
+        ];
+        _host.ProjectByFilePath[target.FilePath] = new FixtureLanguageProject(
+            Path.Join(_tempDir, "Owner", "Owner.csproj"),
+            [target.FilePath]);
+        _host.ProjectMapReady = true;
+
+        var result = await GraphTools.ListCallersAsync(
+            _router!,
+            "Graph.PrivateTarget",
+            kind: EdgeKinds.Calls);
+        var dto = Deserialize<ListCallersResult>(
+            result,
+            ToolOutputJsonContext.Default.ListCallersResult);
+
+        dto.Result.Should().Be("absent");
+        dto.ScopeStatus.Should().Be("partial");
+        dto.Completeness.Should().Be("complete");
+        dto.AbsenceAuthoritative.Should().BeTrue();
+        dto.Reason.Should().BeNull();
+    }
+
+    [Fact]
     public async Task ExactFqnWithMultipleGraphCandidates_isExplicitlyAmbiguous()
     {
         var duplicatePath = Path.Join(_tempDir, "DuplicateC.cs");
@@ -320,7 +386,8 @@ public sealed class Phase1QueryEvidenceTests : IAsyncLifetime
 
     private async Task<SeededSymbol> SeedSymbolAsync(
         SqliteGraphStore store,
-        string name)
+        string name,
+        int accessibility = 0)
     {
         var path = Path.Join(_tempDir, $"{name}.cs");
         var fileId = await store.UpsertFileAsync(
@@ -340,9 +407,14 @@ public sealed class Phase1QueryEvidenceTests : IAsyncLifetime
                 50,
                 1,
                 $"void {name}()",
-                null));
+                null,
+                Accessibility: accessibility));
         return new SeededSymbol(symbolId, fileId, path);
     }
+
+    private sealed record FixtureLanguageProject(
+        string Id,
+        IReadOnlyCollection<string> FilePaths) : ILanguageProject;
 
     private static Edge Edge(
         SeededSymbol source,

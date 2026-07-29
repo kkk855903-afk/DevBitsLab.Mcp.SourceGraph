@@ -11,6 +11,16 @@ below note which package the change applies to.
 ## [Unreleased]
 
 ### Changed
+- **Reduced extension calls, WPF compiler inputs, and compact impact audits.**
+  Reduced extension-method invocations now normalize through Roslyn's
+  `ReducedFrom.OriginalDefinition`, so references, callers, and impact edges
+  target the declared extension method. Validated WPF markup-compiler
+  `*.g.cs` inputs remain compilation-only documents, restoring
+  `InitializeComponent` and `x:Name` members without indexing arbitrary
+  `obj` sources. HSKey `SG0001` is an incomplete-input warning rather than a
+  compiler error. gRPC partial state includes per-RPC link coverage and
+  affected proto files. `impact_of_change` defaults to compact
+  `evidence=summary`; `evidence=full` restores complete per-hop audit paths.
 - **Lossless and observable semantic indexing.** Cold indexing now retains every
   accepted embedding request instead of dropping the oldest work above a
   4096-item queue cap. Interactive semantic-query inference receives priority

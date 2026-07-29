@@ -248,6 +248,53 @@ public sealed class GrpcToolsTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task Contract_check_reads_positive_links_from_partial_projection_without_claiming_absence()
+    {
+        var fixture = await CreateHostAsync(
+            "default",
+            includeServer: true);
+        var state = new GrpcLinkRuntimeState(
+            GrpcLinkRuntimeStatus.Partial,
+            ProtoContracts: 1,
+            ClientLinks: 1,
+            ServerLinks: 1,
+            RetainedLastGood: true,
+            FailureCount: 1,
+            OmittedFailures: 0,
+            Failures:
+            [
+                new GrpcLinkFailure(
+                    "grpc-input-incomplete",
+                    "One unrelated managed project failed to load.",
+                    null),
+            ],
+            Coverage: new GrpcLinkCoverage(
+                CompleteRpcContracts: 1,
+                IncompleteRpcContracts: 0,
+                MissingGeneratedClients: 0,
+                MissingGeneratedServers: 0,
+                UnlinkedManagedMembers: 0,
+                AffectedProtoFiles: []));
+
+        var scope = await new GrpcContractQueryService().CheckAsync(
+            "default",
+            "partial",
+            fixture.Host.Store,
+            state,
+            RpcKey);
+
+        scope.Status.Should().Be("partial");
+        scope.Partial.Should().BeTrue();
+        scope.RetainedLastGood.Should().BeTrue();
+        scope.TotalContractCount.Should().Be(1);
+        scope.TotalFindingCount.Should().Be(0,
+            "a partial projection cannot prove that an implementation is absent");
+        scope.LinkCoverage.Should().BeEquivalentTo(state.Coverage);
+        scope.Failures.Should().ContainSingle(failure =>
+            failure.Code == "grpc-input-incomplete");
+    }
+
+    [Fact]
     public async Task First_observation_is_baseline_then_real_changes_have_both_evidence_sets()
     {
         var fixture = await CreateHostAsync(

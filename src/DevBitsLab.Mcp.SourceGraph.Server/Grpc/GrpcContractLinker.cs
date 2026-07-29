@@ -1,6 +1,7 @@
 using DevBitsLab.Mcp.SourceGraph.Indexing.Protobuf;
 using DevBitsLab.Mcp.SourceGraph.Sdk;
 using DevBitsLab.Mcp.SourceGraph.Storage;
+using System.Text.Json.Serialization;
 using Core = DevBitsLab.Mcp.SourceGraph.Core;
 
 namespace DevBitsLab.Mcp.SourceGraph.Server.Grpc;
@@ -18,6 +19,20 @@ public sealed record GrpcLinkFailure(
     string? ProtoCanonicalKey = null,
     string? GeneratedRole = null);
 
+public sealed record GrpcLinkCoverage(
+    [property: JsonPropertyName("complete_rpc_contracts")]
+        int CompleteRpcContracts,
+    [property: JsonPropertyName("incomplete_rpc_contracts")]
+        int IncompleteRpcContracts,
+    [property: JsonPropertyName("missing_generated_clients")]
+        int MissingGeneratedClients,
+    [property: JsonPropertyName("missing_generated_servers")]
+        int MissingGeneratedServers,
+    [property: JsonPropertyName("unlinked_managed_members")]
+        int UnlinkedManagedMembers,
+    [property: JsonPropertyName("affected_proto_files")]
+        IReadOnlyList<string> AffectedProtoFiles);
+
 public sealed record GrpcLinkRuntimeState(
     GrpcLinkRuntimeStatus Status,
     int ProtoContracts,
@@ -26,7 +41,8 @@ public sealed record GrpcLinkRuntimeState(
     bool RetainedLastGood,
     int FailureCount,
     int OmittedFailures,
-    IReadOnlyList<GrpcLinkFailure> Failures);
+    IReadOnlyList<GrpcLinkFailure> Failures,
+    GrpcLinkCoverage? Coverage = null);
 
 public sealed record GrpcLinkProjectionResult(GrpcLinkRuntimeState State);
 
@@ -68,12 +84,7 @@ public sealed class GrpcContractLinker
         {
             failures.Add(
                 "grpc-input-incomplete",
-                "The managed/protobuf indexing pass was incomplete; persisted gRPC projection evidence was left unchanged.");
-            return await PartialAsync(
-                    failures,
-                    protoContracts: 0,
-                    ct)
-                .ConfigureAwait(false);
+                "The managed/protobuf indexing pass was incomplete; positive gRPC links are refreshed without deleting prior evidence, while absence remains non-authoritative.");
         }
 
         try
@@ -104,8 +115,24 @@ public sealed class GrpcContractLinker
 
             await EnsureBaselinesAsync(snapshot.Facts, ct)
                 .ConfigureAwait(false);
-            await PublishAsync(candidate.Edges, ct)
-                .ConfigureAwait(false);
+            if (sourceUniverseComplete)
+            {
+                await PublishAsync(candidate.Edges, ct)
+                    .ConfigureAwait(false);
+            }
+            else
+            {
+                await MergePositiveEvidenceAsync(candidate.Edges, ct)
+                    .ConfigureAwait(false);
+                return await PartialAsync(
+                        failures,
+                        snapshot.Rpcs.Count,
+                        ct,
+                        candidate.ClientLinks,
+                        candidate.ServerLinks,
+                        candidate.Coverage)
+                    .ConfigureAwait(false);
+            }
             return new GrpcLinkProjectionResult(
                 new GrpcLinkRuntimeState(
                     GrpcLinkRuntimeStatus.Complete,
@@ -115,7 +142,8 @@ public sealed class GrpcContractLinker
                     RetainedLastGood: false,
                     failures.TotalCount,
                     failures.OmittedCount,
-                    failures.Items));
+                    failures.Items,
+                    candidate.Coverage));
         }
         catch (OperationCanceledException)
         {
@@ -350,7 +378,11 @@ public sealed class GrpcContractLinker
     {
         if (snapshot.Rpcs.Count == 0)
         {
-            return new CandidateProjection([], 0, 0);
+            return new CandidateProjection(
+                [],
+                0,
+                0,
+                new GrpcLinkCoverage(0, 0, 0, 0, 0, []));
         }
 
         var requiredKeys = BuildRelevantGeneratedKeySet(snapshot.SymbolKeys);
@@ -606,12 +638,54 @@ public sealed class GrpcContractLinker
             .ThenBy(item => item.Evidence.Location.StartLine)
             .ThenBy(item => item.Evidence.Location.StartColumn)
             .ToArray();
+        var rpcKinds = logicalGroups
+            .GroupBy(group => group.Key.TargetCanonicalKey, StringComparer.Ordinal)
+            .ToDictionary(
+                group => group.Key,
+                group => group.Select(item => item.Key.Kind)
+                    .ToHashSet(StringComparer.Ordinal),
+                StringComparer.Ordinal);
+        var missingClients = snapshot.Rpcs
+            .Where(rpc => !rpcKinds.TryGetValue(
+                    rpc.Fact.SymbolCanonicalKey,
+                    out var kinds)
+                || !kinds.Contains(EdgeKinds.GrpcCalls))
+            .ToArray();
+        var missingServers = snapshot.Rpcs
+            .Where(rpc => !rpcKinds.TryGetValue(
+                    rpc.Fact.SymbolCanonicalKey,
+                    out var kinds)
+                || !kinds.Contains(EdgeKinds.ImplementsRpc))
+            .ToArray();
+        var incompleteKeys = missingClients
+            .Concat(missingServers)
+            .Select(rpc => rpc.Fact.SymbolCanonicalKey)
+            .ToHashSet(StringComparer.Ordinal);
+        var linkedGeneratedMembers = facts
+            .Select(fact => fact.GeneratedMemberCanonicalKey)
+            .ToHashSet(StringComparer.Ordinal);
+        var coverage = new GrpcLinkCoverage(
+            snapshot.Rpcs.Count - incompleteKeys.Count,
+            incompleteKeys.Count,
+            missingClients.Length,
+            missingServers.Length,
+            methods.Count(method =>
+                !linkedGeneratedMembers.Contains(
+                    method.Symbol.CanonicalKey ?? string.Empty)),
+            snapshot.Rpcs
+                .Where(rpc => incompleteKeys.Contains(
+                    rpc.Fact.SymbolCanonicalKey))
+                .Select(rpc => rpc.Row.FilePath)
+                .Distinct(PathComparer)
+                .OrderBy(path => path, PathComparer)
+                .ToArray());
         return new CandidateProjection(
             orderedProjection,
             logicalGroups.Count(group =>
                 group.Key.Kind == EdgeKinds.GrpcCalls),
             logicalGroups.Count(group =>
-                group.Key.Kind == EdgeKinds.ImplementsRpc));
+                group.Key.Kind == EdgeKinds.ImplementsRpc),
+            coverage);
     }
 
     private async Task PublishAsync(
@@ -624,6 +698,67 @@ public sealed class GrpcContractLinker
                 edges,
                 ct)
             .ConfigureAwait(false);
+    }
+
+    private async Task MergePositiveEvidenceAsync(
+        IReadOnlyList<ProducerEdgeEvidenceFact> edges,
+        CancellationToken ct)
+    {
+        if (edges.Count == 0)
+        {
+            return;
+        }
+
+        var files = (await _store.GetAllFilesAsync(ct).ConfigureAwait(false))
+            .ToDictionary(file => Path.GetFullPath(file.Path), file => file.Id, PathComparer);
+        var symbols = new Dictionary<string, SymbolHit>(StringComparer.Ordinal);
+        var resolved = new List<Core.Edge>(edges.Count);
+        foreach (var fact in edges)
+        {
+            ct.ThrowIfCancellationRequested();
+            if (!symbols.TryGetValue(fact.SourceCanonicalKey, out var source))
+            {
+                source = await _store.GetSymbolByCanonicalKeyAsync(
+                        fact.SourceCanonicalKey,
+                        ct)
+                    .ConfigureAwait(false)
+                    ?? throw new InvalidOperationException(
+                        $"Positive gRPC projection could not resolve symbol `{fact.SourceCanonicalKey}`.");
+                symbols[fact.SourceCanonicalKey] = source;
+            }
+            if (!symbols.TryGetValue(fact.TargetCanonicalKey, out var target))
+            {
+                target = await _store.GetSymbolByCanonicalKeyAsync(
+                        fact.TargetCanonicalKey,
+                        ct)
+                    .ConfigureAwait(false)
+                    ?? throw new InvalidOperationException(
+                        $"Positive gRPC projection could not resolve symbol `{fact.TargetCanonicalKey}`.");
+                symbols[fact.TargetCanonicalKey] = target;
+            }
+
+            var evidencePath = Path.GetFullPath(fact.Evidence.Location.FilePath);
+            if (!files.TryGetValue(evidencePath, out var fileId))
+            {
+                throw new InvalidOperationException(
+                    $"Positive gRPC projection could not resolve indexed file `{evidencePath}`.");
+            }
+            resolved.Add(new Core.Edge(
+                source.Id,
+                target.Id,
+                fact.Kind,
+                fact.Metadata)
+            {
+                Evidence = new Core.Evidence(
+                    fileId,
+                    fact.Evidence.Location,
+                    fact.Evidence.Confidence,
+                    Producer,
+                    fact.Evidence.Metadata),
+            });
+        }
+
+        await _store.BulkInsertEdgesAsync(resolved, ct).ConfigureAwait(false);
     }
 
     private async Task EnsureBaselinesAsync(
@@ -1362,7 +1497,10 @@ public sealed class GrpcContractLinker
     private async Task<GrpcLinkProjectionResult> PartialAsync(
         FailureCollector failures,
         int protoContracts,
-        CancellationToken ct)
+        CancellationToken ct,
+        int clientLinks = 0,
+        int serverLinks = 0,
+        GrpcLinkCoverage? coverage = null)
     {
         var retainedLastGood = false;
         try
@@ -1387,12 +1525,13 @@ public sealed class GrpcContractLinker
             new GrpcLinkRuntimeState(
                 GrpcLinkRuntimeStatus.Partial,
                 protoContracts,
-                ClientLinks: 0,
-                ServerLinks: 0,
+                ClientLinks: clientLinks,
+                ServerLinks: serverLinks,
                 RetainedLastGood: retainedLastGood,
                 failures.TotalCount,
                 failures.OmittedCount,
-                failures.Items));
+                failures.Items,
+                coverage));
     }
 
     private sealed record Snapshot(
@@ -1414,7 +1553,8 @@ public sealed class GrpcContractLinker
     private sealed record CandidateProjection(
         IReadOnlyList<ProducerEdgeEvidenceFact> Edges,
         int ClientLinks,
-        int ServerLinks);
+        int ServerLinks,
+        GrpcLinkCoverage Coverage);
 
     private enum GeneratedMethodRole
     {

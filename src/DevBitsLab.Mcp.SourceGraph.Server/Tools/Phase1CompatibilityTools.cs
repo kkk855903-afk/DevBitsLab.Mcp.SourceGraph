@@ -169,7 +169,7 @@ public static class Phase1CompatibilityTools
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(ImpactOfChangeResult))]
     [ToolAnnotation(ReadOnlyHint = true, IdempotentHint = true)]
     [ToolTrigger("\"analyze the impact of changing X\"")]
-    [Description("Compute bounded evidence-backed upstream impact. Compatibility name for impact_of_change; every row includes its BFS predecessor and a source-to-target path whose hops carry real occurrence evidence.")]
+    [Description("Compute bounded evidence-backed upstream impact. Compatibility name for impact_of_change; summary evidence is compact by default.")]
     public static Task<CallToolResult> ImpactAnalysisAsync(
         ScopeRouter router,
         [Description("Symbol name or FQN")] string symbol,
@@ -178,6 +178,20 @@ public static class Phase1CompatibilityTools
         [Description("Edge kind to walk (default calls); pass all to walk every indexed edge kind")] string? kind = null,
         [Description(ScopeDescription)] string? scope = null,
         IProgress<ProgressNotificationValue>? progress = null,
+        [Description("Evidence detail: summary (default) or full")] string evidence = "summary",
+        [Description("Include predecessor paths in summary mode")] bool includePaths = false,
+        [Description("Path rendering: relative (default) or absolute")] string pathFormat = "relative",
         CancellationToken ct = default) =>
-        GraphTools.ImpactOfChangeAsync(router, symbol, maxDepth, limit, kind, scope, progress, ct);
+        GraphTools.ImpactOfChangeAsync(
+            router,
+            symbol,
+            maxDepth,
+            limit,
+            kind,
+            scope,
+            progress,
+            evidence,
+            includePaths,
+            pathFormat,
+            ct);
 }

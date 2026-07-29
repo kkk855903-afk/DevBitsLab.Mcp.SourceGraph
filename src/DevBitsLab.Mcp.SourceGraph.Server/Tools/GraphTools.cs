@@ -4,6 +4,7 @@ using System.Text;
 using System.Text.Json;
 using DevBitsLab.Mcp.SourceGraph.Core;
 using DevBitsLab.Mcp.SourceGraph.Embeddings;
+using DevBitsLab.Mcp.SourceGraph.Indexing;
 using DevBitsLab.Mcp.SourceGraph.Sdk;
 using DevBitsLab.Mcp.SourceGraph.Sdk.Validation;
 using DevBitsLab.Mcp.SourceGraph.Server.Observability;
@@ -612,7 +613,8 @@ public static class GraphTools
                     host,
                     traversal.Truncated,
                     callers.Count,
-                    selection);
+                    selection,
+                    top);
                 var sb = new StringBuilder();
                 sb.AppendLine($"Inbound `{label}` to **{top.Fqn}** ({KindLabel(top.Kind)}):");
                 if (callers.Count == 0)
@@ -968,7 +970,8 @@ public static class GraphTools
                     host,
                     truncated,
                     filtered.Count,
-                    selection);
+                    selection,
+                    top);
                 var sb = new StringBuilder();
                 sb.AppendLine($"Implementations of **{top.Fqn}** ({KindLabel(top.Kind)}):");
                 if (filtered.Count == 0)
@@ -1929,7 +1932,7 @@ public static class GraphTools
 
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(ImpactOfChangeResult))]
     [ToolTrigger("\"what would change if I edit X?\" — transitive callers")]
-    [Description("Compute bounded evidence-backed upstream impact with breadth-first, cycle-safe traversal. Every row includes its canonical identity, BFS predecessor, path confidence, and a source-to-target path whose hops carry real occurrence evidence. maxDepth is 1-12 and limit is 1-1000; truncation is explicit.")]
+    [Description("Compute bounded evidence-backed upstream impact with breadth-first, cycle-safe traversal. The default evidence=summary omits repeated hop paths; use evidence=full for audit output. maxDepth is 1-12 and limit is 1-1000; truncation is explicit.")]
     public static Task<CallToolResult> ImpactOfChangeAsync(
         ScopeRouter router,
         [Description("Symbol name or FQN")] string symbol,
@@ -1938,8 +1941,11 @@ public static class GraphTools
         [Description("Edge kind to walk (kebab-case): calls (default) | uses-type | overrides-member | implements-member | instantiates | throws | tests | code-behind | binds-to | binds-path | binds-element | handles-event | uses-resource | instantiates-type | merges | applies-style | all. Plugin-defined kinds are accepted.")] string? kind = null,
         [Description(ScopeDescription)] string? scope = null,
         IProgress<ProgressNotificationValue>? progress = null,
+        [Description("Evidence detail: summary (default) or full")] string evidence = "summary",
+        [Description("Include predecessor hop paths in summary mode (default false); full evidence always includes paths")] bool includePaths = false,
+        [Description("Path rendering: relative (default) or absolute")] string pathFormat = "relative",
         CancellationToken ct = default) =>
-        ToolMetrics.TrackAsync("impact_of_change", new { symbol, maxDepth, limit, kind, scope }, () =>
+        ToolMetrics.TrackAsync("impact_of_change", new { symbol, maxDepth, limit, kind, scope, evidence, includePaths, pathFormat }, () =>
             ScopedExecution.RunAsync(router, scope, async host =>
             {
                 var sw = System.Diagnostics.Stopwatch.StartNew();
@@ -1950,6 +1956,16 @@ public static class GraphTools
                 if (limit is < 1 or > 1000)
                 {
                     return DiagnosticResult.Error("impact_of_change `limit` must be between 1 and 1000.");
+                }
+                evidence = evidence.Trim().ToLowerInvariant();
+                if (evidence is not ("summary" or "full"))
+                {
+                    return DiagnosticResult.Error("impact_of_change `evidence` must be summary or full.");
+                }
+                pathFormat = pathFormat.Trim().ToLowerInvariant();
+                if (pathFormat is not ("relative" or "absolute"))
+                {
+                    return DiagnosticResult.Error("impact_of_change `pathFormat` must be relative or absolute.");
                 }
                 var (edgeKind, label, isAll) = NormaliseEdgeKindParam(kind);
                 if (!isAll && edgeKind is not null)
@@ -1975,7 +1991,8 @@ public static class GraphTools
                     host,
                     traversal.Truncated,
                     rows.Count,
-                    selection);
+                    selection,
+                    top);
                 var sb = new StringBuilder();
                 sb.AppendLine($"Upstream impact of **{top.Fqn}** ({KindLabel(top.Kind)}) [kind={label}] up to depth {maxDepth}:");
                 if (rows.Count == 0)
@@ -1993,7 +2010,11 @@ public static class GraphTools
                         queryState: queryState,
                         selection: selection,
                         scopeId: host.Scope.Id,
-                        elapsedMs: sw.ElapsedMilliseconds);
+                        elapsedMs: sw.ElapsedMilliseconds,
+                        rootPath: host.Scope.Root,
+                        evidence: evidence,
+                        includePaths: includePaths,
+                        pathFormat: pathFormat);
                 }
                 if (rows.Count >= 2)
                 {
@@ -2021,7 +2042,10 @@ public static class GraphTools
                         sb.AppendLine($"- d{r.Depth}: **{r.Symbol.Fqn}** ({KindLabel(r.Symbol.Kind)}) at {Format.Location(r.Symbol.FilePath, r.Symbol.StartLine, r.Symbol.StartCol)}");
                     }
                 }
-                EvidenceTraversal.AppendImpactPaths(sb, rows);
+                if (evidence == "full")
+                {
+                    EvidenceTraversal.AppendImpactPaths(sb, rows);
+                }
                 if (traversal.Truncated)
                 {
                     sb.AppendLine();
@@ -2039,7 +2063,11 @@ public static class GraphTools
                     queryState: queryState,
                     selection: selection,
                     scopeId: host.Scope.Id,
-                    elapsedMs: sw.ElapsedMilliseconds);
+                    elapsedMs: sw.ElapsedMilliseconds,
+                    rootPath: host.Scope.Root,
+                    evidence: evidence,
+                    includePaths: includePaths,
+                    pathFormat: pathFormat);
             }, ct, progress));
 
     private static CallToolResult BuildImpactOfChangeResult(
@@ -2053,7 +2081,11 @@ public static class GraphTools
         QueryState queryState,
         SymbolSelection selection,
         string scopeId,
-        long elapsedMs)
+        long elapsedMs,
+        string rootPath,
+        string evidence,
+        bool includePaths,
+        string pathFormat)
     {
         var content = new List<ContentBlock>(capacity: 2 + rows.Count)
         {
@@ -2079,6 +2111,9 @@ public static class GraphTools
             ("max_depth", maxDepth.ToString()),
             ("upstream", rows.Count.ToString())));
 
+        var includeStructuredPaths = evidence == "full" || includePaths;
+        var includeFullEvidence = evidence == "full";
+        var relativePaths = pathFormat == "relative";
         var structuredRows = rows
             .Select(r => new ImpactOfChangeRow(
                 Depth: r.Depth,
@@ -2086,12 +2121,22 @@ public static class GraphTools
                 CanonicalKey: r.Symbol.CanonicalKey,
                 Fqn: r.Symbol.Fqn,
                 Kind: r.Symbol.Kind,
-                FilePath: r.Symbol.FilePath,
+                FilePath: FormatImpactPath(rootPath, r.Symbol.FilePath, relativePaths),
                 Line: r.Symbol.StartLine,
                 Column: r.Symbol.StartCol,
-                Predecessor: TraceCallPathTools.MapSymbol(r.Predecessor),
+                Predecessor: MapImpactSymbol(
+                    TraceCallPathTools.MapSymbol(r.Predecessor),
+                    rootPath,
+                    relativePaths),
                 Confidence: r.Confidence,
-                Path: r.Path))
+                Path: includeStructuredPaths
+                    ? r.Path.Select(hop => MapImpactHop(
+                            hop,
+                            rootPath,
+                            relativePaths,
+                            includeFullEvidence))
+                        .ToArray()
+                    : []))
             .ToList();
         var dto = new ImpactOfChangeResult(
             Result: queryState.Result,
@@ -2109,6 +2154,9 @@ public static class GraphTools
             TargetCanonicalKey: target.CanonicalKey,
             EdgeKind: edgeKindLabel,
             MaxDepth: maxDepth,
+            Evidence: evidence,
+            IncludePaths: includeStructuredPaths,
+            PathFormat: pathFormat,
             Truncated: truncated,
             ExpandedNodes: expandedNodes,
             Upstream: structuredRows);
@@ -2119,6 +2167,64 @@ public static class GraphTools
                 dto,
                 ToolOutputJsonContext.Default.ImpactOfChangeResult),
         };
+    }
+
+    private static TraceCallPathHop MapImpactHop(
+        TraceCallPathHop hop,
+        string rootPath,
+        bool relativePaths,
+        bool includeEvidence) =>
+        hop with
+        {
+            From = MapImpactSymbol(hop.From, rootPath, relativePaths),
+            To = MapImpactSymbol(hop.To, rootPath, relativePaths),
+            Evidence = includeEvidence
+                ? hop.Evidence.Select(item => item with
+                    {
+                        FilePath = FormatImpactPath(
+                            rootPath,
+                            item.FilePath,
+                            relativePaths),
+                    }).ToArray()
+                : [],
+        };
+
+    private static TraceCallPathSymbol MapImpactSymbol(
+        TraceCallPathSymbol symbol,
+        string rootPath,
+        bool relativePaths) =>
+        symbol with
+        {
+            FilePath = FormatImpactPath(
+                rootPath,
+                symbol.FilePath,
+                relativePaths),
+        };
+
+    private static string FormatImpactPath(
+        string rootPath,
+        string filePath,
+        bool relative)
+    {
+        if (!relative || string.IsNullOrWhiteSpace(filePath))
+        {
+            return filePath;
+        }
+        try
+        {
+            var result = Path.GetRelativePath(rootPath, filePath);
+            return result.StartsWith(".." + Path.DirectorySeparatorChar, StringComparison.Ordinal)
+                || string.Equals(result, "..", StringComparison.Ordinal)
+                    ? filePath
+                    : result.Replace(Path.DirectorySeparatorChar, '/');
+        }
+        catch (Exception ex) when (
+            ex is ArgumentException
+                or NotSupportedException
+                or PathTooLongException)
+        {
+            return filePath;
+        }
     }
 
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(ListMembersResult))]
@@ -2915,12 +3021,17 @@ public static class GraphTools
         ScopeHost host,
         bool truncated,
         int resultCount,
-        SymbolSelection selection)
+        SymbolSelection selection,
+        SymbolHit target)
     {
         var scopeIncomplete = !string.Equals(
             host.Status,
             "ok",
             StringComparison.OrdinalIgnoreCase);
+        if (scopeIncomplete && IsTargetRelationUniverseComplete(host, target))
+        {
+            scopeIncomplete = false;
+        }
         var incomplete = scopeIncomplete || truncated || selection.Ambiguous;
         var result = selection.Ambiguous
             ? "ambiguous"
@@ -2943,6 +3054,126 @@ public static class GraphTools
             AbsenceAuthoritative: resultCount == 0 && !incomplete,
             reason,
             truncated);
+    }
+
+    private static bool IsTargetRelationUniverseComplete(
+        ScopeHost host,
+        SymbolHit target)
+    {
+        if (!host.ProjectMapReady
+            || !host.ProjectByFilePath.TryGetValue(target.FilePath, out var owner))
+        {
+            return false;
+        }
+
+        if (target.Accessibility == 1)
+        {
+            // A private member's inbound relations cannot originate in another project.
+            return ProjectSetHasNoFailures(host, [owner]);
+        }
+
+        if (owner is not MSBuildLanguageProject msbuildOwner
+            || host.Indexer.Workspace is null)
+        {
+            return false;
+        }
+
+        // Public/internal inbound references can only originate in the owning Roslyn project
+        // or projects that transitively reference it. Failures in unrelated projects no longer
+        // downgrade an exact target's relation universe.
+        var solution = host.Indexer.Workspace.CurrentSolution;
+        var relevantIds = new HashSet<Microsoft.CodeAnalysis.ProjectId>
+        {
+            msbuildOwner.RoslynProject.Id,
+        };
+        var changed = true;
+        while (changed)
+        {
+            changed = false;
+            foreach (var project in solution.Projects)
+            {
+                if (relevantIds.Contains(project.Id)
+                    || !project.ProjectReferences.Any(reference =>
+                        relevantIds.Contains(reference.ProjectId)))
+                {
+                    continue;
+                }
+                changed |= relevantIds.Add(project.Id);
+            }
+        }
+
+        var relevantProjects = host.LanguageProjects
+            .OfType<MSBuildLanguageProject>()
+            .Where(project => relevantIds.Contains(project.RoslynProject.Id))
+            .Cast<ILanguageProject>()
+            .ToArray();
+        return relevantProjects.Length == relevantIds.Count
+            && ProjectSetHasNoFailures(host, relevantProjects);
+    }
+
+    private static bool ProjectSetHasNoFailures(
+        ScopeHost host,
+        IReadOnlyCollection<ILanguageProject> projects)
+    {
+        var projectNames = projects
+            .SelectMany(project => new[]
+            {
+                Path.GetFileNameWithoutExtension(project.Id),
+                project is MSBuildLanguageProject msbuild
+                    ? msbuild.RoslynProject.Name
+                    : null,
+            })
+            .Where(name => !string.IsNullOrWhiteSpace(name))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        if (host.FailedProjects.Any(failure =>
+                projectNames.Contains(failure.Name)))
+        {
+            return false;
+        }
+
+        var projectFiles = projects
+            .SelectMany(project => project.FilePaths)
+            .Select(NormalizeCoveragePath)
+            .Where(path => path is not null)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var projectDirectories = projects
+            .Select(project => NormalizeCoveragePath(project.Id))
+            .Where(path => path is not null)
+            .Select(path => Path.GetDirectoryName(path!))
+            .Where(path => !string.IsNullOrWhiteSpace(path))
+            .Cast<string>()
+            .ToArray();
+        return !host.FailedFiles.Any(failure =>
+        {
+            var failedPath = NormalizeCoveragePath(failure.Path);
+            return failedPath is not null
+                && (projectFiles.Contains(failedPath)
+                    || projectDirectories.Any(directory =>
+                        IsPathWithin(directory, failedPath)));
+        });
+    }
+
+    private static bool IsPathWithin(string directory, string path)
+    {
+        var relative = Path.GetRelativePath(directory, path);
+        return !Path.IsPathRooted(relative)
+            && !relative.Equals("..", StringComparison.Ordinal)
+            && !relative.StartsWith(
+                ".." + Path.DirectorySeparatorChar,
+                StringComparison.Ordinal);
+    }
+
+    private static string? NormalizeCoveragePath(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path)) return null;
+        try
+        {
+            return Path.GetFullPath(path);
+        }
+        catch
+        {
+            return path;
+        }
     }
 
     private static void AppendQueryStateNote(

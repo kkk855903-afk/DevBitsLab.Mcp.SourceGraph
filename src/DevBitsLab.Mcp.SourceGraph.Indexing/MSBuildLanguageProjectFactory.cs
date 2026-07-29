@@ -61,7 +61,10 @@ public sealed class MSBuildLanguageProjectFactory : IExclusionAwareLanguageProje
         // constructor. An MSBuild workspace is not a sandbox; this only prevents excluded Roslyn
         // inputs from being handed to downstream indexers after project evaluation.
         var pathPolicy = new ScopePathPolicy(Path.GetFullPath(repoRoot), excludePatterns);
-        var sanitized = SolutionPrivacySanitizer.SanitizeForScope(solution, pathPolicy);
+        var sanitized = SolutionPrivacySanitizer.SanitizeForScope(
+            solution,
+            pathPolicy,
+            RoslynIndexer.IsBuildGeneratedDocument);
         var projects = sanitized.Projects
             .Select(p => (ILanguageProject)new MSBuildLanguageProject(p))
             .ToList();
