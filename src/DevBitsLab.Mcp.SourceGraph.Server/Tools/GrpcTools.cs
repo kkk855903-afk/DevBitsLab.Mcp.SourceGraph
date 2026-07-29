@@ -282,14 +282,15 @@ public static class GrpcTools
         TraceRpcResult dto,
         bool isError)
     {
-        var prose =
-            $"trace_rpc: status=`{dto.Status}`, scopes={dto.TotalScopeCount}, "
-            + $"rpcs={dto.TotalRpcCount}, clients={dto.TotalClientCount}, "
-            + $"servers={dto.TotalServerCount}, partial={Bool(dto.Partial)}, "
-            + $"truncated={Bool(dto.Truncated)}, omitted={dto.OmittedCount}";
+        var prose = new System.Text.StringBuilder()
+            .Append($"trace_rpc: status=`{dto.Status}`, scopes={dto.TotalScopeCount}, ")
+            .Append($"rpcs={dto.TotalRpcCount}, clients={dto.TotalClientCount}, ")
+            .Append($"servers={dto.TotalServerCount}, partial={Bool(dto.Partial)}, ")
+            .Append($"truncated={Bool(dto.Truncated)}, omitted={dto.OmittedCount}");
+        AppendIncompleteRpcSummary(prose, dto.Scopes);
         return new CallToolResult
         {
-            Content = [new TextContentBlock { Text = prose }],
+            Content = [new TextContentBlock { Text = prose.ToString() }],
             StructuredContent = JsonSerializer.SerializeToElement(
                 dto,
                 ToolOutputJsonContext.Default.TraceRpcResult),
@@ -301,20 +302,81 @@ public static class GrpcTools
         CheckProtoContractResult dto,
         bool isError)
     {
-        var prose =
-            $"check_proto_contract: status=`{dto.Status}`, scopes={dto.TotalScopeCount}, "
-            + $"contracts={dto.TotalContractCount}, findings={dto.TotalFindingCount}, "
-            + "relation=`diagnoses-contract`, "
-            + $"partial={Bool(dto.Partial)}, truncated={Bool(dto.Truncated)}, "
-            + $"omitted={dto.OmittedCount}";
+        var prose = new System.Text.StringBuilder()
+            .Append($"check_proto_contract: status=`{dto.Status}`, scopes={dto.TotalScopeCount}, ")
+            .Append($"contracts={dto.TotalContractCount}, findings={dto.TotalFindingCount}, ")
+            .Append("relation=`diagnoses-contract`, ")
+            .Append($"partial={Bool(dto.Partial)}, truncated={Bool(dto.Truncated)}, ")
+            .Append($"omitted={dto.OmittedCount}");
+        AppendIncompleteRpcSummary(prose, dto.Scopes);
         return new CallToolResult
         {
-            Content = [new TextContentBlock { Text = prose }],
+            Content = [new TextContentBlock { Text = prose.ToString() }],
             StructuredContent = JsonSerializer.SerializeToElement(
                 dto,
                 ToolOutputJsonContext.Default.CheckProtoContractResult),
             IsError = isError ? true : null,
         };
+    }
+
+    private static void AppendIncompleteRpcSummary<TScope>(
+        System.Text.StringBuilder prose,
+        IReadOnlyList<TScope> scopes)
+    {
+        const int maximumRows = 20;
+        var rows = scopes
+            .Select(scope => scope switch
+            {
+                GrpcTraceScopeResult trace =>
+                    (trace.ScopeId, trace.LinkCoverage),
+                GrpcContractCheckScopeResult check =>
+                    (check.ScopeId, check.LinkCoverage),
+                _ => (string.Empty, (GrpcLinkCoverage?)null),
+            })
+            .Where(item => item.Item2 is not null)
+            .SelectMany(item => item.Item2!.IncompleteRpcs.Select(detail =>
+                (ScopeId: item.Item1, Detail: detail)))
+            .OrderBy(item => item.ScopeId, StringComparer.Ordinal)
+            .ThenBy(
+                item => item.Detail.RpcCanonicalKey,
+                StringComparer.Ordinal)
+            .ToArray();
+        var omittedByCoverage = scopes
+            .Select(scope => scope switch
+            {
+                GrpcTraceScopeResult trace =>
+                    trace.LinkCoverage?.OmittedIncompleteRpcDetails ?? 0,
+                GrpcContractCheckScopeResult check =>
+                    check.LinkCoverage?.OmittedIncompleteRpcDetails ?? 0,
+                _ => 0,
+            })
+            .Sum();
+        if (rows.Length == 0 && omittedByCoverage == 0)
+        {
+            return;
+        }
+
+        prose.AppendLine().AppendLine("incomplete_rpcs:");
+        foreach (var row in rows.Take(maximumRows))
+        {
+            prose.Append("- scope=`")
+                .Append(row.ScopeId)
+                .Append("`, rpc=`")
+                .Append(row.Detail.RpcCanonicalKey)
+                .Append("`, missing_client=")
+                .Append(Bool(row.Detail.MissingGeneratedClient))
+                .Append(", missing_server=")
+                .Append(Bool(row.Detail.MissingGeneratedServer))
+                .AppendLine();
+        }
+        var omitted = omittedByCoverage
+            + Math.Max(0, rows.Length - maximumRows);
+        if (omitted > 0)
+        {
+            prose.Append("- omitted_incomplete_rpc_details=")
+                .Append(omitted)
+                .AppendLine();
+        }
     }
 
     private static GrpcTraceScopeResult LimitTraceScope(

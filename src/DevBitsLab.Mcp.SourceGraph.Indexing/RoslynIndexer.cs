@@ -3790,6 +3790,11 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
             foreach (var d in docs) projectsTouched.Add(d.Project.Id);
         }
         projectsTouched.UnionWith(protectedProjectIds);
+        var protectedDependencyProjectIds =
+            FindProjectsDependingOnProtectedInputs(
+                _sanitizedSolution!,
+                protectedProjectIds);
+        projectsTouched.UnionWith(protectedDependencyProjectIds);
         var diagnosticsByFile = new Dictionary<long, List<DiagnosticRecord>>();
         // Pre-create empty buckets for every successfully-walked file so files with zero
         // diagnostics still get an Upsert call to clear out stale rows from a prior index.
@@ -3945,6 +3950,8 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
             }
 
             var hasProtectedInput = protectedProjectIds.Contains(pid);
+            var hasProtectedDependency =
+                protectedDependencyProjectIds.Contains(pid);
             ImmutableArray<Diagnostic> diags = [];
             try
             {
@@ -3994,7 +4001,7 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                         new List<DiagnosticRecord>());
                 }
             }
-            if (hasProtectedInput)
+            if (hasProtectedInput || hasProtectedDependency)
             {
                 foreach (var projectFileId in projectFileIds)
                 {
@@ -4009,6 +4016,7 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                 diagnostic.Severity == DiagnosticSeverity.Error);
             var semanticInputComplete =
                 !hasProtectedInput
+                && !hasProtectedDependency
                 && project?.FilePath is { Length: > 0 } projectFilePath
                 && IsProjectSemanticInputComplete(
                     _workspace!.CurrentSolution,
@@ -4106,6 +4114,20 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                     continue;
                 }
 
+                if (hasProtectedDependency
+                    && diag.Severity == DiagnosticSeverity.Error
+                    && IsUnresolvedProtectedDependencyDiagnostic(diag.Id))
+                {
+                    record = record with
+                    {
+                        Severity = (int)DiagnosticSeverity.Warning,
+                        Code = "SG0002",
+                        Message =
+                            "Unresolved symbol may depend on HSKey-protected source; "
+                            + $"original Roslyn diagnostic {diag.Id}: "
+                            + diag.GetMessage(),
+                    };
+                }
                 diagnosticsByFile[record.FileId].Add(record);
             }
 
@@ -4746,6 +4768,42 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
             }
         }
     }
+
+    private static HashSet<ProjectId> FindProjectsDependingOnProtectedInputs(
+        Solution solution,
+        IReadOnlySet<ProjectId> protectedProjectIds)
+    {
+        var affected = protectedProjectIds.ToHashSet();
+        var changed = true;
+        while (changed)
+        {
+            changed = false;
+            foreach (var project in solution.Projects)
+            {
+                if (affected.Contains(project.Id)
+                    || !project.ProjectReferences.Any(reference =>
+                        affected.Contains(reference.ProjectId)))
+                {
+                    continue;
+                }
+
+                changed |= affected.Add(project.Id);
+            }
+        }
+
+        affected.ExceptWith(protectedProjectIds);
+        return affected;
+    }
+
+    private static bool IsUnresolvedProtectedDependencyDiagnostic(
+        string diagnosticId) =>
+        diagnosticId is
+            "CS0103" // name does not exist in the current context
+            or "CS0117" // type does not contain a definition
+            or "CS0234" // namespace does not contain a type/namespace
+            or "CS0246" // type or namespace could not be found
+            or "CS0426" // nested type does not exist
+            or "CS1061"; // member/extension method could not be found
 
     private static bool HasHsKeyPrefix(ReadOnlySpan<byte> bytes) =>
         bytes.Length >= 5

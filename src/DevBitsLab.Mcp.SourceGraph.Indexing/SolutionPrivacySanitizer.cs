@@ -50,9 +50,20 @@ internal static class SolutionPrivacySanitizer
             {
                 if (isExcluded(document.FilePath))
                 {
-                    if (isBuildGenerated?.Invoke(document) == true
-                        && (TryExtractGlobalUsings(document)
-                            || IsWpfMarkupGeneratedSource(document)))
+                    // MSBuildWorkspace does not consistently preserve Roslyn's internal
+                    // IsGenerated bit for SDK-authored *.GlobalUsings.g.cs documents. This is
+                    // especially visible for Microsoft.NET.Sdk.Web, whose ASP.NET Core imports
+                    // can arrive as an ordinary Document under obj/. Retaining that document is
+                    // safe without trusting its path or generated-looking name because the
+                    // syntax gate below accepts only global-using directives: no declarations,
+                    // attributes, statements, or other excluded source can enter compilation.
+                    //
+                    // WPF markup output is different: it contains generated declarations and
+                    // fields, so it still requires Roslyn build provenance before it can remain
+                    // in the compilation-only snapshot.
+                    if (TryExtractGlobalUsings(document)
+                        || (isBuildGenerated?.Invoke(document) == true
+                            && IsWpfMarkupGeneratedSource(document)))
                     {
                         // Keep the original Roslyn DocumentId so source-generator ownership
                         // remains stable across reloads. Regular-document discovery excludes

@@ -295,6 +295,61 @@ public sealed class GrpcToolsTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task Partial_results_explain_the_concrete_rpc_role_that_is_missing()
+    {
+        var fixture = await CreateHostAsync(
+            "default",
+            includeServer: true);
+        var router = new ScopeRouter();
+        router.Register(fixture.Host);
+        router.SetDefaultScope("default");
+        fixture.Host.GrpcLinkState = new GrpcLinkRuntimeState(
+            GrpcLinkRuntimeStatus.Partial,
+            ProtoContracts: 1,
+            ClientLinks: 0,
+            ServerLinks: 1,
+            RetainedLastGood: false,
+            FailureCount: 1,
+            OmittedFailures: 0,
+            Failures:
+            [
+                new GrpcLinkFailure(
+                    "grpc-input-incomplete",
+                    "Generated client input was unavailable.",
+                    RpcKey),
+            ],
+            Coverage: new GrpcLinkCoverage(
+                CompleteRpcContracts: 0,
+                IncompleteRpcContracts: 1,
+                MissingGeneratedClients: 1,
+                MissingGeneratedServers: 0,
+                UnlinkedManagedMembers: 0,
+                AffectedProtoFiles: [fixture.ProtoPath])
+            {
+                IncompleteRpcs =
+                [
+                    new GrpcIncompleteRpcDetail(
+                        RpcKey,
+                        fixture.ProtoPath,
+                        MissingGeneratedClient: true,
+                        MissingGeneratedServer: false),
+                ],
+            });
+
+        var call = await GrpcTools.CheckProtoContractAsync(router);
+        var prose = CallToolResultHelpers.ProseText(call);
+        var result = ReadCheck(call);
+
+        prose.Should().Contain("incomplete_rpcs:")
+            .And.Contain($"rpc=`{RpcKey}`")
+            .And.Contain("missing_client=true")
+            .And.Contain("missing_server=false");
+        result.Scopes.Should().ContainSingle()
+            .Which.LinkCoverage!.IncompleteRpcs.Should().ContainSingle()
+            .Which.RpcCanonicalKey.Should().Be(RpcKey);
+    }
+
+    [Fact]
     public async Task First_observation_is_baseline_then_real_changes_have_both_evidence_sets()
     {
         var fixture = await CreateHostAsync(

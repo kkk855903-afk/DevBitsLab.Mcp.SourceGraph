@@ -19,6 +19,16 @@ public sealed record GrpcLinkFailure(
     string? ProtoCanonicalKey = null,
     string? GeneratedRole = null);
 
+public sealed record GrpcIncompleteRpcDetail(
+    [property: JsonPropertyName("rpc_canonical_key")]
+        string RpcCanonicalKey,
+    [property: JsonPropertyName("proto_file")]
+        string ProtoFile,
+    [property: JsonPropertyName("missing_generated_client")]
+        bool MissingGeneratedClient,
+    [property: JsonPropertyName("missing_generated_server")]
+        bool MissingGeneratedServer);
+
 public sealed record GrpcLinkCoverage(
     [property: JsonPropertyName("complete_rpc_contracts")]
         int CompleteRpcContracts,
@@ -31,7 +41,15 @@ public sealed record GrpcLinkCoverage(
     [property: JsonPropertyName("unlinked_managed_members")]
         int UnlinkedManagedMembers,
     [property: JsonPropertyName("affected_proto_files")]
-        IReadOnlyList<string> AffectedProtoFiles);
+        IReadOnlyList<string> AffectedProtoFiles)
+{
+    [JsonPropertyName("incomplete_rpcs")]
+    public IReadOnlyList<GrpcIncompleteRpcDetail> IncompleteRpcs { get; init; } =
+        [];
+
+    [JsonPropertyName("omitted_incomplete_rpc_details")]
+    public int OmittedIncompleteRpcDetails { get; init; }
+}
 
 public sealed record GrpcLinkRuntimeState(
     GrpcLinkRuntimeStatus Status,
@@ -65,6 +83,7 @@ public sealed class GrpcContractLinker
 
     private const int AnnotationPageSize = 1_000;
     private const int MaximumFailures = 64;
+    private const int MaximumIncompleteRpcDetails = 64;
     private const int MaximumFailureMessageCharacters = 512;
 
     private readonly IGraphStore _store;
@@ -664,6 +683,25 @@ public sealed class GrpcContractLinker
         var linkedGeneratedMembers = facts
             .Select(fact => fact.GeneratedMemberCanonicalKey)
             .ToHashSet(StringComparer.Ordinal);
+        var missingClientKeys = missingClients
+            .Select(rpc => rpc.Fact.SymbolCanonicalKey)
+            .ToHashSet(StringComparer.Ordinal);
+        var missingServerKeys = missingServers
+            .Select(rpc => rpc.Fact.SymbolCanonicalKey)
+            .ToHashSet(StringComparer.Ordinal);
+        var incompleteRpcDetails = snapshot.Rpcs
+            .Where(rpc => incompleteKeys.Contains(
+                rpc.Fact.SymbolCanonicalKey))
+            .OrderBy(
+                rpc => rpc.Fact.SymbolCanonicalKey,
+                StringComparer.Ordinal)
+            .Select(rpc => new GrpcIncompleteRpcDetail(
+                rpc.Fact.SymbolCanonicalKey,
+                rpc.Row.FilePath,
+                missingClientKeys.Contains(rpc.Fact.SymbolCanonicalKey),
+                missingServerKeys.Contains(rpc.Fact.SymbolCanonicalKey)))
+            .Take(MaximumIncompleteRpcDetails)
+            .ToArray();
         var coverage = new GrpcLinkCoverage(
             snapshot.Rpcs.Count - incompleteKeys.Count,
             incompleteKeys.Count,
@@ -678,7 +716,13 @@ public sealed class GrpcContractLinker
                 .Select(rpc => rpc.Row.FilePath)
                 .Distinct(PathComparer)
                 .OrderBy(path => path, PathComparer)
-                .ToArray());
+                .ToArray())
+        {
+            IncompleteRpcs = incompleteRpcDetails,
+            OmittedIncompleteRpcDetails = Math.Max(
+                0,
+                incompleteKeys.Count - incompleteRpcDetails.Length),
+        };
         return new CandidateProjection(
             orderedProjection,
             logicalGroups.Count(group =>

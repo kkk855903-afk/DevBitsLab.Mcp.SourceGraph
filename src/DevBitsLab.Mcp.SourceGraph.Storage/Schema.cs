@@ -16,9 +16,16 @@ public static class Schema
     /// drops all data tables when the on-disk version is below this, since the index can always be
     /// rebuilt from source.
     /// </summary>
-    public const int Version = 15;
+    public const int Version = 16;
 
     /// <summary>
+    /// V16 is an intentional semantic-projection rebuild boundary with no table-layout change.
+    /// V15 databases may contain SHA-gated Roslyn projections produced before reduced extension
+    /// methods were normalized to their original definitions and before build-generated WPF
+    /// documents were retained safely. Source bytes did not change, so an ordinary incremental
+    /// pass cannot repair those stale references, call edges, or diagnostics. Opening a V15 graph
+    /// therefore drops the rebuildable cache and cold-indexes it with the current semantic rules.
+    ///
     /// V15 makes a semantic reference occurrence unique by target symbol, producing file,
     /// source position, and reference kind. A physical source file can participate in more than
     /// one Roslyn project/TFM compilation; those semantic passes must not duplicate the same
@@ -53,9 +60,9 @@ public static class Schema
     /// test/history awareness, V8 added <c>files.is_generated</c> and <c>diagnostics</c>,
     /// V7 wired in <c>sqlite-vec</c>, V6 added <c>attributes</c> + <c>attributes_fts</c>,
     /// V5 enriched symbols with modifiers/accessibility/xml_summary, V3 dropped FK constraints
-    /// from refs/edges. V15 is the cumulative drop-and-rebuild target — there is no preserved
+    /// from refs/edges. V16 is the cumulative drop-and-rebuild target — there is no preserved
     /// data path; <see cref="SqliteGraphStore.EnsureSchemaAsync"/> calls <see cref="DropAll"/>
-    /// when the on-disk version is anything below 14.
+    /// whenever the on-disk version is below the current <see cref="Version"/>.
     /// </summary>
     internal const string V1 = """
         CREATE TABLE IF NOT EXISTS schema_version (

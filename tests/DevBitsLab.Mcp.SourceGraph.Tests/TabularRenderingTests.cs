@@ -145,6 +145,8 @@ public sealed class TabularRenderingTests : IAsyncLifetime, IDisposable
         var output = CallToolResultHelpers.ProseText(await GraphTools.ListCallersAsync(_router!, "Calculator.Add"));
         output.Should().Contain("Inbound `calls` to **");
         output.Should().Contain("| Symbol | Kind | Location |");
+        output.Should().NotContain(_host!.Scope.Root,
+            "list_callers defaults to repository-relative locations and evidence");
         var firstLine = output.Split('\n')[0];
         firstLine.Should().NotStartWith("|");
     }
@@ -221,8 +223,12 @@ public sealed class TabularRenderingTests : IAsyncLifetime, IDisposable
                 .Should().NotBeNullOrWhiteSpace();
             row.GetProperty("file_path").GetString()
                 .Should().NotBeNullOrWhiteSpace();
+            Path.IsPathRooted(row.GetProperty("file_path").GetString())
+                .Should().BeFalse(
+                    "find_diagnostics defaults to compact repository-relative paths");
             row.GetProperty("line").GetInt32().Should().BeGreaterThan(0);
         });
+        output.Should().NotContain(_host!.Scope.Root);
     }
 
     [Fact]
@@ -256,6 +262,8 @@ public sealed class TabularRenderingTests : IAsyncLifetime, IDisposable
             // Depth column is right-aligned: separator row contains `---:` for that column.
             output.Should().Contain("|---:|");
         }
+        output.Should().NotContain(_host!.Scope.Root,
+            "impact_of_change defaults to repository-relative locations and evidence");
     }
 
     [Fact]

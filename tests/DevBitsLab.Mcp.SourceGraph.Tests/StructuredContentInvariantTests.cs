@@ -287,7 +287,69 @@ public sealed class StructuredContentInvariantTests : IAsyncLifetime, IDisposabl
             reference.SymbolId == dto.TargetSymbolId
             && reference.TargetFqn == dto.TargetFqn
             && reference.Relation == reference.Kind
-            && reference.Confidence == "semantic");
+            && reference.Confidence == "semantic"
+            && !Path.IsPathRooted(reference.FilePath),
+            "find_references defaults to compact repository-relative paths");
+    }
+
+    [Fact]
+    public async Task FindReferences_absolutePathFormat_remainsAvailable()
+    {
+        var result = await GraphTools.FindReferencesAsync(
+            _router!,
+            "Calculator.Add",
+            pathFormat: "absolute");
+        var dto = JsonSerializer.Deserialize(
+            result.StructuredContent!.Value.GetRawText(),
+            ToolOutputJsonContext.Default.FindReferencesResult);
+
+        dto.Should().NotBeNull();
+        dto!.References.Should().NotBeEmpty();
+        dto.References.Should().OnlyContain(reference =>
+            Path.IsPathRooted(reference.FilePath));
+    }
+
+    [Fact]
+    public async Task ListCallers_defaults_all_nested_evidence_toRelativePaths()
+    {
+        var result = await GraphTools.ListCallersAsync(
+            _router!,
+            "Calculator.Add");
+        var dto = JsonSerializer.Deserialize(
+            result.StructuredContent!.Value.GetRawText(),
+            ToolOutputJsonContext.Default.ListCallersResult);
+
+        dto.Should().NotBeNull();
+        dto!.Callers.Should().NotBeEmpty();
+        dto.Callers.Should().OnlyContain(caller =>
+            !Path.IsPathRooted(caller.FilePath)
+            && !Path.IsPathRooted(caller.Source.FilePath)
+            && !Path.IsPathRooted(caller.Target.FilePath)
+            && caller.Evidence.All(evidence =>
+                !Path.IsPathRooted(evidence.FilePath)));
+        CallToolResultHelpers.ProseText(result).Should().NotContain(
+            _host!.Scope.Root);
+    }
+
+    [Fact]
+    public async Task ListCallers_absolutePathFormat_remainsAvailable()
+    {
+        var result = await GraphTools.ListCallersAsync(
+            _router!,
+            "Calculator.Add",
+            pathFormat: "absolute");
+        var dto = JsonSerializer.Deserialize(
+            result.StructuredContent!.Value.GetRawText(),
+            ToolOutputJsonContext.Default.ListCallersResult);
+
+        dto.Should().NotBeNull();
+        dto!.Callers.Should().NotBeEmpty();
+        dto.Callers.Should().OnlyContain(caller =>
+            Path.IsPathRooted(caller.FilePath)
+            && Path.IsPathRooted(caller.Source.FilePath)
+            && Path.IsPathRooted(caller.Target.FilePath)
+            && caller.Evidence.All(evidence =>
+                Path.IsPathRooted(evidence.FilePath)));
     }
 
     [Fact]

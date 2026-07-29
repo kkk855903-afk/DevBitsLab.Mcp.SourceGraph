@@ -354,6 +354,99 @@ public sealed class PartialIndexResultTests
         }
     }
 
+    [Fact]
+    public async Task Protected_project_dependency_isClassifiedAsSg0002Warning()
+    {
+        var root = Path.Combine(
+            Path.GetTempPath(),
+            "protected-dependency-tests-" + Guid.NewGuid().ToString("N"));
+        var libraryDir = Path.Combine(root, "ProtectedLibrary");
+        var appDir = Path.Combine(root, "App");
+        Directory.CreateDirectory(libraryDir);
+        Directory.CreateDirectory(appDir);
+        var solutionPath = Path.Combine(root, "ProtectedDependency.slnx");
+        var protectedPath = Path.Combine(libraryDir, "Protected.cs");
+        var consumerPath = Path.Combine(appDir, "Consumer.cs");
+
+        try
+        {
+            await File.WriteAllTextAsync(
+                solutionPath,
+                """
+                <Solution>
+                  <Project Path="ProtectedLibrary/ProtectedLibrary.csproj" />
+                  <Project Path="App/App.csproj" />
+                </Solution>
+                """);
+            await File.WriteAllTextAsync(
+                Path.Combine(libraryDir, "ProtectedLibrary.csproj"),
+                """
+                <Project Sdk="Microsoft.NET.Sdk">
+                  <PropertyGroup>
+                    <TargetFramework>net10.0</TargetFramework>
+                  </PropertyGroup>
+                </Project>
+                """);
+            await File.WriteAllTextAsync(
+                Path.Combine(appDir, "App.csproj"),
+                """
+                <Project Sdk="Microsoft.NET.Sdk">
+                  <PropertyGroup>
+                    <TargetFramework>net10.0</TargetFramework>
+                  </PropertyGroup>
+                  <ItemGroup>
+                    <ProjectReference Include="../ProtectedLibrary/ProtectedLibrary.csproj" />
+                  </ItemGroup>
+                </Project>
+                """);
+            await File.WriteAllTextAsync(
+                protectedPath,
+                "HSKey.Co.SZ WYDZLJ protected payload");
+            await File.WriteAllTextAsync(
+                consumerPath,
+                """
+                internal sealed class Consumer
+                {
+                    private ProtectedType? _value;
+                }
+                """);
+
+            await using var store = new SqliteGraphStore(
+                Path.Combine(root, "graph.db"));
+            await RoslynIndexer.IndexSolutionOnceAsync(solutionPath, store);
+
+            var diagnostics = await store.FindDiagnosticsAsync(
+                severity: null,
+                code: null,
+                symbolId: null,
+                limit: 100);
+            diagnostics.Should().ContainSingle(diagnostic =>
+                diagnostic.Code == "SG0001"
+                && diagnostic.Severity == (int)DiagnosticSeverity.Warning
+                && diagnostic.FilePath.EndsWith(
+                    "Protected.cs",
+                    StringComparison.Ordinal));
+            diagnostics.Should().Contain(diagnostic =>
+                diagnostic.Code == "SG0002"
+                && diagnostic.Severity == (int)DiagnosticSeverity.Warning
+                && diagnostic.FilePath.EndsWith(
+                    "Consumer.cs",
+                    StringComparison.Ordinal)
+                && diagnostic.Message.Contains(
+                    "original Roslyn diagnostic CS0246",
+                    StringComparison.Ordinal));
+            diagnostics.Should().NotContain(diagnostic =>
+                diagnostic.Severity == (int)DiagnosticSeverity.Error
+                && diagnostic.FilePath.EndsWith(
+                    "Consumer.cs",
+                    StringComparison.Ordinal));
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch { /* best-effort */ }
+        }
+    }
+
     private static string LocateSampleSolution()
     {
         var dir = AppContext.BaseDirectory;

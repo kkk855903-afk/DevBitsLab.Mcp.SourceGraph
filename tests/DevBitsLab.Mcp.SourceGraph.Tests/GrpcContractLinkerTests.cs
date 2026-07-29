@@ -268,9 +268,33 @@ public sealed class GrpcContractLinkerTests : IAsyncLifetime
         result.State.RetainedLastGood.Should().BeTrue();
         result.State.Failures.Should().ContainSingle(failure =>
             failure.Code == "grpc-input-incomplete");
+        result.State.Coverage.Should().NotBeNull();
+        result.State.Coverage!.IncompleteRpcs.Should().BeEmpty(
+            "the concrete RPC is fully linked even though unrelated source input is incomplete");
         (await _store!.HasEdgeEvidenceByProducerAsync(
                 GrpcContractLinker.Producer))
             .Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task Coverage_lists_each_incomplete_rpc_and_which_generated_role_is_missing()
+    {
+        await UpdateSignatureAsync(
+            _graph!.ClientMemberId,
+            "public virtual AsyncUnaryCall<WrongReply> CalculateAsync(CalculateRequest request, CallOptions options)");
+
+        var result = await new GrpcContractLinker(_store!).RunAsync(
+            sourceUniverseComplete: true);
+
+        result.State.Coverage.Should().NotBeNull();
+        result.State.Coverage!.IncompleteRpcs.Should().ContainSingle()
+            .Which.Should().BeEquivalentTo(
+                new GrpcIncompleteRpcDetail(
+                    ProtoCanonicalKeys.ForRpc(Service, "Calculate"),
+                    _protoPath,
+                    MissingGeneratedClient: true,
+                    MissingGeneratedServer: false));
+        result.State.Coverage.OmittedIncompleteRpcDetails.Should().Be(0);
     }
 
     [Fact]
