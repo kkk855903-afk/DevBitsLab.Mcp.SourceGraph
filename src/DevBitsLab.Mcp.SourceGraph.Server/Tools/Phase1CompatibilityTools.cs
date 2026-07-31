@@ -74,8 +74,20 @@ public static class Phase1CompatibilityTools
         [Description("Maximum number of references to return (default 50)")] int limit = 50,
         [Description("Include references from source-generated files (default false)")] bool includeGenerated = false,
         [Description(ScopeDescription)] string? scope = null,
+        [Description("Output detail: summary | locations | evidence (default) | audit.")] string detail = "evidence",
+        [Description("Source context lines before and after each occurrence (0-20).")] int contextLines = 0,
+        [Description("Attach bounded source excerpts to structured evidence.")] bool includeSnippet = false,
         CancellationToken ct = default) =>
-        GraphTools.FindReferencesAsync(router, symbol, limit, includeGenerated, scope, ct);
+        GraphTools.FindReferencesAsync(
+            router,
+            symbol,
+            limit,
+            includeGenerated,
+            scope,
+            detail,
+            contextLines,
+            includeSnippet,
+            ct);
 
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(ListCallersResult))]
     [ToolAnnotation(ReadOnlyHint = true, IdempotentHint = true)]
@@ -87,8 +99,20 @@ public static class Phase1CompatibilityTools
         [Description("Maximum number of results to return (default 50)")] int limit = 50,
         [Description("Edge kind to walk (default calls); pass all to walk every indexed edge kind")] string? kind = null,
         [Description(ScopeDescription)] string? scope = null,
+        [Description("Output detail: summary | locations | evidence (default) | audit.")] string detail = "evidence",
+        [Description("Source context lines before and after each occurrence (0-20).")] int contextLines = 0,
+        [Description("Attach bounded source excerpts to structured evidence.")] bool includeSnippet = false,
         CancellationToken ct = default) =>
-        GraphTools.ListCallersAsync(router, symbol, limit, kind, scope, ct);
+        GraphTools.ListCallersAsync(
+            router,
+            symbol,
+            limit,
+            kind,
+            scope,
+            detail,
+            contextLines,
+            includeSnippet,
+            ct);
 
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(ListCalleesResult))]
     [ToolAnnotation(ReadOnlyHint = true, IdempotentHint = true)]
@@ -100,8 +124,20 @@ public static class Phase1CompatibilityTools
         [Description("Maximum number of results to return (default 50)")] int limit = 50,
         [Description("Edge kind to walk (default calls); pass all to walk every indexed edge kind")] string? kind = null,
         [Description(ScopeDescription)] string? scope = null,
+        [Description("Output detail: summary | locations | evidence (default) | audit.")] string detail = "evidence",
+        [Description("Source context lines before and after each occurrence (0-20).")] int contextLines = 0,
+        [Description("Attach bounded source excerpts to structured evidence.")] bool includeSnippet = false,
         CancellationToken ct = default) =>
-        GraphTools.ListCalleesAsync(router, symbol, limit, kind, scope, ct);
+        GraphTools.ListCalleesAsync(
+            router,
+            symbol,
+            limit,
+            kind,
+            scope,
+            detail,
+            contextLines,
+            includeSnippet,
+            ct);
 
     /// <summary>
     /// Source-compatible entry point for the original Phase 1 alias signature.

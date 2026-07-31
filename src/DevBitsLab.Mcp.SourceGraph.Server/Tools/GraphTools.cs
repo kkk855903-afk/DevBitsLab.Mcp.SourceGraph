@@ -34,18 +34,30 @@ public static class GraphTools
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(FindDefinitionResult))]
     [ToolAnnotation(ReadOnlyHint = true, IdempotentHint = true)]
     [ToolTrigger("\"where is X defined?\"")]
-    [Description("Find the definition of a symbol by name or fully-qualified name. Returns symbol id, exact declaration range, defines relation, confidence, kind, signature, accessibility, modifiers, and one-line XML summary for each match.")]
+    [Description("Find the definition of a symbol by name or fully-qualified name. Returns symbol id, exact declaration range, defines relation, confidence, kind, signature, accessibility, modifiers, and one-line XML summary for each match. Set includeSnippet=true for a bounded source excerpt in structured content.")]
     public static Task<CallToolResult> FindDefinitionAsync(
         ScopeRouter router,
         [Description("Symbol name (e.g. 'Calculator', 'Divide') or FQN suffix (e.g. 'Calculator.Add', 'Sample.Domain.Calculator')")] string symbol,
         [Description("Optional substring to narrow the search to specific file paths")] string? fileHint = null,
         [Description(ScopeDescription)] string? scope = null,
+        [Description("Output detail: summary | locations | evidence (default) | audit.")] string detail = "evidence",
+        [Description("Source lines before and after each declaration when includeSnippet=true (0-20).")] int contextLines = 0,
+        [Description("Attach bounded source excerpts to structured hits (default false).")] bool includeSnippet = false,
         IProgress<ModelContextProtocol.ProgressNotificationValue>? progress = null,
         CancellationToken ct = default) =>
-        ToolMetrics.TrackAsync("find_definition", new { symbol, fileHint, scope }, () =>
+        ToolMetrics.TrackAsync("find_definition", new { symbol, fileHint, scope, detail, contextLines, includeSnippet }, () =>
             ScopedExecution.RunAsync(router, scope, async host =>
             {
                 var sw = System.Diagnostics.Stopwatch.StartNew();
+                if (!EvidenceDetailOptions.TryCreate(
+                        detail,
+                        contextLines,
+                        includeSnippet,
+                        out var evidenceOptions,
+                        out var evidenceError))
+                {
+                    return DiagnosticResult.Error($"find_definition {evidenceError}");
+                }
                 var hits = await host.Store.FindSymbolsAsync(symbol, fileHint, limit: 25, ct).ConfigureAwait(false);
                 if (hits.Count == 0)
                 {
@@ -85,6 +97,15 @@ public static class GraphTools
                         var line = Format.HistoryLine(hist);
                         if (line is not null) sb.AppendLine($"  - {line}");
                     }
+                    var snippet = evidenceOptions.IncludeSnippet
+                        ? await SourceContextReader.ReadAsync(
+                            host.Scope.Root,
+                            h.FilePath,
+                            h.StartLine,
+                            h.EndLine,
+                            evidenceOptions.ContextLines,
+                            ct).ConfigureAwait(false)
+                        : null;
                     structuredHits.Add(new FindDefinitionHit(
                         SymbolId: h.Id,
                         Fqn: h.Fqn,
@@ -97,7 +118,8 @@ public static class GraphTools
                         Relation: "defines",
                         Confidence: "exact",
                         Signature: string.IsNullOrEmpty(h.Signature) ? null : h.Signature,
-                        XmlSummary: string.IsNullOrEmpty(h.XmlSummary) ? null : h.XmlSummary));
+                        XmlSummary: string.IsNullOrEmpty(h.XmlSummary) ? null : h.XmlSummary,
+                        Snippet: snippet));
                 }
 
                 return BuildFindDefinitionResult(
@@ -303,18 +325,30 @@ public static class GraphTools
 
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(FindReferencesResult))]
     [ToolTrigger("\"who uses X?\" or \"who calls X?\"")]
-    [Description("Find every place that references a symbol. Resolves the symbol by name/FQN, then lists each occurrence with target symbol id/FQN, relation kind, semantic confidence, and file:line. By default skips refs from source-generated files; pass includeGenerated=true to surface them.")]
+    [Description("Find every place that references a symbol. Resolves the symbol by name/FQN, then lists each occurrence with target symbol id/FQN, relation kind, semantic confidence, and file:line. By default skips refs from source-generated files; pass includeGenerated=true to surface them. Set includeSnippet=true for bounded source excerpts in structured content.")]
     public static Task<CallToolResult> FindReferencesAsync(
         ScopeRouter router,
         [Description("Symbol name or FQN, same matching rules as find_definition")] string symbol,
         [Description("Maximum number of references to return (default 50)")] int limit = 50,
         [Description("Include references from source-generated files (default false)")] bool includeGenerated = false,
         [Description(ScopeDescription)] string? scope = null,
+        [Description("Output detail: summary | locations | evidence (default) | audit.")] string detail = "evidence",
+        [Description("Source lines before and after each reference when includeSnippet=true (0-20).")] int contextLines = 0,
+        [Description("Attach bounded source excerpts to structured references (default false).")] bool includeSnippet = false,
         CancellationToken ct = default) =>
-        ToolMetrics.TrackAsync("find_references", new { symbol, limit, includeGenerated, scope }, () =>
+        ToolMetrics.TrackAsync("find_references", new { symbol, limit, includeGenerated, scope, detail, contextLines, includeSnippet }, () =>
             ScopedExecution.RunAsync(router, scope, async host =>
             {
                 var sw = System.Diagnostics.Stopwatch.StartNew();
+                if (!EvidenceDetailOptions.TryCreate(
+                        detail,
+                        contextLines,
+                        includeSnippet,
+                        out var evidenceOptions,
+                        out var evidenceError))
+                {
+                    return DiagnosticResult.Error($"find_references {evidenceError}");
+                }
                 var hits = await host.Store.FindSymbolsAsync(symbol, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
                 if (hits.Count == 0)
                 {
@@ -351,6 +385,21 @@ public static class GraphTools
                 }
                 var (refsKept, refsOmitted) = OutputBudget.ChooseKeep(refs.Count, OutputBudget.CompactRowChars);
                 if (refsOmitted > 0) refs = refs.Take(refsKept).ToList();
+                Dictionary<long, SourceSnippet?>? snippets = null;
+                if (evidenceOptions.IncludeSnippet)
+                {
+                    snippets = new Dictionary<long, SourceSnippet?>(refs.Count);
+                    foreach (var reference in refs)
+                    {
+                        snippets[reference.Id] = await SourceContextReader.ReadAsync(
+                            host.Scope.Root,
+                            reference.FilePath,
+                            reference.Line,
+                            reference.Line,
+                            evidenceOptions.ContextLines,
+                            ct).ConfigureAwait(false);
+                    }
+                }
                 sb.AppendLine();
                 sb.AppendLine($"{refs.Count} references:");
                 if (refs.Count >= 2)
@@ -383,7 +432,8 @@ public static class GraphTools
                     refs: refs,
                     scopeId: host.Scope.Id,
                     elapsedMs: sw.ElapsedMilliseconds,
-                    omittedSize: refsOmitted);
+                    omittedSize: refsOmitted,
+                    snippets: snippets);
             }, ct));
 
     /// <summary>
@@ -401,7 +451,8 @@ public static class GraphTools
         IReadOnlyList<ReferenceHit> refs,
         string scopeId,
         long elapsedMs,
-        int omittedSize = 0)
+        int omittedSize = 0,
+        IReadOnlyDictionary<long, SourceSnippet?>? snippets = null)
     {
         var content = new List<ContentBlock>(capacity: 2 + refs.Count)
         {
@@ -434,16 +485,22 @@ public static class GraphTools
         content.Add(AudienceMetadata.Build(scopeId, elapsedMs, extras));
 
         var structuredReferences = refs
-            .Select(r => new FindReferenceHit(
-                SymbolId: target.Id,
-                TargetFqn: target.Fqn,
-                Kind: RefKindLabel(r.Kind),
-                Relation: RefKindLabel(r.Kind),
-                Confidence: "semantic",
-                FilePath: r.FilePath,
-                Line: r.Line,
-                Column: r.Col,
-                IsGenerated: r.IsGenerated))
+            .Select(r =>
+            {
+                SourceSnippet? snippet = null;
+                snippets?.TryGetValue(r.Id, out snippet);
+                return new FindReferenceHit(
+                    SymbolId: target.Id,
+                    TargetFqn: target.Fqn,
+                    Kind: RefKindLabel(r.Kind),
+                    Relation: RefKindLabel(r.Kind),
+                    Confidence: "semantic",
+                    FilePath: r.FilePath,
+                    Line: r.Line,
+                    Column: r.Col,
+                    IsGenerated: r.IsGenerated,
+                    Snippet: snippet);
+            })
             .ToList();
         var dto = new FindReferencesResult(
             TargetFqn: target.Fqn,
@@ -574,18 +631,30 @@ public static class GraphTools
 
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(ListCallersResult))]
     [ToolTrigger("\"who calls X?\" or \"who consumes type X?\"")]
-    [Description("List evidence-backed inbound edges into a target symbol. Every row includes canonical source/target identities, actual relation, confidence, and stored occurrence file/range evidence; malformed edges without evidence are skipped. Default kind=calls; kind=all preserves each actual edge kind. Plugin-defined kebab-case kinds are accepted.")]
+    [Description("List evidence-backed inbound edges into a target symbol. Every row includes canonical source/target identities, actual relation, confidence, and stored occurrence file/range evidence; malformed edges without evidence are skipped. Default kind=calls; kind=all preserves each actual edge kind. Set includeSnippet=true for bounded source excerpts on each evidence occurrence.")]
     public static Task<CallToolResult> ListCallersAsync(
         ScopeRouter router,
         [Description("Target symbol name or FQN")] string symbol,
         [Description("Maximum number of results to return (default 50)")] int limit = 50,
         [Description("Edge kind to walk (kebab-case): calls (default) | uses-type | overrides-member | implements-member | instantiates | throws | tests | code-behind | binds-to | binds-path | binds-element | handles-event | uses-resource | instantiates-type | merges | applies-style | all. Plugin-defined kinds are accepted.")] string? kind = null,
         [Description(ScopeDescription)] string? scope = null,
+        [Description("Output detail: summary | locations | evidence (default) | audit.")] string detail = "evidence",
+        [Description("Source lines before and after each evidence occurrence when includeSnippet=true (0-20).")] int contextLines = 0,
+        [Description("Attach bounded source excerpts to structured edge evidence (default false).")] bool includeSnippet = false,
         CancellationToken ct = default) =>
-        ToolMetrics.TrackAsync("list_callers", new { symbol, limit, kind, scope }, () =>
+        ToolMetrics.TrackAsync("list_callers", new { symbol, limit, kind, scope, detail, contextLines, includeSnippet }, () =>
             ScopedExecution.RunAsync(router, scope, async host =>
             {
                 var sw = System.Diagnostics.Stopwatch.StartNew();
+                if (!EvidenceDetailOptions.TryCreate(
+                        detail,
+                        contextLines,
+                        includeSnippet,
+                        out var evidenceOptions,
+                        out var evidenceError))
+                {
+                    return DiagnosticResult.Error($"list_callers {evidenceError}");
+                }
                 if (limit is < 1 or > 1000)
                 {
                     return DiagnosticResult.Error("list_callers `limit` must be between 1 and 1000.");
@@ -606,7 +675,13 @@ public static class GraphTools
                     limit,
                     edgeKind,
                     ct).ConfigureAwait(false);
-                var callers = traversal.Relations;
+                var callers = evidenceOptions.IncludeSnippet
+                    ? await SourceContextReader.AttachAsync(
+                        host.Scope.Root,
+                        traversal.Relations,
+                        evidenceOptions.ContextLines,
+                        ct).ConfigureAwait(false)
+                    : traversal.Relations;
                 var sb = new StringBuilder();
                 sb.AppendLine($"Inbound `{label}` to **{top.Fqn}** ({KindLabel(top.Kind)}):");
                 if (callers.Count == 0)
@@ -658,7 +733,10 @@ public static class GraphTools
                         if (payloadLine is not null) sb.AppendLine(payloadLine);
                     }
                 }
-                EvidenceTraversal.AppendRelations(sb, callers);
+                if (evidenceOptions.Detail is "evidence" or "audit")
+                {
+                    EvidenceTraversal.AppendRelations(sb, callers);
+                }
                 if (traversal.Truncated)
                 {
                     sb.AppendLine();
@@ -743,18 +821,30 @@ public static class GraphTools
 
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(ListCalleesResult))]
     [ToolTrigger("\"what does X call?\" or \"what types does X use?\"")]
-    [Description("List evidence-backed outbound edges from a source symbol. Every row includes canonical source/target identities, actual relation, confidence, and stored occurrence file/range evidence; malformed edges without evidence are skipped. Default kind=calls; kind=all preserves each actual edge kind. Plugin-defined kebab-case kinds are accepted.")]
+    [Description("List evidence-backed outbound edges from a source symbol. Every row includes canonical source/target identities, actual relation, confidence, and stored occurrence file/range evidence; malformed edges without evidence are skipped. Default kind=calls; kind=all preserves each actual edge kind. Set includeSnippet=true for bounded source excerpts on each evidence occurrence.")]
     public static Task<CallToolResult> ListCalleesAsync(
         ScopeRouter router,
         [Description("Source symbol name or FQN")] string symbol,
         [Description("Maximum number of results to return (default 50)")] int limit = 50,
         [Description("Edge kind to walk (kebab-case): calls (default) | uses-type | overrides-member | implements-member | instantiates | throws | tests | code-behind | binds-to | binds-path | binds-element | handles-event | uses-resource | instantiates-type | merges | applies-style | all. Plugin-defined kinds are accepted.")] string? kind = null,
         [Description(ScopeDescription)] string? scope = null,
+        [Description("Output detail: summary | locations | evidence (default) | audit.")] string detail = "evidence",
+        [Description("Source lines before and after each evidence occurrence when includeSnippet=true (0-20).")] int contextLines = 0,
+        [Description("Attach bounded source excerpts to structured edge evidence (default false).")] bool includeSnippet = false,
         CancellationToken ct = default) =>
-        ToolMetrics.TrackAsync("list_callees", new { symbol, limit, kind, scope }, () =>
+        ToolMetrics.TrackAsync("list_callees", new { symbol, limit, kind, scope, detail, contextLines, includeSnippet }, () =>
             ScopedExecution.RunAsync(router, scope, async host =>
             {
                 var sw = System.Diagnostics.Stopwatch.StartNew();
+                if (!EvidenceDetailOptions.TryCreate(
+                        detail,
+                        contextLines,
+                        includeSnippet,
+                        out var evidenceOptions,
+                        out var evidenceError))
+                {
+                    return DiagnosticResult.Error($"list_callees {evidenceError}");
+                }
                 if (limit is < 1 or > 1000)
                 {
                     return DiagnosticResult.Error("list_callees `limit` must be between 1 and 1000.");
@@ -775,7 +865,13 @@ public static class GraphTools
                     limit,
                     edgeKind,
                     ct).ConfigureAwait(false);
-                var callees = traversal.Relations;
+                var callees = evidenceOptions.IncludeSnippet
+                    ? await SourceContextReader.AttachAsync(
+                        host.Scope.Root,
+                        traversal.Relations,
+                        evidenceOptions.ContextLines,
+                        ct).ConfigureAwait(false)
+                    : traversal.Relations;
                 var sb = new StringBuilder();
                 sb.AppendLine($"Outbound `{label}` from **{top.Fqn}** ({KindLabel(top.Kind)}):");
                 if (callees.Count == 0)
@@ -823,7 +919,10 @@ public static class GraphTools
                         if (payloadLine is not null) sb.AppendLine(payloadLine);
                     }
                 }
-                EvidenceTraversal.AppendRelations(sb, callees);
+                if (evidenceOptions.Detail is "evidence" or "audit")
+                {
+                    EvidenceTraversal.AppendRelations(sb, callees);
+                }
                 if (traversal.Truncated)
                 {
                     sb.AppendLine();

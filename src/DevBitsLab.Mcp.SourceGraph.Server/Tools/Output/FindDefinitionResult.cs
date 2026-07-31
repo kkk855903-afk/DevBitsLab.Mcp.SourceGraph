@@ -41,4 +41,5 @@ public sealed record FindDefinitionHit(
     string Relation,
     string Confidence,
     string? Signature,
-    [property: JsonPropertyName("xml_summary")] string? XmlSummary);
+    [property: JsonPropertyName("xml_summary")] string? XmlSummary,
+    SourceSnippet? Snippet = null);

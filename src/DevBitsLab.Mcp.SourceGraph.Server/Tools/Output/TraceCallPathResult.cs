@@ -86,4 +86,5 @@ public sealed record TraceCallPathEvidence(
     [property: JsonPropertyName("end_column")] int EndColumn,
     string Confidence,
     string Producer,
-    IReadOnlyDictionary<string, string>? Metadata);
+    IReadOnlyDictionary<string, string>? Metadata,
+    SourceSnippet? Snippet = null);
