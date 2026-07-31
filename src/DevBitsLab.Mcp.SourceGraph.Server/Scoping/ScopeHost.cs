@@ -212,6 +212,17 @@ public sealed class ScopeHost : IAsyncDisposable
     /// </summary>
     public bool ProjectMapReady { get; internal set; }
 
+    /// <summary>Stable, user-facing identities of language/relation indexers loaded for this scope.</summary>
+    public IReadOnlyList<string> LoadedIndexers { get; internal set; } = ["roslyn"];
+
+    /// <summary>
+    /// Complete source-file universe observed by the registered non-Roslyn dispatcher during its
+    /// latest full walk, incrementally maintained by watcher batches. Keeping this separately from
+    /// the graph is what lets completeness reporting detect an eligible file that produced no row.
+    /// </summary>
+    public IReadOnlyCollection<string> RegisteredLanguageEligibleFiles { get; internal set; } =
+        Array.Empty<string>();
+
     public async ValueTask DisposeAsync()
     {
         MarkEmbeddingsReady(false);

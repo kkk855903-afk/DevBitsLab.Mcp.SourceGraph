@@ -699,7 +699,6 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
         var complete = new TraceCallPathExecutionState(
             "complete",
             Partial: false,
-            AbsenceAuthoritative: true,
             RetainedLastGood: false,
             Projections:
             [
@@ -711,7 +710,19 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
                     RetainedLastGood: false,
                     FailureCount: 0),
             ],
-            Failures: []);
+            Failures: [],
+            SourceCoverageComplete: true,
+            LanguageProjectionComplete: true,
+            RelationProjectionComplete: true,
+            QueryTraversalComplete: true,
+            IndexedFiles: 1,
+            EligibleFiles: 1,
+            MissingFiles: [],
+            MissingFileCount: 0,
+            MissingFilesTruncated: false,
+            LoadedIndexers: ["roslyn"],
+            IndexGeneration: 1,
+            IndexedAt: "2026-08-01T00:00:00.0000000+00:00");
         var version = new GraphReadVersion(10, 3);
 
         TraceCallPathTools.ReconcileExecutionState(

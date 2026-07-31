@@ -239,7 +239,19 @@ public static class ScopeTools
                 LastIndexedAt: host.LastIndexedAt == DateTimeOffset.MinValue ? null : host.LastIndexedAt.ToString("o"),
                 RowCounts: null,
                 IntegrityCheck: null,
-                DriftSample: null);
+                DriftSample: null,
+                SourceCoverageComplete: null,
+                LanguageProjectionComplete: null,
+                RelationProjectionComplete: null,
+                QueryTraversalComplete: null,
+                IndexedFiles: null,
+                EligibleFiles: null,
+                MissingFiles: null,
+                MissingFileCount: null,
+                MissingFilesTruncated: null,
+                LoadedIndexers: null,
+                IndexGeneration: null,
+                IndexedAt: null);
         }
 
         // Run integrity check first. If it fails, the DB's btree pages are unreliable —
@@ -260,7 +272,19 @@ public static class ScopeTools
                 LastIndexedAt: host.LastIndexedAt == DateTimeOffset.MinValue ? null : host.LastIndexedAt.ToString("o"),
                 RowCounts: null,
                 IntegrityCheck: integrity,
-                DriftSample: null);
+                DriftSample: null,
+                SourceCoverageComplete: null,
+                LanguageProjectionComplete: null,
+                RelationProjectionComplete: null,
+                QueryTraversalComplete: null,
+                IndexedFiles: null,
+                EligibleFiles: null,
+                MissingFiles: null,
+                MissingFileCount: null,
+                MissingFilesTruncated: null,
+                LoadedIndexers: null,
+                IndexGeneration: null,
+                IndexedAt: null);
         }
 
         progress?.Report(Format.Progress(baseFraction + 0.4 / hostCount, "reading row counts"));
@@ -268,6 +292,12 @@ public static class ScopeTools
 
         progress?.Report(Format.Progress(baseFraction + 0.8 / hostCount, "sampling drift"));
         var drift = await SampleDriftAsync(host, counts.Files, ct).ConfigureAwait(false);
+        var completeness = await IndexCompleteness.BuildAsync(
+            host,
+            queryTraversalComplete: true,
+            requireGrpcProjection: true,
+            requireNativeInteropProjection: host.Scope.Interop is not null,
+            ct).ConfigureAwait(false);
 
         return new VerifyScopeRow(
             Scope: host.Scope.Id,
@@ -278,7 +308,19 @@ public static class ScopeTools
             LastIndexedAt: host.LastIndexedAt == DateTimeOffset.MinValue ? null : host.LastIndexedAt.ToString("o"),
             RowCounts: new VerifyScopeCounts(counts.Symbols, counts.Refs, counts.Edges, counts.Files, counts.Annotations, counts.Diagnostics),
             IntegrityCheck: integrity,
-            DriftSample: drift);
+            DriftSample: drift,
+            SourceCoverageComplete: completeness.SourceCoverageComplete,
+            LanguageProjectionComplete: completeness.LanguageProjectionComplete,
+            RelationProjectionComplete: completeness.RelationProjectionComplete,
+            QueryTraversalComplete: completeness.QueryTraversalComplete,
+            IndexedFiles: completeness.IndexedFiles,
+            EligibleFiles: completeness.EligibleFiles,
+            MissingFiles: completeness.MissingFiles,
+            MissingFileCount: completeness.MissingFileCount,
+            MissingFilesTruncated: completeness.MissingFilesTruncated,
+            LoadedIndexers: completeness.LoadedIndexers,
+            IndexGeneration: completeness.IndexGeneration,
+            IndexedAt: completeness.IndexedAt);
     }
 
     private static async Task<VerifyScopeDriftSample> SampleDriftAsync(ScopeHost host, long totalFiles, CancellationToken ct)

@@ -202,6 +202,12 @@ public static class WpfTools
         CancellationToken ct)
     {
         var sw = Stopwatch.StartNew();
+        var completeness = await IndexCompleteness.BuildAsync(
+            host,
+            queryTraversalComplete: true,
+            requireGrpcProjection: false,
+            requireNativeInteropProjection: false,
+            ct).ConfigureAwait(false);
         var element = await ResolveElementAsync(
             host.Store,
             host.Scope.Id,
@@ -247,7 +253,8 @@ public static class WpfTools
                         ? "Candidates were bounded by the shared query limit; narrow the element filter for a complete slice."
                         : null),
                 scopes: null,
-                elapsedMs: sw.ElapsedMilliseconds);
+                elapsedMs: sw.ElapsedMilliseconds,
+                completeness: completeness);
         }
 
         var pending = new List<PendingTrace>();
@@ -389,7 +396,8 @@ public static class WpfTools
             omittedCount,
             note,
             scopes: null,
-            elapsedMs: sw.ElapsedMilliseconds);
+            elapsedMs: sw.ElapsedMilliseconds,
+            completeness: completeness);
     }
 
     private static async Task<CallToolResult> CheckResourcesScopeAsync(
@@ -400,6 +408,12 @@ public static class WpfTools
         CancellationToken ct)
     {
         var sw = Stopwatch.StartNew();
+        var completeness = await IndexCompleteness.BuildAsync(
+            host,
+            queryTraversalComplete: true,
+            requireGrpcProjection: false,
+            requireNativeInteropProjection: false,
+            ct).ConfigureAwait(false);
         var probeLimit = ProbeLimit(limit);
         var pending = new List<PendingResource>();
 
@@ -595,7 +609,8 @@ public static class WpfTools
             omittedCount,
             note,
             scopes: null,
-            elapsedMs: sw.ElapsedMilliseconds);
+            elapsedMs: sw.ElapsedMilliseconds,
+            completeness: completeness);
     }
 
     private static async Task<ElementResolution> ResolveElementAsync(
@@ -1294,7 +1309,8 @@ public static class WpfTools
         int omittedCount,
         string? note,
         IReadOnlyList<WpfScopeSummary>? scopes,
-        long elapsedMs)
+        long elapsedMs,
+        IndexCompletenessReport? completeness = null)
     {
         elementQuery = BoundOutputText(elementQuery);
         memberQuery = BoundOutputText(memberQuery);
@@ -1310,10 +1326,23 @@ public static class WpfTools
                     scopeId,
                     scopeStatus,
                     status,
-                    IsPartial(scopeStatus, truncated),
+                    IsPartial(scopeStatus, truncated)
+                    || completeness?.AbsenceAuthoritative != true,
                     truncated,
                     omittedCount,
-                    note),
+                    note,
+                    completeness?.SourceCoverageComplete ?? false,
+                    completeness?.LanguageProjectionComplete ?? false,
+                    completeness?.RelationProjectionComplete ?? false,
+                    completeness?.QueryTraversalComplete == true && !truncated,
+                    completeness?.IndexedFiles ?? 0,
+                    completeness?.EligibleFiles ?? 0,
+                    completeness?.MissingFiles ?? [],
+                    completeness?.MissingFileCount ?? 0,
+                    completeness?.MissingFilesTruncated ?? false,
+                    completeness?.LoadedIndexers ?? [],
+                    completeness?.IndexGeneration ?? 0,
+                    completeness?.IndexedAt),
             };
         var includeScopeProse = true;
         var result = CreateTraceResult(
@@ -1560,7 +1589,8 @@ public static class WpfTools
         int omittedCount,
         string? note,
         IReadOnlyList<WpfScopeSummary>? scopes,
-        long elapsedMs)
+        long elapsedMs,
+        IndexCompletenessReport? completeness = null)
     {
         fileQuery = BoundOutputText(fileQuery);
         keyQuery = BoundOutputText(keyQuery);
@@ -1574,10 +1604,23 @@ public static class WpfTools
                     scopeId,
                     scopeStatus,
                     status,
-                    IsPartial(scopeStatus, truncated),
+                    IsPartial(scopeStatus, truncated)
+                    || completeness?.AbsenceAuthoritative != true,
                     truncated,
                     omittedCount,
-                    note),
+                    note,
+                    completeness?.SourceCoverageComplete ?? false,
+                    completeness?.LanguageProjectionComplete ?? false,
+                    completeness?.RelationProjectionComplete ?? false,
+                    completeness?.QueryTraversalComplete == true && !truncated,
+                    completeness?.IndexedFiles ?? 0,
+                    completeness?.EligibleFiles ?? 0,
+                    completeness?.MissingFiles ?? [],
+                    completeness?.MissingFileCount ?? 0,
+                    completeness?.MissingFilesTruncated ?? false,
+                    completeness?.LoadedIndexers ?? [],
+                    completeness?.IndexGeneration ?? 0,
+                    completeness?.IndexedAt),
             };
         var includeScopeProse = true;
         var result = CreateResourceResult(
@@ -1807,7 +1850,19 @@ public static class WpfTools
                     Partial: true,
                     Truncated: false,
                     OmittedCount: 0,
-                    Note: BoundOutputText(DiagnosticText(scoped.Result))));
+                    Note: BoundOutputText(DiagnosticText(scoped.Result)),
+                    SourceCoverageComplete: false,
+                    LanguageProjectionComplete: false,
+                    RelationProjectionComplete: false,
+                    QueryTraversalComplete: false,
+                    IndexedFiles: 0,
+                    EligibleFiles: 0,
+                    MissingFiles: null,
+                    MissingFileCount: 0,
+                    MissingFilesTruncated: false,
+                    LoadedIndexers: null,
+                    IndexGeneration: 0,
+                    IndexedAt: null));
                 elementStatuses.Add("error");
                 continue;
             }
@@ -1880,7 +1935,19 @@ public static class WpfTools
                     Partial: true,
                     Truncated: false,
                     OmittedCount: 0,
-                    Note: BoundOutputText(DiagnosticText(scoped.Result))));
+                    Note: BoundOutputText(DiagnosticText(scoped.Result)),
+                    SourceCoverageComplete: false,
+                    LanguageProjectionComplete: false,
+                    RelationProjectionComplete: false,
+                    QueryTraversalComplete: false,
+                    IndexedFiles: 0,
+                    EligibleFiles: 0,
+                    MissingFiles: null,
+                    MissingFileCount: 0,
+                    MissingFilesTruncated: false,
+                    LoadedIndexers: null,
+                    IndexGeneration: 0,
+                    IndexedAt: null));
                 continue;
             }
 
@@ -1926,7 +1993,21 @@ public static class WpfTools
             partial || emitted?.Partial == true,
             truncated || emitted?.Truncated == true,
             Math.Max(omittedCount, emitted?.OmittedCount ?? 0),
-            BoundOutputText(CombineNotes(note, emitted?.Note, scoped.ScopeStatusMessage)));
+            BoundOutputText(CombineNotes(note, emitted?.Note, scoped.ScopeStatusMessage)),
+            emitted?.SourceCoverageComplete ?? false,
+            emitted?.LanguageProjectionComplete ?? false,
+            emitted?.RelationProjectionComplete ?? false,
+            (emitted?.QueryTraversalComplete ?? false)
+            && !truncated
+            && emitted?.Truncated != true,
+            emitted?.IndexedFiles ?? 0,
+            emitted?.EligibleFiles ?? 0,
+            emitted?.MissingFiles ?? [],
+            emitted?.MissingFileCount ?? 0,
+            emitted?.MissingFilesTruncated ?? false,
+            emitted?.LoadedIndexers ?? [],
+            emitted?.IndexGeneration ?? 0,
+            emitted?.IndexedAt);
     }
 
     private static WpfTraceMatch ScopeTraceMatch(WpfTraceMatch match, string scopeId) =>
@@ -1969,6 +2050,7 @@ public static class WpfTools
             {
                 Partial = true,
                 Truncated = true,
+                QueryTraversalComplete = false,
                 Note = null,
             };
             changed = true;
@@ -1992,6 +2074,7 @@ public static class WpfTools
         {
             Partial = true,
             Truncated = true,
+            QueryTraversalComplete = false,
             Note = BoundOutputText(CombineNotes(
                 scope.Note,
                 "Evidence was reduced to keep the response within the shared output budget.")),
@@ -2008,6 +2091,7 @@ public static class WpfTools
         {
             Partial = true,
             Truncated = true,
+            QueryTraversalComplete = false,
             OmittedCount = scope.OmittedCount == int.MaxValue
                 ? int.MaxValue
                 : scope.OmittedCount + 1,

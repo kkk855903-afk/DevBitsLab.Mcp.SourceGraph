@@ -203,7 +203,10 @@ public sealed class MedInteropFixtureContractTests
                 .ContainSingle()
                 .Which;
             tracedScope.ExecutionState.Should().NotBeNull();
-            tracedScope.ExecutionState!.Status.Should().Be("complete");
+            tracedScope.ExecutionState!.Status.Should().Be(
+                "complete",
+                "execution state was {0}",
+                JsonSerializer.Serialize(tracedScope.ExecutionState));
             tracedScope.ExecutionState.Partial.Should().BeFalse();
             tracedScope.ExecutionState.AbsenceAuthoritative
                 .Should().BeTrue();

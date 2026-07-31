@@ -231,15 +231,9 @@ public static class TraceCallPathTools
         var sw = Stopwatch.StartNew();
         var perScope = await Task.WhenAll(resolution.Hosts.Select(async host =>
         {
-            var executionState = executionProfile
-                ? BuildExecutionState(host)
-                : null;
             if (host.Status == "indexing" && !host.Ready.IsCompleted)
             {
                 await host.Ready.WaitAsync(ct).ConfigureAwait(false);
-                executionState = executionProfile
-                    ? BuildExecutionState(host)
-                    : null;
             }
             if (host.Status == "degraded")
             {
@@ -249,7 +243,11 @@ public static class TraceCallPathTools
                     Truncated: false,
                     ExpandedNodes: 0,
                     Note: $"scope is degraded: {host.StatusMessage ?? "(no message)"}",
-                    ExecutionState: executionState);
+                    ExecutionState: executionProfile
+                        ? BuildUnavailableExecutionState(
+                            host,
+                            "The scope is degraded, so index completeness cannot be established.")
+                        : null);
             }
 
             try
@@ -277,7 +275,7 @@ public static class TraceCallPathTools
             {
                 var failedExecutionState = executionProfile
                     ? MarkExecutionUnstable(
-                        BuildExecutionState(host),
+                        await TryBuildExecutionStateAsync(host, ct).ConfigureAwait(false),
                         "The graph query did not complete against a stable read.")
                     : null;
                 return new TraceCallPathScopeResult(
@@ -380,7 +378,7 @@ public static class TraceCallPathTools
             initialProjectionStamp = CaptureProjectionStamp(host);
         }
         var executionState = executionProfile
-            ? BuildExecutionState(host)
+            ? await BuildExecutionStateAsync(host, ct).ConfigureAwait(false)
             : null;
         var sourceResolution = await SymbolResolver.ResolveAsync(
             host.Store,
@@ -677,7 +675,7 @@ public static class TraceCallPathTools
 
             var finalProjectionStampBefore =
                 CaptureProjectionStamp(host);
-            var finalState = BuildExecutionState(host);
+            var finalState = await BuildExecutionStateAsync(host, ct).ConfigureAwait(false);
             var finalProjectionStampAfter =
                 CaptureProjectionStamp(host);
             var finalReadVersion = await host.Store
@@ -842,8 +840,9 @@ public static class TraceCallPathTools
         return ExecutionStage.ManagedClient;
     }
 
-    private static TraceCallPathExecutionState BuildExecutionState(
-        ScopeHost host)
+    private static async Task<TraceCallPathExecutionState> BuildExecutionStateAsync(
+        ScopeHost host,
+        CancellationToken ct)
     {
         var projections = new List<TraceCallPathProjectionState>(3);
         var failures = new List<string>();
@@ -967,8 +966,15 @@ public static class TraceCallPathTools
             }
         }
 
-        var partial = projections.Any(projection =>
-            projection.Applicable && !projection.Authoritative);
+        var completeness = await IndexCompleteness.BuildAsync(
+            host,
+            queryTraversalComplete: true,
+            requireGrpcProjection: true,
+            requireNativeInteropProjection: true,
+            ct).ConfigureAwait(false);
+        var partial = !completeness.AbsenceAuthoritative
+            || projections.Any(projection =>
+                projection.Applicable && !projection.Authoritative);
         var retainedLastGood = projections.Any(projection =>
             projection.RetainedLastGood);
         IReadOnlyList<string> boundedFailures = failures.Count
@@ -982,11 +988,72 @@ public static class TraceCallPathTools
         return new TraceCallPathExecutionState(
             partial ? "partial" : "complete",
             partial,
-            AbsenceAuthoritative: !partial,
             retainedLastGood,
             projections,
-            boundedFailures);
+            boundedFailures,
+            completeness.SourceCoverageComplete,
+            completeness.LanguageProjectionComplete,
+            completeness.RelationProjectionComplete,
+            completeness.QueryTraversalComplete,
+            completeness.IndexedFiles,
+            completeness.EligibleFiles,
+            completeness.MissingFiles,
+            completeness.MissingFileCount,
+            completeness.MissingFilesTruncated,
+            completeness.LoadedIndexers,
+            completeness.IndexGeneration,
+            completeness.IndexedAt);
     }
+
+    private static async Task<TraceCallPathExecutionState> TryBuildExecutionStateAsync(
+        ScopeHost host,
+        CancellationToken ct)
+    {
+        try
+        {
+            return await BuildExecutionStateAsync(host, ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            return BuildUnavailableExecutionState(
+                host,
+                $"Index completeness query failed: {FailureMessage.Truncate(ex.Message)}");
+        }
+    }
+
+    private static TraceCallPathExecutionState BuildUnavailableExecutionState(
+        ScopeHost host,
+        string failure) =>
+        new(
+            Status: "partial",
+            Partial: true,
+            RetainedLastGood: false,
+            Projections:
+            [
+                new TraceCallPathProjectionState(
+                    "scope",
+                    host.Status,
+                    Applicable: true,
+                    Authoritative: false,
+                    RetainedLastGood: false,
+                    FailureCount: 1),
+            ],
+            Failures: [failure],
+            SourceCoverageComplete: false,
+            LanguageProjectionComplete: false,
+            RelationProjectionComplete: false,
+            QueryTraversalComplete: false,
+            IndexedFiles: 0,
+            EligibleFiles: 0,
+            MissingFiles: [],
+            MissingFileCount: 0,
+            MissingFilesTruncated: false,
+            LoadedIndexers: host.LoadedIndexers,
+            IndexGeneration: host.IndexGeneration,
+            IndexedAt: host.LastIndexedAt == default
+                ? null
+                : host.LastIndexedAt.ToString("O"));
 
     internal static TraceCallPathExecutionState ReconcileExecutionState(
         TraceCallPathExecutionState current,
@@ -1037,7 +1104,7 @@ public static class TraceCallPathTools
         {
             Status = "partial",
             Partial = true,
-            AbsenceAuthoritative = false,
+            QueryTraversalComplete = false,
             Projections = projections,
             Failures = boundedFailures,
         };
@@ -1077,7 +1144,7 @@ public static class TraceCallPathTools
         {
             Status = "partial",
             Partial = true,
-            AbsenceAuthoritative = false,
+            QueryTraversalComplete = false,
             Projections = projections,
             Failures = boundedFailures,
         };
@@ -1260,6 +1327,22 @@ public static class TraceCallPathTools
                   .AppendLine(scope.ExecutionState.AbsenceAuthoritative
                       ? "yes"
                       : "no");
+                sb.Append("completeness: source=")
+                  .Append(scope.ExecutionState.SourceCoverageComplete ? "complete" : "partial")
+                  .Append(", language=")
+                  .Append(scope.ExecutionState.LanguageProjectionComplete ? "complete" : "partial")
+                  .Append(", relations=")
+                  .Append(scope.ExecutionState.RelationProjectionComplete ? "complete" : "partial")
+                  .Append(", traversal=")
+                  .AppendLine(scope.ExecutionState.QueryTraversalComplete ? "complete" : "partial");
+                sb.Append("coverage: indexed_files=")
+                  .Append(scope.ExecutionState.IndexedFiles)
+                  .Append(", eligible_files=")
+                  .Append(scope.ExecutionState.EligibleFiles)
+                  .Append(", missing_files=")
+                  .Append(scope.ExecutionState.MissingFileCount)
+                  .Append(", generation=")
+                  .AppendLine(scope.ExecutionState.IndexGeneration.ToString());
                 if (scope.ExecutionState.RetainedLastGood)
                 {
                     sb.AppendLine(

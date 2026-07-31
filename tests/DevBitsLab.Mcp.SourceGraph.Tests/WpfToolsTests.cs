@@ -722,7 +722,9 @@ public sealed class WpfToolBehaviorTests : IAsyncLifetime, IDisposable
         dto.Status.Should().Be("resolved");
         dto.Truncated.Should().BeFalse();
         dto.Result.Should().Be("found");
-        dto.Completeness.Should().Be("complete");
+        dto.Completeness.Should().Be("partial");
+        dto.SourceCoverageComplete.Should().BeFalse(
+            "the synthetic graph fixture has no source-content snapshot");
         dto.AbsenceAuthoritative.Should().BeFalse();
         dto.Resources.Should().HaveCount(3);
         dto.Resources.Should().OnlyContain(item => item.Key == "AccentBrush");

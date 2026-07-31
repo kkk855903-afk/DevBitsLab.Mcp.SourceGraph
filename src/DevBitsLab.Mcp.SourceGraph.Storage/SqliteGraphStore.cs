@@ -121,6 +121,22 @@ public sealed partial class SqliteGraphStore : IGraphStore
             var current = await _connection.ExecuteScalarAsync<int?>(
                 new CommandDefinition("SELECT MAX(version) FROM schema_version;", cancellationToken: ct)).ConfigureAwait(false);
 
+            if (current == Schema.Version)
+            {
+                // Replaying the full DDL against a populated external-content FTS5 table can
+                // make SQLite re-validate its trigger/table relationship and fail with the
+                // unhelpful "SQL logic error". A committed current-version marker proves the
+                // core schema transaction completed, so only the optional vec0 table may still
+                // need to be attached by a process that loaded the extension later.
+                if (_vectorExtensionLoaded && _embeddingDimension > 0)
+                {
+                    await _connection.ExecuteAsync(new CommandDefinition(
+                        Schema.V7Embeddings(_embeddingDimension),
+                        cancellationToken: ct)).ConfigureAwait(false);
+                }
+                return;
+            }
+
             if (current is not null && current < Schema.Version)
             {
                 _logger.LogInformation("On-disk graph schema is v{Old}; rebuilding to v{New}", current, Schema.Version);

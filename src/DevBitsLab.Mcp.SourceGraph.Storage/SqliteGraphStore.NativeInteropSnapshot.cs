@@ -44,6 +44,14 @@ public sealed partial class SqliteGraphStore
             replacement.Files,
             expectedFlavors,
             ct);
+        var sourceDocuments = new Dictionary<string, SourceDocumentSnapshot?>(PathComparer);
+        foreach (var file in files)
+        {
+            sourceDocuments[file.Path] = await SourceDocumentReader.TryReadAsync(
+                file.Path,
+                file.IndexedAt,
+                ct).ConfigureAwait(false);
+        }
 
         const string upsertFileSql = """
             INSERT INTO files(path, content_sha256, last_indexed_at, is_generated)
@@ -142,6 +150,12 @@ public sealed partial class SqliteGraphStore
                             cancellationToken: ct))
                     .ConfigureAwait(false);
                 fileIdsByPath.Add(file.Path, fileId);
+                await ReplaceSourceDocumentAsync(
+                    fileId,
+                    file.ContentSha256,
+                    sourceDocuments[file.Path],
+                    tx,
+                    ct).ConfigureAwait(false);
             }
 
             var symbolsByKey =

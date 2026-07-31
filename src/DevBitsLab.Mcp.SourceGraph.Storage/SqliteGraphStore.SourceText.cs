@@ -101,6 +101,29 @@ public sealed partial class SqliteGraphStore
             totalMatchingLines > hits.Count);
     }
 
+    public async Task<SourceDocumentCoverage> GetSourceDocumentCoverageAsync(
+        CancellationToken ct = default)
+    {
+        await using var reader = await OpenReaderAsync(ct).ConfigureAwait(false);
+        var rows = (await reader.QueryAsync<SourceCoverageRow>(new CommandDefinition(
+            """
+            SELECT
+                f.path AS Path,
+                CASE WHEN d.file_id IS NULL THEN 0 ELSE 1 END AS HasSourceDocument
+            FROM files f
+            LEFT JOIN source_documents d ON d.file_id = f.id
+            WHERE f.is_generated = 0
+            ORDER BY f.path;
+            """,
+            cancellationToken: ct)).ConfigureAwait(false)).AsList();
+        var eligible = rows.Select(row => row.Path).ToList();
+        var indexed = rows.Where(row => row.HasSourceDocument != 0)
+            .Select(row => row.Path).ToList();
+        var missing = rows.Where(row => row.HasSourceDocument == 0)
+            .Select(row => row.Path).ToList();
+        return new SourceDocumentCoverage(eligible, indexed, missing);
+    }
+
     private async Task<IReadOnlyList<SourceDocumentRow>> LoadSourceCandidatesAsync(
         string? literalQuery,
         CancellationToken ct)
@@ -209,4 +232,5 @@ public sealed partial class SqliteGraphStore
     }
 
     private sealed record SourceDocumentRow(long FileId, string Path, string Content);
+    private sealed record SourceCoverageRow(string Path, long HasSourceDocument);
 }

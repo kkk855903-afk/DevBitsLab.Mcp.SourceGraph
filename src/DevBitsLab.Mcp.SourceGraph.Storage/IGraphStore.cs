@@ -57,6 +57,12 @@ public interface IGraphStore : IAsyncDisposable
         throw new NotSupportedException(
             "This graph-store implementation predates first-party source text search.");
 
+    /// <summary>Return non-generated graph files, source-content-indexed files, and the gap.</summary>
+    Task<SourceDocumentCoverage> GetSourceDocumentCoverageAsync(
+        CancellationToken ct = default) =>
+        throw new NotSupportedException(
+            "This graph-store implementation predates source coverage reporting.");
+
     /// <summary>Wipes refs and edge evidence emitted by this file, then removes logical edges
     /// left with no evidence. Does NOT delete symbols — they retain stable ids across edits.</summary>
     Task ClearFileOutgoingAsync(long fileId, CancellationToken ct = default);

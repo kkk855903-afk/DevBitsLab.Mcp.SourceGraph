@@ -104,6 +104,11 @@ public sealed record SourceTextSearchPage(
     int CandidateDocuments,
     bool Truncated);
 
+public sealed record SourceDocumentCoverage(
+    IReadOnlyList<string> EligibleGraphFiles,
+    IReadOnlyList<string> IndexedSourceDocuments,
+    IReadOnlyList<string> MissingSourceDocuments);
+
 /// <summary>
 /// One persisted annotation together with its declaration owner. <see cref="AnnotationId"/> is
 /// the stable, store-local cursor used by <see cref="IGraphStore.ListAnnotationsByFlavorAsync"/>.

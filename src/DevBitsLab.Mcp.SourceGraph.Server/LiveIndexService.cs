@@ -659,6 +659,7 @@ public sealed class LiveIndexService : BackgroundService
                 EmbeddingProducerName = scopeSink is null
                     ? null
                     : SymbolTextBuilder.ProducerName(_embeddingGenerator.Model.Version),
+                LoadedIndexers = LoadedIndexerNames(scope),
             };
             host.ApplyIndexState(await store.GetIndexStateAsync(ct).ConfigureAwait(false));
             if (scope.Interop is not null)
@@ -1203,6 +1204,28 @@ public sealed class LiveIndexService : BackgroundService
         }
 
         return newHost;
+    }
+
+    private IReadOnlyList<string> LoadedIndexerNames(Scope scope)
+    {
+        var names = _languageDispatcher.Indexers.All()
+            .Select(pair => pair.Value.GetType().Name switch
+            {
+                "BuiltInRoslynLanguageIndexerStub" => "roslyn",
+                "ProtobufLanguageIndexer" => "protobuf",
+                "XamlLanguageIndexer" => "xaml",
+                "TypeScriptLanguageIndexer" => "typescript",
+                "CppSyntaxLanguageIndexer" => "cpp-syntax",
+                var name => name,
+            })
+            .Distinct(StringComparer.Ordinal)
+            .OrderBy(name => name, StringComparer.Ordinal)
+            .ToList();
+        if (scope.Interop is not null && !names.Contains("interop", StringComparer.Ordinal))
+        {
+            names.Add("interop");
+        }
+        return names;
     }
 
     private LanguageIndexerDispatcher CreateScopeLanguageDispatcher(ScopeHost host)

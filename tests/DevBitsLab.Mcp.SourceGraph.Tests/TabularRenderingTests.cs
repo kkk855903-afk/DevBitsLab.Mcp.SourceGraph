@@ -155,9 +155,11 @@ public sealed class TabularRenderingTests : IAsyncLifetime, IDisposable
     public async Task ListCallees_multipleHits_rendersTable()
     {
         // Greeter.Greet's body calls Bump and TrySet — at least 2 outbound `calls` edges. We
-        // pin to the full FQN to avoid the name-resolver picking up the Greeter constructor
-        // (whose name shares the "Greet" prefix).
-        var output = CallToolResultHelpers.ProseText(await GraphTools.ListCalleesAsync(_router!, "Sample.Domain.Greeter.Greet"));
+        // pin to the canonical key: strict resolution intentionally refuses the still-ambiguous
+        // FQN prefix instead of silently selecting the method over the constructor.
+        var output = CallToolResultHelpers.ProseText(await GraphTools.ListCalleesAsync(
+            _router!,
+            "csharp:M:Sample.Domain.Greeter.Greet(System.String)"));
         output.Should().Contain("Outbound `calls` from **");
         var firstLine = output.Split('\n')[0];
         firstLine.Should().NotStartWith("|");
