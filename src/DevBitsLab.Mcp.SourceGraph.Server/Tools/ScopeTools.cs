@@ -379,7 +379,7 @@ public static class ScopeTools
 
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(RepairScopeResult))]
     [ToolTrigger("\"this scope looks broken — try to fix it\". `mode = \"minimal\"` (cheap: prune + retry) or `mode = \"rebuild\"` (nuclear: archive + cold-index from sources). Always operates on a single named scope; reject `*` and lists.")]
-    [Description("Recover one named scope. `minimal`: integrity check (refuses if non-`ok`) → prune orphan embeddings → retry-wrap workspace reload + index. `rebuild`: archive current DB to orphans/<id>-rebuild-<ts>.db → drop → cold-index from sources. Returns structured before/after status, elapsed_ms, and a free-form message. Use `verify_scope` first to decide which mode is appropriate.")]
+    [Description("Recover one named scope. `minimal`: integrity check (refuses if non-`ok`) → prune orphan embeddings → retry-wrap workspace reload + index. `rebuild`: cold-index and validate a shadow DB → atomically promote it while retaining the old DB under orphans/. A failed shadow build leaves the active DB unchanged. Returns structured before/after status, elapsed_ms, and a free-form message. Use `verify_scope` first to decide which mode is appropriate.")]
     public static Task<CallToolResult> RepairScopeAsync(
         ScopeRouter router,
         LiveIndexService liveIndex,
@@ -428,14 +428,16 @@ public static class ScopeTools
             }
             else
             {
-                progress?.Report(Format.Progress(0.0, "archiving old DB"));
+                progress?.Report(Format.Progress(0.0, "building and validating shadow index"));
                 var post = await liveIndex.RebuildScopeAsync(scope, archiveDiscriminator: "rebuild", ct).ConfigureAwait(false);
                 progress?.Report(Format.Progress(0.95, "finalising"));
                 sw.Stop();
                 if (post is null)
                 {
-                    afterStatus = "degraded";
-                    message = "rebuild failed — see server logs for details";
+                    afterStatus = router.TryGet(scope, out var retained)
+                        ? retained.Status
+                        : "degraded";
+                    message = "shadow rebuild was rejected or could not be promoted; existing index was retained";
                 }
                 else
                 {

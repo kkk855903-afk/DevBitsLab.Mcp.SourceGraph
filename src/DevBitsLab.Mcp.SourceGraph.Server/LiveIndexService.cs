@@ -420,6 +420,129 @@ public sealed class LiveIndexService : BackgroundService
         }
     }
 
+    private async Task UpgradeSchemaThroughShadowAsync(
+        Scope scope,
+        string primaryPath,
+        CancellationToken ct)
+    {
+        var oldVersion = await GraphSchemaProbe.ReadVersionAsync(primaryPath, ct).ConfigureAwait(false);
+        _logger.LogInformation(
+            "Scope `{Id}` graph schema v{Old} requires v{New}; building a shadow index",
+            scope.Id,
+            oldVersion,
+            Schema.Version);
+
+        var shadowPath = await BuildValidatedShadowIndexAsync(
+            scope,
+            primaryPath,
+            ct).ConfigureAwait(false);
+        PromoteShadowDatabase(scope, primaryPath, shadowPath, "schema-v" + oldVersion);
+    }
+
+    private async Task<string> BuildValidatedShadowIndexAsync(
+        Scope scope,
+        string primaryPath,
+        CancellationToken ct)
+    {
+        var shadowPath = primaryPath + $".shadow-{Guid.NewGuid():N}";
+        ScopeHost? shadowHost = null;
+        try
+        {
+            shadowHost = await PrepareScopeAsync(
+                    scope,
+                    ct,
+                    registerWithRouter: false,
+                    databasePathOverride: shadowPath,
+                    persistRegistry: false,
+                    allowShadowUpgrade: false)
+                .ConfigureAwait(false);
+            if (shadowHost is null)
+            {
+                throw new InvalidOperationException(
+                    $"Scope `{scope.Id}` shadow database could not be prepared.");
+            }
+
+            await RunInitialIndexAsync(shadowHost, ct, persistRegistry: false)
+                .ConfigureAwait(false);
+            if (shadowHost.Status != "ok")
+            {
+                throw new InvalidOperationException(
+                    $"Scope `{scope.Id}` shadow index settled to {shadowHost.Status}: "
+                    + (shadowHost.StatusMessage ?? "no diagnostic"));
+            }
+
+            var integrity = await shadowHost.Store.IntegrityCheckAsync(ct).ConfigureAwait(false);
+            if (!string.Equals(integrity, "ok", StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException(
+                    $"Scope `{scope.Id}` shadow integrity check failed: {integrity}");
+            }
+
+            var counts = await shadowHost.Store.RowCountsAsync(ct).ConfigureAwait(false);
+            await shadowHost.Store.CheckpointForActivationAsync(ct).ConfigureAwait(false);
+            _logger.LogInformation(
+                "Scope `{Id}` shadow index validated ({Files} files, {Symbols} symbols, {Edges} edges)",
+                scope.Id,
+                counts.Files,
+                counts.Symbols,
+                counts.Edges);
+
+            await shadowHost.DisposeAsync().ConfigureAwait(false);
+            shadowHost = null;
+            Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+            return shadowPath;
+        }
+        catch
+        {
+            if (shadowHost is not null)
+            {
+                await shadowHost.DisposeAsync().ConfigureAwait(false);
+            }
+            Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+            DeleteShadowArtifacts(shadowPath);
+            throw;
+        }
+    }
+
+    private void PromoteShadowDatabase(
+        Scope scope,
+        string primaryPath,
+        string shadowPath,
+        string archiveDiscriminator)
+    {
+        Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+        var archive = ShadowDatabaseActivator.Activate(
+            primaryPath,
+            shadowPath,
+            ScopeLayout.OrphansDirectory(scope.Root),
+            archiveDiscriminator);
+        _logger.LogInformation(
+            "Scope `{Id}` atomically promoted shadow index; previous database retained at {Archive}",
+            scope.Id,
+            archive);
+        HealLog.Append(
+            kind: "shadow-index-promoted",
+            scope: scope.Id,
+            ok: true,
+            ms: 0,
+            details: $"archive={archive}");
+    }
+
+    private static void DeleteShadowArtifacts(string shadowPath)
+    {
+        foreach (var path in new[] { shadowPath, shadowPath + "-wal", shadowPath + "-shm" })
+        {
+            try
+            {
+                if (File.Exists(path)) File.Delete(path);
+            }
+            catch (IOException)
+            {
+                // Best effort: a uniquely named rejected shadow is never opened on next boot.
+            }
+        }
+    }
+
     /// <summary>
     /// Phase 1 of scope bring-up. Runs during <see cref="StartAsync"/> before MCP starts accepting
     /// requests: opens the graph store, prepares the embeddings drain (if available), constructs
@@ -429,10 +552,16 @@ public sealed class LiveIndexService : BackgroundService
     /// </summary>
     [SuppressMessage("Design", "CA1031:DoNotCatchGeneralExceptionTypes",
         Justification = "Bring-up of any single scope must not crash the host: a per-scope failure (Roslyn workspace, plugin embeddings, malformed config, transient I/O) marks that scope `degraded` in the registry and lets every other scope and the MCP transport keep running. The exception is logged + persisted before the catch returns.")]
-    private async Task<ScopeHost?> PrepareScopeAsync(Scope scope, CancellationToken ct, bool registerWithRouter = true)
+    private async Task<ScopeHost?> PrepareScopeAsync(
+        Scope scope,
+        CancellationToken ct,
+        bool registerWithRouter = true,
+        string? databasePathOverride = null,
+        bool persistRegistry = true,
+        bool allowShadowUpgrade = true)
     {
         var solutionPath = ResolvePrimarySolution(scope);
-        var dbPath = ScopeLayout.ScopeDbPath(scope.Root, scope.Id);
+        var dbPath = databasePathOverride ?? ScopeLayout.ScopeDbPath(scope.Root, scope.Id);
         Directory.CreateDirectory(Path.GetDirectoryName(dbPath)!);
 
         SqliteGraphStore? store = null;
@@ -441,6 +570,13 @@ public sealed class LiveIndexService : BackgroundService
         EmbeddingsHostedService? scopeEmbeddings = null;
         try
         {
+            if (allowShadowUpgrade
+                && await GraphSchemaProbe.RequiresUpgradeAsync(dbPath, ct).ConfigureAwait(false))
+            {
+                await UpgradeSchemaThroughShadowAsync(scope, dbPath, ct)
+                    .ConfigureAwait(false);
+            }
+
             store = new SqliteGraphStore(dbPath, _loggerFactory.CreateLogger<SqliteGraphStore>());
             store.TryLoadVectorExtension(_modelInfo.Dimension);
             await store.EnsureSchemaAsync(ct).ConfigureAwait(false);
@@ -501,7 +637,7 @@ public sealed class LiveIndexService : BackgroundService
                 scope.Root,
                 scope.ProjectSet.Exclude,
                 scope.Interop?.Target);
-            if (!_historyOptions.Disabled)
+            if (persistRegistry && !_historyOptions.Disabled)
             {
                 indexer.OnFileIndexed = (fileId, path, sha) =>
                     _historyQueue.Writer.WriteAsync(new HistoryRequest(fileId, path, sha, scope.Id)).AsTask();
@@ -533,7 +669,10 @@ public sealed class LiveIndexService : BackgroundService
             // "indexing" (which would hang any tool waiting on ScopeHost.Ready and trip a
             // double-dispose during StopAsync). Once the upsert succeeds, registration is a
             // pure dictionary insert under a lock and is the last fallible step here.
-            await _registry.UpsertAsync(ToRow(scope, host.Status, null), ct).ConfigureAwait(false);
+            if (persistRegistry)
+            {
+                await _registry.UpsertAsync(ToRow(scope, host.Status, null), ct).ConfigureAwait(false);
+            }
             // The live-modify path passes registerWithRouter=false because it needs to atomically
             // swap this freshly-prepared host into the slot via ScopeRouter.Replace, capturing the
             // displaced *old* host. Registering here would cause Replace to return the new host as
@@ -567,7 +706,10 @@ public sealed class LiveIndexService : BackgroundService
             // registry is recoverable on next bring-up.
             try
             {
-                await _registry.UpsertAsync(ToRow(scope, "degraded", ex.Message), ct).ConfigureAwait(false);
+                if (persistRegistry)
+                {
+                    await _registry.UpsertAsync(ToRow(scope, "degraded", ex.Message), ct).ConfigureAwait(false);
+                }
             }
             catch (Exception upsertEx)
             {
@@ -587,7 +729,10 @@ public sealed class LiveIndexService : BackgroundService
     /// </summary>
     [SuppressMessage("Design", "CA1031:DoNotCatchGeneralExceptionTypes",
         Justification = "Cold-indexing surface area spans Roslyn workspace open, MSBuild project load, our own indexer, and arbitrary plugin analyzers — any of which can throw any exception type. The broad catch logs, marks the scope `degraded`, persists the message to the registry, and signals readiness via the finally so waiting tools see the failure rather than hang. The host stays up to serve healthy scopes.")]
-    private async Task RunInitialIndexAsync(ScopeHost host, CancellationToken ct)
+    private async Task RunInitialIndexAsync(
+        ScopeHost host,
+        CancellationToken ct,
+        bool persistRegistry = true)
     {
         var scope = host.Scope;
         var solutionPath = host.SolutionPath;
@@ -836,9 +981,12 @@ public sealed class LiveIndexService : BackgroundService
                     status.UsesRetainedGraph);
             }
             host.LastIndexedAt = DateTimeOffset.UtcNow;
-            await _registry.UpsertAsync(
-                ToRow(scope, host.Status, host.StatusMessage, host.FailedProjects, host.FailedFiles),
-                ct).ConfigureAwait(false);
+            if (persistRegistry)
+            {
+                await _registry.UpsertAsync(
+                    ToRow(scope, host.Status, host.StatusMessage, host.FailedProjects, host.FailedFiles),
+                    ct).ConfigureAwait(false);
+            }
 
             // Autonomous embeddings prune: cold-index can leave behind embeddings for symbols
             // that were deleted (refactors, file renames, generator-output drift). Prune is
@@ -872,7 +1020,12 @@ public sealed class LiveIndexService : BackgroundService
             _logger.LogError(ex, "Scope `{Id}` initial indexing failed; marking degraded", scope.Id);
             host.Status = "degraded";
             host.StatusMessage = ex.Message;
-            await _registry.UpsertAsync(ToRow(scope, host.Status, host.StatusMessage, host.FailedProjects, host.FailedFiles), ct).ConfigureAwait(false);
+            if (persistRegistry)
+            {
+                await _registry.UpsertAsync(
+                    ToRow(scope, host.Status, host.StatusMessage, host.FailedProjects, host.FailedFiles),
+                    ct).ConfigureAwait(false);
+            }
         }
         finally
         {
@@ -940,10 +1093,10 @@ public sealed class LiveIndexService : BackgroundService
     }
 
     /// <summary>
-    /// Drives a full rebuild of the named scope: archives the existing DB to
-    /// <c>orphans/&lt;id&gt;-&lt;archiveDiscriminator&gt;-&lt;utc-iso&gt;.db</c> (if present), disposes the existing
-    /// <see cref="ScopeHost"/>, runs <see cref="PrepareScopeAsync"/> + <see cref="RunInitialIndexAsync"/>
-    /// for the scope, and registers the new host with the router (the call to
+    /// Drives a full rebuild of the named scope through a shadow database. The existing host
+    /// remains queryable while the shadow is indexed and validated. Only then is the old host
+    /// disposed, the database atomically replaced (with the old file retained under
+    /// <c>orphans/</c>), and a new host registered with the router. The call to
     /// <see cref="ScopeRouter.Register"/> overwrites the prior entry by id, so the rebuild is
     /// transparent to other components). Used by the <c>repair_scope</c> tool's <c>rebuild</c>
     /// mode and (in Phase 3) by the autonomous corrupt-DB recovery path.
@@ -963,39 +1116,58 @@ public sealed class LiveIndexService : BackgroundService
         var scope = oldHost.Scope;
         var dbPath = ScopeLayout.ScopeDbPath(_repoRoot.Path, scopeId);
 
-        // Step 1 — archive the existing DB if present. We dispose the host first to release SQLite
-        // handles; otherwise the move would race with the running connection.
-        await oldHost.DisposeAsync().ConfigureAwait(false);
-        // Drop SQLite's connection pool so any other handle on this DB gets reaped before the move.
-        Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
-
-        if (File.Exists(dbPath))
+        // Build and validate without touching the active database. A failure returns null while
+        // the router continues serving oldHost, so callers never observe a cleared graph.
+        string shadowPath;
+        try
         {
-            try
-            {
-                var orphansDir = ScopeLayout.OrphansDirectory(_repoRoot.Path);
-                Directory.CreateDirectory(orphansDir);
-                var ts = DateTimeOffset.UtcNow.ToString("yyyy-MM-ddTHH-mm-ssZ");
-                var dest = Path.Join(orphansDir, $"{scopeId}-{archiveDiscriminator}-{ts}.db");
-                File.Move(dbPath, dest);
-                foreach (var suffix in new[] { "-wal", "-shm" })
-                {
-                    var s = dbPath + suffix;
-                    var d = dest + suffix;
-                    if (File.Exists(s) && !File.Exists(d))
-                    {
-                        try { File.Move(s, d); } catch (IOException) { /* best-effort */ }
-                    }
-                }
-                _logger.LogInformation("Archived scope `{Id}` DB to {Dest} ahead of rebuild", scopeId, dest);
-            }
-            catch (IOException ex)
-            {
-                _logger.LogWarning(ex, "Failed to archive scope `{Id}` DB before rebuild; continuing", scopeId);
-            }
+            shadowPath = await BuildValidatedShadowIndexAsync(
+                    scope,
+                    dbPath,
+                    ct)
+                .ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            _logger.LogError(
+                ex,
+                "Scope `{Id}` shadow rebuild failed validation; existing index remains active",
+                scopeId);
+            HealLog.Append(
+                kind: "shadow-index-rejected",
+                scope: scopeId,
+                ok: false,
+                ms: 0,
+                details: ex.Message);
+            return null;
         }
 
-        // Step 2 — re-prepare + cold-index. PrepareScopeAsync registers the new host with the
+        // The activation window is deliberately short: all expensive indexing and validation is
+        // complete. Close the active connection, atomically replace the main file, then reopen.
+        await oldHost.DisposeAsync().ConfigureAwait(false);
+        try
+        {
+            PromoteShadowDatabase(scope, dbPath, shadowPath, archiveDiscriminator);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Scope `{Id}` shadow promotion failed", scopeId);
+            DeleteShadowArtifacts(shadowPath);
+            // File.Replace is atomic, so the primary still points at the old database on
+            // failure. Reopen it to replace the disposed router entry whenever possible.
+            var restored = await PrepareScopeAsync(scope, ct).ConfigureAwait(false);
+            if (restored is not null)
+            {
+                await RunInitialIndexAsync(restored, ct).ConfigureAwait(false);
+                if (IsWatchable(restored)) StartWatcher(restored, _hostStoppingToken);
+            }
+            return null;
+        }
+
+        // Re-prepare + cold-index. The second cold pass is incremental against the promoted DB;
+        // it restores the Roslyn workspace and live-indexer state required by the watcher.
+        // PrepareScopeAsync registers the new host with the
         // router (overwriting the disposed entry by id). RunInitialIndexAsync settles status.
         var newHost = await PrepareScopeAsync(scope, ct).ConfigureAwait(false);
         if (newHost is null)

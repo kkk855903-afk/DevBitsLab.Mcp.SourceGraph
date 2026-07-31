@@ -3409,6 +3409,14 @@ public sealed partial class SqliteGraphStore : IGraphStore
         return "ok";
     }
 
+    /// <summary>
+    /// Flushes the WAL into the main database before a validated shadow file is promoted.
+    /// </summary>
+    public Task CheckpointForActivationAsync(CancellationToken ct = default) =>
+        _connection.ExecuteAsync(new CommandDefinition(
+            "PRAGMA wal_checkpoint(TRUNCATE);",
+            cancellationToken: ct));
+
     public async Task BulkInsertAnnotationsAsync(IEnumerable<AnnotationRecord> annotations, CancellationToken ct = default)
     {
         const string sql = """
