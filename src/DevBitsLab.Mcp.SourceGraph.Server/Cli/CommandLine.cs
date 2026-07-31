@@ -77,6 +77,10 @@ internal sealed class CommandLine
     public bool Json { get; private init; }
     /// <summary>True when <c>--no-color</c> was passed; consumed by <c>demo</c> to suppress the green-leaf glyph on per-line output. Independent of <see cref="NoLeaf"/>, which is the server-wide opt-out.</summary>
     public bool NoColor { get; private init; }
+    /// <summary>Reopen the graph database before every benchmark probe.</summary>
+    public bool Cold { get; private init; }
+    /// <summary>Optional JSON golden-task file consumed by <c>benchmark</c>.</summary>
+    public string? GoldenPath { get; private init; }
 
     public static CommandLine Parse(string[] args)
     {
@@ -162,6 +166,8 @@ internal sealed class CommandLine
         var solutions = new List<string>();
         var json = false;
         var noColor = false;
+        var cold = false;
+        string? goldenPath = null;
         var helpLanguage = CliHelpLanguage.English;
         var sawHelpLanguage = false;
 
@@ -282,6 +288,12 @@ internal sealed class CommandLine
                 case "--no-color":
                     noColor = true;
                     break;
+                case "--cold":
+                    cold = true;
+                    break;
+                case "--golden":
+                    goldenPath = ExpandTokens(RequireArg(args, ref i, a));
+                    break;
                 default:
                     if (subcommand == "index" && solution is null && !a.StartsWith('-'))
                     {
@@ -302,6 +314,7 @@ internal sealed class CommandLine
         if (solution is not null) AssertExpanded(solution, "--solution");
         if (db is not null) AssertExpanded(db, "--db");
         if (root is not null) AssertExpanded(root, "--root");
+        if (goldenPath is not null) AssertExpanded(goldenPath, "--golden");
         if (sawHelpLanguage)
         {
             throw new ArgumentException("--lang can only be used together with --help.");
@@ -350,6 +363,8 @@ internal sealed class CommandLine
             Solutions = solutions,
             Json = json,
             NoColor = noColor,
+            Cold = cold,
+            GoldenPath = goldenPath,
         };
     }
 
@@ -472,6 +487,11 @@ internal sealed class CommandLine
           sourcegraph-mcp clear [--db <path>]
               Delete all rows from the graph database (schema preserved).
 
+          sourcegraph-mcp benchmark [--scope <id>] [--root <path>] [--db <path>] [--cold] [--golden <tasks.json>] [--json]
+              Run graph health/performance probes. --golden adds assertion-backed definition,
+              reference, implementation, edge-kind, semantic Top-K, and call-path tasks.
+              --cold reopens the database for every task. Any failed task exits 2.
+
           sourcegraph-mcp init [--yes] [--client <id>] [--no-<client>] [--user-<client>]
                                 [--claude-desktop] [--solution <path>] [--install-mode <mode>]
                                 [--print-only] [--force] [--prewarm | --no-prewarm]
@@ -581,6 +601,8 @@ internal sealed class CommandLine
                             Maximum rows returned by a `query_graph` call. Default 5000. The tool
                             returns up to <int> rows and reports `truncated: true` if more matched.
                             Equivalent to setting SOURCEGRAPH_QUERY_ROW_LIMIT=<int>.
+          --cold            Reopen the SQLite database for every benchmark task.
+          --golden <path>   Load benchmark assertions from a JSON golden-task file.
 
         Defaults:
           --db   ./.sourcegraph/scopes/default.db   (created if missing; legacy graph.db is migrated)
@@ -614,6 +636,11 @@ internal sealed class CommandLine
 
           sourcegraph-mcp clear [--db <path>]
               删除数据库中的所有数据行，但保留架构。
+
+          sourcegraph-mcp benchmark [--scope <id>] [--root <path>] [--db <path>] [--cold] [--golden <tasks.json>] [--json]
+              运行图健康度与性能探针。--golden 可增加带断言的定义、引用、实现、边类型、
+              语义 Top-K 和调用路径任务；--cold 会为每项任务重新打开数据库。
+              任一任务失败时退出码为 2。
 
           sourcegraph-mcp init [--yes] [--client <id>] [--no-<client>] [--user-<client>]
                                 [--claude-desktop] [--solution <path>] [--install-mode <mode>]
@@ -718,6 +745,8 @@ internal sealed class CommandLine
                             query_graph 每次调用最多返回的行数，默认为 5000。
                             超出时返回最多 <int> 行并报告 truncated: true。
                             等价于 SOURCEGRAPH_QUERY_ROW_LIMIT=<int>。
+          --cold            为每项 benchmark 任务重新打开 SQLite 数据库。
+          --golden <path>   从 JSON 文件加载 benchmark 断言任务。
 
         默认值:
           --db   ./.sourcegraph/scopes/default.db   （不存在时创建；旧 graph.db 会迁移）

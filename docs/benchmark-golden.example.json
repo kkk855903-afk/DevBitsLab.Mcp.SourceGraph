@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "tasks": [
+    {
+      "name": "wpf-to-native-seven-hop",
+      "kind": "path",
+      "from": "csharp:M:PostureGuard.App.MainWindow.OnStartClicked",
+      "to": "cpp:function:pg_camera_start_impl",
+      "relations": ["handles-event", "calls", "dispatches-to", "native-implementation"],
+      "minHops": 7,
+      "maxDepth": 10,
+      "maxLatencyMs": 100,
+      "maxResponseBytes": 8192
+    },
+    {
+      "name": "camera-service-definition",
+      "kind": "definition",
+      "query": "PostureGuard.App.Services.CameraService",
+      "expected_canonical_keys": ["csharp:T:PostureGuard.App.Services.CameraService"],
+      "minRecall": 1.0
+    },
+    {
+      "name": "camera-start-semantic",
+      "kind": "semantic",
+      "query": "start native camera capture",
+      "expected_canonical_keys": ["csharp:M:PostureGuard.App.Services.CameraService.Start"],
+      "topK": 10,
+      "minRecall": 1.0
+    }
+  ]
+}

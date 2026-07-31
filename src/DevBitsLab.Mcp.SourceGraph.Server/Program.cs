@@ -52,6 +52,7 @@ return cli.Subcommand switch
     "index" => await RunIndexAsync(cli).ConfigureAwait(false),
     "stats" => await RunStatsAsync(cli).ConfigureAwait(false),
     "clear" => await RunClearAsync(cli).ConfigureAwait(false),
+    "benchmark" => await BenchmarkCli.RunAsync(cli).ConfigureAwait(false),
     "init" => await InitCli.RunAsync(cli).ConfigureAwait(false),
     "doctor" => await DoctorCli.RunAsync(cli).ConfigureAwait(false),
     "demo" => await DemoCli.RunAsync(cli).ConfigureAwait(false),
