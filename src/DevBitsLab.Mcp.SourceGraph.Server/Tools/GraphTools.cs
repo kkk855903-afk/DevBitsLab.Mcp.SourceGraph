@@ -2,6 +2,7 @@ using System.ComponentModel;
 using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using DevBitsLab.Mcp.SourceGraph.Core;
 using DevBitsLab.Mcp.SourceGraph.Embeddings;
 using DevBitsLab.Mcp.SourceGraph.Sdk;
@@ -1629,6 +1630,128 @@ public static class GraphTools
                 ToolOutputJsonContext.Default.FindDataBindingsResult),
         };
     }
+
+    [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(SearchTextResult))]
+    [ToolAnnotation(ReadOnlyHint = true, IdempotentHint = true)]
+    [ToolTrigger("\"find this exact text/regex in source files\"")]
+    [Description("Search SourceGraph's own persisted source-content index; does not invoke ripgrep. Returns exact file/line/column matches, bounded context, truncation/total counts, excluded directories, and index generation.")]
+    public static Task<CallToolResult> SearchTextAsync(
+        ScopeRouter router,
+        [Description("Literal text or .NET regular expression to search for.")] string query,
+        [Description("Search mode: literal (default) | regex.")] string mode = "literal",
+        [Description("Use ordinal case-sensitive matching (default false).")] bool caseSensitive = false,
+        [Description("Optional repository-style glob such as **/*.cs, src/**, or *.xaml.")] string? fileGlob = null,
+        [Description("Source lines before and after each matching line (0-20, default 0).")] int contextLines = 0,
+        [Description("Maximum matching lines returned (1-500, default 100). Total counts still scan every candidate.")] int maxResults = 100,
+        [Description(ScopeDescription)] string? scope = null,
+        CancellationToken ct = default) =>
+        ToolMetrics.TrackAsync(
+            "search_text",
+            new { query, mode, caseSensitive, fileGlob, contextLines, maxResults, scope },
+            () => ScopedExecution.RunAsync(router, scope, async host =>
+            {
+                var sw = Stopwatch.StartNew();
+                if (string.IsNullOrWhiteSpace(query))
+                    return DiagnosticResult.Error("search_text requires a non-empty query.");
+                if (query.Length > 4096)
+                    return DiagnosticResult.Error("search_text query must not exceed 4096 characters.");
+                if (contextLines is < 0 or > 20)
+                    return DiagnosticResult.Error("search_text contextLines must be between 0 and 20.");
+                if (maxResults is < 1 or > 500)
+                    return DiagnosticResult.Error("search_text maxResults must be between 1 and 500.");
+                var normalizedMode = mode.Trim().ToLowerInvariant();
+                var searchMode = normalizedMode switch
+                {
+                    "literal" => SourceTextSearchMode.Literal,
+                    "regex" => SourceTextSearchMode.Regex,
+                    _ => (SourceTextSearchMode?)null,
+                };
+                if (searchMode is null)
+                    return DiagnosticResult.Error("search_text mode must be literal or regex.");
+
+                SourceTextSearchPage page;
+                try
+                {
+                    page = await host.Store.SearchSourceTextAsync(
+                        query,
+                        searchMode.Value,
+                        caseSensitive,
+                        fileGlob,
+                        contextLines,
+                        maxResults,
+                        ct).ConfigureAwait(false);
+                }
+                catch (RegexMatchTimeoutException)
+                {
+                    return DiagnosticResult.Error(
+                        "search_text regex exceeded the per-document safety timeout; simplify the expression.");
+                }
+                catch (ArgumentException ex)
+                {
+                    return DiagnosticResult.Error($"search_text: {ex.Message}");
+                }
+
+                var sb = new StringBuilder();
+                sb.Append(page.TotalMatchingLines)
+                    .Append(" matching lines / ")
+                    .Append(page.TotalMatches)
+                    .Append(" matches for `")
+                    .Append(query.Replace("`", "\\`", StringComparison.Ordinal))
+                    .Append("`");
+                if (page.Truncated) sb.Append(" (truncated)");
+                sb.AppendLine(".");
+                foreach (var hit in page.Hits.Take(20))
+                {
+                    sb.Append("- ").Append(Format.Location(hit.FilePath, hit.Line, hit.Column))
+                        .Append(": ").AppendLine(hit.LineText.Trim());
+                }
+                if (page.Hits.Count > 20)
+                    sb.AppendLine($"- … {page.Hits.Count - 20} more matching lines are available in structured content.");
+
+                var structuredHits = page.Hits.Select(hit => new SearchTextHit(
+                    hit.FilePath,
+                    hit.Line,
+                    hit.Column,
+                    hit.EndColumn,
+                    hit.MatchCount,
+                    hit.LineText,
+                    hit.BeforeContext,
+                    hit.AfterContext)).ToList();
+                var dto = new SearchTextResult(
+                    query,
+                    normalizedMode,
+                    caseSensitive,
+                    string.IsNullOrWhiteSpace(fileGlob) ? null : fileGlob,
+                    contextLines,
+                    maxResults,
+                    page.TotalMatches,
+                    page.TotalMatchingLines,
+                    structuredHits.Count,
+                    page.CandidateDocuments,
+                    page.Truncated,
+                    PrivacyPathPolicy.MandatoryExcludePatterns
+                        .Concat(host.Scope.ProjectSet.Exclude)
+                        .Distinct(StringComparer.OrdinalIgnoreCase)
+                        .ToList(),
+                    host.IndexGeneration,
+                    structuredHits);
+                return new CallToolResult
+                {
+                    Content =
+                    [
+                        new TextContentBlock { Text = sb.ToString() },
+                        AudienceMetadata.Build(
+                            host.Scope.Id,
+                            sw.ElapsedMilliseconds,
+                            ("matching_lines", page.TotalMatchingLines.ToString()),
+                            ("matches", page.TotalMatches.ToString()),
+                            ("truncated", page.Truncated.ToString().ToLowerInvariant())),
+                    ],
+                    StructuredContent = JsonSerializer.SerializeToElement(
+                        dto,
+                        ToolOutputJsonContext.Default.SearchTextResult),
+                };
+            }, ct));
 
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(SearchSymbolsResult))]
     [ToolTrigger("\"I only have a fragment of the name (e.g. 'Calc', 'Greet', 'Async')\"")]

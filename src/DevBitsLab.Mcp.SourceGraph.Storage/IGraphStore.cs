@@ -41,6 +41,22 @@ public interface IGraphStore : IAsyncDisposable
     Task<long> UpsertFileAsync(string path, byte[] contentSha256, DateTimeOffset indexedAt, bool isGenerated = false, CancellationToken ct = default);
     Task<byte[]?> GetFileContentHashAsync(string path, CancellationToken ct = default);
 
+    /// <summary>
+    /// Search the first-party source-content index. Literal searches use the trigram FTS index
+    /// for candidate selection when possible and always verify exact casing/content in memory;
+    /// regex searches scan the indexed documents with a bounded regex timeout.
+    /// </summary>
+    Task<SourceTextSearchPage> SearchSourceTextAsync(
+        string query,
+        SourceTextSearchMode mode,
+        bool caseSensitive,
+        string? fileGlob,
+        int contextLines,
+        int maxResults,
+        CancellationToken ct = default) =>
+        throw new NotSupportedException(
+            "This graph-store implementation predates first-party source text search.");
+
     /// <summary>Wipes refs and edge evidence emitted by this file, then removes logical edges
     /// left with no evidence. Does NOT delete symbols — they retain stable ids across edits.</summary>
     Task ClearFileOutgoingAsync(long fileId, CancellationToken ct = default);

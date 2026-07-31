@@ -318,6 +318,8 @@ public sealed partial class SqliteGraphStore : IGraphStore
 
     public async Task<long> UpsertFileAsync(string path, byte[] contentSha256, DateTimeOffset indexedAt, bool isGenerated = false, CancellationToken ct = default)
     {
+        var sourceDocument = await SourceDocumentReader.TryReadAsync(path, indexedAt, ct)
+            .ConfigureAwait(false);
         const string sql = """
             INSERT INTO files(path, content_sha256, last_indexed_at, is_generated)
             VALUES (@path, @sha, @at, @gen)
@@ -330,10 +332,20 @@ public sealed partial class SqliteGraphStore : IGraphStore
         await _writeLock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
-            return await _connection.ExecuteScalarAsync<long>(new CommandDefinition(
+            using var tx = _connection.BeginTransaction();
+            var fileId = await _connection.ExecuteScalarAsync<long>(new CommandDefinition(
                 sql,
                 new { path, sha = contentSha256, at = indexedAt.ToUnixTimeMilliseconds(), gen = isGenerated ? 1 : 0 },
+                transaction: tx,
                 cancellationToken: ct)).ConfigureAwait(false);
+            await ReplaceSourceDocumentAsync(
+                fileId,
+                contentSha256,
+                sourceDocument,
+                transaction: tx,
+                ct).ConfigureAwait(false);
+            tx.Commit();
+            return fileId;
         }
         finally
         {
@@ -1553,6 +1565,10 @@ public sealed partial class SqliteGraphStore : IGraphStore
         ArgumentNullException.ThrowIfNull(replacement.Edges);
         ArgumentNullException.ThrowIfNull(replacement.Annotations);
         ArgumentNullException.ThrowIfNull(replacement.References);
+        var sourceDocument = await SourceDocumentReader.TryReadAsync(
+            replacement.Path,
+            replacement.IndexedAt,
+            ct).ConfigureAwait(false);
 
         const string upsertFileSql = """
             INSERT INTO files(path, content_sha256, last_indexed_at, is_generated)
@@ -1627,6 +1643,12 @@ public sealed partial class SqliteGraphStore : IGraphStore
                 },
                 transaction: tx,
                 cancellationToken: ct)).ConfigureAwait(false);
+            await ReplaceSourceDocumentAsync(
+                fileId,
+                replacement.ContentSha256,
+                sourceDocument,
+                tx,
+                ct).ConfigureAwait(false);
 
             // Remove only facts produced by the prior pass for this file, retaining logical
             // edges that still have evidence from another producer file.
@@ -1984,6 +2006,47 @@ public sealed partial class SqliteGraphStore : IGraphStore
         }
     }
 
+    private async Task ReplaceSourceDocumentAsync(
+        long fileId,
+        byte[] expectedSha256,
+        SourceDocumentSnapshot? document,
+        SqliteTransaction? transaction,
+        CancellationToken ct)
+    {
+        if (document is null || !document.Sha256.AsSpan().SequenceEqual(expectedSha256))
+        {
+            await _connection.ExecuteAsync(new CommandDefinition(
+                "DELETE FROM source_documents WHERE file_id = @fileId;",
+                new { fileId },
+                transaction: transaction,
+                cancellationToken: ct)).ConfigureAwait(false);
+            return;
+        }
+
+        await _connection.ExecuteAsync(new CommandDefinition(
+            """
+            INSERT INTO source_documents(file_id, path, content, byte_length, line_count, indexed_at)
+            VALUES (@FileId, @Path, @Content, @ByteLength, @LineCount, @IndexedAt)
+            ON CONFLICT(file_id) DO UPDATE SET
+                path = excluded.path,
+                content = excluded.content,
+                byte_length = excluded.byte_length,
+                line_count = excluded.line_count,
+                indexed_at = excluded.indexed_at;
+            """,
+            new
+            {
+                FileId = fileId,
+                document.Path,
+                document.Content,
+                document.ByteLength,
+                document.LineCount,
+                IndexedAt = document.IndexedAt.ToUnixTimeMilliseconds(),
+            },
+            transaction: transaction,
+            cancellationToken: ct)).ConfigureAwait(false);
+    }
+
     private async Task<bool> DeleteFileCoreAsync(
         long fileId,
         SqliteTransaction tx,
@@ -2121,7 +2184,10 @@ public sealed partial class SqliteGraphStore : IGraphStore
         }
 
         await _connection.ExecuteAsync(new CommandDefinition(
-            "DELETE FROM symbols WHERE file_id = @id;",
+            """
+            DELETE FROM source_documents WHERE file_id = @id;
+            DELETE FROM symbols WHERE file_id = @id;
+            """,
             parameters,
             transaction: tx,
             cancellationToken: ct)).ConfigureAwait(false);

@@ -16,9 +16,13 @@ public static class Schema
     /// drops all data tables when the on-disk version is below this, since the index can always be
     /// rebuilt from source.
     /// </summary>
-    public const int Version = 17;
+    public const int Version = 18;
 
     /// <summary>
+    /// V18 adds a first-party source document store plus a trigram FTS5 content index used by
+    /// source-text search. Source contents are rebuilt from eligible indexed files and never
+    /// depend on an external ripgrep process.
+    ///
     /// V17 adds the singleton <c>index_state</c> row used to publish a persistent monotonic
     /// generation plus source-change/index-completion timestamps on every query response.
     ///
@@ -59,9 +63,9 @@ public static class Schema
     /// test/history awareness, V8 added <c>files.is_generated</c> and <c>diagnostics</c>,
     /// V7 wired in <c>sqlite-vec</c>, V6 added <c>attributes</c> + <c>attributes_fts</c>,
     /// V5 enriched symbols with modifiers/accessibility/xml_summary, V3 dropped FK constraints
-    /// from refs/edges. V16 is the cumulative drop-and-rebuild target — there is no preserved
+    /// from refs/edges. V18 is the cumulative drop-and-rebuild target — there is no preserved
     /// data path; <see cref="SqliteGraphStore.EnsureSchemaAsync"/> calls <see cref="DropAll"/>
-    /// when the on-disk version is anything below 17.
+    /// when the on-disk version is anything below 18.
     /// </summary>
     internal const string V1 = """
         CREATE TABLE IF NOT EXISTS schema_version (
@@ -75,6 +79,16 @@ public static class Schema
             last_indexed_at INTEGER NOT NULL,
             is_generated INTEGER NOT NULL DEFAULT 0
         );
+
+        CREATE TABLE IF NOT EXISTS source_documents (
+            file_id INTEGER PRIMARY KEY,
+            path TEXT UNIQUE NOT NULL,
+            content TEXT NOT NULL,
+            byte_length INTEGER NOT NULL,
+            line_count INTEGER NOT NULL,
+            indexed_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_source_documents_path ON source_documents(path);
 
         CREATE TABLE IF NOT EXISTS projection_versions (
             producer TEXT PRIMARY KEY,
@@ -322,6 +336,31 @@ public static class Schema
                 )
             );
         END;
+
+        CREATE VIRTUAL TABLE IF NOT EXISTS source_text_fts USING fts5(
+            path,
+            content,
+            content='source_documents',
+            content_rowid='file_id',
+            tokenize='trigram'
+        );
+
+        CREATE TRIGGER IF NOT EXISTS source_documents_ai AFTER INSERT ON source_documents BEGIN
+            INSERT INTO source_text_fts(rowid, path, content)
+            VALUES (new.file_id, new.path, new.content);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS source_documents_ad AFTER DELETE ON source_documents BEGIN
+            INSERT INTO source_text_fts(source_text_fts, rowid, path, content)
+            VALUES ('delete', old.file_id, old.path, old.content);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS source_documents_au AFTER UPDATE ON source_documents BEGIN
+            INSERT INTO source_text_fts(source_text_fts, rowid, path, content)
+            VALUES ('delete', old.file_id, old.path, old.content);
+            INSERT INTO source_text_fts(rowid, path, content)
+            VALUES (new.file_id, new.path, new.content);
+        END;
         """;
 
     /// <summary>
@@ -363,6 +402,11 @@ public static class Schema
         DROP TRIGGER IF EXISTS symbols_ad;
         DROP TRIGGER IF EXISTS symbols_ai;
         DROP TABLE   IF EXISTS symbols_fts;
+        DROP TRIGGER IF EXISTS source_documents_au;
+        DROP TRIGGER IF EXISTS source_documents_ad;
+        DROP TRIGGER IF EXISTS source_documents_ai;
+        DROP TABLE   IF EXISTS source_text_fts;
+        DROP TABLE   IF EXISTS source_documents;
         DROP TABLE   IF EXISTS symbol_embeddings;
         DROP TABLE   IF EXISTS embedding_meta;
         DROP TABLE   IF EXISTS edge_evidence;
