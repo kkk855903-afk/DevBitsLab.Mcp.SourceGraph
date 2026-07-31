@@ -42,6 +42,37 @@ public sealed class EmbeddingsDisabledPathTests
     }
 
     [Fact]
+    public async Task JinaCodeEmbeddingGenerator_availabilityProbe_doesNotLoadModel()
+    {
+        var directory = Path.Join(Path.GetTempPath(), "embedding-lazy-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        try
+        {
+            var modelPath = Path.Join(directory, "model.onnx");
+            var tokenizerPath = Path.Join(directory, "tokenizer.json");
+            await File.WriteAllBytesAsync(modelPath, new byte[64]);
+            await File.WriteAllTextAsync(tokenizerPath, "{}");
+            using var gen = new JinaCodeEmbeddingGenerator(
+                modelPath,
+                tokenizerPath,
+                DefaultEmbeddingModel.Info,
+                idleTimeout: TimeSpan.FromMinutes(1));
+
+            gen.IsAvailable.Should().BeTrue();
+            var runtime = gen.GetRuntimeSnapshot();
+            runtime.Loaded.Should().BeFalse();
+            runtime.ModelFileBytes.Should().Be(64);
+            runtime.ModelResidentEstimateBytes.Should().Be(0);
+            runtime.IdleTimeout.Should().Be(TimeSpan.FromMinutes(1));
+            gen.TryUnloadIfIdle(DateTimeOffset.UtcNow.AddHours(1)).Should().BeFalse();
+        }
+        finally
+        {
+            Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    [Fact]
     public void NoOpEmbeddingsRequestSink_swallowsRequests_andReportsDisabled()
     {
         var sink = new NoOpEmbeddingsRequestSink();

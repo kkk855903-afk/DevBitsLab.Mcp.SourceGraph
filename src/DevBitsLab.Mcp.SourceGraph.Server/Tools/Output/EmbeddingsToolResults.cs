@@ -14,7 +14,22 @@ public sealed record EmbeddingsStatusResult(
     int Dimension,
     [property: JsonPropertyName("cache_dir")] string CacheDir,
     IReadOnlyList<EmbeddingsFileRow> Files,
-    [property: JsonPropertyName("free_disk_bytes")] long? FreeDiskBytes);
+    [property: JsonPropertyName("free_disk_bytes")] long? FreeDiskBytes,
+    EmbeddingRuntimeResourceRow? Runtime = null);
+
+/// <summary>Process and native-resource visibility for the active embedding runtime.</summary>
+public sealed record EmbeddingRuntimeResourceRow(
+    [property: JsonPropertyName("active_model")] bool ActiveModel,
+    bool Available,
+    bool Loaded,
+    [property: JsonPropertyName("loaded_at")] DateTimeOffset? LoadedAt,
+    [property: JsonPropertyName("last_used_at")] DateTimeOffset? LastUsedAt,
+    [property: JsonPropertyName("idle_timeout_seconds")] long? IdleTimeoutSeconds,
+    [property: JsonPropertyName("model_file_bytes")] long ModelFileBytes,
+    [property: JsonPropertyName("model_resident_estimate_bytes")] long ModelResidentEstimateBytes,
+    [property: JsonPropertyName("process_working_set_bytes")] long ProcessWorkingSetBytes,
+    [property: JsonPropertyName("graph_database_file_bytes")] long GraphDatabaseFileBytes,
+    [property: JsonPropertyName("graph_cache_limit_bytes")] long GraphCacheLimitBytes);
 
 /// <summary>
 /// One file row inside <see cref="EmbeddingsStatusResult.Files"/>. <see cref="Match"/> is null

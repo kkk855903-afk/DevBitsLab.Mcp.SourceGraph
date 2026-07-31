@@ -1,8 +1,11 @@
 using System.ComponentModel;
 using System.Text;
 using System.Text.Json;
+using DevBitsLab.Mcp.SourceGraph.Embeddings;
 using DevBitsLab.Mcp.SourceGraph.Server.Observability;
+using DevBitsLab.Mcp.SourceGraph.Server.Scoping;
 using DevBitsLab.Mcp.SourceGraph.Server.Tools.Output;
+using DevBitsLab.Mcp.SourceGraph.Storage;
 using ModelContextProtocol.Protocol;
 using ModelContextProtocol.Server;
 
@@ -26,9 +29,11 @@ public static class EmbeddingsTools
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(EmbeddingsStatusResult))]
     [ToolAnnotation(ReadOnlyHint = true, IdempotentHint = true)]
     [ToolTrigger("\"is semantic search working?\" or \"where does the embedding model live on disk?\" — call before suggesting a manual cache fix")]
-    [Description("Inspect the embedding model cache: cache directory, active model id and dimension, per-file presence/size/SHA, free disk on the cache volume.")]
+    [Description("Inspect the embedding model cache and live runtime: cache files, active model id, whether ONNX is loaded, idle-unload timing, process working set, model residency estimate, graph DB bytes, and SQLite cache limits.")]
     public static Task<CallToolResult> EmbeddingsStatusAsync(
         EmbeddingsManager manager,
+        ICodeEmbeddingGenerator generator,
+        ScopeRouter router,
         string? modelId = null) =>
         ToolMetrics.TrackAsync("embeddings_status", null, async () =>
         {
@@ -40,7 +45,9 @@ public static class EmbeddingsTools
             try
             {
                 var status = await manager.GetStatusAsync(modelId).ConfigureAwait(false);
-                return BuildStatusResult(status, verifying: false, prefix: null, sw);
+                var runtime = await BuildRuntimeStatusAsync(status, generator, router)
+                    .ConfigureAwait(false);
+                return BuildStatusResult(status, verifying: false, prefix: null, sw, runtime);
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
@@ -132,7 +139,12 @@ public static class EmbeddingsTools
             }
         });
 
-    private static CallToolResult BuildStatusResult(EmbeddingsStatus status, bool verifying, string? prefix, System.Diagnostics.Stopwatch sw)
+    private static CallToolResult BuildStatusResult(
+        EmbeddingsStatus status,
+        bool verifying,
+        string? prefix,
+        System.Diagnostics.Stopwatch sw,
+        EmbeddingRuntimeResourceRow? runtime = null)
     {
         var prose = new StringBuilder();
         if (!string.IsNullOrEmpty(prefix)) prose.AppendLine(prefix);
@@ -141,6 +153,15 @@ public static class EmbeddingsTools
         if (status.FreeDiskBytes is { } free)
         {
             prose.AppendLine($"**free disk**: {FormatBytes(free)}");
+        }
+        if (runtime is not null)
+        {
+            prose.AppendLine($"**runtime**: {(runtime.Loaded ? "loaded" : "unloaded")} "
+                + $"(idle unload: {runtime.IdleTimeoutSeconds?.ToString() ?? "n/a"}s)");
+            prose.AppendLine($"**memory**: process {FormatBytes(runtime.ProcessWorkingSetBytes)}, "
+                + $"model estimate {FormatBytes(runtime.ModelResidentEstimateBytes)}, "
+                + $"SQLite cache limit {FormatBytes(runtime.GraphCacheLimitBytes)}");
+            prose.AppendLine($"**graph DB files**: {FormatBytes(runtime.GraphDatabaseFileBytes)}");
         }
         prose.AppendLine();
         if (status.Files.Count == 0)
@@ -184,7 +205,8 @@ public static class EmbeddingsTools
                 ComputedSha: f.ComputedSha,
                 PinnedSha: f.PinnedSha,
                 Match: f.Match)).ToList(),
-            FreeDiskBytes: status.FreeDiskBytes);
+            FreeDiskBytes: status.FreeDiskBytes,
+            Runtime: runtime);
 
         var anyMismatch = verifying && status.Files.Any(f => f.Match == false);
 
@@ -203,6 +225,58 @@ public static class EmbeddingsTools
             StructuredContent = JsonSerializer.SerializeToElement(dto, ToolOutputJsonContext.Default.EmbeddingsStatusResult),
             IsError = anyMismatch,
         };
+    }
+
+    private static async Task<EmbeddingRuntimeResourceRow> BuildRuntimeStatusAsync(
+        EmbeddingsStatus status,
+        ICodeEmbeddingGenerator generator,
+        ScopeRouter router)
+    {
+        var activeModel = string.Equals(
+            status.ModelId,
+            generator.Model.ModelId,
+            StringComparison.Ordinal);
+        var managed = activeModel
+            ? (generator as IManagedEmbeddingRuntime)?.GetRuntimeSnapshot()
+            : null;
+        long graphFiles = 0;
+        long graphCacheLimit = 0;
+        foreach (var host in router.All())
+        {
+            var path = ScopeLayout.ScopeDbPath(host.Scope.Root, host.Scope.Id);
+            foreach (var candidate in new[] { path, path + "-wal", path + "-shm" })
+            {
+                try
+                {
+                    if (File.Exists(candidate)) graphFiles += new FileInfo(candidate).Length;
+                }
+                catch (IOException)
+                {
+                    // Status remains useful when one concurrently-rotated file cannot be read.
+                }
+            }
+            try
+            {
+                graphCacheLimit += await host.Store.GetCacheCapacityBytesAsync().ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is IOException or Microsoft.Data.Sqlite.SqliteException)
+            {
+                // A rebuilding/disposed scope may disappear while the status call fans out.
+            }
+        }
+
+        return new EmbeddingRuntimeResourceRow(
+            ActiveModel: activeModel,
+            Available: activeModel && generator.IsAvailable,
+            Loaded: managed?.Loaded ?? false,
+            LoadedAt: managed?.LoadedAt,
+            LastUsedAt: managed?.LastUsedAt,
+            IdleTimeoutSeconds: managed is null ? null : (long)managed.IdleTimeout.TotalSeconds,
+            ModelFileBytes: managed?.ModelFileBytes ?? 0,
+            ModelResidentEstimateBytes: managed?.ModelResidentEstimateBytes ?? 0,
+            ProcessWorkingSetBytes: System.Diagnostics.Process.GetCurrentProcess().WorkingSet64,
+            GraphDatabaseFileBytes: graphFiles,
+            GraphCacheLimitBytes: graphCacheLimit);
     }
 
     private static CallToolResult BuildRemoveResult(RemoveResult result, System.Diagnostics.Stopwatch sw)

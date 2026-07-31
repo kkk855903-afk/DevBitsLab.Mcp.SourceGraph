@@ -3417,6 +3417,24 @@ public sealed partial class SqliteGraphStore : IGraphStore
             "PRAGMA wal_checkpoint(TRUNCATE);",
             cancellationToken: ct));
 
+    /// <summary>
+    /// Returns this connection's configured SQLite page-cache capacity. SQLite does not expose
+    /// exact live cache residency through SQL, so callers must label this as a limit rather than
+    /// current memory usage.
+    /// </summary>
+    public async Task<long> GetCacheCapacityBytesAsync(CancellationToken ct = default)
+    {
+        var cacheSize = await _connection.ExecuteScalarAsync<long>(new CommandDefinition(
+            "PRAGMA cache_size;",
+            cancellationToken: ct)).ConfigureAwait(false);
+        if (cacheSize < 0) return -cacheSize * 1024L;
+
+        var pageSize = await _connection.ExecuteScalarAsync<long>(new CommandDefinition(
+            "PRAGMA page_size;",
+            cancellationToken: ct)).ConfigureAwait(false);
+        return cacheSize * pageSize;
+    }
+
     public async Task BulkInsertAnnotationsAsync(IEnumerable<AnnotationRecord> annotations, CancellationToken ct = default)
     {
         const string sql = """

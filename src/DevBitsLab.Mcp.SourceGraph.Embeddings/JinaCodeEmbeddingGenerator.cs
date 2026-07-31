@@ -28,19 +28,24 @@ namespace DevBitsLab.Mcp.SourceGraph.Embeddings;
 /// next caller (the hosted service) shuts down the channel cleanly.
 /// </para>
 /// </summary>
-public sealed class JinaCodeEmbeddingGenerator : ICodeEmbeddingGenerator
+public sealed class JinaCodeEmbeddingGenerator : ICodeEmbeddingGenerator, IManagedEmbeddingRuntime
 {
     private readonly string _modelOnnxPath;
     private readonly string _tokenizerJsonPath;
     private readonly ILogger _logger;
     private readonly EmbeddingModelInfo _model;
     private readonly int _maxTokens;
+    private readonly TimeSpan _idleTimeout;
 
     private InferenceSession? _session;
     private Tokenizer? _tokenizer;
     private long _padId;
     private bool _initialised;
     private bool _available;
+    private bool _disposed;
+    private DateTimeOffset? _loadedAt;
+    private DateTimeOffset? _lastUsedAt;
+    private readonly Timer _idleTimer;
     private readonly object _initLock = new();
     // Serialises EmbedAsync calls. The interface contract only guarantees single-worker access,
     // but the host now wires one drain per scope (all sharing this singleton generator), so we
@@ -52,13 +57,24 @@ public sealed class JinaCodeEmbeddingGenerator : ICodeEmbeddingGenerator
         string tokenizerJsonPath,
         EmbeddingModelInfo model,
         int maxTokens = 8192,
+        TimeSpan? idleTimeout = null,
         ILogger? logger = null)
     {
         _modelOnnxPath = modelOnnxPath;
         _tokenizerJsonPath = tokenizerJsonPath;
         _model = model;
         _maxTokens = maxTokens;
+        _idleTimeout = idleTimeout ?? TimeSpan.FromMinutes(5);
+        if (_idleTimeout <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(idleTimeout), "Idle timeout must be positive.");
+        }
         _logger = logger ?? NullLogger.Instance;
+        _idleTimer = new Timer(
+            static state => ((JinaCodeEmbeddingGenerator)state!).TryUnloadIfIdle(DateTimeOffset.UtcNow),
+            this,
+            _idleTimeout,
+            _idleTimeout);
     }
 
     public EmbeddingModelInfo Model => _model;
@@ -67,20 +83,20 @@ public sealed class JinaCodeEmbeddingGenerator : ICodeEmbeddingGenerator
     {
         get
         {
-            EnsureInitialised();
-            return _available;
+            lock (_initLock)
+            {
+                if (_disposed) return false;
+                if (_initialised) return _available;
+                // Availability probing stays cheap and does not map the ONNX model into memory.
+                // EmbedAsync performs the real tokenizer/session load on first use.
+                return File.Exists(_modelOnnxPath) && File.Exists(_tokenizerJsonPath);
+            }
         }
     }
 
     public async Task<IReadOnlyList<float[]>> EmbedAsync(IReadOnlyList<string> inputs, CancellationToken ct = default)
     {
         if (inputs.Count == 0) return Array.Empty<float[]>();
-        EnsureInitialised();
-        if (!_available || _session is null || _tokenizer is null)
-        {
-            throw new InvalidOperationException("Embedding generator is not available; check IsAvailable before calling.");
-        }
-
         // Run the synchronous ONNX session call on a worker so we don't block the indexer's
         // task pump. ORT's Run() is reentrant-safe per session, but we serialise here because
         // the host now shares this singleton across one drain task per scope — the interface
@@ -88,6 +104,12 @@ public sealed class JinaCodeEmbeddingGenerator : ICodeEmbeddingGenerator
         await _embedGate.WaitAsync(ct).ConfigureAwait(false);
         try
         {
+            EnsureInitialised();
+            if (!_available || _session is null || _tokenizer is null)
+            {
+                throw new InvalidOperationException("Embedding generator is not available; check IsAvailable before calling.");
+            }
+            _lastUsedAt = DateTimeOffset.UtcNow;
             return await Task.Run(() => EncodeBatch(inputs, ct), ct).ConfigureAwait(false);
         }
         finally
@@ -229,6 +251,8 @@ public sealed class JinaCodeEmbeddingGenerator : ICodeEmbeddingGenerator
                     _tokenizer = tokenizer;
                     _padId = padId;
                     _available = true;
+                    _loadedAt = DateTimeOffset.UtcNow;
+                    _lastUsedAt = _loadedAt;
                     _logger.LogInformation("Loaded embedding model {Model} (dim={Dim})", _model.ModelId, _model.Dimension);
                 }
                 else
@@ -244,6 +268,7 @@ public sealed class JinaCodeEmbeddingGenerator : ICodeEmbeddingGenerator
                 _session?.Dispose();
                 _session = null;
                 _tokenizer = null;
+                _loadedAt = null;
             }
             _initialised = true;
         }
@@ -436,9 +461,90 @@ public sealed class JinaCodeEmbeddingGenerator : ICodeEmbeddingGenerator
 
     public void Dispose()
     {
+        _idleTimer.Dispose();
+        _embedGate.Wait();
+        try
+        {
+            lock (_initLock)
+            {
+                _disposed = true;
+                UnloadCore();
+                _available = false;
+                _initialised = true;
+            }
+        }
+        finally
+        {
+            _embedGate.Release();
+        }
+        _embedGate.Dispose();
+    }
+
+    public EmbeddingRuntimeSnapshot GetRuntimeSnapshot()
+    {
+        lock (_initLock)
+        {
+            var fileBytes = File.Exists(_modelOnnxPath)
+                ? new FileInfo(_modelOnnxPath).Length
+                : 0;
+            return new EmbeddingRuntimeSnapshot(
+                Loaded: _session is not null,
+                Available: !_disposed && (_initialised
+                    ? _available
+                    : fileBytes > 0 && File.Exists(_tokenizerJsonPath)),
+                LoadedAt: _loadedAt,
+                LastUsedAt: _lastUsedAt,
+                IdleTimeout: _idleTimeout,
+                ModelFileBytes: fileBytes,
+                // ORT does not expose allocator residency per session. The ONNX file size is a
+                // stable, explicitly-labelled estimate rather than a misleading process delta.
+                ModelResidentEstimateBytes: _session is null ? 0 : fileBytes);
+        }
+    }
+
+    public bool TryUnloadIfIdle(DateTimeOffset now)
+    {
+        try
+        {
+            if (!_embedGate.Wait(0)) return false;
+        }
+        catch (ObjectDisposedException)
+        {
+            return false;
+        }
+        try
+        {
+            lock (_initLock)
+            {
+                if (_session is null || _lastUsedAt is null
+                    || now - _lastUsedAt.Value < _idleTimeout)
+                {
+                    return false;
+                }
+
+                UnloadCore();
+                // Allow the next EmbedAsync call to recreate the session. File availability is
+                // re-evaluated then, so a cache removal while idle also fails closed.
+                _initialised = false;
+                _available = false;
+                _logger.LogInformation(
+                    "Unloaded embedding model {Model} after {Idle} of inactivity",
+                    _model.ModelId,
+                    _idleTimeout);
+                return true;
+            }
+        }
+        finally
+        {
+            _embedGate.Release();
+        }
+    }
+
+    private void UnloadCore()
+    {
         _session?.Dispose();
         _session = null;
         _tokenizer = null;
-        _embedGate.Dispose();
+        _loadedAt = null;
     }
 }

@@ -6,6 +6,7 @@ using System.Text.Json;
 using System.Threading.Tasks;
 using DevBitsLab.Mcp.SourceGraph.Embeddings;
 using DevBitsLab.Mcp.SourceGraph.Server;
+using DevBitsLab.Mcp.SourceGraph.Server.Scoping;
 using DevBitsLab.Mcp.SourceGraph.Server.Tools;
 using FluentAssertions;
 using Xunit;
@@ -30,7 +31,10 @@ public sealed class EmbeddingsToolsTests : IDisposable
     public async Task EmbeddingsStatusAsync_returnsTypedStructuredContent()
     {
         var (mgr, _) = MakeManager();
-        var result = await EmbeddingsTools.EmbeddingsStatusAsync(mgr);
+        var result = await EmbeddingsTools.EmbeddingsStatusAsync(
+            mgr,
+            new DisabledEmbeddingGenerator(DefaultEmbeddingModel.Info),
+            new ScopeRouter());
 
         result.IsError.Should().NotBe(true);
         result.StructuredContent.HasValue.Should().BeTrue();
@@ -39,6 +43,11 @@ public sealed class EmbeddingsToolsTests : IDisposable
         json.GetProperty("dimension").GetInt32().Should().Be(DefaultEmbeddingModel.Dimension);
         json.GetProperty("cache_dir").GetString().Should().NotBeNullOrEmpty();
         json.GetProperty("files").GetArrayLength().Should().Be(2);
+        var runtime = json.GetProperty("runtime");
+        runtime.GetProperty("active_model").GetBoolean().Should().BeTrue();
+        runtime.GetProperty("loaded").GetBoolean().Should().BeFalse();
+        runtime.GetProperty("process_working_set_bytes").GetInt64().Should().BePositive();
+        runtime.GetProperty("graph_database_file_bytes").GetInt64().Should().Be(0);
     }
 
     [Fact]
