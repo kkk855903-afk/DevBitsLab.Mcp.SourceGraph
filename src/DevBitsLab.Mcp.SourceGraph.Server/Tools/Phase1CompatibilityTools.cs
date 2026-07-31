@@ -212,7 +212,7 @@ public static class Phase1CompatibilityTools
         [Description("Maximum traversal depth (default 4)")] int maxDepth = 4,
         [Description("Maximum results (default 100)")] int limit = 100,
         [Description("Edge kind to walk (default calls); pass all to walk every indexed edge kind")] string? kind = null,
-        [Description("Output detail: summary (default) | paths | evidence")] string detail = "summary",
+        [Description("Output detail: summary (default) | locations | evidence | audit; legacy paths is accepted.")] string detail = "summary",
         [Description("Optional file-path hint used to disambiguate symbols with the same name.")] string? file = null,
         [Description("Optional kebab-case symbol kind used to disambiguate the target.")] string? symbolKind = null,
         [Description(ScopeDescription)] string? scope = null,

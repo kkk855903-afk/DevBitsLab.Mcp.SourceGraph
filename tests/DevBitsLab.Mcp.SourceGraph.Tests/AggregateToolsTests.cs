@@ -68,7 +68,12 @@ public sealed class AggregateToolsTests : IAsyncLifetime
         dto.Status.Should().Be("ok");
         dto.Definition.Should().NotBeNull();
         dto.Definition!.CanonicalKey.Should().NotBeNullOrEmpty();
+        dto.Definition.FilePath.Should().BeNull();
+        dto.Definition.FileRef.Should().MatchRegex("^f[0-9]+$");
+        dto.Files.Should().ContainKey(dto.Definition.FileRef!);
         dto.References.Should().NotBeEmpty();
+        dto.References.Should().OnlyContain(reference =>
+            reference.FilePath == null && reference.FileRef != null);
     }
 
     [Fact]
@@ -84,6 +89,43 @@ public sealed class AggregateToolsTests : IAsyncLifetime
         dto.Status.Should().Be("ok");
         dto.Definition.Should().NotBeNull();
         dto.Members.Should().NotBeEmpty();
+        dto.Files.Should().NotBeEmpty();
+    }
+
+    [Fact]
+    public async Task SymbolOverview_summaryReturnsCountsWithoutLocationRows()
+    {
+        var result = await AggregateTools.SymbolOverviewAsync(
+            _router!,
+            "Sample.Domain.Calculator",
+            detail: "summary");
+
+        var dto = JsonSerializer.Deserialize(
+            result.StructuredContent!.Value,
+            ToolOutputJsonContext.Default.SymbolOverviewResult)!;
+        dto.Detail.Should().Be("summary");
+        dto.Counts.Members.Should().BeGreaterThan(0);
+        dto.Members.Should().BeEmpty();
+        dto.Callers.Should().BeEmpty();
+        dto.Implementations.Should().BeEmpty();
+    }
+
+    [Fact]
+    public async Task ResolveAndReferences_nonCompactKeepsPathsInline()
+    {
+        var result = await AggregateTools.ResolveAndReferencesAsync(
+            _router!,
+            "Sample.Domain.Calculator.Add",
+            compact: false);
+
+        var dto = JsonSerializer.Deserialize(
+            result.StructuredContent!.Value,
+            ToolOutputJsonContext.Default.ResolveAndReferencesResult)!;
+        dto.Files.Should().BeEmpty();
+        dto.Definition!.FilePath.Should().NotBeNullOrEmpty();
+        dto.Definition.FileRef.Should().BeNull();
+        dto.References.Should().OnlyContain(reference =>
+            reference.FilePath != null && reference.FileRef == null);
     }
 
     [Fact]

@@ -7,7 +7,8 @@ public sealed record AggregateSymbol(
     [property: JsonPropertyName("canonical_key")] string? CanonicalKey,
     string Fqn,
     string Kind,
-    [property: JsonPropertyName("file_path")] string FilePath,
+    [property: JsonPropertyName("file_path")] string? FilePath,
+    [property: JsonPropertyName("file_ref")] string? FileRef,
     int Line,
     int Column,
     [property: JsonPropertyName("end_line")] int EndLine,
@@ -16,7 +17,8 @@ public sealed record AggregateSymbol(
 
 public sealed record AggregateReference(
     string Kind,
-    [property: JsonPropertyName("file_path")] string FilePath,
+    [property: JsonPropertyName("file_path")] string? FilePath,
+    [property: JsonPropertyName("file_ref")] string? FileRef,
     int Line,
     int Column,
     [property: JsonPropertyName("is_generated")] bool IsGenerated);
@@ -25,12 +27,32 @@ public sealed record AggregateRelation(
     AggregateSymbol Symbol,
     string Relation,
     string Confidence,
-    IReadOnlyList<TraceCallPathEvidence> Evidence,
+    IReadOnlyList<AggregateEvidence> Evidence,
     [property: JsonPropertyName("evidence_truncated")] bool EvidenceTruncated);
+
+public sealed record AggregateEvidence(
+    [property: JsonPropertyName("file_path")] string? FilePath,
+    [property: JsonPropertyName("file_ref")] string? FileRef,
+    [property: JsonPropertyName("start_line")] int StartLine,
+    [property: JsonPropertyName("start_column")] int StartColumn,
+    [property: JsonPropertyName("end_line")] int EndLine,
+    [property: JsonPropertyName("end_column")] int EndColumn,
+    string Confidence,
+    string Producer,
+    SourceSnippet? Snippet);
+
+public sealed record AggregateCounts(
+    int References = 0,
+    int Members = 0,
+    int Callers = 0,
+    int Implementations = 0);
 
 public sealed record ResolveAndReferencesResult(
     string Query,
     string Status,
+    string Detail,
+    IReadOnlyDictionary<string, string> Files,
+    AggregateCounts Counts,
     IReadOnlyList<AggregateSymbol> Candidates,
     AggregateSymbol? Definition,
     bool Truncated,
@@ -39,6 +61,9 @@ public sealed record ResolveAndReferencesResult(
 public sealed record SymbolOverviewResult(
     string Query,
     string Status,
+    string Detail,
+    IReadOnlyDictionary<string, string> Files,
+    AggregateCounts Counts,
     IReadOnlyList<AggregateSymbol> Candidates,
     AggregateSymbol? Definition,
     bool Truncated,
@@ -51,7 +76,9 @@ public sealed record BatchQueryRequest(
     string Symbol,
     int Limit = 20,
     [property: JsonPropertyName("include_generated")] bool IncludeGenerated = false,
-    [property: JsonPropertyName("file_hint")] string? FileHint = null);
+    [property: JsonPropertyName("file_hint")] string? FileHint = null,
+    string Detail = "locations",
+    bool Compact = true);
 
 public sealed record BatchQueryItemResult(
     string Operation,

@@ -1973,7 +1973,7 @@ public static class GraphTools
         [Description("Maximum traversal depth (default 4)")] int maxDepth = 4,
         [Description("Maximum results (default 100)")] int limit = 100,
         [Description("Edge kind to walk (kebab-case): calls (default) | uses-type | overrides-member | implements-member | instantiates | throws | tests | code-behind | binds-to | binds-path | binds-element | handles-event | uses-resource | instantiates-type | merges | applies-style | all. Plugin-defined kinds are accepted.")] string? kind = null,
-        [Description("Output detail: summary (default, smallest) | paths (predecessors only) | evidence (full occurrence evidence). Structured output always remains auditable.")] string detail = "summary",
+        [Description("Output detail: summary (default) | locations | evidence | audit. The legacy value paths remains accepted for predecessor-only prose. Structured output always remains auditable.")] string detail = "summary",
         [Description("Optional file-path hint used to disambiguate symbols with the same name.")] string? file = null,
         [Description("Optional kebab-case symbol kind used to disambiguate the target.")] string? symbolKind = null,
         [Description(ScopeDescription)] string? scope = null,
@@ -1992,10 +1992,16 @@ public static class GraphTools
                     return DiagnosticResult.Error("impact_of_change `limit` must be between 1 and 1000.");
                 }
                 var detailLevel = detail.Trim().ToLowerInvariant();
-                if (detailLevel is not ("summary" or "paths" or "evidence"))
+                if (detailLevel != "paths"
+                    && !EvidenceDetailOptions.TryCreate(
+                        detailLevel,
+                        0,
+                        false,
+                        out _,
+                        out _))
                 {
                     return DiagnosticResult.Error(
-                        "impact_of_change `detail` must be summary, paths, or evidence.");
+                        "impact_of_change `detail` must be summary, locations, evidence, or audit (legacy paths is also accepted).");
                 }
                 var (edgeKind, label, isAll) = NormaliseEdgeKindParam(kind);
                 if (!isAll && edgeKind is not null)
@@ -2069,7 +2075,7 @@ public static class GraphTools
                 {
                     EvidenceTraversal.AppendImpactPredecessors(sb, rows);
                 }
-                else if (detailLevel == "evidence")
+                else if (detailLevel is "evidence" or "audit")
                 {
                     EvidenceTraversal.AppendImpactPaths(sb, rows);
                 }

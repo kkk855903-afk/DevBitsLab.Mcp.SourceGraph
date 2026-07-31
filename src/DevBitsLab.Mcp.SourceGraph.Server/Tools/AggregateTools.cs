@@ -26,11 +26,13 @@ public static class AggregateTools
         [Description("Maximum references (1-500, default 50).")] int limit = 50,
         [Description("Include references from generated files.")] bool includeGenerated = false,
         [Description("Optional file-path hint used during resolution.")] string? fileHint = null,
+        [Description("Output detail: summary | locations (default) | evidence | audit.")] string detail = "locations",
+        [Description("Replace repeated file paths with a response-local file dictionary (default true).")] bool compact = true,
         [Description(ScopeDescription)] string? scope = null,
         CancellationToken ct = default) =>
         ToolMetrics.TrackAsync(
             "resolve_and_references",
-            new { symbol, limit, includeGenerated, fileHint, scope },
+            new { symbol, limit, includeGenerated, fileHint, detail, compact, scope },
             () => ScopedExecution.RunAsync(router, scope, async host =>
             {
                 var sw = System.Diagnostics.Stopwatch.StartNew();
@@ -39,12 +41,20 @@ public static class AggregateTools
                     return DiagnosticResult.Error(
                         "resolve_and_references `limit` must be between 1 and 500.");
                 }
+                if (!EvidenceDetailOptions.TryCreate(
+                        detail, 0, false, out var options, out var detailError))
+                {
+                    return DiagnosticResult.Error(
+                        $"resolve_and_references {detailError}");
+                }
                 var dto = await BuildResolveAndReferencesAsync(
                     host,
                     symbol,
                     limit,
                     includeGenerated,
                     fileHint,
+                    options.Detail,
+                    compact,
                     ct).ConfigureAwait(false);
                 return BuildResult(
                     StatusLine(dto.Status, symbol, dto.References.Count),
@@ -63,11 +73,13 @@ public static class AggregateTools
         [Description("Symbol name, FQN, or canonical key.")] string symbol,
         [Description("Maximum rows per category (1-200, default 20).")] int limit = 20,
         [Description("Optional file-path hint used during resolution.")] string? fileHint = null,
+        [Description("Output detail: summary | locations (default) | evidence | audit.")] string detail = "locations",
+        [Description("Replace repeated file paths with a response-local file dictionary (default true).")] bool compact = true,
         [Description(ScopeDescription)] string? scope = null,
         CancellationToken ct = default) =>
         ToolMetrics.TrackAsync(
             "symbol_overview",
-            new { symbol, limit, fileHint, scope },
+            new { symbol, limit, fileHint, detail, compact, scope },
             () => ScopedExecution.RunAsync(router, scope, async host =>
             {
                 var sw = System.Diagnostics.Stopwatch.StartNew();
@@ -76,11 +88,18 @@ public static class AggregateTools
                     return DiagnosticResult.Error(
                         "symbol_overview `limit` must be between 1 and 200.");
                 }
+                if (!EvidenceDetailOptions.TryCreate(
+                        detail, 0, false, out var options, out var detailError))
+                {
+                    return DiagnosticResult.Error($"symbol_overview {detailError}");
+                }
                 var dto = await BuildSymbolOverviewAsync(
                     host,
                     symbol,
                     limit,
                     fileHint,
+                    options.Detail,
+                    compact,
                     ct).ConfigureAwait(false);
                 var count = dto.Members.Count + dto.Callers.Count + dto.Implementations.Count;
                 return BuildResult(
@@ -126,6 +145,15 @@ public static class AggregateTools
                         return DiagnosticResult.Error(
                             "batch_query operation must be resolve_and_references or symbol_overview.");
                     }
+                    if (!EvidenceDetailOptions.TryCreate(
+                            request.Detail,
+                            0,
+                            false,
+                            out var options,
+                            out var detailError))
+                    {
+                        return DiagnosticResult.Error($"batch_query {detailError}");
+                    }
 
                     if (operation == "resolve_and_references")
                     {
@@ -140,6 +168,8 @@ public static class AggregateTools
                             request.Limit,
                             request.IncludeGenerated,
                             request.FileHint,
+                            options.Detail,
+                            request.Compact,
                             ct).ConfigureAwait(false);
                         results.Add(new BatchQueryItemResult(
                             operation,
@@ -160,6 +190,8 @@ public static class AggregateTools
                             request.Symbol,
                             request.Limit,
                             request.FileHint,
+                            options.Detail,
+                            request.Compact,
                             ct).ConfigureAwait(false);
                         results.Add(new BatchQueryItemResult(
                             operation,
@@ -186,8 +218,11 @@ public static class AggregateTools
         int limit,
         bool includeGenerated,
         string? fileHint,
+        string detail,
+        bool compact,
         CancellationToken ct)
     {
+        var paths = new FileTableBuilder(compact);
         var (status, candidates, selected) = await ResolveAsync(
             host.Store,
             query,
@@ -198,7 +233,10 @@ public static class AggregateTools
             return new ResolveAndReferencesResult(
                 query,
                 status,
-                candidates.Select(MapSymbol).ToList(),
+                detail,
+                paths.Files,
+                new AggregateCounts(),
+                candidates.Select(candidate => MapSymbol(candidate, paths)).ToList(),
                 null,
                 false,
                 Array.Empty<AggregateReference>());
@@ -210,18 +248,23 @@ public static class AggregateTools
             checked(limit + 1),
             ct).ConfigureAwait(false);
         var truncated = references.Count > limit;
+        IReadOnlyList<AggregateReference> visibleReferences = detail == "summary"
+            ? Array.Empty<AggregateReference>()
+            : references.Take(limit).Select(reference => MapReference(reference, paths)).ToList();
+        var mappedCandidates = candidates
+            .Select(candidate => MapSymbol(candidate, paths))
+            .ToList();
+        var definition = MapSymbol(selected, paths);
         return new ResolveAndReferencesResult(
             query,
             "ok",
-            candidates.Select(MapSymbol).ToList(),
-            MapSymbol(selected),
+            detail,
+            paths.Files,
+            new AggregateCounts(References: references.Count),
+            mappedCandidates,
+            definition,
             truncated,
-            references.Take(limit).Select(reference => new AggregateReference(
-                GraphTools.RefKindLabel(reference.Kind),
-                reference.FilePath,
-                reference.Line,
-                reference.Col,
-                reference.IsGenerated)).ToList());
+            visibleReferences);
     }
 
     private static async Task<SymbolOverviewResult> BuildSymbolOverviewAsync(
@@ -229,8 +272,11 @@ public static class AggregateTools
         string query,
         int limit,
         string? fileHint,
+        string detail,
+        bool compact,
         CancellationToken ct)
     {
+        var paths = new FileTableBuilder(compact);
         var (status, candidates, selected) = await ResolveAsync(
             host.Store,
             query,
@@ -241,7 +287,10 @@ public static class AggregateTools
             return new SymbolOverviewResult(
                 query,
                 status,
-                candidates.Select(MapSymbol).ToList(),
+                detail,
+                paths.Files,
+                new AggregateCounts(),
+                candidates.Select(candidate => MapSymbol(candidate, paths)).ToList(),
                 null,
                 false,
                 Array.Empty<AggregateSymbol>(),
@@ -268,20 +317,44 @@ public static class AggregateTools
             || callers.Truncated
             || implementations.Count > limit;
 
+        var mappedCandidates = candidates
+            .Select(candidate => MapSymbol(candidate, paths))
+            .ToList();
+        var definition = MapSymbol(selected, paths);
+        IReadOnlyList<AggregateSymbol> visibleMembers = detail == "summary"
+            ? Array.Empty<AggregateSymbol>()
+            : members.Take(limit).Select(member => MapSymbol(member, paths)).ToList();
+        IReadOnlyList<AggregateSymbol> visibleImplementations = detail == "summary"
+            ? Array.Empty<AggregateSymbol>()
+            : implementations.Take(limit)
+                .Select(implementation => MapSymbol(implementation, paths))
+                .ToList();
+        IReadOnlyList<AggregateRelation> visibleCallers = detail == "summary"
+            ? Array.Empty<AggregateRelation>()
+            : callers.Relations.Select(relation => new AggregateRelation(
+                MapSymbol(relation.Source, paths),
+                relation.Hop.Relation,
+                relation.Hop.Confidence,
+                detail is "evidence" or "audit"
+                    ? relation.Hop.Evidence.Select(item => MapEvidence(item, paths)).ToList()
+                    : Array.Empty<AggregateEvidence>(),
+                relation.Hop.EvidenceTruncated)).ToList();
+
         return new SymbolOverviewResult(
             query,
             "ok",
-            candidates.Select(MapSymbol).ToList(),
-            MapSymbol(selected),
+            detail,
+            paths.Files,
+            new AggregateCounts(
+                Members: members.Count,
+                Callers: callers.Relations.Count,
+                Implementations: implementations.Count),
+            mappedCandidates,
+            definition,
             truncated,
-            members.Take(limit).Select(MapSymbol).ToList(),
-            callers.Relations.Select(relation => new AggregateRelation(
-                MapSymbol(relation.Source),
-                relation.Hop.Relation,
-                relation.Hop.Confidence,
-                relation.Hop.Evidence,
-                relation.Hop.EvidenceTruncated)).ToList(),
-            implementations.Take(limit).Select(MapSymbol).ToList());
+            visibleMembers,
+            visibleCallers,
+            visibleImplementations);
     }
 
     private static async Task<(string Status, IReadOnlyList<SymbolHit> Candidates, SymbolHit? Selected)>
@@ -309,17 +382,55 @@ public static class AggregateTools
             : ("ambiguous", candidates, null);
     }
 
-    private static AggregateSymbol MapSymbol(SymbolHit symbol) => new(
-        symbol.Id,
-        symbol.CanonicalKey,
-        symbol.Fqn,
-        symbol.Kind,
-        symbol.FilePath,
-        symbol.StartLine,
-        symbol.StartCol,
-        symbol.EndLine,
-        symbol.EndCol,
-        string.IsNullOrEmpty(symbol.Signature) ? null : symbol.Signature);
+    private static AggregateSymbol MapSymbol(
+        SymbolHit symbol,
+        FileTableBuilder paths)
+    {
+        var fileRef = paths.Add(symbol.FilePath);
+        return new AggregateSymbol(
+            symbol.Id,
+            symbol.CanonicalKey,
+            symbol.Fqn,
+            symbol.Kind,
+            paths.Compact ? null : symbol.FilePath,
+            fileRef,
+            symbol.StartLine,
+            symbol.StartCol,
+            symbol.EndLine,
+            symbol.EndCol,
+            string.IsNullOrEmpty(symbol.Signature) ? null : symbol.Signature);
+    }
+
+    private static AggregateReference MapReference(
+        ReferenceHit reference,
+        FileTableBuilder paths)
+    {
+        var fileRef = paths.Add(reference.FilePath);
+        return new AggregateReference(
+            GraphTools.RefKindLabel(reference.Kind),
+            paths.Compact ? null : reference.FilePath,
+            fileRef,
+            reference.Line,
+            reference.Col,
+            reference.IsGenerated);
+    }
+
+    private static AggregateEvidence MapEvidence(
+        TraceCallPathEvidence evidence,
+        FileTableBuilder paths)
+    {
+        var fileRef = paths.Add(evidence.FilePath);
+        return new AggregateEvidence(
+            paths.Compact ? null : evidence.FilePath,
+            fileRef,
+            evidence.StartLine,
+            evidence.StartColumn,
+            evidence.EndLine,
+            evidence.EndColumn,
+            evidence.Confidence,
+            evidence.Producer,
+            evidence.Snippet);
+    }
 
     private static string StatusLine(string status, string query, int count) =>
         status switch
@@ -344,4 +455,26 @@ public static class AggregateTools
             ],
             StructuredContent = JsonSerializer.SerializeToElement(dto, typeInfo),
         };
+
+    private sealed class FileTableBuilder(bool compact)
+    {
+        private readonly Dictionary<string, string> _idsByPath = new(
+            OperatingSystem.IsWindows()
+                ? StringComparer.OrdinalIgnoreCase
+                : StringComparer.Ordinal);
+        private readonly Dictionary<string, string> _files = new(StringComparer.Ordinal);
+
+        internal bool Compact { get; } = compact;
+        internal IReadOnlyDictionary<string, string> Files => _files;
+
+        internal string? Add(string path)
+        {
+            if (!Compact) return null;
+            if (_idsByPath.TryGetValue(path, out var existing)) return existing;
+            var id = $"f{_files.Count + 1}";
+            _idsByPath[path] = id;
+            _files[id] = path;
+            return id;
+        }
+    }
 }
