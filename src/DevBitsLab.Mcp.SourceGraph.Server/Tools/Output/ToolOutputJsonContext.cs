@@ -15,6 +15,7 @@ namespace DevBitsLab.Mcp.SourceGraph.Server.Tools.Output;
 /// </summary>
 [JsonSourceGenerationOptions(PropertyNamingPolicy = JsonKnownNamingPolicy.SnakeCaseLower)]
 [JsonSerializable(typeof(FindDefinitionResult))]
+[JsonSerializable(typeof(ResolveSymbolResult))]
 [JsonSerializable(typeof(FindReferencesResult))]
 [JsonSerializable(typeof(SearchSymbolsResult))]
 [JsonSerializable(typeof(SearchSymbolsBatchResult))]

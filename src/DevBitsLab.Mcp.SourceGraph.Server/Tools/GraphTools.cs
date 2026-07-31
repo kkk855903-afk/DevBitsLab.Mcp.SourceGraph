@@ -31,6 +31,93 @@ public static class GraphTools
     // short-circuits — anywhere a tool body returning Task<CallToolResult> needs to ship plain
     // prose without a structured payload while still feeding the leaf chokepoint.
 
+    [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(ResolveSymbolResult))]
+    [ToolAnnotation(ReadOnlyHint = true, IdempotentHint = true)]
+    [ToolTrigger("resolve a symbol before chaining graph queries")]
+    [Description("Resolve exactly one symbol identity from text, canonical key, or a prior symbol_id. Ambiguous text never selects a default; inspect candidates and retry with symbol_id or canonical_key.")]
+    public static Task<CallToolResult> ResolveSymbolAsync(
+        ScopeRouter router,
+        [Description("Symbol name, FQN, or exact canonical key. Mutually exclusive with symbolId.")]
+        string? symbol = null,
+        [Description("Stable per-scope symbol id returned by another tool. Mutually exclusive with symbol.")]
+        long? symbolId = null,
+        [Description("Optional file-path substring used only for text resolution.")]
+        string? fileHint = null,
+        [Description(ScopeDescription)] string? scope = null,
+        CancellationToken ct = default) =>
+        ToolMetrics.TrackAsync(
+            "resolve_symbol",
+            new { symbol, symbolId, fileHint, scope },
+            () => ScopedExecution.RunAsync(router, scope, async host =>
+            {
+                var sw = Stopwatch.StartNew();
+                var resolution = await SymbolResolver.ResolveAsync(
+                    host.Store,
+                    symbol,
+                    symbolId,
+                    fileHint,
+                    candidateLimit: 10,
+                    ct).ConfigureAwait(false);
+                var candidates = resolution.Candidates.Select(MapResolvedSymbol).ToList();
+                var selected = resolution.Selected is null
+                    ? null
+                    : MapResolvedSymbol(resolution.Selected);
+                var dto = new ResolveSymbolResult(
+                    resolution.Status,
+                    resolution.Match,
+                    selected,
+                    candidates,
+                    resolution.Error);
+                var prose = resolution.Status switch
+                {
+                    "ok" => $"Resolved `{selected!.Fqn}` → symbol_id={selected.SymbolId}, canonical_key=`{selected.CanonicalKey ?? "(missing)"}`.",
+                    "ambiguous" => $"Ambiguous symbol text; {candidates.Count} candidates returned. Retry with symbol_id or canonical_key.",
+                    "invalid" => resolution.Error!,
+                    _ => "No symbol matched the requested identity.",
+                };
+                return new CallToolResult
+                {
+                    Content =
+                    [
+                        new TextContentBlock { Text = prose },
+                        AudienceMetadata.Build(host.Scope.Id, sw.ElapsedMilliseconds,
+                            ("candidates", candidates.Count.ToString())),
+                    ],
+                    StructuredContent = JsonSerializer.SerializeToElement(
+                        dto,
+                        ToolOutputJsonContext.Default.ResolveSymbolResult),
+                    IsError = resolution.Status == "invalid" ? true : null,
+                };
+            }, ct));
+
+    private static ResolveSymbolIdentity MapResolvedSymbol(SymbolHit hit) =>
+        new(
+            hit.Id,
+            hit.CanonicalKey,
+            hit.Name,
+            hit.Fqn,
+            hit.Kind,
+            hit.FilePath,
+            hit.StartLine,
+            hit.StartCol,
+            string.IsNullOrEmpty(hit.Signature) ? null : hit.Signature);
+
+    private static CallToolResult SymbolResolutionDiagnostic(
+        string tool,
+        string? query,
+        long? symbolId,
+        SymbolResolution resolution) =>
+        resolution.Status switch
+        {
+            "invalid" => DiagnosticResult.Error($"{tool}: {resolution.Error}"),
+            "ambiguous" => DiagnosticResult.Error(
+                $"{tool}: ambiguous symbol; no default was selected. Candidates: "
+                + string.Join(", ", resolution.Candidates.Select(candidate =>
+                    $"{candidate.Fqn} (id={candidate.Id}, key={candidate.CanonicalKey ?? "missing"})"))),
+            _ => DiagnosticResult.Build(
+                $"No matches for '{query?.Trim() ?? $"#{symbolId}"}'."),
+        };
+
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(FindDefinitionResult))]
     [ToolAnnotation(ReadOnlyHint = true, IdempotentHint = true)]
     [ToolTrigger("\"where is X defined?\"")]
@@ -108,6 +195,7 @@ public static class GraphTools
                         : null;
                     structuredHits.Add(new FindDefinitionHit(
                         SymbolId: h.Id,
+                        CanonicalKey: h.CanonicalKey,
                         Fqn: h.Fqn,
                         Kind: h.Kind,
                         FilePath: h.FilePath,
@@ -305,6 +393,7 @@ public static class GraphTools
                     .ToList();
                 return new FindByAnnotationHit(
                     SymbolId: h.Id,
+                    CanonicalKey: h.CanonicalKey,
                     Fqn: h.Fqn,
                     Kind: h.Kind,
                     FilePath: h.FilePath,
@@ -328,15 +417,16 @@ public static class GraphTools
     [Description("Find every place that references a symbol. Resolves the symbol by name/FQN, then lists each occurrence with target symbol id/FQN, relation kind, semantic confidence, and file:line. By default skips refs from source-generated files; pass includeGenerated=true to surface them. Set includeSnippet=true for bounded source excerpts in structured content.")]
     public static Task<CallToolResult> FindReferencesAsync(
         ScopeRouter router,
-        [Description("Symbol name or FQN, same matching rules as find_definition")] string symbol,
+        [Description("Symbol name, FQN, or canonical key. Mutually exclusive with symbolId.")] string? symbol = null,
         [Description("Maximum number of references to return (default 50)")] int limit = 50,
         [Description("Include references from source-generated files (default false)")] bool includeGenerated = false,
         [Description(ScopeDescription)] string? scope = null,
         [Description("Output detail: summary | locations | evidence (default) | audit.")] string detail = "evidence",
         [Description("Source lines before and after each reference when includeSnippet=true (0-20).")] int contextLines = 0,
         [Description("Attach bounded source excerpts to structured references (default false).")] bool includeSnippet = false,
+        [Description("Exact symbol id returned by resolve_symbol. Mutually exclusive with symbol.")] long? symbolId = null,
         CancellationToken ct = default) =>
-        ToolMetrics.TrackAsync("find_references", new { symbol, limit, includeGenerated, scope, detail, contextLines, includeSnippet }, () =>
+        ToolMetrics.TrackAsync("find_references", new { symbol, symbolId, limit, includeGenerated, scope, detail, contextLines, includeSnippet }, () =>
             ScopedExecution.RunAsync(router, scope, async host =>
             {
                 var sw = System.Diagnostics.Stopwatch.StartNew();
@@ -349,8 +439,25 @@ public static class GraphTools
                 {
                     return DiagnosticResult.Error($"find_references {evidenceError}");
                 }
-                var hits = await host.Store.FindSymbolsAsync(symbol, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
-                if (hits.Count == 0)
+                var resolution = await SymbolResolver.ResolveAsync(
+                    host.Store,
+                    symbol,
+                    symbolId,
+                    fileHint: null,
+                    candidateLimit: 10,
+                    ct).ConfigureAwait(false);
+                if (resolution.Status == "invalid")
+                {
+                    return DiagnosticResult.Error(resolution.Error!);
+                }
+                if (resolution.Status == "ambiguous")
+                {
+                    return DiagnosticResult.Error(
+                        "Ambiguous symbol; no default was selected. Candidates: "
+                        + string.Join(", ", resolution.Candidates.Select(candidate =>
+                            $"{candidate.Fqn} (id={candidate.Id}, key={candidate.CanonicalKey ?? "missing"})")));
+                }
+                if (resolution.Selected is null)
                 {
                     // No symbol resolved — short-circuit through DiagnosticResult.Build instead of
                     // BuildFindReferencesResult. Without a resolved target we can't construct a
@@ -358,16 +465,11 @@ public static class GraphTools
                     // ambiguous to consumers). Matches every other target-shaped tool's no-resolve
                     // path. Telemetry counts as ok=true (success-with-empty), symmetric with the
                     // pre-conversion `Task<string>` "No matches for 'X'." behaviour.
-                    return DiagnosticResult.Build($"No matches for '{symbol}'.");
+                    return DiagnosticResult.Build($"No matches for '{symbol?.Trim() ?? $"#{symbolId}"}'.");
                 }
 
                 var sb = new StringBuilder();
-                if (hits.Count > 1)
-                {
-                    sb.AppendLine($"Multiple symbols match '{symbol}'; reporting references for the top match. Other matches: {string.Join(", ", hits.Skip(1).Select(h => h.Fqn))}");
-                    sb.AppendLine();
-                }
-                var top = hits[0];
+                var top = resolution.Selected;
                 var refs = await host.Store.FindReferencesAsync(top.Id, includeGenerated, limit, ct).ConfigureAwait(false);
                 sb.AppendLine($"References to **{top.Fqn}** ({KindLabel(top.Kind)}){GeneratedSuffix(top.IsGenerated)}:");
                 sb.AppendLine($"- definition: {Format.Location(top.FilePath, top.StartLine, top.StartCol)}");
@@ -491,6 +593,7 @@ public static class GraphTools
                 snippets?.TryGetValue(r.Id, out snippet);
                 return new FindReferenceHit(
                     SymbolId: target.Id,
+                    CanonicalKey: target.CanonicalKey,
                     TargetFqn: target.Fqn,
                     Kind: RefKindLabel(r.Kind),
                     Relation: RefKindLabel(r.Kind),
@@ -506,6 +609,7 @@ public static class GraphTools
             TargetFqn: target.Fqn,
             TargetKind: target.Kind,
             TargetSymbolId: target.Id,
+            TargetCanonicalKey: target.CanonicalKey,
             References: structuredReferences);
 
         return new CallToolResult
@@ -609,6 +713,7 @@ public static class GraphTools
         var structuredSymbols = symbols
             .Select(s => new ListSymbolsInFileRow(
                 SymbolId: s.Id,
+                CanonicalKey: s.CanonicalKey,
                 Name: s.Name,
                 Fqn: s.Fqn,
                 Kind: s.Kind,
@@ -634,15 +739,16 @@ public static class GraphTools
     [Description("List evidence-backed inbound edges into a target symbol. Every row includes canonical source/target identities, actual relation, confidence, and stored occurrence file/range evidence; malformed edges without evidence are skipped. Default kind=calls; kind=all preserves each actual edge kind. Set includeSnippet=true for bounded source excerpts on each evidence occurrence.")]
     public static Task<CallToolResult> ListCallersAsync(
         ScopeRouter router,
-        [Description("Target symbol name or FQN")] string symbol,
+        [Description("Target symbol name, FQN, or canonical key. Mutually exclusive with symbolId.")] string? symbol = null,
         [Description("Maximum number of results to return (default 50)")] int limit = 50,
         [Description("Edge kind to walk (kebab-case): calls (default) | uses-type | overrides-member | implements-member | instantiates | throws | tests | code-behind | binds-to | binds-path | binds-element | handles-event | uses-resource | instantiates-type | merges | applies-style | all. Plugin-defined kinds are accepted.")] string? kind = null,
         [Description(ScopeDescription)] string? scope = null,
         [Description("Output detail: summary | locations | evidence (default) | audit.")] string detail = "evidence",
         [Description("Source lines before and after each evidence occurrence when includeSnippet=true (0-20).")] int contextLines = 0,
         [Description("Attach bounded source excerpts to structured edge evidence (default false).")] bool includeSnippet = false,
+        [Description("Exact target id returned by resolve_symbol. Mutually exclusive with symbol.")] long? symbolId = null,
         CancellationToken ct = default) =>
-        ToolMetrics.TrackAsync("list_callers", new { symbol, limit, kind, scope, detail, contextLines, includeSnippet }, () =>
+        ToolMetrics.TrackAsync("list_callers", new { symbol, symbolId, limit, kind, scope, detail, contextLines, includeSnippet }, () =>
             ScopedExecution.RunAsync(router, scope, async host =>
             {
                 var sw = System.Diagnostics.Stopwatch.StartNew();
@@ -666,9 +772,13 @@ public static class GraphTools
                     if (unknownNote is not null) return DiagnosticResult.Error(unknownNote);
                 }
 
-                var hits = await host.Store.FindSymbolsAsync(symbol, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
-                if (hits.Count == 0) return DiagnosticResult.Build($"No matches for '{symbol}'.");
-                var top = hits[0];
+                var resolution = await SymbolResolver.ResolveAsync(
+                    host.Store, symbol, symbolId, null, 10, ct).ConfigureAwait(false);
+                if (resolution.Selected is null)
+                {
+                    return SymbolResolutionDiagnostic("list_callers", symbol, symbolId, resolution);
+                }
+                var top = resolution.Selected;
                 var traversal = await EvidenceTraversal.LoadInboundAsync(
                     host.Store,
                     top,
@@ -824,15 +934,16 @@ public static class GraphTools
     [Description("List evidence-backed outbound edges from a source symbol. Every row includes canonical source/target identities, actual relation, confidence, and stored occurrence file/range evidence; malformed edges without evidence are skipped. Default kind=calls; kind=all preserves each actual edge kind. Set includeSnippet=true for bounded source excerpts on each evidence occurrence.")]
     public static Task<CallToolResult> ListCalleesAsync(
         ScopeRouter router,
-        [Description("Source symbol name or FQN")] string symbol,
+        [Description("Source symbol name, FQN, or canonical key. Mutually exclusive with symbolId.")] string? symbol = null,
         [Description("Maximum number of results to return (default 50)")] int limit = 50,
         [Description("Edge kind to walk (kebab-case): calls (default) | uses-type | overrides-member | implements-member | instantiates | throws | tests | code-behind | binds-to | binds-path | binds-element | handles-event | uses-resource | instantiates-type | merges | applies-style | all. Plugin-defined kinds are accepted.")] string? kind = null,
         [Description(ScopeDescription)] string? scope = null,
         [Description("Output detail: summary | locations | evidence (default) | audit.")] string detail = "evidence",
         [Description("Source lines before and after each evidence occurrence when includeSnippet=true (0-20).")] int contextLines = 0,
         [Description("Attach bounded source excerpts to structured edge evidence (default false).")] bool includeSnippet = false,
+        [Description("Exact source id returned by resolve_symbol. Mutually exclusive with symbol.")] long? symbolId = null,
         CancellationToken ct = default) =>
-        ToolMetrics.TrackAsync("list_callees", new { symbol, limit, kind, scope, detail, contextLines, includeSnippet }, () =>
+        ToolMetrics.TrackAsync("list_callees", new { symbol, symbolId, limit, kind, scope, detail, contextLines, includeSnippet }, () =>
             ScopedExecution.RunAsync(router, scope, async host =>
             {
                 var sw = System.Diagnostics.Stopwatch.StartNew();
@@ -856,9 +967,13 @@ public static class GraphTools
                     if (unknownNote is not null) return DiagnosticResult.Error(unknownNote);
                 }
 
-                var hits = await host.Store.FindSymbolsAsync(symbol, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
-                if (hits.Count == 0) return DiagnosticResult.Build($"No matches for '{symbol}'.");
-                var top = hits[0];
+                var resolution = await SymbolResolver.ResolveAsync(
+                    host.Store, symbol, symbolId, null, 10, ct).ConfigureAwait(false);
+                if (resolution.Selected is null)
+                {
+                    return SymbolResolutionDiagnostic("list_callees", symbol, symbolId, resolution);
+                }
+                var top = resolution.Selected;
                 var traversal = await EvidenceTraversal.LoadOutboundAsync(
                     host.Store,
                     top,
@@ -1099,6 +1214,7 @@ public static class GraphTools
         var structuredImpls = impls
             .Select(c => new FindImplementationsRow(
                 SymbolId: c.Id,
+                CanonicalKey: c.CanonicalKey,
                 Fqn: c.Fqn,
                 Kind: c.Kind,
                 FilePath: c.FilePath,
@@ -1110,6 +1226,7 @@ public static class GraphTools
             TargetFqn: target.Fqn,
             TargetKind: target.Kind,
             TargetSymbolId: target.Id,
+            TargetCanonicalKey: target.CanonicalKey,
             Implementations: structuredImpls);
         return new CallToolResult
         {
@@ -1737,6 +1854,7 @@ public static class GraphTools
 
         static NeighborhoodRow Project(SymbolHit s) => new(
             SymbolId: s.Id,
+            CanonicalKey: s.CanonicalKey,
             Fqn: s.Fqn,
             Kind: s.Kind,
             FilePath: s.FilePath,
@@ -1745,6 +1863,7 @@ public static class GraphTools
             PayloadJson: string.IsNullOrEmpty(s.PayloadJson) ? null : s.PayloadJson);
         var dto = new NeighborhoodResult(
             SymbolId: target.Id,
+            CanonicalKey: target.CanonicalKey,
             Fqn: target.Fqn,
             Kind: target.Kind,
             FilePath: target.FilePath,
@@ -1948,6 +2067,7 @@ public static class GraphTools
             .Select(row => new ModuleSummaryRow(
                 InDegree: row.InDegree,
                 SymbolId: row.Symbol.Id,
+                CanonicalKey: row.Symbol.CanonicalKey,
                 Fqn: row.Symbol.Fqn,
                 Kind: row.Symbol.Kind,
                 FilePath: row.Symbol.FilePath,
@@ -2276,6 +2396,7 @@ public static class GraphTools
         var structuredMembers = members
             .Select(m => new ListMembersRow(
                 SymbolId: m.Id,
+                CanonicalKey: m.CanonicalKey,
                 Name: m.Name,
                 Fqn: m.Fqn,
                 Kind: m.Kind,
@@ -2287,6 +2408,7 @@ public static class GraphTools
             .ToList();
         var dto = new ListMembersResult(
             ContainerSymbolId: container.Id,
+            ContainerCanonicalKey: container.CanonicalKey,
             ContainerFqn: container.Fqn,
             ContainerKind: container.Kind,
             Members: structuredMembers);
@@ -2566,6 +2688,7 @@ public static class GraphTools
             .Select(row => new SemanticSearchHit(
                 Score: row.Score,
                 SymbolId: row.Symbol.Id,
+                CanonicalKey: row.Symbol.CanonicalKey,
                 Fqn: row.Symbol.Fqn,
                 Kind: row.Symbol.Kind,
                 FilePath: row.Symbol.FilePath,

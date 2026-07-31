@@ -9,6 +9,8 @@ namespace DevBitsLab.Mcp.SourceGraph.Server.Tools.Output;
 public sealed record TraceCallPathResult(
     [property: JsonPropertyName("from_query")] string FromQuery,
     [property: JsonPropertyName("to_query")] string? ToQuery,
+    [property: JsonPropertyName("from_id")] long? FromId,
+    [property: JsonPropertyName("to_id")] long? ToId,
     string Profile,
     [property: JsonPropertyName("destination_mode")] string DestinationMode,
     [property: JsonPropertyName("terminal_definition")] string? TerminalDefinition,

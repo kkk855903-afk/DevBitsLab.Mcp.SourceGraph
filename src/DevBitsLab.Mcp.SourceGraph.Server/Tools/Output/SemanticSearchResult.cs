@@ -25,6 +25,7 @@ public sealed record SemanticSearchResult(
 public sealed record SemanticSearchHit(
     double Score,
     [property: JsonPropertyName("symbol_id")] long SymbolId,
+    [property: JsonPropertyName("canonical_key")] string? CanonicalKey,
     string Fqn,
     string Kind,
     [property: JsonPropertyName("file_path")] string FilePath,

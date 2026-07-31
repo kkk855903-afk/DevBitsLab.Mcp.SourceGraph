@@ -223,11 +223,15 @@ public static class AggregateTools
         CancellationToken ct)
     {
         var paths = new FileTableBuilder(compact);
-        var (status, candidates, selected) = await ResolveAsync(
+        var resolution = await SymbolResolver.ResolveAsync(
             host.Store,
             query,
+            symbolId: null,
             fileHint,
+            candidateLimit: 6,
             ct).ConfigureAwait(false);
+        var (status, candidates, selected) =
+            (resolution.Status, resolution.Candidates, resolution.Selected);
         if (selected is null)
         {
             return new ResolveAndReferencesResult(
@@ -277,11 +281,15 @@ public static class AggregateTools
         CancellationToken ct)
     {
         var paths = new FileTableBuilder(compact);
-        var (status, candidates, selected) = await ResolveAsync(
+        var resolution = await SymbolResolver.ResolveAsync(
             host.Store,
             query,
+            symbolId: null,
             fileHint,
+            candidateLimit: 6,
             ct).ConfigureAwait(false);
+        var (status, candidates, selected) =
+            (resolution.Status, resolution.Candidates, resolution.Selected);
         if (selected is null)
         {
             return new SymbolOverviewResult(
@@ -355,31 +363,6 @@ public static class AggregateTools
             visibleMembers,
             visibleCallers,
             visibleImplementations);
-    }
-
-    private static async Task<(string Status, IReadOnlyList<SymbolHit> Candidates, SymbolHit? Selected)>
-        ResolveAsync(
-            IGraphStore store,
-            string query,
-            string? fileHint,
-            CancellationToken ct)
-    {
-        var candidates = await store.FindSymbolsAsync(
-            query,
-            fileHint,
-            limit: 6,
-            ct).ConfigureAwait(false);
-        if (candidates.Count == 0) return ("not_found", candidates, null);
-        if (candidates.Count == 1) return ("ok", candidates, candidates[0]);
-
-        var exact = candidates.Where(candidate =>
-                string.Equals(candidate.CanonicalKey, query, StringComparison.Ordinal)
-                || string.Equals(candidate.Fqn, query, StringComparison.Ordinal)
-                || string.Equals(candidate.Name, query, StringComparison.Ordinal))
-            .ToList();
-        return exact.Count == 1
-            ? ("ok", candidates, exact[0])
-            : ("ambiguous", candidates, null);
     }
 
     private static AggregateSymbol MapSymbol(

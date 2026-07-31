@@ -18,6 +18,7 @@ public sealed record ModuleSummaryResult(
 public sealed record ModuleSummaryRow(
     [property: JsonPropertyName("in_degree")] int InDegree,
     [property: JsonPropertyName("symbol_id")] long SymbolId,
+    [property: JsonPropertyName("canonical_key")] string? CanonicalKey,
     string Fqn,
     string Kind,
     [property: JsonPropertyName("file_path")] string FilePath,

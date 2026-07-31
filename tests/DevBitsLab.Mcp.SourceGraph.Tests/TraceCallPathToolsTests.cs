@@ -450,6 +450,27 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
             EdgeKinds.NativeImplementation);
     }
 
+    [Fact]
+    public async Task Trace_acceptsResolvedFromIdAndToId()
+    {
+        var from = (await _host!.Store.FindSymbolsAsync("Graph.A")).Single();
+        var to = (await _host.Store.FindSymbolsAsync("Graph.C")).Single();
+
+        var result = await TraceCallPathTools.TraceCallPathWithProfileAsync(
+            _router!,
+            fromId: from.Id,
+            toId: to.Id,
+            maxDepth: 4,
+            maxPaths: 10,
+            maxNodes: 100);
+        var dto = result.StructuredContent!.Value.Deserialize(
+            ToolOutputJsonContext.Default.TraceCallPathResult)!;
+
+        dto.FromId.Should().Be(from.Id);
+        dto.ToId.Should().Be(to.Id);
+        dto.Scopes.Single().Paths.Should().HaveCount(2);
+    }
+
     [Theory]
     [InlineData("csharp:M:Graph.OutOfOrderNative")]
     [InlineData("csharp:M:Graph.DuplicateNative")]

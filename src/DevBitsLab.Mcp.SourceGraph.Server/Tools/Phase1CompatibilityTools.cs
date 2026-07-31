@@ -79,15 +79,15 @@ public static class Phase1CompatibilityTools
         [Description("Attach bounded source excerpts to structured evidence.")] bool includeSnippet = false,
         CancellationToken ct = default) =>
         GraphTools.FindReferencesAsync(
-            router,
-            symbol,
-            limit,
-            includeGenerated,
-            scope,
-            detail,
-            contextLines,
-            includeSnippet,
-            ct);
+            router: router,
+            symbol: symbol,
+            limit: limit,
+            includeGenerated: includeGenerated,
+            scope: scope,
+            detail: detail,
+            contextLines: contextLines,
+            includeSnippet: includeSnippet,
+            ct: ct);
 
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(ListCallersResult))]
     [ToolAnnotation(ReadOnlyHint = true, IdempotentHint = true)]
@@ -104,15 +104,15 @@ public static class Phase1CompatibilityTools
         [Description("Attach bounded source excerpts to structured evidence.")] bool includeSnippet = false,
         CancellationToken ct = default) =>
         GraphTools.ListCallersAsync(
-            router,
-            symbol,
-            limit,
-            kind,
-            scope,
-            detail,
-            contextLines,
-            includeSnippet,
-            ct);
+            router: router,
+            symbol: symbol,
+            limit: limit,
+            kind: kind,
+            scope: scope,
+            detail: detail,
+            contextLines: contextLines,
+            includeSnippet: includeSnippet,
+            ct: ct);
 
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(ListCalleesResult))]
     [ToolAnnotation(ReadOnlyHint = true, IdempotentHint = true)]
@@ -129,15 +129,15 @@ public static class Phase1CompatibilityTools
         [Description("Attach bounded source excerpts to structured evidence.")] bool includeSnippet = false,
         CancellationToken ct = default) =>
         GraphTools.ListCalleesAsync(
-            router,
-            symbol,
-            limit,
-            kind,
-            scope,
-            detail,
-            contextLines,
-            includeSnippet,
-            ct);
+            router: router,
+            symbol: symbol,
+            limit: limit,
+            kind: kind,
+            scope: scope,
+            detail: detail,
+            contextLines: contextLines,
+            includeSnippet: includeSnippet,
+            ct: ct);
 
     /// <summary>
     /// Source-compatible entry point for the original Phase 1 alias signature.
@@ -191,16 +191,16 @@ public static class Phase1CompatibilityTools
         [Description(ScopeDescription)] string? scope = null,
         CancellationToken ct = default) =>
         TraceCallPathTools.TraceCallPathWithProfileAsync(
-            router,
-            from,
-            to,
-            kind,
-            profile,
-            maxDepth,
-            maxPaths,
-            maxNodes,
-            scope,
-            ct);
+            router: router,
+            from: from,
+            to: to,
+            kind: kind,
+            profile: profile,
+            maxDepth: maxDepth,
+            maxPaths: maxPaths,
+            maxNodes: maxNodes,
+            scope: scope,
+            ct: ct);
 
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(ImpactOfChangeResult))]
     [ToolAnnotation(ReadOnlyHint = true, IdempotentHint = true)]

@@ -82,6 +82,44 @@ public sealed class AggregateToolsTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task ResolveSymbol_returnsReusableIdAndCanonicalKey()
+    {
+        var result = await GraphTools.ResolveSymbolAsync(
+            _router!,
+            symbol: "Sample.Domain.Calculator.Add");
+        var dto = JsonSerializer.Deserialize(
+            result.StructuredContent!.Value,
+            ToolOutputJsonContext.Default.ResolveSymbolResult)!;
+
+        dto.Status.Should().Be("ok");
+        dto.Symbol.Should().NotBeNull();
+        dto.Symbol!.CanonicalKey.Should().NotBeNullOrEmpty();
+
+        var byId = await GraphTools.ResolveSymbolAsync(
+            _router!,
+            symbolId: dto.Symbol.SymbolId);
+        var byIdDto = JsonSerializer.Deserialize(
+            byId.StructuredContent!.Value,
+            ToolOutputJsonContext.Default.ResolveSymbolResult)!;
+        byIdDto.Symbol!.CanonicalKey.Should().Be(dto.Symbol.CanonicalKey);
+    }
+
+    [Fact]
+    public async Task ResolveSymbol_doesNotSelectAmbiguousText()
+    {
+        var result = await GraphTools.ResolveSymbolAsync(_router!, symbol: "Greet");
+        var dto = JsonSerializer.Deserialize(
+            result.StructuredContent!.Value,
+            ToolOutputJsonContext.Default.ResolveSymbolResult)!;
+
+        dto.Status.Should().Be("ambiguous");
+        dto.Symbol.Should().BeNull();
+        dto.Candidates.Should().HaveCountGreaterThan(1);
+        dto.Candidates.Should().OnlyContain(candidate =>
+            candidate.SymbolId > 0 && candidate.CanonicalKey != null);
+    }
+
+    [Fact]
     public async Task SymbolOverview_combinesDefinitionMembersCallersAndImplementations()
     {
         var result = await AggregateTools.SymbolOverviewAsync(

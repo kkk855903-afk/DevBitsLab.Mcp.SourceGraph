@@ -10,6 +10,7 @@ public sealed record FindImplementationsResult(
     [property: JsonPropertyName("target_fqn")] string TargetFqn,
     [property: JsonPropertyName("target_kind")] string TargetKind,
     [property: JsonPropertyName("target_symbol_id")] long TargetSymbolId,
+    [property: JsonPropertyName("target_canonical_key")] string? TargetCanonicalKey,
     IReadOnlyList<FindImplementationsRow> Implementations);
 
 /// <summary>
@@ -17,6 +18,7 @@ public sealed record FindImplementationsResult(
 /// </summary>
 public sealed record FindImplementationsRow(
     [property: JsonPropertyName("symbol_id")] long SymbolId,
+    [property: JsonPropertyName("canonical_key")] string? CanonicalKey,
     string Fqn,
     string Kind,
     [property: JsonPropertyName("file_path")] string FilePath,

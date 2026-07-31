@@ -9,6 +9,7 @@ namespace DevBitsLab.Mcp.SourceGraph.Server.Tools.Output;
 /// </summary>
 public sealed record NeighborhoodResult(
     [property: JsonPropertyName("symbol_id")] long SymbolId,
+    [property: JsonPropertyName("canonical_key")] string? CanonicalKey,
     string Fqn,
     string Kind,
     [property: JsonPropertyName("file_path")] string FilePath,
@@ -25,6 +26,7 @@ public sealed record NeighborhoodResult(
 /// </summary>
 public sealed record NeighborhoodRow(
     [property: JsonPropertyName("symbol_id")] long SymbolId,
+    [property: JsonPropertyName("canonical_key")] string? CanonicalKey,
     string Fqn,
     string Kind,
     [property: JsonPropertyName("file_path")] string FilePath,

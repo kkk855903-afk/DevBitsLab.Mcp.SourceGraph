@@ -17,6 +17,7 @@ public sealed record ListSymbolsInFileResult(
 /// </summary>
 public sealed record ListSymbolsInFileRow(
     [property: JsonPropertyName("symbol_id")] long SymbolId,
+    [property: JsonPropertyName("canonical_key")] string? CanonicalKey,
     string Name,
     string Fqn,
     string Kind,
