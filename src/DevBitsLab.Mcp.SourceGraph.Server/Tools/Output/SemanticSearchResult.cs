@@ -10,6 +10,13 @@ namespace DevBitsLab.Mcp.SourceGraph.Server.Tools.Output;
 public sealed record SemanticSearchResult(
     string Query,
     string Mode,
+    [property: JsonPropertyName("strategy_used")] string StrategyUsed,
+    [property: JsonPropertyName("candidate_source")] string CandidateSource,
+    [property: JsonPropertyName("embedded_symbols")] long EmbeddedSymbols,
+    [property: JsonPropertyName("eligible_symbols")] long EligibleSymbols,
+    [property: JsonPropertyName("embedding_coverage")] double EmbeddingCoverage,
+    string Model,
+    [property: JsonPropertyName("model_hash")] string? ModelHash,
     IReadOnlyList<SemanticSearchHit> Hits);
 
 /// <summary>
@@ -23,4 +30,6 @@ public sealed record SemanticSearchHit(
     [property: JsonPropertyName("file_path")] string FilePath,
     int Line,
     int Column,
-    [property: JsonPropertyName("xml_summary")] string? XmlSummary);
+    [property: JsonPropertyName("xml_summary")] string? XmlSummary,
+    [property: JsonPropertyName("vector_score")] double? VectorScore = null,
+    string Group = "production");

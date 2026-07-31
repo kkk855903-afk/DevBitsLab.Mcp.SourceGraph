@@ -2301,14 +2301,14 @@ public static class GraphTools
 
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(SemanticSearchResult))]
     [ToolTrigger("\"find code that does retry logic\", \"how does this codebase handle authentication\", \"show me the rate-limiting code\"")]
-    [Description("Hybrid code search. strategy=auto first resolves identifier-like queries through FTS5 and skips semantic encoding when exact lexical hits exist; natural-language queries use embeddings. strategy=semantic forces vector search and strategy=lexical forces FTS5.")]
+    [Description("Hybrid code search. FTS5 supplies candidates before vector reranking, results are diversified by file, and the response reports coverage/model provenance. strategy=auto falls back to lexical when embedding coverage is incomplete; semantic forces full vector search, hybrid requires FTS candidates, and lexical skips encoding.")]
     public static Task<CallToolResult> SemanticSearchAsync(
         ScopeRouter router,
         ICodeEmbeddingGenerator generator,
         [Description("Free-text intent query, e.g. 'retry on transient errors', 'masks PII in logs'")] string query,
         [Description("Top-K results to return (default 20)")] int k = 20,
         [Description("Optional kebab-case symbol kind filter: class|method|property|field|interface|namespace|enum|enum-member|operator|record|delegate|struct|event|xaml-view|xaml-element|xaml-resource|xaml-style|xaml-template|... (any plugin-defined kebab-case kind also accepted).")] string? kind = null,
-        [Description("Retrieval strategy: auto (default) | semantic | lexical.")] string strategy = "auto",
+        [Description("Retrieval strategy: auto (default) | hybrid | semantic | lexical.")] string strategy = "auto",
         [Description(ScopeDescription)] string? scope = null,
         IProgress<ProgressNotificationValue>? progress = null,
         CancellationToken ct = default) =>
@@ -2334,45 +2334,98 @@ public static class GraphTools
 
                 var kindFilter = NormaliseKindFilter(kind);
                 var retrievalStrategy = strategy.Trim().ToLowerInvariant();
-                if (retrievalStrategy is not ("auto" or "semantic" or "lexical"))
+                if (retrievalStrategy is not ("auto" or "hybrid" or "semantic" or "lexical"))
                 {
                     return DiagnosticResult.Error(
-                        "semantic_search `strategy` must be auto, semantic, or lexical.");
+                        "semantic_search `strategy` must be auto, hybrid, semantic, or lexical.");
                 }
 
-                if (retrievalStrategy == "lexical"
-                    || (retrievalStrategy == "auto" && LooksLikeIdentifierQuery(query)))
-                {
-                    var lexicalHits = await host.Store.SearchSymbolsAsync(
+                var stats = await host.Store.GetStatsAsync(ct).ConfigureAwait(false);
+                var eligibleSymbols = stats.SymbolCount;
+                var embeddedSymbols = host.EmbeddingsStore.IsAvailable
+                    ? await host.EmbeddingsStore.CountAsync(ct).ConfigureAwait(false)
+                    : 0;
+                var embeddingCoverage = eligibleSymbols == 0
+                    ? 1.0
+                    : Math.Min(1.0, embeddedSymbols / (double)eligibleSymbols);
+                var modelHash = string.Equals(
+                        generator.Model.ModelId,
+                        DefaultEmbeddingModel.ModelId,
+                        StringComparison.Ordinal)
+                    ? DefaultEmbeddingModel.Manifest
+                        .First(file => file.RemotePath.EndsWith("model.onnx", StringComparison.Ordinal))
+                        .ExpectedSha256
+                    : null;
+
+                var candidateLimit = Math.Min(500, Math.Max(100, k * 20));
+                var lexicalCandidates = retrievalStrategy == "semantic"
+                    ? Array.Empty<SymbolHit>()
+                    : await CollectLexicalCandidatesAsync(
+                        host.Store,
                         query,
                         kindFilter,
-                        k,
+                        candidateLimit,
                         ct).ConfigureAwait(false);
-                    if (lexicalHits.Count > 0 || retrievalStrategy == "lexical")
+
+                var useLexical = retrievalStrategy == "lexical"
+                    || (retrievalStrategy == "auto" && LooksLikeIdentifierQuery(query))
+                    || (retrievalStrategy == "auto" && embeddingCoverage < 1.0);
+                if (useLexical)
+                {
+                    var lexicalRows = lexicalCandidates
+                        .Take(k)
+                        .Select((symbol, index) => new SemanticRankedRow(
+                            Score: Math.Max(0.5, 1.0 - index * 0.01),
+                            VectorScore: null,
+                            Symbol: symbol))
+                        .ToList();
+                    if (lexicalRows.Count > 0
+                        || retrievalStrategy == "lexical"
+                        || embeddingCoverage < 1.0)
                     {
-                        var lexicalRows = lexicalHits
-                            .Select((symbol, index) =>
-                                (new EmbeddingHit(
-                                    symbol.Id,
-                                    Math.Max(0.5, 1.0 - index * 0.01)),
-                                 symbol))
-                            .ToList();
-                        var lexicalProse = new StringBuilder();
-                        lexicalProse.AppendLine(
-                            $"{lexicalRows.Count} lexical hits for '{query}' (semantic encoding skipped):");
-                        foreach (var (hit, symbol) in lexicalRows)
-                        {
-                            lexicalProse.AppendLine(
-                                $"- score {hit.Score:F3} — **{symbol.Fqn}** ({Format.KindWithAttrs(symbol)}) at {Format.Location(symbol.FilePath, symbol.StartLine, symbol.StartCol)}");
-                        }
+                        var lexicalReason = LooksLikeIdentifierQuery(query)
+                            ? "semantic encoding skipped"
+                            : embeddingCoverage < 1.0
+                                ? $"embedding coverage {embeddingCoverage:P1}; degraded to lexical"
+                                : "semantic encoding skipped";
+                        var lexicalProse = BuildSemanticProse(
+                            query,
+                            lexicalRows,
+                            "lexical",
+                            lexicalReason);
                         return BuildSemanticSearchResult(
-                            lexicalProse.ToString(),
+                            lexicalProse,
                             query,
                             lexicalRows,
                             host.Scope.Id,
                             sw.ElapsedMilliseconds,
-                            mode: "lexical");
+                            mode: "lexical",
+                            strategyUsed: "lexical",
+                            candidateSource: "fts",
+                            embeddedSymbols: embeddedSymbols,
+                            eligibleSymbols: eligibleSymbols,
+                            embeddingCoverage: embeddingCoverage,
+                            model: generator.Model.ModelId,
+                            modelHash: modelHash);
                     }
+                }
+
+                if (retrievalStrategy == "hybrid" && lexicalCandidates.Count == 0)
+                {
+                    return BuildSemanticSearchResult(
+                        prose: $"No FTS candidates for hybrid query '{query}'.",
+                        query: query,
+                        rows: Array.Empty<SemanticRankedRow>(),
+                        scopeId: host.Scope.Id,
+                        elapsedMs: sw.ElapsedMilliseconds,
+                        mode: "hybrid",
+                        strategyUsed: "hybrid",
+                        candidateSource: "fts-empty",
+                        embeddedSymbols: embeddedSymbols,
+                        eligibleSymbols: eligibleSymbols,
+                        embeddingCoverage: embeddingCoverage,
+                        model: generator.Model.ModelId,
+                        modelHash: modelHash);
                 }
 
                 if (!host.EmbeddingsStore.IsAvailable || !generator.IsAvailable)
@@ -2399,115 +2452,140 @@ public static class GraphTools
                 }
 
                 progress?.Report(Format.Progress(0.5, "searching"));
-                var hits = await host.EmbeddingsStore.SearchAsync(queryEmbeddings[0], k, kindFilter, ct).ConfigureAwait(false);
+                var searchK = Math.Min(1000, Math.Max(k, k * 5));
+                var isHybrid = lexicalCandidates.Count > 0 && retrievalStrategy != "semantic";
+                var hits = isHybrid
+                    ? await host.EmbeddingsStore.SearchCandidatesAsync(
+                        queryEmbeddings[0],
+                        lexicalCandidates.Select(candidate => candidate.Id).ToList(),
+                        searchK,
+                        ct).ConfigureAwait(false)
+                    : await host.EmbeddingsStore.SearchAsync(
+                        queryEmbeddings[0],
+                        searchK,
+                        kindFilter,
+                        ct).ConfigureAwait(false);
+                var mode = isHybrid ? "hybrid" : "semantic";
+                var candidateSource = isHybrid ? "fts" : "vector-full";
                 if (hits.Count == 0)
                 {
                     return BuildSemanticSearchResult(
-                        prose: $"No semantic matches for '{query}'. The graph may not have any embeddings yet — let the indexer's embedding pass complete after a fresh `index` and try again.",
+                        prose: $"No {mode} matches for '{query}'.",
                         query: query,
-                        rows: Array.Empty<(EmbeddingHit Hit, SymbolHit Symbol)>(),
+                        rows: Array.Empty<SemanticRankedRow>(),
                         scopeId: host.Scope.Id,
                         elapsedMs: sw.ElapsedMilliseconds,
-                        mode: "semantic");
+                        mode: mode,
+                        strategyUsed: mode,
+                        candidateSource: candidateSource,
+                        embeddedSymbols: embeddedSymbols,
+                        eligibleSymbols: eligibleSymbols,
+                        embeddingCoverage: embeddingCoverage,
+                        model: generator.Model.ModelId,
+                        modelHash: modelHash);
                 }
 
                 progress?.Report(Format.Progress(0.9, "formatting results"));
-                // Apply the size budget at the hit level *before* resolving symbols so omitted rows
-                // don't incur per-row GetSymbolByIdAsync calls — important when callers pass a large
-                // k and the budget trims to ~30. Resolving only the kept hits keeps prose-row count
-                // and structured-array length in lockstep with the budget decision.
-                var (hitsKept, hitsOmitted) = OutputBudget.ChooseKeep(hits.Count, OutputBudget.SnippetRowChars);
-                IEnumerable<EmbeddingHit> hitsToResolve = hitsOmitted > 0 ? hits.Take(hitsKept) : hits;
-                var resolved = new List<(EmbeddingHit Hit, SymbolHit Symbol)>(hitsKept);
-                foreach (var h in hitsToResolve)
+                var resolved = new List<SemanticRankedRow>(hits.Count);
+                foreach (var hit in hits)
                 {
-                    var sym = await host.Store.GetSymbolByIdAsync(h.SymbolId, ct).ConfigureAwait(false);
-                    if (sym is not null) resolved.Add((h, sym));
+                    var symbol = await host.Store.GetSymbolByIdAsync(hit.SymbolId, ct).ConfigureAwait(false);
+                    if (symbol is null) continue;
+                    resolved.Add(new SemanticRankedRow(
+                        Score: Math.Min(1.0, hit.Score + LexicalRerankBonus(query, symbol)),
+                        VectorScore: hit.Score,
+                        Symbol: symbol));
                 }
-                var sb = new StringBuilder();
-                sb.AppendLine($"{resolved.Count} semantic hits for '{query}':");
-                if (resolved.Count >= 2)
-                {
-                    var rows = new List<IReadOnlyList<string>>(resolved.Count);
-                    foreach (var (h, sym) in resolved)
-                    {
-                        rows.Add(new[]
-                        {
-                            h.Score.ToString("F3"),
-                            $"**{sym.Fqn}**",
-                            Format.KindWithAttrs(sym),
-                            Format.Location(sym.FilePath, sym.StartLine, sym.StartCol),
-                        });
-                    }
-                    Format.AppendTable(
-                        sb,
-                        new[] { "Score", "Symbol", "Kind", "Location" },
-                        rows,
-                        new[] { TableAlignment.Right, TableAlignment.Left, TableAlignment.Left, TableAlignment.Left });
-                }
-                else
-                {
-                    foreach (var (h, sym) in resolved)
-                    {
-                        sb.Append($"- score {h.Score:F3} — **{sym.Fqn}** ({Format.KindWithAttrs(sym)}) at {Format.Location(sym.FilePath, sym.StartLine, sym.StartCol)}");
-                        var s = Format.OneLineSummary(sym.XmlSummary);
-                        if (!string.IsNullOrEmpty(s)) sb.Append(" — _" + s + "_");
-                        sb.AppendLine();
-                    }
-                }
+                var diversified = DiversifySemanticRows(resolved, k);
+                var (rowsKept, hitsOmitted) = OutputBudget.ChooseKeep(
+                    diversified.Count,
+                    OutputBudget.SnippetRowChars);
+                var rows = diversified.Take(rowsKept).ToList();
+                var prose = BuildSemanticProse(
+                    query,
+                    rows,
+                    mode,
+                    $"candidate_source={candidateSource}");
                 return BuildSemanticSearchResult(
-                    prose: sb.ToString(),
+                    prose: prose,
                     query: query,
-                    rows: resolved,
+                    rows: rows,
                     scopeId: host.Scope.Id,
                     elapsedMs: sw.ElapsedMilliseconds,
                     omittedSize: hitsOmitted,
-                    mode: "semantic");
+                    mode: mode,
+                    strategyUsed: mode,
+                    candidateSource: candidateSource,
+                    embeddedSymbols: embeddedSymbols,
+                    eligibleSymbols: eligibleSymbols,
+                    embeddingCoverage: embeddingCoverage,
+                    model: generator.Model.ModelId,
+                    modelHash: modelHash);
             }, ct, progress));
 
     private static CallToolResult BuildSemanticSearchResult(
         string prose,
         string query,
-        IReadOnlyList<(EmbeddingHit Hit, SymbolHit Symbol)> rows,
+        IReadOnlyList<SemanticRankedRow> rows,
         string scopeId,
         long elapsedMs,
         int omittedSize = 0,
-        string mode = "semantic")
+        string mode = "semantic",
+        string strategyUsed = "semantic",
+        string candidateSource = "vector-full",
+        long embeddedSymbols = 0,
+        long eligibleSymbols = 0,
+        double embeddingCoverage = 0,
+        string model = "unknown",
+        string? modelHash = null)
     {
         var content = new List<ContentBlock>(capacity: 2 + rows.Count)
         {
             new TextContentBlock { Text = prose },
         };
 
-        foreach (var (h, sym) in rows)
+        foreach (var row in rows)
         {
+            var sym = row.Symbol;
             content.Add(new ResourceLinkBlock
             {
                 Uri = GraphResourceUris.Symbol(sym.Id),
                 Name = sym.Fqn,
-                Title = $"score {h.Score:F3}: {sym.Fqn}",
+                Title = $"score {row.Score:F3}: {sym.Fqn}",
                 Description = $"{Format.KindWithAttrs(sym)} — {Format.Location(sym.FilePath, sym.StartLine, sym.StartCol)}",
                 MimeType = "text/markdown",
             });
         }
 
         var extras = omittedSize > 0
-            ? new[] { ("hits", rows.Count.ToString()), ("mode", mode), ("omitted_size", omittedSize.ToString()) }
-            : new[] { ("hits", rows.Count.ToString()), ("mode", mode) };
+            ? new[] { ("hits", rows.Count.ToString()), ("mode", mode), ("coverage", embeddingCoverage.ToString("F3")), ("omitted_size", omittedSize.ToString()) }
+            : new[] { ("hits", rows.Count.ToString()), ("mode", mode), ("coverage", embeddingCoverage.ToString("F3")) };
         content.Add(AudienceMetadata.Build(scopeId, elapsedMs, extras));
 
         var structuredHits = rows
-            .Select(r => new SemanticSearchHit(
-                Score: r.Hit.Score,
-                SymbolId: r.Symbol.Id,
-                Fqn: r.Symbol.Fqn,
-                Kind: r.Symbol.Kind,
-                FilePath: r.Symbol.FilePath,
-                Line: r.Symbol.StartLine,
-                Column: r.Symbol.StartCol,
-                XmlSummary: string.IsNullOrEmpty(r.Symbol.XmlSummary) ? null : r.Symbol.XmlSummary))
+            .Select(row => new SemanticSearchHit(
+                Score: row.Score,
+                SymbolId: row.Symbol.Id,
+                Fqn: row.Symbol.Fqn,
+                Kind: row.Symbol.Kind,
+                FilePath: row.Symbol.FilePath,
+                Line: row.Symbol.StartLine,
+                Column: row.Symbol.StartCol,
+                XmlSummary: string.IsNullOrEmpty(row.Symbol.XmlSummary) ? null : row.Symbol.XmlSummary,
+                VectorScore: row.VectorScore,
+                Group: IsTestSymbol(row.Symbol) ? "test" : "production"))
             .ToList();
-        var dto = new SemanticSearchResult(Query: query, Mode: mode, Hits: structuredHits);
+        var dto = new SemanticSearchResult(
+            Query: query,
+            Mode: mode,
+            StrategyUsed: strategyUsed,
+            CandidateSource: candidateSource,
+            EmbeddedSymbols: embeddedSymbols,
+            EligibleSymbols: eligibleSymbols,
+            EmbeddingCoverage: embeddingCoverage,
+            Model: model,
+            ModelHash: modelHash,
+            Hits: structuredHits);
         return new CallToolResult
         {
             Content = content,
@@ -2614,6 +2692,134 @@ public static class GraphTools
             EndColumn: hit.EndCol,
             Signature: string.IsNullOrEmpty(hit.Signature) ? null : hit.Signature,
             XmlSummary: string.IsNullOrEmpty(hit.XmlSummary) ? null : hit.XmlSummary);
+
+    private static async Task<IReadOnlyList<SymbolHit>> CollectLexicalCandidatesAsync(
+        IGraphStore store,
+        string query,
+        string? kindFilter,
+        int limit,
+        CancellationToken ct)
+    {
+        var candidates = new List<SymbolHit>(limit);
+        var seen = new HashSet<long>();
+
+        async Task AddAsync(string probe)
+        {
+            if (candidates.Count >= limit) return;
+            var hits = await store.SearchSymbolsAsync(
+                probe,
+                kindFilter,
+                limit - candidates.Count,
+                ct).ConfigureAwait(false);
+            foreach (var hit in hits)
+            {
+                if (seen.Add(hit.Id)) candidates.Add(hit);
+            }
+        }
+
+        await AddAsync(query).ConfigureAwait(false);
+        foreach (var token in SemanticTokens(query))
+        {
+            await AddAsync(token).ConfigureAwait(false);
+            if (candidates.Count >= limit) break;
+        }
+        return candidates;
+    }
+
+    private static IReadOnlyList<string> SemanticTokens(string query)
+    {
+        var stopWords = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "and", "the", "for", "with", "from", "that", "this", "code", "find",
+            "show", "does", "how", "into", "using", "where",
+        };
+        return query
+            .Split(
+                [' ', '\t', '\r', '\n', '.', ',', ':', ';', '(', ')', '[', ']', '{', '}', '/', '\\', '-', '_'],
+                StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Where(token => token.Length >= 3 && !stopWords.Contains(token))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Take(12)
+            .ToList();
+    }
+
+    private static double LexicalRerankBonus(string query, SymbolHit symbol)
+    {
+        var haystack = string.Join(
+            ' ',
+            symbol.Fqn,
+            symbol.Signature ?? string.Empty,
+            symbol.XmlSummary ?? string.Empty);
+        var matches = SemanticTokens(query).Count(token =>
+            haystack.Contains(token, StringComparison.OrdinalIgnoreCase));
+        return Math.Min(0.10, matches * 0.02);
+    }
+
+    private static IReadOnlyList<SemanticRankedRow> DiversifySemanticRows(
+        IReadOnlyList<SemanticRankedRow> rows,
+        int k)
+    {
+        var ordered = rows
+            .OrderByDescending(row => row.Score)
+            .ThenBy(row => row.Symbol.Fqn, StringComparer.Ordinal)
+            .ToList();
+        var result = new List<SemanticRankedRow>(Math.Min(k, ordered.Count));
+        var perFile = new Dictionary<string, int>(
+            OperatingSystem.IsWindows()
+                ? StringComparer.OrdinalIgnoreCase
+                : StringComparer.Ordinal);
+        var deferred = new List<SemanticRankedRow>();
+        foreach (var row in ordered)
+        {
+            perFile.TryGetValue(row.Symbol.FilePath, out var count);
+            if (count >= 2)
+            {
+                deferred.Add(row);
+                continue;
+            }
+            result.Add(row);
+            perFile[row.Symbol.FilePath] = count + 1;
+            if (result.Count == k) return result;
+        }
+        foreach (var row in deferred)
+        {
+            result.Add(row);
+            if (result.Count == k) break;
+        }
+        return result;
+    }
+
+    private static string BuildSemanticProse(
+        string query,
+        IReadOnlyList<SemanticRankedRow> rows,
+        string mode,
+        string note)
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine($"{rows.Count} {mode} hits for '{query}' ({note}):");
+        foreach (var row in rows)
+        {
+            sb.AppendLine(
+                $"- score {row.Score:F3} — **{row.Symbol.Fqn}** "
+                + $"({Format.KindWithAttrs(row.Symbol)}) at "
+                + Format.Location(
+                    row.Symbol.FilePath,
+                    row.Symbol.StartLine,
+                    row.Symbol.StartCol));
+        }
+        return sb.ToString();
+    }
+
+    private static bool IsTestSymbol(SymbolHit symbol) =>
+        !string.IsNullOrEmpty(symbol.TestFramework)
+        || symbol.FilePath.Contains("/test", StringComparison.OrdinalIgnoreCase)
+        || symbol.FilePath.Contains("\\test", StringComparison.OrdinalIgnoreCase)
+        || symbol.FilePath.Contains(".Tests", StringComparison.OrdinalIgnoreCase);
+
+    private sealed record SemanticRankedRow(
+        double Score,
+        double? VectorScore,
+        SymbolHit Symbol);
 
     private static bool LooksLikeIdentifierQuery(string query)
     {

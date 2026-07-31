@@ -152,6 +152,52 @@ public sealed class SqliteEmbeddingsStore : IEmbeddingsStore
         }
     }
 
+    public async Task<IReadOnlyList<EmbeddingHit>> SearchCandidatesAsync(
+        IReadOnlyList<float> queryEmbedding,
+        IReadOnlyList<long> candidateSymbolIds,
+        int k,
+        CancellationToken ct = default)
+    {
+        if (queryEmbedding.Count != _dimension)
+        {
+            throw new ArgumentException(
+                $"Expected embedding of dimension {_dimension}; got {queryEmbedding.Count}.",
+                nameof(queryEmbedding));
+        }
+        if (candidateSymbolIds.Count == 0 || k <= 0)
+        {
+            return Array.Empty<EmbeddingHit>();
+        }
+        if (candidateSymbolIds.Count > 1000)
+        {
+            throw new ArgumentException(
+                "Candidate vector ranking supports at most 1000 symbol ids.",
+                nameof(candidateSymbolIds));
+        }
+
+        var query = queryEmbedding as float[] ?? queryEmbedding.ToArray();
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            var rows = await _connection.QueryAsync<CandidateVectorRow>(new CommandDefinition(
+                "SELECT symbol_id AS SymbolId, embedding AS Embedding FROM symbol_embeddings WHERE symbol_id IN @ids;",
+                new { ids = candidateSymbolIds.Distinct().ToArray() },
+                cancellationToken: ct)).ConfigureAwait(false);
+            return rows
+                .Select(row => new EmbeddingHit(
+                    row.SymbolId,
+                    Cosine(query, DecodeVector(row.Embedding))))
+                .OrderByDescending(hit => hit.Score)
+                .ThenBy(hit => hit.SymbolId)
+                .Take(k)
+                .ToList();
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
     public async Task<int> PruneOrphanedAsync(CancellationToken ct = default)
     {
         // Match-by-symbol-id rather than rowid: vec0's virtual-table primary key is the
@@ -186,7 +232,32 @@ public sealed class SqliteEmbeddingsStore : IEmbeddingsStore
         return 1.0 - (l2distance * l2distance) / 2.0;
     }
 
+    private static float[] DecodeVector(byte[] bytes)
+    {
+        var values = new float[bytes.Length / sizeof(float)];
+        Buffer.BlockCopy(bytes, 0, values, 0, bytes.Length);
+        return values;
+    }
+
+    private static double Cosine(IReadOnlyList<float> left, IReadOnlyList<float> right)
+    {
+        if (left.Count != right.Count) return -1;
+        double dot = 0;
+        double leftNorm = 0;
+        double rightNorm = 0;
+        for (var i = 0; i < left.Count; i++)
+        {
+            dot += left[i] * right[i];
+            leftNorm += left[i] * left[i];
+            rightNorm += right[i] * right[i];
+        }
+        return leftNorm <= 0 || rightNorm <= 0
+            ? -1
+            : dot / Math.Sqrt(leftNorm * rightNorm);
+    }
+
     private sealed record RawHit(long SymbolId, double Distance);
+    private sealed record CandidateVectorRow(long SymbolId, byte[] Embedding);
     private sealed record EmbeddingMetaRow(byte[] ContentHash, string ModelVersion);
 }
 
@@ -204,6 +275,12 @@ public sealed class DisabledEmbeddingsStore : IEmbeddingsStore
     public Task UpsertAsync(long symbolId, byte[] contentHash, IReadOnlyList<float> embedding, string modelVersion, CancellationToken ct = default) => Task.CompletedTask;
     public Task<bool> ShouldReembedAsync(long symbolId, byte[] contentHash, string modelVersion, CancellationToken ct = default) => Task.FromResult(false);
     public Task<IReadOnlyList<EmbeddingHit>> SearchAsync(IReadOnlyList<float> queryEmbedding, int k, string? kindFilter = null, CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<EmbeddingHit>>(Array.Empty<EmbeddingHit>());
+    public Task<IReadOnlyList<EmbeddingHit>> SearchCandidatesAsync(
+        IReadOnlyList<float> queryEmbedding,
+        IReadOnlyList<long> candidateSymbolIds,
+        int k,
+        CancellationToken ct = default) =>
         Task.FromResult<IReadOnlyList<EmbeddingHit>>(Array.Empty<EmbeddingHit>());
     public Task<long> CountAsync(CancellationToken ct = default) => Task.FromResult(0L);
     public Task<int> PruneOrphanedAsync(CancellationToken ct = default) => Task.FromResult(0);

@@ -38,6 +38,16 @@ public interface IEmbeddingsStore
     /// </summary>
     Task<IReadOnlyList<EmbeddingHit>> SearchAsync(IReadOnlyList<float> queryEmbedding, int k, string? kindFilter = null, CancellationToken ct = default);
 
+    /// <summary>
+    /// Rank only the supplied symbol ids. Intended for hybrid retrieval where FTS first narrows
+    /// the candidate universe and vector scoring reranks that bounded set.
+    /// </summary>
+    Task<IReadOnlyList<EmbeddingHit>> SearchCandidatesAsync(
+        IReadOnlyList<float> queryEmbedding,
+        IReadOnlyList<long> candidateSymbolIds,
+        int k,
+        CancellationToken ct = default);
+
     /// <summary>Total number of stored embeddings (count of rows in <c>symbol_embeddings</c>).</summary>
     Task<long> CountAsync(CancellationToken ct = default);
 

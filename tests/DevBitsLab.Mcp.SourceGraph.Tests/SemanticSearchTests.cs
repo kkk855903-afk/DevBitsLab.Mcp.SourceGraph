@@ -98,6 +98,29 @@ public sealed class SemanticSearchTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task CandidateSearch_ranksOnlyFtsCandidateIds()
+    {
+        if (!_vec0Loaded) return;
+        var embStore = _store!.CreateEmbeddingsStore(Dim);
+        var query = DeterministicMockEmbeddingGenerator.Embed("calculator add", Dim);
+        var bestButExcluded = DeterministicMockEmbeddingGenerator.Embed("calculator add", Dim);
+        var candidateA = DeterministicMockEmbeddingGenerator.Embed("calculator subtract", Dim);
+        var candidateB = DeterministicMockEmbeddingGenerator.Embed("logger warning", Dim);
+
+        await embStore.UpsertAsync(201, [1], bestButExcluded, "test/v1");
+        await embStore.UpsertAsync(202, [2], candidateA, "test/v1");
+        await embStore.UpsertAsync(203, [3], candidateB, "test/v1");
+
+        var hits = await embStore.SearchCandidatesAsync(
+            query,
+            candidateSymbolIds: [202, 203],
+            k: 10);
+
+        hits.Select(hit => hit.SymbolId).Should().Equal(202, 203);
+        hits.Should().NotContain(hit => hit.SymbolId == 201);
+    }
+
+    [Fact]
     public async Task ShouldReembed_returnsFalseForUnchangedHashAndModel()
     {
         if (!_vec0Loaded) return;

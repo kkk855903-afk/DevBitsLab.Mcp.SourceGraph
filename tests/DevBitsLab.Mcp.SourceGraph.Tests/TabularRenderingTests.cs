@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using DevBitsLab.Mcp.SourceGraph.Core;
@@ -11,6 +12,7 @@ using DevBitsLab.Mcp.SourceGraph.Indexing;
 using DevBitsLab.Mcp.SourceGraph.Server;
 using DevBitsLab.Mcp.SourceGraph.Server.Scoping;
 using DevBitsLab.Mcp.SourceGraph.Server.Tools;
+using DevBitsLab.Mcp.SourceGraph.Server.Tools.Output;
 using DevBitsLab.Mcp.SourceGraph.Storage;
 using FluentAssertions;
 using ModelContextProtocol.Protocol;
@@ -312,15 +314,23 @@ public sealed class TabularRenderingTests : IAsyncLifetime, IDisposable
         using var generator = new DisabledEmbeddingGenerator(
             new EmbeddingModelInfo("disabled/test", 384));
 
-        var output = CallToolResultHelpers.ProseText(
-            await GraphTools.SemanticSearchAsync(
-                _router!,
-                generator,
-                "Calculator"));
+        var result = await GraphTools.SemanticSearchAsync(
+            _router!,
+            generator,
+            "Calculator");
+        var output = CallToolResultHelpers.ProseText(result);
 
         output.Should().Contain("lexical hits");
         output.Should().Contain("semantic encoding skipped");
         output.Should().NotContain("semantic_search disabled");
+        var dto = JsonSerializer.Deserialize(
+            result.StructuredContent!.Value,
+            ToolOutputJsonContext.Default.SemanticSearchResult)!;
+        dto.StrategyUsed.Should().Be("lexical");
+        dto.CandidateSource.Should().Be("fts");
+        dto.EligibleSymbols.Should().BeGreaterThan(0);
+        dto.EmbeddingCoverage.Should().BeInRange(0, 1);
+        dto.Model.Should().Be("disabled/test");
     }
 
     [Fact]
