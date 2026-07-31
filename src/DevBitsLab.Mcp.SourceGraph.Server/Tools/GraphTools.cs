@@ -2978,7 +2978,7 @@ public static class GraphTools
         _ => string.IsNullOrEmpty(kind) ? "?" : kind,
     };
 
-    private static string RefKindLabel(ReferenceKind kind) => kind switch
+    internal static string RefKindLabel(ReferenceKind kind) => kind switch
     {
         ReferenceKind.Definition => "def",
         ReferenceKind.Reference => "ref",
