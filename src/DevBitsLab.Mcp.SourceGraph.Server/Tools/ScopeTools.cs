@@ -24,7 +24,7 @@ public static class ScopeTools
 {
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(ListScopesResult))]
     [ToolTrigger("\"what scopes are configured?\" — call before passing the `scope` parameter to other tools, or after a 'no default_scope' error")]
-    [Description("List every registered scope: id, name, root directory, project count, last-indexed timestamp, status (ok | partial | degraded | indexing), isolation flag, and any failed_projects / failed_files surfaced by the most recent index. Pair with the optional `scope` parameter on every other tool. A `partial` status means at least one project produced symbols and one or more failed; queries succeed but results may be incomplete.")]
+    [Description("List every registered scope: id, name, root, persistent index generation, last-indexed timestamp, current watcher lag, status (ok | partial | degraded | indexing), isolation flag, and cold-index failures. Pair with the optional `scope` parameter on every other tool.")]
     public static Task<CallToolResult> ListScopesAsync(ScopeRouter router) =>
         // Body is sync but tracking goes through the async overload that knows how to brand-mark
         // the first user-visible TextContentBlock and serialise StructuredContent. Wrap in
@@ -54,8 +54,8 @@ public static class ScopeTools
         var scopeNoun = hosts.Count == 1 ? "scope" : "scopes";
         sb.AppendLine($"{hosts.Count} {scopeNoun} registered:");
         sb.AppendLine();
-        sb.AppendLine("| Id | Name | Status | Isolated | Projects | Last indexed | Root |");
-        sb.AppendLine("|----|------|--------|---------:|---------:|--------------|------|");
+        sb.AppendLine("| Id | Name | Status | Generation | Watcher lag | Isolated | Projects | Last indexed | Root |");
+        sb.AppendLine("|----|------|--------|-----------:|------------:|---------:|---------:|--------------|------|");
         foreach (var host in hosts)
         {
             var scope = host.Scope;
@@ -69,7 +69,7 @@ public static class ScopeTools
             // Status messages, names, and roots can contain user data (exception messages, file
             // paths from `.sourcegraph.json`). A literal `|` or newline in any cell would break
             // the GFM table renderer; escape both via the shared MarkdownTable helper.
-            sb.AppendLine($"| `{scope.Id}` | {MarkdownTable.EscapeCell(scope.Name)} | {MarkdownTable.EscapeCell(statusCell)} | {(scope.Isolated ? "yes" : "no")} | {projectCount} | {lastIndexed} | `{MarkdownTable.EscapeCell(scope.Root)}` |");
+            sb.AppendLine($"| `{scope.Id}` | {MarkdownTable.EscapeCell(scope.Name)} | {MarkdownTable.EscapeCell(statusCell)} | {host.IndexGeneration} | {host.WatcherLagMs} ms | {(scope.Isolated ? "yes" : "no")} | {projectCount} | {lastIndexed} | `{MarkdownTable.EscapeCell(scope.Root)}` |");
         }
 
         // Per-scope failure detail: only emit when at least one scope has non-empty failure
@@ -139,9 +139,11 @@ public static class ScopeTools
                 Status: host.Status,
                 StatusMessage: string.IsNullOrEmpty(host.StatusMessage) ? null : host.StatusMessage,
                 Isolated: host.Scope.Isolated,
+                Generation: host.IndexGeneration,
                 LastIndexedAt: host.LastIndexedAt == DateTimeOffset.MinValue
                     ? null
                     : host.LastIndexedAt.ToString("o"),
+                WatcherLagMs: host.WatcherLagMs,
                 ProjectCount: ProjectCount(host.Scope.ProjectSet),
                 FailedProjects: host.FailedProjects
                     .Select(pf => new ListScopesProjectFailure(pf.Name, pf.Reason))
@@ -536,8 +538,9 @@ public static class ScopeTools
             if (!dry_run)
             {
                 progress?.Report(Format.Progress(0.7, "applying changes"));
+                await host.RecordSourceChangeAsync(DateTimeOffset.UtcNow, ct).ConfigureAwait(false);
                 await DriftReconciler.ApplyAsync(host, diff, ct).ConfigureAwait(false);
-                host.LastIndexedAt = DateTimeOffset.UtcNow;
+                await host.CompleteIndexGenerationAsync(DateTimeOffset.UtcNow, ct).ConfigureAwait(false);
                 HealLog.Append(kind: "reconcile-drift-invoked", scope: scope, ok: true,
                     ms: sw.Elapsed.TotalMilliseconds,
                     details: $"scanned={diff.Scanned}, reindexed={diff.Changed.Count}, added={diff.Added.Count}, removed={diff.Removed.Count}, unchanged={diff.Unchanged}");

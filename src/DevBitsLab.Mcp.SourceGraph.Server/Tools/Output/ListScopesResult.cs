@@ -29,7 +29,9 @@ public sealed record ListScopesRow(
     string Status,
     [property: JsonPropertyName("status_message")] string? StatusMessage,
     bool Isolated,
+    long Generation,
     [property: JsonPropertyName("last_indexed_at")] string? LastIndexedAt,
+    [property: JsonPropertyName("watcher_lag_ms")] long WatcherLagMs,
     [property: JsonPropertyName("project_count")] int ProjectCount,
     [property: JsonPropertyName("failed_projects")] IReadOnlyList<ListScopesProjectFailure> FailedProjects,
     [property: JsonPropertyName("failed_files")] IReadOnlyList<ListScopesFileFailure> FailedFiles);

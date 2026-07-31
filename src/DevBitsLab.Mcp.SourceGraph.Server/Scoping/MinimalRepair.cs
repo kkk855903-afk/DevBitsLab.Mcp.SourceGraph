@@ -67,7 +67,7 @@ internal static class MinimalRepair
                     logger,
                     ct).ConfigureAwait(false);
                 reindexed = true;
-                host.LastIndexedAt = DateTimeOffset.UtcNow;
+                await host.CompleteIndexGenerationAsync(DateTimeOffset.UtcNow, ct).ConfigureAwait(false);
                 host.Status = "ok";
                 await registry.UpsertAsync(ToRow(host, "ok", null), ct).ConfigureAwait(false);
             }

@@ -683,6 +683,12 @@ public sealed record RowCountsRow(
     long Annotations,
     long Diagnostics);
 
+/// <summary>Persistent freshness state shared by every query response for one scope.</summary>
+public sealed record IndexStateRow(
+    long Generation,
+    long? IndexedAt,
+    long? SourceChangedAt);
+
 /// <summary>
 /// One <c>files</c> row projected to the columns the drift-sample needs.
 /// </summary>

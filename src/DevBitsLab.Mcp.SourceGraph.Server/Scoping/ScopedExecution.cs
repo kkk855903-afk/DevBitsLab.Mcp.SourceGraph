@@ -53,7 +53,9 @@ public static class ScopedExecution
                 return BoundDiagnostic(
                     $"scope `{host.Scope.Id}` is degraded: {host.StatusMessage ?? "(no message)"}");
             }
-            return await onResolved(host).ConfigureAwait(false);
+            var body = await onResolved(host).ConfigureAwait(false);
+            return body.TrimEnd() + Environment.NewLine + Environment.NewLine
+                + IndexFreshnessMetadata.BuildText(new[] { host });
         }
 
         // Multi-host: render each scope's response in turn, prefixed with the scope id. Tools that
@@ -86,6 +88,9 @@ public static class ScopedExecution
             sb.AppendLine($"### scope: `{id}`");
             sb.AppendLine();
             sb.AppendLine(body.TrimEnd());
+            sb.AppendLine();
+            var metadataHost = hosts.First(h => h.Scope.Id == id);
+            sb.AppendLine(IndexFreshnessMetadata.BuildText(new[] { metadataHost }));
             sb.AppendLine();
         }
         return sb.ToString();
@@ -195,7 +200,8 @@ public static class ScopedExecution
             }
             try
             {
-                return await onResolved(host, 0, 1).ConfigureAwait(false);
+                var result = await onResolved(host, 0, 1).ConfigureAwait(false);
+                return IndexFreshnessMetadata.Attach(result, new[] { host });
             }
             catch (Exception ex) when (CorruptionGuard.IsCorruptionError(ex) && CorruptionPolicy.Registry is not null)
             {
@@ -267,14 +273,14 @@ public static class ScopedExecution
             {
                 schemaAwareResult.IsError = true;
             }
-            return schemaAwareResult;
+            return IndexFreshnessMetadata.Attach(schemaAwareResult, hosts);
         }
 
-        return new CallToolResult
+        return IndexFreshnessMetadata.Attach(new CallToolResult
         {
             Content = merged,
             IsError = anyError ? true : null,
-        };
+        }, hosts);
     }
 
     private static string BoundDiagnostic(string value) =>

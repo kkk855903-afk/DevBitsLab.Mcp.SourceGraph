@@ -426,6 +426,8 @@ public sealed class LiveIndexService : BackgroundService
         CancellationToken ct)
     {
         var oldVersion = await GraphSchemaProbe.ReadVersionAsync(primaryPath, ct).ConfigureAwait(false);
+        var oldGeneration = await GraphSchemaProbe.ReadIndexGenerationAsync(primaryPath, ct)
+            .ConfigureAwait(false);
         _logger.LogInformation(
             "Scope `{Id}` graph schema v{Old} requires v{New}; building a shadow index",
             scope.Id,
@@ -435,6 +437,7 @@ public sealed class LiveIndexService : BackgroundService
         var shadowPath = await BuildValidatedShadowIndexAsync(
             scope,
             primaryPath,
+            oldGeneration,
             ct).ConfigureAwait(false);
         PromoteShadowDatabase(scope, primaryPath, shadowPath, "schema-v" + oldVersion);
     }
@@ -442,6 +445,7 @@ public sealed class LiveIndexService : BackgroundService
     private async Task<string> BuildValidatedShadowIndexAsync(
         Scope scope,
         string primaryPath,
+        long baseGeneration,
         CancellationToken ct)
     {
         var shadowPath = primaryPath + $".shadow-{Guid.NewGuid():N}";
@@ -461,6 +465,11 @@ public sealed class LiveIndexService : BackgroundService
                 throw new InvalidOperationException(
                     $"Scope `{scope.Id}` shadow database could not be prepared.");
             }
+
+            await shadowHost.Store.SeedIndexGenerationAsync(baseGeneration, ct)
+                .ConfigureAwait(false);
+            shadowHost.ApplyIndexState(
+                await shadowHost.Store.GetIndexStateAsync(ct).ConfigureAwait(false));
 
             await RunInitialIndexAsync(shadowHost, ct, persistRegistry: false)
                 .ConfigureAwait(false);
@@ -651,6 +660,7 @@ public sealed class LiveIndexService : BackgroundService
                     ? null
                     : SymbolTextBuilder.ProducerName(_embeddingGenerator.Model.Version),
             };
+            host.ApplyIndexState(await store.GetIndexStateAsync(ct).ConfigureAwait(false));
             if (scope.Interop is not null)
             {
                 host.NativeInteropCoordinator = new NativeInteropCoordinator(
@@ -980,7 +990,8 @@ public sealed class LiveIndexService : BackgroundService
                     failedFileCount,
                     status.UsesRetainedGraph);
             }
-            host.LastIndexedAt = DateTimeOffset.UtcNow;
+            await host.CompleteIndexGenerationAsync(DateTimeOffset.UtcNow, ct)
+                .ConfigureAwait(false);
             if (persistRegistry)
             {
                 await _registry.UpsertAsync(
@@ -1124,6 +1135,7 @@ public sealed class LiveIndexService : BackgroundService
             shadowPath = await BuildValidatedShadowIndexAsync(
                     scope,
                     dbPath,
+                    oldHost.IndexGeneration,
                     ct)
                 .ConfigureAwait(false);
         }
@@ -1393,6 +1405,8 @@ public sealed class LiveIndexService : BackgroundService
                 {
                     try
                     {
+                        await host.RecordSourceChangeAsync(DateTimeOffset.UtcNow, stoppingToken)
+                            .ConfigureAwait(false);
                         if (batch.Reason == FileChangeReason.GitHeadChanged)
                         {
                             _logger.LogInformation("Scope `{Id}`: git HEAD changed; running full reindex", host.Scope.Id);
@@ -1452,7 +1466,10 @@ public sealed class LiveIndexService : BackgroundService
                                     host,
                                     stoppingToken)
                                 .ConfigureAwait(false);
-                            host.LastIndexedAt = DateTimeOffset.UtcNow;
+                            await host.CompleteIndexGenerationAsync(
+                                    DateTimeOffset.UtcNow,
+                                    stoppingToken)
+                                .ConfigureAwait(false);
                             _logger.LogInformation(
                                 "Scope `{Id}`: full reindex complete ({CSharpFiles} C# files, {OtherFiles} registered-language files)",
                                 host.Scope.Id,
@@ -1594,7 +1611,10 @@ public sealed class LiveIndexService : BackgroundService
                                         stoppingToken)
                                     .ConfigureAwait(false);
                             }
-                            host.LastIndexedAt = DateTimeOffset.UtcNow;
+                            await host.CompleteIndexGenerationAsync(
+                                    DateTimeOffset.UtcNow,
+                                    stoppingToken)
+                                .ConfigureAwait(false);
                             _logger.LogInformation(
                                 "Scope `{Id}`: applied live batch ({CSharpFiles} C# indexed, {OtherFiles} registered-language indexed, {DeletedFiles} deleted)",
                                 host.Scope.Id,

@@ -39,6 +39,8 @@ public sealed class AggregateToolsTests : IAsyncLifetime
             store.CreateEmbeddingsStore(384),
             new RoslynIndexer(store),
             solution);
+        _host.ApplyIndexState(
+            await store.CompleteIndexGenerationAsync(DateTimeOffset.UtcNow));
         _host.MarkReady();
         _router = new ScopeRouter();
         _router.Register(_host);
@@ -62,6 +64,9 @@ public sealed class AggregateToolsTests : IAsyncLifetime
 
         result.Content!.OfType<ResourceLinkBlock>().Should().BeEmpty();
         result.Content.OfType<TextContentBlock>().Should().HaveCount(2);
+        result.Content.OfType<TextContentBlock>().Last().Text.Should()
+            .Contain("generation=1")
+            .And.Contain("watcher_lag_ms=0");
         var dto = JsonSerializer.Deserialize(
             result.StructuredContent!.Value,
             ToolOutputJsonContext.Default.ResolveAndReferencesResult)!;

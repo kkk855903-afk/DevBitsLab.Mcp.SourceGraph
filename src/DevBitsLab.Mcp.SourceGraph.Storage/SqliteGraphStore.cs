@@ -163,6 +163,96 @@ public sealed partial class SqliteGraphStore : IGraphStore
             new CommandDefinition(sql, cancellationToken: ct));
     }
 
+    public Task<IndexStateRow> GetIndexStateAsync(CancellationToken ct = default) =>
+        _connection.QuerySingleAsync<IndexStateRow>(new CommandDefinition(
+            """
+            SELECT
+                generation AS Generation,
+                indexed_at AS IndexedAt,
+                source_changed_at AS SourceChangedAt
+            FROM index_state
+            WHERE singleton = 1;
+            """,
+            cancellationToken: ct));
+
+    public async Task<IndexStateRow> RecordSourceChangedAsync(
+        DateTimeOffset changedAt,
+        CancellationToken ct = default)
+    {
+        var unixMs = changedAt.ToUnixTimeMilliseconds();
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            return await _connection.QuerySingleAsync<IndexStateRow>(new CommandDefinition(
+                """
+                UPDATE index_state
+                SET source_changed_at = MAX(COALESCE(source_changed_at, 0), @unixMs)
+                WHERE singleton = 1
+                RETURNING
+                    generation AS Generation,
+                    indexed_at AS IndexedAt,
+                    source_changed_at AS SourceChangedAt;
+                """,
+                new { unixMs },
+                cancellationToken: ct)).ConfigureAwait(false);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public async Task<IndexStateRow> CompleteIndexGenerationAsync(
+        DateTimeOffset indexedAt,
+        CancellationToken ct = default)
+    {
+        var unixMs = indexedAt.ToUnixTimeMilliseconds();
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            return await _connection.QuerySingleAsync<IndexStateRow>(new CommandDefinition(
+                """
+                UPDATE index_state
+                SET generation = generation + 1,
+                    indexed_at = @unixMs
+                WHERE singleton = 1
+                RETURNING
+                    generation AS Generation,
+                    indexed_at AS IndexedAt,
+                    source_changed_at AS SourceChangedAt;
+                """,
+                new { unixMs },
+                cancellationToken: ct)).ConfigureAwait(false);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public async Task SeedIndexGenerationAsync(
+        long minimumGeneration,
+        CancellationToken ct = default)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(minimumGeneration);
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await _connection.ExecuteAsync(new CommandDefinition(
+                """
+                UPDATE index_state
+                SET generation = MAX(generation, @minimumGeneration)
+                WHERE singleton = 1;
+                """,
+                new { minimumGeneration },
+                cancellationToken: ct)).ConfigureAwait(false);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
     public Task<int?> GetProjectionVersionAsync(
         string producer,
         CancellationToken ct = default)

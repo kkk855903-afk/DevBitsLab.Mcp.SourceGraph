@@ -16,9 +16,12 @@ public static class Schema
     /// drops all data tables when the on-disk version is below this, since the index can always be
     /// rebuilt from source.
     /// </summary>
-    public const int Version = 16;
+    public const int Version = 17;
 
     /// <summary>
+    /// V17 adds the singleton <c>index_state</c> row used to publish a persistent monotonic
+    /// generation plus source-change/index-completion timestamps on every query response.
+    ///
     /// V16 rebuilds V15 projections after incomplete Roslyn compilations gained unique-candidate
     /// call recovery and source-declared code-behind bindings became independently provable.
     ///
@@ -58,7 +61,7 @@ public static class Schema
     /// V5 enriched symbols with modifiers/accessibility/xml_summary, V3 dropped FK constraints
     /// from refs/edges. V16 is the cumulative drop-and-rebuild target — there is no preserved
     /// data path; <see cref="SqliteGraphStore.EnsureSchemaAsync"/> calls <see cref="DropAll"/>
-    /// when the on-disk version is anything below 16.
+    /// when the on-disk version is anything below 17.
     /// </summary>
     internal const string V1 = """
         CREATE TABLE IF NOT EXISTS schema_version (
@@ -78,6 +81,15 @@ public static class Schema
             version INTEGER NOT NULL,
             completed_at INTEGER NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS index_state (
+            singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+            generation INTEGER NOT NULL DEFAULT 0,
+            indexed_at INTEGER,
+            source_changed_at INTEGER
+        );
+        INSERT OR IGNORE INTO index_state(singleton, generation)
+        VALUES (1, 0);
 
         CREATE TABLE IF NOT EXISTS symbols (
             id INTEGER PRIMARY KEY,
@@ -358,6 +370,7 @@ public static class Schema
         DROP TABLE   IF EXISTS refs;
         DROP TABLE   IF EXISTS symbols;
         DROP TABLE   IF EXISTS files;
+        DROP TABLE   IF EXISTS index_state;
         DROP TABLE   IF EXISTS projection_versions;
         """;
 }

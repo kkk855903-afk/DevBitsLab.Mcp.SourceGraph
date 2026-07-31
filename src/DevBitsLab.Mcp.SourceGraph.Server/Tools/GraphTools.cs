@@ -3474,13 +3474,16 @@ public static class GraphTools
                     ("annotation_flavors", annotationFlavors.Count.ToString())),
             };
 
-            return new CallToolResult
+            var result = new CallToolResult
             {
                 Content = content,
                 StructuredContent = JsonSerializer.SerializeToElement(
                     dto,
                     ToolOutputJsonContext.Default.DescribeSchemaResult),
             };
+            return IndexFreshnessMetadata.Attach(
+                result,
+                await ReadAttachedFreshnessAsync(connection, ct).ConfigureAwait(false));
         }
         finally
         {
@@ -3510,6 +3513,59 @@ public static class GraphTools
             }
         }
         return values;
+    }
+
+    private static async Task<IReadOnlyList<IndexFreshnessSnapshot>> ReadAttachedFreshnessAsync(
+        SqliteConnection connection,
+        CancellationToken ct)
+    {
+        var scopes = new List<string>();
+        await using (var list = connection.CreateCommand())
+        {
+            list.CommandText = "PRAGMA database_list;";
+            await using var reader = await list.ExecuteReaderAsync(ct).ConfigureAwait(false);
+            while (await reader.ReadAsync(ct).ConfigureAwait(false))
+            {
+                var name = reader.GetString(1);
+                if (name is not ("main" or "temp" or "meta")) scopes.Add(name);
+            }
+        }
+
+        var snapshots = new List<IndexFreshnessSnapshot>(scopes.Count);
+        foreach (var scopeId in scopes.OrderBy(value => value, StringComparer.Ordinal))
+        {
+            var quoted = '"' + scopeId.Replace("\"", "\"\"", StringComparison.Ordinal) + '"';
+            await using var command = connection.CreateCommand();
+            command.CommandText = $"""
+                SELECT
+                    state.generation,
+                    state.indexed_at,
+                    state.source_changed_at,
+                    COALESCE((SELECT status FROM v_scopes WHERE scope = @scope), 'ok')
+                FROM {quoted}.index_state AS state
+                WHERE state.singleton = 1;
+                """;
+            command.Parameters.AddWithValue("@scope", scopeId);
+            await using var reader = await command.ExecuteReaderAsync(ct).ConfigureAwait(false);
+            if (!await reader.ReadAsync(ct).ConfigureAwait(false)) continue;
+
+            var generation = reader.GetInt64(0);
+            var indexedMs = reader.IsDBNull(1) ? (long?)null : reader.GetInt64(1);
+            var changedMs = reader.IsDBNull(2) ? (long?)null : reader.GetInt64(2);
+            var status = reader.GetString(3);
+            var caughtUp = changedMs is null || indexedMs >= changedMs;
+            snapshots.Add(new IndexFreshnessSnapshot(
+                scopeId,
+                generation,
+                status,
+                indexedMs is null ? null : DateTimeOffset.FromUnixTimeMilliseconds(indexedMs.Value),
+                caughtUp
+                    ? 0
+                    : Math.Max(
+                        0,
+                        DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - changedMs!.Value)));
+        }
+        return snapshots;
     }
 
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(QueryGraphResult))]
@@ -3723,7 +3779,7 @@ public static class GraphTools
                 sb.Append("_(truncated at ").Append(rowCap).AppendLine(" rows; add a tighter LIMIT or WHERE)_");
             }
 
-            return new CallToolResult
+            var result = new CallToolResult
             {
                 Content = new List<ContentBlock>
                 {
@@ -3738,6 +3794,9 @@ public static class GraphTools
                     dto,
                     ToolOutputJsonContext.Default.QueryGraphResult),
             };
+            return IndexFreshnessMetadata.Attach(
+                result,
+                await ReadAttachedFreshnessAsync(connection, ct).ConfigureAwait(false));
         }
         catch (MultiStatementRejectedException ex)
         {

@@ -42,4 +42,28 @@ public static class GraphSchemaProbe
         var version = await ReadVersionAsync(databasePath, ct).ConfigureAwait(false);
         return version is not null && version < Schema.Version;
     }
+
+    public static async Task<long> ReadIndexGenerationAsync(
+        string databasePath,
+        CancellationToken ct = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(databasePath);
+        if (!File.Exists(databasePath)) return 0;
+
+        var builder = new SqliteConnectionStringBuilder
+        {
+            DataSource = databasePath,
+            Mode = SqliteOpenMode.ReadOnly,
+            Pooling = false,
+        };
+        await using var connection = new SqliteConnection(builder.ConnectionString);
+        await connection.OpenAsync(ct).ConfigureAwait(false);
+        var hasState = await connection.ExecuteScalarAsync<long>(new CommandDefinition(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='index_state';",
+            cancellationToken: ct)).ConfigureAwait(false);
+        if (hasState == 0) return 0;
+        return await connection.ExecuteScalarAsync<long>(new CommandDefinition(
+            "SELECT generation FROM index_state WHERE singleton = 1;",
+            cancellationToken: ct)).ConfigureAwait(false);
+    }
 }
