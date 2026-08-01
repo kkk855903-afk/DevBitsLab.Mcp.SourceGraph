@@ -29,7 +29,44 @@ public sealed record VerifyScopeRow(
     [property: JsonPropertyName("last_indexed_at")] string? LastIndexedAt,
     [property: JsonPropertyName("row_counts")] VerifyScopeCounts? RowCounts,
     [property: JsonPropertyName("integrity_check")] string? IntegrityCheck,
-    [property: JsonPropertyName("drift_sample")] VerifyScopeDriftSample? DriftSample);
+    [property: JsonPropertyName("drift_sample")] VerifyScopeDriftSample? DriftSample,
+    [property: JsonPropertyName("source_coverage_complete")]
+    bool? SourceCoverageComplete,
+    [property: JsonPropertyName("language_projection_complete")]
+    bool? LanguageProjectionComplete,
+    [property: JsonPropertyName("relation_projection_complete")]
+    bool? RelationProjectionComplete,
+    [property: JsonPropertyName("query_traversal_complete")]
+    bool? QueryTraversalComplete,
+    [property: JsonPropertyName("indexed_files")]
+    int? IndexedFiles,
+    [property: JsonPropertyName("eligible_files")]
+    int? EligibleFiles,
+    [property: JsonPropertyName("missing_files")]
+    IReadOnlyList<string>? MissingFiles,
+    [property: JsonPropertyName("missing_file_count")]
+    int? MissingFileCount,
+    [property: JsonPropertyName("missing_files_truncated")]
+    bool? MissingFilesTruncated,
+    [property: JsonPropertyName("loaded_indexers")]
+    IReadOnlyList<string>? LoadedIndexers,
+    [property: JsonPropertyName("index_generation")]
+    long? IndexGeneration,
+    [property: JsonPropertyName("indexed_at")]
+    string? IndexedAt)
+{
+    [JsonPropertyName("absence_authoritative")]
+    public bool? AbsenceAuthoritative =>
+        SourceCoverageComplete is null
+        || LanguageProjectionComplete is null
+        || RelationProjectionComplete is null
+        || QueryTraversalComplete is null
+            ? null
+            : SourceCoverageComplete.Value
+              && LanguageProjectionComplete.Value
+              && RelationProjectionComplete.Value
+              && QueryTraversalComplete.Value;
+}
 
 /// <summary>Per-table counts. Mirrors <see cref="DevBitsLab.Mcp.SourceGraph.Storage.RowCountsRow"/>.</summary>
 public sealed record VerifyScopeCounts(

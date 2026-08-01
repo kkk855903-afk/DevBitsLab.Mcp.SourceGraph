@@ -127,6 +127,7 @@ public static class HistoryTools
         var structuredTests = tests
             .Select(t => new ListTestsForRow(
                 TestSymbolId: t.Test.Id,
+                CanonicalKey: t.Test.CanonicalKey,
                 Framework: string.IsNullOrEmpty(t.Framework) ? "unknown" : t.Framework,
                 TestFqn: t.Test.Fqn,
                 FilePath: t.Test.FilePath,
@@ -135,6 +136,7 @@ public static class HistoryTools
             .ToList();
         var dto = new ListTestsForResult(
             TargetSymbolId: target.Id,
+            TargetCanonicalKey: target.CanonicalKey,
             TargetFqn: target.Fqn,
             TargetKind: target.Kind,
             Tests: structuredTests);
@@ -218,6 +220,7 @@ public static class HistoryTools
         var authoredAtIso = history?.LastAuthoredAt is { } t ? t.ToString("o") : null;
         var dto = new WhoAuthoredResult(
             SymbolId: target.Id,
+            CanonicalKey: target.CanonicalKey,
             Fqn: target.Fqn,
             Author: history?.LastAuthor,
             Sha: sha,
@@ -333,6 +336,7 @@ public static class HistoryTools
                 var authoredAtIso = r.History.LastAuthoredAt is { } t ? t.ToString("o") : null;
                 return new RecentChangesRow(
                     SymbolId: r.Symbol.Id,
+                    CanonicalKey: r.Symbol.CanonicalKey,
                     Fqn: r.Symbol.Fqn,
                     Kind: r.Symbol.Kind,
                     FilePath: r.Symbol.FilePath,

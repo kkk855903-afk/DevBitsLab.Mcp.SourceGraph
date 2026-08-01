@@ -6,10 +6,16 @@ using System.Linq;
 namespace DevBitsLab.Mcp.SourceGraph.Indexing.Xaml;
 
 /// <summary>
-/// Immutable project resource-cascade snapshot.
+/// Immutable project resource-cascade snapshot. Completeness is stored alongside candidates so
+/// resource resolution can distinguish "not found" from "not proven absent" when a merged
+/// dictionary could not be read or resolved during incremental discovery.
 /// </summary>
 public sealed class XamlResourceSnapshot
 {
+    /// <summary>
+    /// Copies the supplied collections to prevent a later discovery mutation from changing a
+    /// snapshot already observed by concurrent document indexers.
+    /// </summary>
     public XamlResourceSnapshot(
         IReadOnlyDictionary<string, IReadOnlyList<ResourceDefinition>> definitions,
         IReadOnlyCollection<string> contributorPaths,

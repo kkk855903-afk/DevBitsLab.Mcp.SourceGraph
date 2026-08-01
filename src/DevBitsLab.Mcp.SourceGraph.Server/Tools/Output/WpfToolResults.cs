@@ -84,7 +84,27 @@ public sealed record WpfScopeSummary(
     bool Partial,
     bool Truncated,
     [property: JsonPropertyName("omitted_count")] int OmittedCount,
-    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Note);
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Note,
+    [property: JsonPropertyName("source_coverage_complete"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] bool SourceCoverageComplete,
+    [property: JsonPropertyName("language_projection_complete"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] bool LanguageProjectionComplete,
+    [property: JsonPropertyName("relation_projection_complete"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] bool RelationProjectionComplete,
+    [property: JsonPropertyName("query_traversal_complete"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] bool QueryTraversalComplete,
+    [property: JsonPropertyName("indexed_files"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] int IndexedFiles,
+    [property: JsonPropertyName("eligible_files"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] int EligibleFiles,
+    [property: JsonPropertyName("missing_files"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] IReadOnlyList<string>? MissingFiles,
+    [property: JsonPropertyName("missing_file_count"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] int MissingFileCount,
+    [property: JsonPropertyName("missing_files_truncated"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] bool MissingFilesTruncated,
+    [property: JsonPropertyName("loaded_indexers"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] IReadOnlyList<string>? LoadedIndexers,
+    [property: JsonPropertyName("index_generation"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)] long IndexGeneration,
+    [property: JsonPropertyName("indexed_at"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? IndexedAt)
+{
+    [JsonPropertyName("absence_authoritative"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public bool AbsenceAuthoritative =>
+        SourceCoverageComplete
+        && LanguageProjectionComplete
+        && RelationProjectionComplete
+        && QueryTraversalComplete;
+}
 
 /// <summary>
 /// Structured output for <c>trace_binding</c>.
@@ -108,9 +128,19 @@ public sealed record TraceBindingResult(
         ? "found"
         : Partial || Truncated ? "unknown" : "absent";
     public string Completeness => Partial || Truncated ? "partial" : "complete";
+    [JsonPropertyName("source_coverage_complete")]
+    public bool SourceCoverageComplete => Scopes.Count > 0 && Scopes.All(row => row.SourceCoverageComplete);
+    [JsonPropertyName("language_projection_complete")]
+    public bool LanguageProjectionComplete => Scopes.Count > 0 && Scopes.All(row => row.LanguageProjectionComplete);
+    [JsonPropertyName("relation_projection_complete")]
+    public bool RelationProjectionComplete => Scopes.Count > 0 && Scopes.All(row => row.RelationProjectionComplete);
+    [JsonPropertyName("query_traversal_complete")]
+    public bool QueryTraversalComplete => Scopes.Count > 0 && Scopes.All(row => row.QueryTraversalComplete);
     [JsonPropertyName("absence_authoritative")]
     public bool AbsenceAuthoritative =>
-        Matches.Count == 0 && !Partial && !Truncated;
+        Matches.Count == 0 && !Partial && !Truncated
+        && SourceCoverageComplete && LanguageProjectionComplete
+        && RelationProjectionComplete && QueryTraversalComplete;
     public string Reason => Truncated
         ? "scan-cap"
         : Partial ? "partial-scope" : Matches.Count == 0 ? "not-found" : "matched";
@@ -138,9 +168,19 @@ public sealed record TraceCommandResult(
         ? "found"
         : Partial || Truncated ? "unknown" : "absent";
     public string Completeness => Partial || Truncated ? "partial" : "complete";
+    [JsonPropertyName("source_coverage_complete")]
+    public bool SourceCoverageComplete => Scopes.Count > 0 && Scopes.All(row => row.SourceCoverageComplete);
+    [JsonPropertyName("language_projection_complete")]
+    public bool LanguageProjectionComplete => Scopes.Count > 0 && Scopes.All(row => row.LanguageProjectionComplete);
+    [JsonPropertyName("relation_projection_complete")]
+    public bool RelationProjectionComplete => Scopes.Count > 0 && Scopes.All(row => row.RelationProjectionComplete);
+    [JsonPropertyName("query_traversal_complete")]
+    public bool QueryTraversalComplete => Scopes.Count > 0 && Scopes.All(row => row.QueryTraversalComplete);
     [JsonPropertyName("absence_authoritative")]
     public bool AbsenceAuthoritative =>
-        Matches.Count == 0 && !Partial && !Truncated;
+        Matches.Count == 0 && !Partial && !Truncated
+        && SourceCoverageComplete && LanguageProjectionComplete
+        && RelationProjectionComplete && QueryTraversalComplete;
     public string Reason => Truncated
         ? "scan-cap"
         : Partial ? "partial-scope" : Matches.Count == 0 ? "not-found" : "matched";
@@ -184,9 +224,19 @@ public sealed record CheckResourcesResult(
         ? "found"
         : Partial || Truncated ? "unknown" : "absent";
     public string Completeness => Partial || Truncated ? "partial" : "complete";
+    [JsonPropertyName("source_coverage_complete")]
+    public bool SourceCoverageComplete => Scopes.Count > 0 && Scopes.All(row => row.SourceCoverageComplete);
+    [JsonPropertyName("language_projection_complete")]
+    public bool LanguageProjectionComplete => Scopes.Count > 0 && Scopes.All(row => row.LanguageProjectionComplete);
+    [JsonPropertyName("relation_projection_complete")]
+    public bool RelationProjectionComplete => Scopes.Count > 0 && Scopes.All(row => row.RelationProjectionComplete);
+    [JsonPropertyName("query_traversal_complete")]
+    public bool QueryTraversalComplete => Scopes.Count > 0 && Scopes.All(row => row.QueryTraversalComplete);
     [JsonPropertyName("absence_authoritative")]
     public bool AbsenceAuthoritative =>
-        Resources.Count == 0 && !Partial && !Truncated;
+        Resources.Count == 0 && !Partial && !Truncated
+        && SourceCoverageComplete && LanguageProjectionComplete
+        && RelationProjectionComplete && QueryTraversalComplete;
     public string Reason => Truncated
         ? "scan-cap"
         : Partial ? "partial-scope" : Resources.Count == 0 ? "not-found" : "matched";

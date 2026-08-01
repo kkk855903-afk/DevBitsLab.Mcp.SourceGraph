@@ -12,8 +12,56 @@ public interface IGraphStore : IAsyncDisposable
     /// </summary>
     Task<GraphReadVersion> GetReadVersionAsync(CancellationToken ct = default);
 
+    /// <summary>
+    /// Returns the last completely published version for a derived-fact producer, or null when
+    /// that producer has never completed. Producer versions let an indexer refresh only its own
+    /// files after an implementation upgrade instead of forcing a whole-schema rebuild.
+    /// </summary>
+    Task<int?> GetProjectionVersionAsync(
+        string producer,
+        CancellationToken ct = default) =>
+        Task.FromResult<int?>(null);
+
+    /// <summary>Records a producer version only after its complete projection succeeds.</summary>
+    Task SetProjectionVersionAsync(
+        string producer,
+        int version,
+        CancellationToken ct = default) =>
+        Task.CompletedTask;
+
+    /// <summary>
+    /// Clears a producer checkpoint before a new publication pass. If the process stops before
+    /// completion, the missing checkpoint forces a safe refresh on the next startup.
+    /// </summary>
+    Task ClearProjectionVersionAsync(
+        string producer,
+        CancellationToken ct = default) =>
+        Task.CompletedTask;
+
     Task<long> UpsertFileAsync(string path, byte[] contentSha256, DateTimeOffset indexedAt, bool isGenerated = false, CancellationToken ct = default);
     Task<byte[]?> GetFileContentHashAsync(string path, CancellationToken ct = default);
+
+    /// <summary>
+    /// Search the first-party source-content index. Literal searches use the trigram FTS index
+    /// for candidate selection when possible and always verify exact casing/content in memory;
+    /// regex searches scan the indexed documents with a bounded regex timeout.
+    /// </summary>
+    Task<SourceTextSearchPage> SearchSourceTextAsync(
+        string query,
+        SourceTextSearchMode mode,
+        bool caseSensitive,
+        string? fileGlob,
+        int contextLines,
+        int maxResults,
+        CancellationToken ct = default) =>
+        throw new NotSupportedException(
+            "This graph-store implementation predates first-party source text search.");
+
+    /// <summary>Return non-generated graph files, source-content-indexed files, and the gap.</summary>
+    Task<SourceDocumentCoverage> GetSourceDocumentCoverageAsync(
+        CancellationToken ct = default) =>
+        throw new NotSupportedException(
+            "This graph-store implementation predates source coverage reporting.");
 
     /// <summary>Wipes refs and edge evidence emitted by this file, then removes logical edges
     /// left with no evidence. Does NOT delete symbols — they retain stable ids across edits.</summary>
@@ -391,6 +439,16 @@ public interface IGraphStore : IAsyncDisposable
     Task<GraphStats> GetStatsAsync(CancellationToken ct = default);
 
     /// <summary>
+    /// Counts symbols that the built-in C# embedding producer can actually enqueue. XAML, C++,
+    /// and other language projections are intentionally excluded; generated files and C# symbols
+    /// with neither documentation nor a body excerpt are also outside the producer's scope. The
+    /// default keeps older graph-store implementations source-compatible and falls back to the
+    /// historical all-symbol count.
+    /// </summary>
+    async Task<long> CountEmbeddingEligibleSymbolsAsync(CancellationToken ct = default) =>
+        (await GetStatsAsync(ct).ConfigureAwait(false)).SymbolCount;
+
+    /// <summary>
     /// Detailed row counts for the graph's main tables. Returned to <c>verify_scope</c> as part
     /// of its structured health snapshot. Counts are taken in a single round-trip via subselect.
     /// </summary>
@@ -656,6 +714,12 @@ public sealed record RowCountsRow(
     long Files,
     long Annotations,
     long Diagnostics);
+
+/// <summary>Persistent freshness state shared by every query response for one scope.</summary>
+public sealed record IndexStateRow(
+    long Generation,
+    long? IndexedAt,
+    long? SourceChangedAt);
 
 /// <summary>
 /// One <c>files</c> row projected to the columns the drift-sample needs.

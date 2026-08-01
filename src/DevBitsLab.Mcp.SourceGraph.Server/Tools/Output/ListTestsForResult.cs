@@ -9,6 +9,7 @@ namespace DevBitsLab.Mcp.SourceGraph.Server.Tools.Output;
 /// </summary>
 public sealed record ListTestsForResult(
     [property: JsonPropertyName("target_symbol_id")] long TargetSymbolId,
+    [property: JsonPropertyName("target_canonical_key")] string? TargetCanonicalKey,
     [property: JsonPropertyName("target_fqn")] string TargetFqn,
     [property: JsonPropertyName("target_kind")] string TargetKind,
     IReadOnlyList<ListTestsForRow> Tests);
@@ -20,6 +21,7 @@ public sealed record ListTestsForResult(
 /// </summary>
 public sealed record ListTestsForRow(
     [property: JsonPropertyName("test_symbol_id")] long TestSymbolId,
+    [property: JsonPropertyName("canonical_key")] string? CanonicalKey,
     string Framework,
     [property: JsonPropertyName("test_fqn")] string TestFqn,
     [property: JsonPropertyName("file_path")] string FilePath,

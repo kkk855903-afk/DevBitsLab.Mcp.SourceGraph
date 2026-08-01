@@ -24,7 +24,7 @@ public static class ScopeTools
 {
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(ListScopesResult))]
     [ToolTrigger("\"what scopes are configured?\" — call before passing the `scope` parameter to other tools, or after a 'no default_scope' error")]
-    [Description("List every registered scope: id, name, root directory, project count, last-indexed timestamp, status (ok | partial | degraded | indexing), isolation flag, and any failed_projects / failed_files surfaced by the most recent index. Pair with the optional `scope` parameter on every other tool. A `partial` status means at least one project produced symbols and one or more failed; queries succeed but results may be incomplete.")]
+    [Description("List every registered scope: id, name, root, persistent index generation, last-indexed timestamp, current watcher lag, status (ok | partial | degraded | indexing), isolation flag, and cold-index failures. Pair with the optional `scope` parameter on every other tool.")]
     public static Task<CallToolResult> ListScopesAsync(ScopeRouter router) =>
         // Body is sync but tracking goes through the async overload that knows how to brand-mark
         // the first user-visible TextContentBlock and serialise StructuredContent. Wrap in
@@ -54,8 +54,8 @@ public static class ScopeTools
         var scopeNoun = hosts.Count == 1 ? "scope" : "scopes";
         sb.AppendLine($"{hosts.Count} {scopeNoun} registered:");
         sb.AppendLine();
-        sb.AppendLine("| Id | Name | Status | Isolated | Projects | Last indexed | Root |");
-        sb.AppendLine("|----|------|--------|---------:|---------:|--------------|------|");
+        sb.AppendLine("| Id | Name | Status | Generation | Watcher lag | Isolated | Projects | Last indexed | Root |");
+        sb.AppendLine("|----|------|--------|-----------:|------------:|---------:|---------:|--------------|------|");
         foreach (var host in hosts)
         {
             var scope = host.Scope;
@@ -69,7 +69,7 @@ public static class ScopeTools
             // Status messages, names, and roots can contain user data (exception messages, file
             // paths from `.sourcegraph.json`). A literal `|` or newline in any cell would break
             // the GFM table renderer; escape both via the shared MarkdownTable helper.
-            sb.AppendLine($"| `{scope.Id}` | {MarkdownTable.EscapeCell(scope.Name)} | {MarkdownTable.EscapeCell(statusCell)} | {(scope.Isolated ? "yes" : "no")} | {projectCount} | {lastIndexed} | `{MarkdownTable.EscapeCell(scope.Root)}` |");
+            sb.AppendLine($"| `{scope.Id}` | {MarkdownTable.EscapeCell(scope.Name)} | {MarkdownTable.EscapeCell(statusCell)} | {host.IndexGeneration} | {host.WatcherLagMs} ms | {(scope.Isolated ? "yes" : "no")} | {projectCount} | {lastIndexed} | `{MarkdownTable.EscapeCell(scope.Root)}` |");
         }
 
         // Per-scope failure detail: only emit when at least one scope has non-empty failure
@@ -139,9 +139,11 @@ public static class ScopeTools
                 Status: host.Status,
                 StatusMessage: string.IsNullOrEmpty(host.StatusMessage) ? null : host.StatusMessage,
                 Isolated: host.Scope.Isolated,
+                Generation: host.IndexGeneration,
                 LastIndexedAt: host.LastIndexedAt == DateTimeOffset.MinValue
                     ? null
                     : host.LastIndexedAt.ToString("o"),
+                WatcherLagMs: host.WatcherLagMs,
                 ProjectCount: ProjectCount(host.Scope.ProjectSet),
                 FailedProjects: host.FailedProjects
                     .Select(pf => new ListScopesProjectFailure(pf.Name, pf.Reason))
@@ -237,7 +239,19 @@ public static class ScopeTools
                 LastIndexedAt: host.LastIndexedAt == DateTimeOffset.MinValue ? null : host.LastIndexedAt.ToString("o"),
                 RowCounts: null,
                 IntegrityCheck: null,
-                DriftSample: null);
+                DriftSample: null,
+                SourceCoverageComplete: null,
+                LanguageProjectionComplete: null,
+                RelationProjectionComplete: null,
+                QueryTraversalComplete: null,
+                IndexedFiles: null,
+                EligibleFiles: null,
+                MissingFiles: null,
+                MissingFileCount: null,
+                MissingFilesTruncated: null,
+                LoadedIndexers: null,
+                IndexGeneration: null,
+                IndexedAt: null);
         }
 
         // Run integrity check first. If it fails, the DB's btree pages are unreliable —
@@ -258,7 +272,19 @@ public static class ScopeTools
                 LastIndexedAt: host.LastIndexedAt == DateTimeOffset.MinValue ? null : host.LastIndexedAt.ToString("o"),
                 RowCounts: null,
                 IntegrityCheck: integrity,
-                DriftSample: null);
+                DriftSample: null,
+                SourceCoverageComplete: null,
+                LanguageProjectionComplete: null,
+                RelationProjectionComplete: null,
+                QueryTraversalComplete: null,
+                IndexedFiles: null,
+                EligibleFiles: null,
+                MissingFiles: null,
+                MissingFileCount: null,
+                MissingFilesTruncated: null,
+                LoadedIndexers: null,
+                IndexGeneration: null,
+                IndexedAt: null);
         }
 
         progress?.Report(Format.Progress(baseFraction + 0.4 / hostCount, "reading row counts"));
@@ -266,6 +292,12 @@ public static class ScopeTools
 
         progress?.Report(Format.Progress(baseFraction + 0.8 / hostCount, "sampling drift"));
         var drift = await SampleDriftAsync(host, counts.Files, ct).ConfigureAwait(false);
+        var completeness = await IndexCompleteness.BuildAsync(
+            host,
+            queryTraversalComplete: true,
+            requireGrpcProjection: true,
+            requireNativeInteropProjection: host.Scope.Interop is not null,
+            ct).ConfigureAwait(false);
 
         return new VerifyScopeRow(
             Scope: host.Scope.Id,
@@ -276,7 +308,19 @@ public static class ScopeTools
             LastIndexedAt: host.LastIndexedAt == DateTimeOffset.MinValue ? null : host.LastIndexedAt.ToString("o"),
             RowCounts: new VerifyScopeCounts(counts.Symbols, counts.Refs, counts.Edges, counts.Files, counts.Annotations, counts.Diagnostics),
             IntegrityCheck: integrity,
-            DriftSample: drift);
+            DriftSample: drift,
+            SourceCoverageComplete: completeness.SourceCoverageComplete,
+            LanguageProjectionComplete: completeness.LanguageProjectionComplete,
+            RelationProjectionComplete: completeness.RelationProjectionComplete,
+            QueryTraversalComplete: completeness.QueryTraversalComplete,
+            IndexedFiles: completeness.IndexedFiles,
+            EligibleFiles: completeness.EligibleFiles,
+            MissingFiles: completeness.MissingFiles,
+            MissingFileCount: completeness.MissingFileCount,
+            MissingFilesTruncated: completeness.MissingFilesTruncated,
+            LoadedIndexers: completeness.LoadedIndexers,
+            IndexGeneration: completeness.IndexGeneration,
+            IndexedAt: completeness.IndexedAt);
     }
 
     private static async Task<VerifyScopeDriftSample> SampleDriftAsync(ScopeHost host, long totalFiles, CancellationToken ct)
@@ -379,7 +423,7 @@ public static class ScopeTools
 
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(RepairScopeResult))]
     [ToolTrigger("\"this scope looks broken — try to fix it\". `mode = \"minimal\"` (cheap: prune + retry) or `mode = \"rebuild\"` (nuclear: archive + cold-index from sources). Always operates on a single named scope; reject `*` and lists.")]
-    [Description("Recover one named scope. `minimal`: integrity check (refuses if non-`ok`) → prune orphan embeddings → retry-wrap workspace reload + index. `rebuild`: archive current DB to orphans/<id>-rebuild-<ts>.db → drop → cold-index from sources. Returns structured before/after status, elapsed_ms, and a free-form message. Use `verify_scope` first to decide which mode is appropriate.")]
+    [Description("Recover one named scope. `minimal`: integrity check (refuses if non-`ok`) → prune orphan embeddings → retry-wrap workspace reload + index. `rebuild`: cold-index and validate a shadow DB → atomically promote it while retaining the old DB under orphans/. A failed shadow build leaves the active DB unchanged. Returns structured before/after status, elapsed_ms, and a free-form message. Use `verify_scope` first to decide which mode is appropriate.")]
     public static Task<CallToolResult> RepairScopeAsync(
         ScopeRouter router,
         LiveIndexService liveIndex,
@@ -428,14 +472,16 @@ public static class ScopeTools
             }
             else
             {
-                progress?.Report(Format.Progress(0.0, "archiving old DB"));
+                progress?.Report(Format.Progress(0.0, "building and validating shadow index"));
                 var post = await liveIndex.RebuildScopeAsync(scope, archiveDiscriminator: "rebuild", ct).ConfigureAwait(false);
                 progress?.Report(Format.Progress(0.95, "finalising"));
                 sw.Stop();
                 if (post is null)
                 {
-                    afterStatus = "degraded";
-                    message = "rebuild failed — see server logs for details";
+                    afterStatus = router.TryGet(scope, out var retained)
+                        ? retained.Status
+                        : "degraded";
+                    message = "shadow rebuild was rejected or could not be promoted; existing index was retained";
                 }
                 else
                 {
@@ -534,8 +580,9 @@ public static class ScopeTools
             if (!dry_run)
             {
                 progress?.Report(Format.Progress(0.7, "applying changes"));
+                await host.RecordSourceChangeAsync(DateTimeOffset.UtcNow, ct).ConfigureAwait(false);
                 await DriftReconciler.ApplyAsync(host, diff, ct).ConfigureAwait(false);
-                host.LastIndexedAt = DateTimeOffset.UtcNow;
+                await host.CompleteIndexGenerationAsync(DateTimeOffset.UtcNow, ct).ConfigureAwait(false);
                 HealLog.Append(kind: "reconcile-drift-invoked", scope: scope, ok: true,
                     ms: sw.Elapsed.TotalMilliseconds,
                     details: $"scanned={diff.Scanned}, reindexed={diff.Changed.Count}, added={diff.Added.Count}, removed={diff.Removed.Count}, unchanged={diff.Unchanged}");

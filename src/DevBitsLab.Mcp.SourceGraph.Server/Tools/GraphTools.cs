@@ -2,6 +2,7 @@ using System.ComponentModel;
 using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using DevBitsLab.Mcp.SourceGraph.Core;
 using DevBitsLab.Mcp.SourceGraph.Embeddings;
 using DevBitsLab.Mcp.SourceGraph.Sdk;
@@ -31,21 +32,120 @@ public static class GraphTools
     // short-circuits — anywhere a tool body returning Task<CallToolResult> needs to ship plain
     // prose without a structured payload while still feeding the leaf chokepoint.
 
+    [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(ResolveSymbolResult))]
+    [ToolAnnotation(ReadOnlyHint = true, IdempotentHint = true)]
+    [ToolTrigger("resolve a symbol before chaining graph queries")]
+    [Description("Resolve exactly one symbol identity from text, canonical key, or a prior symbol_id. Ambiguous text never selects a default; inspect candidates and retry with symbol_id or canonical_key.")]
+    public static Task<CallToolResult> ResolveSymbolAsync(
+        ScopeRouter router,
+        [Description("Symbol name, FQN, or exact canonical key. Mutually exclusive with symbolId.")]
+        string? symbol = null,
+        [Description("Stable per-scope symbol id returned by another tool. Mutually exclusive with symbol.")]
+        long? symbolId = null,
+        [Description("Optional file-path substring used only for text resolution.")]
+        string? fileHint = null,
+        [Description(ScopeDescription)] string? scope = null,
+        CancellationToken ct = default) =>
+        ToolMetrics.TrackAsync(
+            "resolve_symbol",
+            new { symbol, symbolId, fileHint, scope },
+            () => ScopedExecution.RunAsync(router, scope, async host =>
+            {
+                var sw = Stopwatch.StartNew();
+                var resolution = await SymbolResolver.ResolveAsync(
+                    host.Store,
+                    symbol,
+                    symbolId,
+                    fileHint,
+                    candidateLimit: 10,
+                    ct).ConfigureAwait(false);
+                var candidates = resolution.Candidates.Select(MapResolvedSymbol).ToList();
+                var selected = resolution.Selected is null
+                    ? null
+                    : MapResolvedSymbol(resolution.Selected);
+                var dto = new ResolveSymbolResult(
+                    resolution.Status,
+                    resolution.Match,
+                    selected,
+                    candidates,
+                    resolution.Error);
+                var prose = resolution.Status switch
+                {
+                    "ok" => $"Resolved `{selected!.Fqn}` → symbol_id={selected.SymbolId}, canonical_key=`{selected.CanonicalKey ?? "(missing)"}`.",
+                    "ambiguous" => $"Ambiguous symbol text; {candidates.Count} candidates returned. Retry with symbol_id or canonical_key.",
+                    "invalid" => resolution.Error!,
+                    _ => "No symbol matched the requested identity.",
+                };
+                return new CallToolResult
+                {
+                    Content =
+                    [
+                        new TextContentBlock { Text = prose },
+                        AudienceMetadata.Build(host.Scope.Id, sw.ElapsedMilliseconds,
+                            ("candidates", candidates.Count.ToString())),
+                    ],
+                    StructuredContent = JsonSerializer.SerializeToElement(
+                        dto,
+                        ToolOutputJsonContext.Default.ResolveSymbolResult),
+                    IsError = resolution.Status == "invalid" ? true : null,
+                };
+            }, ct));
+
+    private static ResolveSymbolIdentity MapResolvedSymbol(SymbolHit hit) =>
+        new(
+            hit.Id,
+            hit.CanonicalKey,
+            hit.Name,
+            hit.Fqn,
+            hit.Kind,
+            hit.FilePath,
+            hit.StartLine,
+            hit.StartCol,
+            string.IsNullOrEmpty(hit.Signature) ? null : hit.Signature);
+
+    private static CallToolResult SymbolResolutionDiagnostic(
+        string tool,
+        string? query,
+        long? symbolId,
+        SymbolResolution resolution) =>
+        resolution.Status switch
+        {
+            "invalid" => DiagnosticResult.Error($"{tool}: {resolution.Error}"),
+            "ambiguous" => DiagnosticResult.Error(
+                $"{tool}: ambiguous symbol; no default was selected. Candidates: "
+                + string.Join(", ", resolution.Candidates.Select(candidate =>
+                    $"{candidate.Fqn} (id={candidate.Id}, key={candidate.CanonicalKey ?? "missing"})"))),
+            _ => DiagnosticResult.Build(
+                $"No matches for '{query?.Trim() ?? $"#{symbolId}"}'."),
+        };
+
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(FindDefinitionResult))]
     [ToolAnnotation(ReadOnlyHint = true, IdempotentHint = true)]
     [ToolTrigger("\"where is X defined?\"")]
-    [Description("Find the definition of a symbol by name or fully-qualified name. Returns symbol id, exact declaration range, defines relation, confidence, kind, signature, accessibility, modifiers, and one-line XML summary for each match.")]
+    [Description("Find the definition of a symbol by name or fully-qualified name. Returns symbol id, exact declaration range, defines relation, confidence, kind, signature, accessibility, modifiers, and one-line XML summary for each match. Set includeSnippet=true for a bounded source excerpt in structured content.")]
     public static Task<CallToolResult> FindDefinitionAsync(
         ScopeRouter router,
         [Description("Symbol name (e.g. 'Calculator', 'Divide') or FQN suffix (e.g. 'Calculator.Add', 'Sample.Domain.Calculator')")] string symbol,
         [Description("Optional substring to narrow the search to specific file paths")] string? fileHint = null,
         [Description(ScopeDescription)] string? scope = null,
+        [Description("Output detail: summary | locations | evidence (default) | audit.")] string detail = "evidence",
+        [Description("Source lines before and after each declaration when includeSnippet=true (0-20).")] int contextLines = 0,
+        [Description("Attach bounded source excerpts to structured hits (default false).")] bool includeSnippet = false,
         IProgress<ModelContextProtocol.ProgressNotificationValue>? progress = null,
         CancellationToken ct = default) =>
-        ToolMetrics.TrackAsync("find_definition", new { symbol, fileHint, scope }, () =>
+        ToolMetrics.TrackAsync("find_definition", new { symbol, fileHint, scope, detail, contextLines, includeSnippet }, () =>
             ScopedExecution.RunAsync(router, scope, async host =>
             {
                 var sw = System.Diagnostics.Stopwatch.StartNew();
+                if (!EvidenceDetailOptions.TryCreate(
+                        detail,
+                        contextLines,
+                        includeSnippet,
+                        out var evidenceOptions,
+                        out var evidenceError))
+                {
+                    return DiagnosticResult.Error($"find_definition {evidenceError}");
+                }
                 var hits = await host.Store.FindSymbolsAsync(symbol, fileHint, limit: 25, ct).ConfigureAwait(false);
                 if (hits.Count == 0)
                 {
@@ -85,8 +185,18 @@ public static class GraphTools
                         var line = Format.HistoryLine(hist);
                         if (line is not null) sb.AppendLine($"  - {line}");
                     }
+                    var snippet = evidenceOptions.IncludeSnippet
+                        ? await SourceContextReader.ReadAsync(
+                            host.Scope.Root,
+                            h.FilePath,
+                            h.StartLine,
+                            h.EndLine,
+                            evidenceOptions.ContextLines,
+                            ct).ConfigureAwait(false)
+                        : null;
                     structuredHits.Add(new FindDefinitionHit(
                         SymbolId: h.Id,
+                        CanonicalKey: h.CanonicalKey,
                         Fqn: h.Fqn,
                         Kind: h.Kind,
                         FilePath: h.FilePath,
@@ -97,7 +207,8 @@ public static class GraphTools
                         Relation: "defines",
                         Confidence: "exact",
                         Signature: string.IsNullOrEmpty(h.Signature) ? null : h.Signature,
-                        XmlSummary: string.IsNullOrEmpty(h.XmlSummary) ? null : h.XmlSummary));
+                        XmlSummary: string.IsNullOrEmpty(h.XmlSummary) ? null : h.XmlSummary,
+                        Snippet: snippet));
                 }
 
                 return BuildFindDefinitionResult(
@@ -283,6 +394,7 @@ public static class GraphTools
                     .ToList();
                 return new FindByAnnotationHit(
                     SymbolId: h.Id,
+                    CanonicalKey: h.CanonicalKey,
                     Fqn: h.Fqn,
                     Kind: h.Kind,
                     FilePath: h.FilePath,
@@ -303,20 +415,50 @@ public static class GraphTools
 
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(FindReferencesResult))]
     [ToolTrigger("\"who uses X?\" or \"who calls X?\"")]
-    [Description("Find every place that references a symbol. Resolves the symbol by name/FQN, then lists each occurrence with target symbol id/FQN, relation kind, semantic confidence, and file:line. By default skips refs from source-generated files; pass includeGenerated=true to surface them.")]
+    [Description("Find every place that references a symbol. Resolves the symbol by name/FQN, then lists each occurrence with target symbol id/FQN, relation kind, semantic confidence, and file:line. By default skips refs from source-generated files; pass includeGenerated=true to surface them. Set includeSnippet=true for bounded source excerpts in structured content.")]
     public static Task<CallToolResult> FindReferencesAsync(
         ScopeRouter router,
-        [Description("Symbol name or FQN, same matching rules as find_definition")] string symbol,
+        [Description("Symbol name, FQN, or canonical key. Mutually exclusive with symbolId.")] string? symbol = null,
         [Description("Maximum number of references to return (default 50)")] int limit = 50,
         [Description("Include references from source-generated files (default false)")] bool includeGenerated = false,
         [Description(ScopeDescription)] string? scope = null,
+        [Description("Output detail: summary | locations | evidence (default) | audit.")] string detail = "evidence",
+        [Description("Source lines before and after each reference when includeSnippet=true (0-20).")] int contextLines = 0,
+        [Description("Attach bounded source excerpts to structured references (default false).")] bool includeSnippet = false,
+        [Description("Exact symbol id returned by resolve_symbol. Mutually exclusive with symbol.")] long? symbolId = null,
         CancellationToken ct = default) =>
-        ToolMetrics.TrackAsync("find_references", new { symbol, limit, includeGenerated, scope }, () =>
+        ToolMetrics.TrackAsync("find_references", new { symbol, symbolId, limit, includeGenerated, scope, detail, contextLines, includeSnippet }, () =>
             ScopedExecution.RunAsync(router, scope, async host =>
             {
                 var sw = System.Diagnostics.Stopwatch.StartNew();
-                var hits = await host.Store.FindSymbolsAsync(symbol, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
-                if (hits.Count == 0)
+                if (!EvidenceDetailOptions.TryCreate(
+                        detail,
+                        contextLines,
+                        includeSnippet,
+                        out var evidenceOptions,
+                        out var evidenceError))
+                {
+                    return DiagnosticResult.Error($"find_references {evidenceError}");
+                }
+                var resolution = await SymbolResolver.ResolveAsync(
+                    host.Store,
+                    symbol,
+                    symbolId,
+                    fileHint: null,
+                    candidateLimit: 10,
+                    ct).ConfigureAwait(false);
+                if (resolution.Status == "invalid")
+                {
+                    return DiagnosticResult.Error(resolution.Error!);
+                }
+                if (resolution.Status == "ambiguous")
+                {
+                    return DiagnosticResult.Error(
+                        "Ambiguous symbol; no default was selected. Candidates: "
+                        + string.Join(", ", resolution.Candidates.Select(candidate =>
+                            $"{candidate.Fqn} (id={candidate.Id}, key={candidate.CanonicalKey ?? "missing"})")));
+                }
+                if (resolution.Selected is null)
                 {
                     // No symbol resolved — short-circuit through DiagnosticResult.Build instead of
                     // BuildFindReferencesResult. Without a resolved target we can't construct a
@@ -324,16 +466,11 @@ public static class GraphTools
                     // ambiguous to consumers). Matches every other target-shaped tool's no-resolve
                     // path. Telemetry counts as ok=true (success-with-empty), symmetric with the
                     // pre-conversion `Task<string>` "No matches for 'X'." behaviour.
-                    return DiagnosticResult.Build($"No matches for '{symbol}'.");
+                    return DiagnosticResult.Build($"No matches for '{symbol?.Trim() ?? $"#{symbolId}"}'.");
                 }
 
                 var sb = new StringBuilder();
-                if (hits.Count > 1)
-                {
-                    sb.AppendLine($"Multiple symbols match '{symbol}'; reporting references for the top match. Other matches: {string.Join(", ", hits.Skip(1).Select(h => h.Fqn))}");
-                    sb.AppendLine();
-                }
-                var top = hits[0];
+                var top = resolution.Selected;
                 var refs = await host.Store.FindReferencesAsync(top.Id, includeGenerated, limit, ct).ConfigureAwait(false);
                 sb.AppendLine($"References to **{top.Fqn}** ({KindLabel(top.Kind)}){GeneratedSuffix(top.IsGenerated)}:");
                 sb.AppendLine($"- definition: {Format.Location(top.FilePath, top.StartLine, top.StartCol)}");
@@ -351,6 +488,21 @@ public static class GraphTools
                 }
                 var (refsKept, refsOmitted) = OutputBudget.ChooseKeep(refs.Count, OutputBudget.CompactRowChars);
                 if (refsOmitted > 0) refs = refs.Take(refsKept).ToList();
+                Dictionary<long, SourceSnippet?>? snippets = null;
+                if (evidenceOptions.IncludeSnippet)
+                {
+                    snippets = new Dictionary<long, SourceSnippet?>(refs.Count);
+                    foreach (var reference in refs)
+                    {
+                        snippets[reference.Id] = await SourceContextReader.ReadAsync(
+                            host.Scope.Root,
+                            reference.FilePath,
+                            reference.Line,
+                            reference.Line,
+                            evidenceOptions.ContextLines,
+                            ct).ConfigureAwait(false);
+                    }
+                }
                 sb.AppendLine();
                 sb.AppendLine($"{refs.Count} references:");
                 if (refs.Count >= 2)
@@ -383,7 +535,8 @@ public static class GraphTools
                     refs: refs,
                     scopeId: host.Scope.Id,
                     elapsedMs: sw.ElapsedMilliseconds,
-                    omittedSize: refsOmitted);
+                    omittedSize: refsOmitted,
+                    snippets: snippets);
             }, ct));
 
     /// <summary>
@@ -401,7 +554,8 @@ public static class GraphTools
         IReadOnlyList<ReferenceHit> refs,
         string scopeId,
         long elapsedMs,
-        int omittedSize = 0)
+        int omittedSize = 0,
+        IReadOnlyDictionary<long, SourceSnippet?>? snippets = null)
     {
         var content = new List<ContentBlock>(capacity: 2 + refs.Count)
         {
@@ -434,21 +588,29 @@ public static class GraphTools
         content.Add(AudienceMetadata.Build(scopeId, elapsedMs, extras));
 
         var structuredReferences = refs
-            .Select(r => new FindReferenceHit(
-                SymbolId: target.Id,
-                TargetFqn: target.Fqn,
-                Kind: RefKindLabel(r.Kind),
-                Relation: RefKindLabel(r.Kind),
-                Confidence: "semantic",
-                FilePath: r.FilePath,
-                Line: r.Line,
-                Column: r.Col,
-                IsGenerated: r.IsGenerated))
+            .Select(r =>
+            {
+                SourceSnippet? snippet = null;
+                snippets?.TryGetValue(r.Id, out snippet);
+                return new FindReferenceHit(
+                    SymbolId: target.Id,
+                    CanonicalKey: target.CanonicalKey,
+                    TargetFqn: target.Fqn,
+                    Kind: RefKindLabel(r.Kind),
+                    Relation: RefKindLabel(r.Kind),
+                    Confidence: "semantic",
+                    FilePath: r.FilePath,
+                    Line: r.Line,
+                    Column: r.Col,
+                    IsGenerated: r.IsGenerated,
+                    Snippet: snippet);
+            })
             .ToList();
         var dto = new FindReferencesResult(
             TargetFqn: target.Fqn,
             TargetKind: target.Kind,
             TargetSymbolId: target.Id,
+            TargetCanonicalKey: target.CanonicalKey,
             References: structuredReferences);
 
         return new CallToolResult
@@ -552,6 +714,7 @@ public static class GraphTools
         var structuredSymbols = symbols
             .Select(s => new ListSymbolsInFileRow(
                 SymbolId: s.Id,
+                CanonicalKey: s.CanonicalKey,
                 Name: s.Name,
                 Fqn: s.Fqn,
                 Kind: s.Kind,
@@ -574,18 +737,31 @@ public static class GraphTools
 
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(ListCallersResult))]
     [ToolTrigger("\"who calls X?\" or \"who consumes type X?\"")]
-    [Description("List evidence-backed inbound edges into a target symbol. Every row includes canonical source/target identities, actual relation, confidence, and stored occurrence file/range evidence; malformed edges without evidence are skipped. Default kind=calls; kind=all preserves each actual edge kind. Plugin-defined kebab-case kinds are accepted.")]
+    [Description("List evidence-backed inbound edges into a target symbol. Every row includes canonical source/target identities, actual relation, confidence, and stored occurrence file/range evidence; malformed edges without evidence are skipped. Default kind=calls; kind=all preserves each actual edge kind. Set includeSnippet=true for bounded source excerpts on each evidence occurrence.")]
     public static Task<CallToolResult> ListCallersAsync(
         ScopeRouter router,
-        [Description("Target symbol name or FQN")] string symbol,
+        [Description("Target symbol name, FQN, or canonical key. Mutually exclusive with symbolId.")] string? symbol = null,
         [Description("Maximum number of results to return (default 50)")] int limit = 50,
         [Description("Edge kind to walk (kebab-case): calls (default) | uses-type | overrides-member | implements-member | instantiates | throws | tests | code-behind | binds-to | binds-path | binds-element | handles-event | uses-resource | instantiates-type | merges | applies-style | all. Plugin-defined kinds are accepted.")] string? kind = null,
         [Description(ScopeDescription)] string? scope = null,
+        [Description("Output detail: summary | locations | evidence (default) | audit.")] string detail = "evidence",
+        [Description("Source lines before and after each evidence occurrence when includeSnippet=true (0-20).")] int contextLines = 0,
+        [Description("Attach bounded source excerpts to structured edge evidence (default false).")] bool includeSnippet = false,
+        [Description("Exact target id returned by resolve_symbol. Mutually exclusive with symbol.")] long? symbolId = null,
         CancellationToken ct = default) =>
-        ToolMetrics.TrackAsync("list_callers", new { symbol, limit, kind, scope }, () =>
+        ToolMetrics.TrackAsync("list_callers", new { symbol, symbolId, limit, kind, scope, detail, contextLines, includeSnippet }, () =>
             ScopedExecution.RunAsync(router, scope, async host =>
             {
                 var sw = System.Diagnostics.Stopwatch.StartNew();
+                if (!EvidenceDetailOptions.TryCreate(
+                        detail,
+                        contextLines,
+                        includeSnippet,
+                        out var evidenceOptions,
+                        out var evidenceError))
+                {
+                    return DiagnosticResult.Error($"list_callers {evidenceError}");
+                }
                 if (limit is < 1 or > 1000)
                 {
                     return DiagnosticResult.Error("list_callers `limit` must be between 1 and 1000.");
@@ -597,16 +773,26 @@ public static class GraphTools
                     if (unknownNote is not null) return DiagnosticResult.Error(unknownNote);
                 }
 
-                var hits = await host.Store.FindSymbolsAsync(symbol, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
-                if (hits.Count == 0) return DiagnosticResult.Build($"No matches for '{symbol}'.");
-                var top = hits[0];
+                var resolution = await SymbolResolver.ResolveAsync(
+                    host.Store, symbol, symbolId, null, 10, ct).ConfigureAwait(false);
+                if (resolution.Selected is null)
+                {
+                    return SymbolResolutionDiagnostic("list_callers", symbol, symbolId, resolution);
+                }
+                var top = resolution.Selected;
                 var traversal = await EvidenceTraversal.LoadInboundAsync(
                     host.Store,
                     top,
                     limit,
                     edgeKind,
                     ct).ConfigureAwait(false);
-                var callers = traversal.Relations;
+                var callers = evidenceOptions.IncludeSnippet
+                    ? await SourceContextReader.AttachAsync(
+                        host.Scope.Root,
+                        traversal.Relations,
+                        evidenceOptions.ContextLines,
+                        ct).ConfigureAwait(false)
+                    : traversal.Relations;
                 var sb = new StringBuilder();
                 sb.AppendLine($"Inbound `{label}` to **{top.Fqn}** ({KindLabel(top.Kind)}):");
                 if (callers.Count == 0)
@@ -658,7 +844,10 @@ public static class GraphTools
                         if (payloadLine is not null) sb.AppendLine(payloadLine);
                     }
                 }
-                EvidenceTraversal.AppendRelations(sb, callers);
+                if (evidenceOptions.Detail is "evidence" or "audit")
+                {
+                    EvidenceTraversal.AppendRelations(sb, callers);
+                }
                 if (traversal.Truncated)
                 {
                     sb.AppendLine();
@@ -743,18 +932,31 @@ public static class GraphTools
 
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(ListCalleesResult))]
     [ToolTrigger("\"what does X call?\" or \"what types does X use?\"")]
-    [Description("List evidence-backed outbound edges from a source symbol. Every row includes canonical source/target identities, actual relation, confidence, and stored occurrence file/range evidence; malformed edges without evidence are skipped. Default kind=calls; kind=all preserves each actual edge kind. Plugin-defined kebab-case kinds are accepted.")]
+    [Description("List evidence-backed outbound edges from a source symbol. Every row includes canonical source/target identities, actual relation, confidence, and stored occurrence file/range evidence; malformed edges without evidence are skipped. Default kind=calls; kind=all preserves each actual edge kind. Set includeSnippet=true for bounded source excerpts on each evidence occurrence.")]
     public static Task<CallToolResult> ListCalleesAsync(
         ScopeRouter router,
-        [Description("Source symbol name or FQN")] string symbol,
+        [Description("Source symbol name, FQN, or canonical key. Mutually exclusive with symbolId.")] string? symbol = null,
         [Description("Maximum number of results to return (default 50)")] int limit = 50,
         [Description("Edge kind to walk (kebab-case): calls (default) | uses-type | overrides-member | implements-member | instantiates | throws | tests | code-behind | binds-to | binds-path | binds-element | handles-event | uses-resource | instantiates-type | merges | applies-style | all. Plugin-defined kinds are accepted.")] string? kind = null,
         [Description(ScopeDescription)] string? scope = null,
+        [Description("Output detail: summary | locations | evidence (default) | audit.")] string detail = "evidence",
+        [Description("Source lines before and after each evidence occurrence when includeSnippet=true (0-20).")] int contextLines = 0,
+        [Description("Attach bounded source excerpts to structured edge evidence (default false).")] bool includeSnippet = false,
+        [Description("Exact source id returned by resolve_symbol. Mutually exclusive with symbol.")] long? symbolId = null,
         CancellationToken ct = default) =>
-        ToolMetrics.TrackAsync("list_callees", new { symbol, limit, kind, scope }, () =>
+        ToolMetrics.TrackAsync("list_callees", new { symbol, symbolId, limit, kind, scope, detail, contextLines, includeSnippet }, () =>
             ScopedExecution.RunAsync(router, scope, async host =>
             {
                 var sw = System.Diagnostics.Stopwatch.StartNew();
+                if (!EvidenceDetailOptions.TryCreate(
+                        detail,
+                        contextLines,
+                        includeSnippet,
+                        out var evidenceOptions,
+                        out var evidenceError))
+                {
+                    return DiagnosticResult.Error($"list_callees {evidenceError}");
+                }
                 if (limit is < 1 or > 1000)
                 {
                     return DiagnosticResult.Error("list_callees `limit` must be between 1 and 1000.");
@@ -766,16 +968,26 @@ public static class GraphTools
                     if (unknownNote is not null) return DiagnosticResult.Error(unknownNote);
                 }
 
-                var hits = await host.Store.FindSymbolsAsync(symbol, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
-                if (hits.Count == 0) return DiagnosticResult.Build($"No matches for '{symbol}'.");
-                var top = hits[0];
+                var resolution = await SymbolResolver.ResolveAsync(
+                    host.Store, symbol, symbolId, null, 10, ct).ConfigureAwait(false);
+                if (resolution.Selected is null)
+                {
+                    return SymbolResolutionDiagnostic("list_callees", symbol, symbolId, resolution);
+                }
+                var top = resolution.Selected;
                 var traversal = await EvidenceTraversal.LoadOutboundAsync(
                     host.Store,
                     top,
                     limit,
                     edgeKind,
                     ct).ConfigureAwait(false);
-                var callees = traversal.Relations;
+                var callees = evidenceOptions.IncludeSnippet
+                    ? await SourceContextReader.AttachAsync(
+                        host.Scope.Root,
+                        traversal.Relations,
+                        evidenceOptions.ContextLines,
+                        ct).ConfigureAwait(false)
+                    : traversal.Relations;
                 var sb = new StringBuilder();
                 sb.AppendLine($"Outbound `{label}` from **{top.Fqn}** ({KindLabel(top.Kind)}):");
                 if (callees.Count == 0)
@@ -823,7 +1035,10 @@ public static class GraphTools
                         if (payloadLine is not null) sb.AppendLine(payloadLine);
                     }
                 }
-                EvidenceTraversal.AppendRelations(sb, callees);
+                if (evidenceOptions.Detail is "evidence" or "audit")
+                {
+                    EvidenceTraversal.AppendRelations(sb, callees);
+                }
                 if (traversal.Truncated)
                 {
                     sb.AppendLine();
@@ -1000,6 +1215,7 @@ public static class GraphTools
         var structuredImpls = impls
             .Select(c => new FindImplementationsRow(
                 SymbolId: c.Id,
+                CanonicalKey: c.CanonicalKey,
                 Fqn: c.Fqn,
                 Kind: c.Kind,
                 FilePath: c.FilePath,
@@ -1011,6 +1227,7 @@ public static class GraphTools
             TargetFqn: target.Fqn,
             TargetKind: target.Kind,
             TargetSymbolId: target.Id,
+            TargetCanonicalKey: target.CanonicalKey,
             Implementations: structuredImpls);
         return new CallToolResult
         {
@@ -1414,6 +1631,234 @@ public static class GraphTools
         };
     }
 
+    [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(SearchTextResult))]
+    [ToolAnnotation(ReadOnlyHint = true, IdempotentHint = true)]
+    [ToolTrigger("\"find this exact text/regex in source files\"")]
+    [Description("Search SourceGraph's own persisted source-content index; does not invoke ripgrep. Returns exact file/line/column matches, bounded context, truncation/total counts, excluded directories, and index generation.")]
+    public static Task<CallToolResult> SearchTextAsync(
+        ScopeRouter router,
+        [Description("Literal text or .NET regular expression to search for.")] string query,
+        [Description("Search mode: literal (default) | regex.")] string mode = "literal",
+        [Description("Use ordinal case-sensitive matching (default false).")] bool caseSensitive = false,
+        [Description("Optional repository-style glob such as **/*.cs, src/**, or *.xaml.")] string? fileGlob = null,
+        [Description("Source lines before and after each matching line (0-20, default 0).")] int contextLines = 0,
+        [Description("Maximum matching lines returned (1-500, default 100). Total counts still scan every candidate.")] int maxResults = 100,
+        [Description(ScopeDescription)] string? scope = null,
+        CancellationToken ct = default) =>
+        ToolMetrics.TrackAsync(
+            "search_text",
+            new { query, mode, caseSensitive, fileGlob, contextLines, maxResults, scope },
+            () => ScopedExecution.RunAsync(router, scope, async host =>
+            {
+                var sw = Stopwatch.StartNew();
+                if (string.IsNullOrWhiteSpace(query))
+                    return DiagnosticResult.Error("search_text requires a non-empty query.");
+                if (query.Length > 4096)
+                    return DiagnosticResult.Error("search_text query must not exceed 4096 characters.");
+                if (contextLines is < 0 or > 20)
+                    return DiagnosticResult.Error("search_text contextLines must be between 0 and 20.");
+                if (maxResults is < 1 or > 500)
+                    return DiagnosticResult.Error("search_text maxResults must be between 1 and 500.");
+                var normalizedMode = mode.Trim().ToLowerInvariant();
+                var searchMode = normalizedMode switch
+                {
+                    "literal" => SourceTextSearchMode.Literal,
+                    "regex" => SourceTextSearchMode.Regex,
+                    _ => (SourceTextSearchMode?)null,
+                };
+                if (searchMode is null)
+                    return DiagnosticResult.Error("search_text mode must be literal or regex.");
+
+                SourceTextSearchPage page;
+                try
+                {
+                    page = await host.Store.SearchSourceTextAsync(
+                        query,
+                        searchMode.Value,
+                        caseSensitive,
+                        fileGlob,
+                        contextLines,
+                        maxResults,
+                        ct).ConfigureAwait(false);
+                }
+                catch (RegexMatchTimeoutException)
+                {
+                    return DiagnosticResult.Error(
+                        "search_text regex exceeded the per-document safety timeout; simplify the expression.");
+                }
+                catch (ArgumentException ex)
+                {
+                    return DiagnosticResult.Error($"search_text: {ex.Message}");
+                }
+
+                var allStructuredHits = page.Hits.Select(hit => new SearchTextHit(
+                    hit.FilePath,
+                    hit.Line,
+                    hit.Column,
+                    hit.EndColumn,
+                    hit.MatchCount,
+                    hit.LineText,
+                    hit.BeforeContext,
+                    hit.AfterContext)).ToList();
+                var excludedDirectories = PrivacyPathPolicy.MandatoryExcludePatterns
+                    .Concat(host.Scope.ProjectSet.Exclude)
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .ToList();
+                var truncationReasons = new List<string>();
+                if (page.Truncated) truncationReasons.Add("max_results");
+
+                // Reserve the prose preview and protocol wrapper, then account for each hit's
+                // actual JSON representation. This keeps a single unusually long line/context
+                // from defeating a fixed rows-per-response estimate.
+                const int prosePreviewLimit = 20;
+                var previewReserve = EstimateSearchTextProseChars(
+                    query,
+                    page.TotalMatchingLines,
+                    page.TotalMatches,
+                    allStructuredHits.Take(prosePreviewLimit));
+                var budgetProbe = new SearchTextResult(
+                    query,
+                    normalizedMode,
+                    caseSensitive,
+                    string.IsNullOrWhiteSpace(fileGlob) ? null : fileGlob,
+                    contextLines,
+                    maxResults,
+                    page.TotalMatches,
+                    page.TotalMatchingLines,
+                    0,
+                    page.TotalMatchingLines,
+                    page.CandidateDocuments,
+                    page.TotalMatchingLines > 0,
+                    ["max_results", "output_budget"],
+                    0,
+                    false,
+                    excludedDirectories,
+                    host.IndexGeneration,
+                    []);
+                var usedChars = OutputBudget.BaseOverheadChars
+                    + previewReserve
+                    + JsonSerializer.Serialize(
+                        budgetProbe,
+                        ToolOutputJsonContext.Default.SearchTextResult).Length;
+                var structuredHits = new List<SearchTextHit>(allStructuredHits.Count);
+                foreach (var hit in allStructuredHits)
+                {
+                    var hitChars = JsonSerializer.Serialize(
+                        hit,
+                        ToolOutputJsonContext.Default.SearchTextHit).Length + 1;
+                    if (usedChars + hitChars > OutputBudget.DefaultBudgetChars) break;
+                    structuredHits.Add(hit);
+                    usedChars += hitChars;
+                }
+                if (structuredHits.Count < allStructuredHits.Count)
+                    truncationReasons.Add("output_budget");
+
+                var omittedLines = Math.Max(0, page.TotalMatchingLines - structuredHits.Count);
+                var truncated = omittedLines > 0;
+                var previewedLines = Math.Min(prosePreviewLimit, structuredHits.Count);
+                var prosePreviewTruncated = structuredHits.Count > previewedLines;
+
+                var sb = new StringBuilder();
+                sb.Append(page.TotalMatchingLines)
+                    .Append(" matching lines / ")
+                    .Append(page.TotalMatches)
+                    .Append(" matches for `")
+                    .Append(query.Replace("`", "\\`", StringComparison.Ordinal))
+                    .Append("`");
+                if (truncated)
+                {
+                    sb.Append("; returned ")
+                        .Append(structuredHits.Count)
+                        .Append(", omitted ")
+                        .Append(omittedLines)
+                        .Append(" (")
+                        .Append(string.Join(", ", truncationReasons))
+                        .Append(')');
+                }
+                sb.AppendLine(".");
+                foreach (var hit in structuredHits.Take(prosePreviewLimit))
+                {
+                    sb.Append("- ").Append(Format.Location(hit.FilePath, hit.Line, hit.Column))
+                        .Append(": ").AppendLine(hit.LineText.Trim());
+                    if (hit.BeforeContext.Count > 0)
+                    {
+                        sb.AppendLine("  context before:");
+                        foreach (var line in hit.BeforeContext)
+                            sb.Append("    ").AppendLine(line);
+                    }
+                    if (hit.AfterContext.Count > 0)
+                    {
+                        sb.AppendLine("  context after:");
+                        foreach (var line in hit.AfterContext)
+                            sb.Append("    ").AppendLine(line);
+                    }
+                }
+                if (prosePreviewTruncated)
+                {
+                    sb.AppendLine(
+                        $"- Prose preview shows {previewedLines} of {structuredHits.Count} returned matching lines; "
+                        + $"all {structuredHits.Count} returned lines are present in structured content.");
+                }
+
+                var dto = new SearchTextResult(
+                    query,
+                    normalizedMode,
+                    caseSensitive,
+                    string.IsNullOrWhiteSpace(fileGlob) ? null : fileGlob,
+                    contextLines,
+                    maxResults,
+                    page.TotalMatches,
+                    page.TotalMatchingLines,
+                    structuredHits.Count,
+                    omittedLines,
+                    page.CandidateDocuments,
+                    truncated,
+                    truncationReasons,
+                    previewedLines,
+                    prosePreviewTruncated,
+                    excludedDirectories,
+                    host.IndexGeneration,
+                    structuredHits);
+                return new CallToolResult
+                {
+                    Content =
+                    [
+                        new TextContentBlock { Text = sb.ToString() },
+                        AudienceMetadata.Build(
+                            host.Scope.Id,
+                            sw.ElapsedMilliseconds,
+                            ("matching_lines", page.TotalMatchingLines.ToString()),
+                            ("matches", page.TotalMatches.ToString()),
+                            ("returned_lines", structuredHits.Count.ToString()),
+                            ("omitted_lines", omittedLines.ToString()),
+                            ("truncated", truncated.ToString().ToLowerInvariant()),
+                            ("truncation_reasons", string.Join(",", truncationReasons))),
+                    ],
+                    StructuredContent = JsonSerializer.SerializeToElement(
+                        dto,
+                        ToolOutputJsonContext.Default.SearchTextResult),
+                };
+            }, ct));
+
+    private static int EstimateSearchTextProseChars(
+        string query,
+        long totalMatchingLines,
+        long totalMatches,
+        IEnumerable<SearchTextHit> hits)
+    {
+        var chars = JsonSerializer.Serialize(query).Length + totalMatchingLines.ToString().Length
+            + totalMatches.ToString().Length + 128;
+        foreach (var hit in hits)
+        {
+            // The prose lives inside JSON too. Reusing the hit's escaped JSON length is a
+            // conservative proxy for paths/source lines dominated by quotes or backslashes.
+            chars += JsonSerializer.Serialize(
+                hit,
+                ToolOutputJsonContext.Default.SearchTextHit).Length + 64;
+        }
+        return chars;
+    }
+
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(SearchSymbolsResult))]
     [ToolTrigger("\"I only have a fragment of the name (e.g. 'Calc', 'Greet', 'Async')\"")]
     [Description("Free-text search for symbols by partial name, FQN, or signature using FTS5.")]
@@ -1638,6 +2083,7 @@ public static class GraphTools
 
         static NeighborhoodRow Project(SymbolHit s) => new(
             SymbolId: s.Id,
+            CanonicalKey: s.CanonicalKey,
             Fqn: s.Fqn,
             Kind: s.Kind,
             FilePath: s.FilePath,
@@ -1646,6 +2092,7 @@ public static class GraphTools
             PayloadJson: string.IsNullOrEmpty(s.PayloadJson) ? null : s.PayloadJson);
         var dto = new NeighborhoodResult(
             SymbolId: target.Id,
+            CanonicalKey: target.CanonicalKey,
             Fqn: target.Fqn,
             Kind: target.Kind,
             FilePath: target.FilePath,
@@ -1849,6 +2296,7 @@ public static class GraphTools
             .Select(row => new ModuleSummaryRow(
                 InDegree: row.InDegree,
                 SymbolId: row.Symbol.Id,
+                CanonicalKey: row.Symbol.CanonicalKey,
                 Fqn: row.Symbol.Fqn,
                 Kind: row.Symbol.Kind,
                 FilePath: row.Symbol.FilePath,
@@ -1867,17 +2315,20 @@ public static class GraphTools
 
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(ImpactOfChangeResult))]
     [ToolTrigger("\"what would change if I edit X?\" — transitive callers")]
-    [Description("Compute bounded evidence-backed upstream impact with breadth-first, cycle-safe traversal. Every row includes its canonical identity, BFS predecessor, path confidence, and a source-to-target path whose hops carry real occurrence evidence. maxDepth is 1-12 and limit is 1-1000; truncation is explicit.")]
+    [Description("Compute bounded evidence-backed upstream impact with breadth-first, cycle-safe traversal. Defaults to a token-efficient summary; set detail=paths for predecessor chains or detail=evidence for occurrence evidence. maxDepth is 1-12 and limit is 1-1000; truncation is explicit.")]
     public static Task<CallToolResult> ImpactOfChangeAsync(
         ScopeRouter router,
         [Description("Symbol name or FQN")] string symbol,
         [Description("Maximum traversal depth (default 4)")] int maxDepth = 4,
         [Description("Maximum results (default 100)")] int limit = 100,
         [Description("Edge kind to walk (kebab-case): calls (default) | uses-type | overrides-member | implements-member | instantiates | throws | tests | code-behind | binds-to | binds-path | binds-element | handles-event | uses-resource | instantiates-type | merges | applies-style | all. Plugin-defined kinds are accepted.")] string? kind = null,
+        [Description("Output detail: summary (default) | locations | evidence | audit. The legacy value paths remains accepted for predecessor-only prose. Structured output always remains auditable.")] string detail = "summary",
+        [Description("Optional file-path hint used to disambiguate symbols with the same name.")] string? file = null,
+        [Description("Optional kebab-case symbol kind used to disambiguate the target.")] string? symbolKind = null,
         [Description(ScopeDescription)] string? scope = null,
         IProgress<ProgressNotificationValue>? progress = null,
         CancellationToken ct = default) =>
-        ToolMetrics.TrackAsync("impact_of_change", new { symbol, maxDepth, limit, kind, scope }, () =>
+        ToolMetrics.TrackAsync("impact_of_change", new { symbol, maxDepth, limit, kind, detail, file, symbolKind, scope }, () =>
             ScopedExecution.RunAsync(router, scope, async host =>
             {
                 var sw = System.Diagnostics.Stopwatch.StartNew();
@@ -1889,6 +2340,18 @@ public static class GraphTools
                 {
                     return DiagnosticResult.Error("impact_of_change `limit` must be between 1 and 1000.");
                 }
+                var detailLevel = detail.Trim().ToLowerInvariant();
+                if (detailLevel != "paths"
+                    && !EvidenceDetailOptions.TryCreate(
+                        detailLevel,
+                        0,
+                        false,
+                        out _,
+                        out _))
+                {
+                    return DiagnosticResult.Error(
+                        "impact_of_change `detail` must be summary, locations, evidence, or audit (legacy paths is also accepted).");
+                }
                 var (edgeKind, label, isAll) = NormaliseEdgeKindParam(kind);
                 if (!isAll && edgeKind is not null)
                 {
@@ -1896,7 +2359,14 @@ public static class GraphTools
                     if (unknownNote is not null) return DiagnosticResult.Error(unknownNote);
                 }
 
-                var hits = await host.Store.FindSymbolsAsync(symbol, filePathHint: null, limit: 5, ct).ConfigureAwait(false);
+                var hits = await host.Store.FindSymbolsAsync(symbol, filePathHint: file, limit: 20, ct).ConfigureAwait(false);
+                var targetKind = NormaliseKindFilter(symbolKind);
+                if (targetKind is not null)
+                {
+                    hits = hits.Where(hit =>
+                            string.Equals(hit.Kind, targetKind, StringComparison.Ordinal))
+                        .ToList();
+                }
                 if (hits.Count == 0) return DiagnosticResult.Build($"No matches for '{symbol}'.");
                 var top = hits[0];
                 progress?.Report(Format.Progress(0.0, "querying"));
@@ -1950,7 +2420,14 @@ public static class GraphTools
                         sb.AppendLine($"- d{r.Depth}: **{r.Symbol.Fqn}** ({KindLabel(r.Symbol.Kind)}) at {Format.Location(r.Symbol.FilePath, r.Symbol.StartLine, r.Symbol.StartCol)}");
                     }
                 }
-                EvidenceTraversal.AppendImpactPaths(sb, rows);
+                if (detailLevel == "paths")
+                {
+                    EvidenceTraversal.AppendImpactPredecessors(sb, rows);
+                }
+                else if (detailLevel is "evidence" or "audit")
+                {
+                    EvidenceTraversal.AppendImpactPaths(sb, rows);
+                }
                 if (traversal.Truncated)
                 {
                     sb.AppendLine();
@@ -2148,6 +2625,7 @@ public static class GraphTools
         var structuredMembers = members
             .Select(m => new ListMembersRow(
                 SymbolId: m.Id,
+                CanonicalKey: m.CanonicalKey,
                 Name: m.Name,
                 Fqn: m.Fqn,
                 Kind: m.Kind,
@@ -2159,6 +2637,7 @@ public static class GraphTools
             .ToList();
         var dto = new ListMembersResult(
             ContainerSymbolId: container.Id,
+            ContainerCanonicalKey: container.CanonicalKey,
             ContainerFqn: container.Fqn,
             ContainerKind: container.Kind,
             Members: structuredMembers);
@@ -2173,38 +2652,146 @@ public static class GraphTools
 
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(SemanticSearchResult))]
     [ToolTrigger("\"find code that does retry logic\", \"how does this codebase handle authentication\", \"show me the rate-limiting code\"")]
-    [Description("Semantic / intent search: encode a natural-language query, find symbols whose code embeddings are nearest by cosine similarity. Complements (not replaces) search_symbols, which does name-fragment FTS5 trigram matching. Returns a top-k list with location, kind, and a similarity score in [-1, 1].")]
+    [Description("Hybrid code search. FTS5 supplies candidates before vector reranking, results are diversified by file, and the response reports coverage/model provenance. strategy=auto falls back to lexical when embedding coverage is incomplete; semantic forces full vector search, hybrid requires FTS candidates, and lexical skips encoding.")]
     public static Task<CallToolResult> SemanticSearchAsync(
         ScopeRouter router,
         ICodeEmbeddingGenerator generator,
         [Description("Free-text intent query, e.g. 'retry on transient errors', 'masks PII in logs'")] string query,
         [Description("Top-K results to return (default 20)")] int k = 20,
         [Description("Optional kebab-case symbol kind filter: class|method|property|field|interface|namespace|enum|enum-member|operator|record|delegate|struct|event|xaml-view|xaml-element|xaml-resource|xaml-style|xaml-template|... (any plugin-defined kebab-case kind also accepted).")] string? kind = null,
+        [Description("Retrieval strategy: auto (default) | hybrid | semantic | lexical.")] string strategy = "auto",
         [Description(ScopeDescription)] string? scope = null,
         IProgress<ProgressNotificationValue>? progress = null,
         CancellationToken ct = default) =>
-        ToolMetrics.TrackAsync("semantic_search", new { query, k, kind, scope }, () =>
+        ToolMetrics.TrackAsync("semantic_search", new { query, k, kind, strategy, scope }, () =>
             ScopedExecution.RunAsync(router, scope, async host =>
             {
                 var sw = System.Diagnostics.Stopwatch.StartNew();
-                // The next three short-circuits ship as plain prose (no structuredContent) — by
+                // The next short-circuits ship as plain prose (no structuredContent) — by
                 // design. They're config-/input-/encoder-failure diagnostics, NOT zero-row query
                 // results. The "Empty result populates structured content" spec scenario applies
                 // only when the search ran cleanly and produced zero matches (handled below by
                 // BuildSemanticSearchResult with hits=[]). Distinguishing the two lets agents
                 // detect "search was attempted, found nothing" vs. "search couldn't run" without
                 // string-matching the prose.
-                if (!host.EmbeddingsStore.IsAvailable || !generator.IsAvailable)
-                {
-                    return DiagnosticResult.Error(
-                        "semantic_search disabled: install the embedding model (run with the network on for first start) or remove `--no-embeddings`. The graph itself is fully indexed; other tools (`find_definition`, `search_symbols`, `list_callers`, …) work as normal.");
-                }
                 if (string.IsNullOrWhiteSpace(query))
                 {
                     return DiagnosticResult.Error("semantic_search: provide a non-empty query.");
                 }
+                if (k is < 1 or > 1000)
+                {
+                    return DiagnosticResult.Error("semantic_search `k` must be between 1 and 1000.");
+                }
 
                 var kindFilter = NormaliseKindFilter(kind);
+                var retrievalStrategy = strategy.Trim().ToLowerInvariant();
+                if (retrievalStrategy is not ("auto" or "hybrid" or "semantic" or "lexical"))
+                {
+                    return DiagnosticResult.Error(
+                        "semantic_search `strategy` must be auto, hybrid, semantic, or lexical.");
+                }
+
+                var eligibleSymbols = await host.Store
+                    .CountEmbeddingEligibleSymbolsAsync(ct)
+                    .ConfigureAwait(false);
+                var embeddedSymbols = host.EmbeddingsStore.IsAvailable
+                    ? await host.EmbeddingsStore.CountAsync(ct).ConfigureAwait(false)
+                    : 0;
+                var embeddingCoverage = eligibleSymbols == 0
+                    ? 1.0
+                    : Math.Min(1.0, embeddedSymbols / (double)eligibleSymbols);
+                var modelHash = string.Equals(
+                        generator.Model.ModelId,
+                        DefaultEmbeddingModel.ModelId,
+                        StringComparison.Ordinal)
+                    ? DefaultEmbeddingModel.Manifest
+                        .First(file => file.RemotePath.EndsWith("model.onnx", StringComparison.Ordinal))
+                        .ExpectedSha256
+                    : null;
+
+                var candidateLimit = Math.Min(500, Math.Max(100, k * 20));
+                var lexicalCandidates = retrievalStrategy == "semantic"
+                    ? Array.Empty<SymbolHit>()
+                    : await CollectLexicalCandidatesAsync(
+                        host.Store,
+                        query,
+                        kindFilter,
+                        candidateLimit,
+                        ct).ConfigureAwait(false);
+
+                var useLexical = retrievalStrategy == "lexical"
+                    || (retrievalStrategy == "auto" && LooksLikeIdentifierQuery(query))
+                    || (retrievalStrategy == "auto" && embeddingCoverage < 1.0);
+                if (useLexical)
+                {
+                    var lexicalRows = lexicalCandidates
+                        .Take(k)
+                        .Select((symbol, index) => new SemanticRankedRow(
+                            Score: Math.Max(0.5, 1.0 - index * 0.01),
+                            VectorScore: null,
+                            Symbol: symbol))
+                        .ToList();
+                    if (lexicalRows.Count > 0
+                        || retrievalStrategy == "lexical"
+                        || embeddingCoverage < 1.0)
+                    {
+                        var lexicalReason = LooksLikeIdentifierQuery(query)
+                            ? "semantic encoding skipped"
+                            : embeddingCoverage < 1.0
+                                ? $"embedding coverage {embeddingCoverage:P1}; degraded to lexical"
+                                : "semantic encoding skipped";
+                        var lexicalProse = BuildSemanticProse(
+                            query,
+                            lexicalRows,
+                            "lexical",
+                            lexicalReason);
+                        return BuildSemanticSearchResult(
+                            lexicalProse,
+                            query,
+                            lexicalRows,
+                            host.Scope.Id,
+                            sw.ElapsedMilliseconds,
+                            mode: "lexical",
+                            strategyUsed: "lexical",
+                            candidateSource: "fts",
+                            embeddedSymbols: embeddedSymbols,
+                            eligibleSymbols: eligibleSymbols,
+                            embeddingCoverage: embeddingCoverage,
+                            model: generator.Model.ModelId,
+                            modelHash: modelHash);
+                    }
+                }
+
+                if (retrievalStrategy == "hybrid" && lexicalCandidates.Count == 0)
+                {
+                    return BuildSemanticSearchResult(
+                        prose: $"No FTS candidates for hybrid query '{query}'.",
+                        query: query,
+                        rows: Array.Empty<SemanticRankedRow>(),
+                        scopeId: host.Scope.Id,
+                        elapsedMs: sw.ElapsedMilliseconds,
+                        mode: "hybrid",
+                        strategyUsed: "hybrid",
+                        candidateSource: "fts-empty",
+                        embeddedSymbols: embeddedSymbols,
+                        eligibleSymbols: eligibleSymbols,
+                        embeddingCoverage: embeddingCoverage,
+                        model: generator.Model.ModelId,
+                        modelHash: modelHash);
+                }
+
+                if (!host.EmbeddingsStore.IsAvailable || !generator.IsAvailable)
+                {
+                    return DiagnosticResult.Error(
+                        "semantic_search disabled: no lexical match was found and semantic embeddings are unavailable. Start the server with `--enable-embeddings` and install the embedding model; exact identifier queries can still use strategy=lexical.");
+                }
+
+                progress?.Report(Format.Progress(0.0, "waiting for embedding index"));
+                if (!await host.EmbeddingsReady.WaitAsync(ct).ConfigureAwait(false))
+                {
+                    return DiagnosticResult.Error(
+                        "semantic_search unavailable: the initial embedding backfill did not complete. Restart the server to retry the safe full backfill; lexical and graph queries remain available.");
+                }
 
                 // Cold-start: the JinaCodeEmbeddingGenerator singleton is lazy-instantiated by DI
                 // on first use, so the first `EmbedAsync` call after server start carries the ONNX
@@ -2217,112 +2804,147 @@ public static class GraphTools
                 }
 
                 progress?.Report(Format.Progress(0.5, "searching"));
-                var hits = await host.EmbeddingsStore.SearchAsync(queryEmbeddings[0], k, kindFilter, ct).ConfigureAwait(false);
+                var searchK = Math.Min(1000, Math.Max(k, k * 5));
+                var isHybrid = lexicalCandidates.Count > 0 && retrievalStrategy != "semantic";
+                var hits = isHybrid
+                    ? await host.EmbeddingsStore.SearchCandidatesAsync(
+                        queryEmbeddings[0],
+                        lexicalCandidates.Select(candidate => candidate.Id).ToList(),
+                        searchK,
+                        ct).ConfigureAwait(false)
+                    : await host.EmbeddingsStore.SearchAsync(
+                        queryEmbeddings[0],
+                        searchK,
+                        kindFilter,
+                        ct).ConfigureAwait(false);
+                var mode = isHybrid ? "hybrid" : "semantic";
+                var candidateSource = isHybrid ? "fts" : "vector-full";
                 if (hits.Count == 0)
                 {
                     return BuildSemanticSearchResult(
-                        prose: $"No semantic matches for '{query}'. The graph may not have any embeddings yet — let the indexer's embedding pass complete after a fresh `index` and try again.",
+                        prose: $"No {mode} matches for '{query}'.",
                         query: query,
-                        rows: Array.Empty<(EmbeddingHit Hit, SymbolHit Symbol)>(),
+                        rows: Array.Empty<SemanticRankedRow>(),
                         scopeId: host.Scope.Id,
-                        elapsedMs: sw.ElapsedMilliseconds);
+                        elapsedMs: sw.ElapsedMilliseconds,
+                        mode: mode,
+                        strategyUsed: mode,
+                        candidateSource: candidateSource,
+                        embeddedSymbols: embeddedSymbols,
+                        eligibleSymbols: eligibleSymbols,
+                        embeddingCoverage: embeddingCoverage,
+                        model: generator.Model.ModelId,
+                        modelHash: modelHash);
                 }
 
                 progress?.Report(Format.Progress(0.9, "formatting results"));
-                // Apply the size budget at the hit level *before* resolving symbols so omitted rows
-                // don't incur per-row GetSymbolByIdAsync calls — important when callers pass a large
-                // k and the budget trims to ~30. Resolving only the kept hits keeps prose-row count
-                // and structured-array length in lockstep with the budget decision.
-                var (hitsKept, hitsOmitted) = OutputBudget.ChooseKeep(hits.Count, OutputBudget.SnippetRowChars);
-                IEnumerable<EmbeddingHit> hitsToResolve = hitsOmitted > 0 ? hits.Take(hitsKept) : hits;
-                var resolved = new List<(EmbeddingHit Hit, SymbolHit Symbol)>(hitsKept);
-                foreach (var h in hitsToResolve)
+                var resolved = new List<SemanticRankedRow>(hits.Count);
+                foreach (var hit in hits)
                 {
-                    var sym = await host.Store.GetSymbolByIdAsync(h.SymbolId, ct).ConfigureAwait(false);
-                    if (sym is not null) resolved.Add((h, sym));
+                    var symbol = await host.Store.GetSymbolByIdAsync(hit.SymbolId, ct).ConfigureAwait(false);
+                    if (symbol is null) continue;
+                    resolved.Add(new SemanticRankedRow(
+                        Score: Math.Min(1.0, hit.Score + LexicalRerankBonus(query, symbol)),
+                        VectorScore: hit.Score,
+                        Symbol: symbol));
                 }
-                var sb = new StringBuilder();
-                sb.AppendLine($"{resolved.Count} semantic hits for '{query}':");
-                if (resolved.Count >= 2)
-                {
-                    var rows = new List<IReadOnlyList<string>>(resolved.Count);
-                    foreach (var (h, sym) in resolved)
-                    {
-                        rows.Add(new[]
-                        {
-                            h.Score.ToString("F3"),
-                            $"**{sym.Fqn}**",
-                            Format.KindWithAttrs(sym),
-                            Format.Location(sym.FilePath, sym.StartLine, sym.StartCol),
-                        });
-                    }
-                    Format.AppendTable(
-                        sb,
-                        new[] { "Score", "Symbol", "Kind", "Location" },
-                        rows,
-                        new[] { TableAlignment.Right, TableAlignment.Left, TableAlignment.Left, TableAlignment.Left });
-                }
-                else
-                {
-                    foreach (var (h, sym) in resolved)
-                    {
-                        sb.Append($"- score {h.Score:F3} — **{sym.Fqn}** ({Format.KindWithAttrs(sym)}) at {Format.Location(sym.FilePath, sym.StartLine, sym.StartCol)}");
-                        var s = Format.OneLineSummary(sym.XmlSummary);
-                        if (!string.IsNullOrEmpty(s)) sb.Append(" — _" + s + "_");
-                        sb.AppendLine();
-                    }
-                }
+                var diversified = DiversifySemanticRows(resolved, k);
+                var (rowsKept, hitsOmitted) = OutputBudget.ChooseKeep(
+                    diversified.Count,
+                    OutputBudget.SnippetRowChars);
+                var rows = diversified.Take(rowsKept).ToList();
+                var prose = BuildSemanticProse(
+                    query,
+                    rows,
+                    mode,
+                    $"candidate_source={candidateSource}");
                 return BuildSemanticSearchResult(
-                    prose: sb.ToString(),
+                    prose: prose,
                     query: query,
-                    rows: resolved,
+                    rows: rows,
                     scopeId: host.Scope.Id,
                     elapsedMs: sw.ElapsedMilliseconds,
-                    omittedSize: hitsOmitted);
+                    omittedSize: hitsOmitted,
+                    mode: mode,
+                    strategyUsed: mode,
+                    candidateSource: candidateSource,
+                    embeddedSymbols: embeddedSymbols,
+                    eligibleSymbols: eligibleSymbols,
+                    embeddingCoverage: embeddingCoverage,
+                    model: generator.Model.ModelId,
+                    modelHash: modelHash);
             }, ct, progress));
 
     private static CallToolResult BuildSemanticSearchResult(
         string prose,
         string query,
-        IReadOnlyList<(EmbeddingHit Hit, SymbolHit Symbol)> rows,
+        IReadOnlyList<SemanticRankedRow> rows,
         string scopeId,
         long elapsedMs,
-        int omittedSize = 0)
+        int omittedSize = 0,
+        string mode = "semantic",
+        string strategyUsed = "semantic",
+        string candidateSource = "vector-full",
+        long embeddedSymbols = 0,
+        long eligibleSymbols = 0,
+        double embeddingCoverage = 0,
+        string model = "unknown",
+        string? modelHash = null)
     {
+        var provenance =
+            $"retrieval: strategy_used={strategyUsed}; candidate_source={candidateSource}; " +
+            $"embedded_symbols={embeddedSymbols}; eligible_symbols={eligibleSymbols}; " +
+            $"embedding_coverage={embeddingCoverage:F3}; model={model}; " +
+            $"model_hash={modelHash ?? "unknown"}";
+        var visibleProse = prose.TrimEnd() + Environment.NewLine + provenance + Environment.NewLine;
         var content = new List<ContentBlock>(capacity: 2 + rows.Count)
         {
-            new TextContentBlock { Text = prose },
+            new TextContentBlock { Text = visibleProse },
         };
 
-        foreach (var (h, sym) in rows)
+        foreach (var row in rows)
         {
+            var sym = row.Symbol;
             content.Add(new ResourceLinkBlock
             {
                 Uri = GraphResourceUris.Symbol(sym.Id),
                 Name = sym.Fqn,
-                Title = $"score {h.Score:F3}: {sym.Fqn}",
+                Title = $"score {row.Score:F3}: {sym.Fqn}",
                 Description = $"{Format.KindWithAttrs(sym)} — {Format.Location(sym.FilePath, sym.StartLine, sym.StartCol)}",
                 MimeType = "text/markdown",
             });
         }
 
         var extras = omittedSize > 0
-            ? new[] { ("hits", rows.Count.ToString()), ("omitted_size", omittedSize.ToString()) }
-            : new[] { ("hits", rows.Count.ToString()) };
+            ? new[] { ("hits", rows.Count.ToString()), ("mode", mode), ("coverage", embeddingCoverage.ToString("F3")), ("omitted_size", omittedSize.ToString()) }
+            : new[] { ("hits", rows.Count.ToString()), ("mode", mode), ("coverage", embeddingCoverage.ToString("F3")) };
         content.Add(AudienceMetadata.Build(scopeId, elapsedMs, extras));
 
         var structuredHits = rows
-            .Select(r => new SemanticSearchHit(
-                Score: r.Hit.Score,
-                SymbolId: r.Symbol.Id,
-                Fqn: r.Symbol.Fqn,
-                Kind: r.Symbol.Kind,
-                FilePath: r.Symbol.FilePath,
-                Line: r.Symbol.StartLine,
-                Column: r.Symbol.StartCol,
-                XmlSummary: string.IsNullOrEmpty(r.Symbol.XmlSummary) ? null : r.Symbol.XmlSummary))
+            .Select(row => new SemanticSearchHit(
+                Score: row.Score,
+                SymbolId: row.Symbol.Id,
+                CanonicalKey: row.Symbol.CanonicalKey,
+                Fqn: row.Symbol.Fqn,
+                Kind: row.Symbol.Kind,
+                FilePath: row.Symbol.FilePath,
+                Line: row.Symbol.StartLine,
+                Column: row.Symbol.StartCol,
+                XmlSummary: string.IsNullOrEmpty(row.Symbol.XmlSummary) ? null : row.Symbol.XmlSummary,
+                VectorScore: row.VectorScore,
+                Group: IsTestSymbol(row.Symbol) ? "test" : "production"))
             .ToList();
-        var dto = new SemanticSearchResult(Query: query, Hits: structuredHits);
+        var dto = new SemanticSearchResult(
+            Query: query,
+            Mode: mode,
+            StrategyUsed: strategyUsed,
+            CandidateSource: candidateSource,
+            EmbeddedSymbols: embeddedSymbols,
+            EligibleSymbols: eligibleSymbols,
+            EmbeddingCoverage: embeddingCoverage,
+            Model: model,
+            ModelHash: modelHash,
+            Hits: structuredHits);
         return new CallToolResult
         {
             Content = content,
@@ -2330,6 +2952,242 @@ public static class GraphTools
                 dto,
                 ToolOutputJsonContext.Default.SemanticSearchResult),
         };
+    }
+
+    [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(SearchSymbolsBatchResult))]
+    [ToolTrigger("\"find several symbols in one request\"")]
+    [Description("Run 1-20 independent FTS5 symbol queries in one MCP round-trip. Use this instead of repeated search_symbols calls when resolving several names.")]
+    public static Task<CallToolResult> SearchSymbolsBatchAsync(
+        ScopeRouter router,
+        [Description("Independent symbol queries (1-20).")] IReadOnlyList<string> queries,
+        [Description("Maximum results per query (default 10, maximum 100).")] int topK = 10,
+        [Description("Optional kebab-case symbol kind applied to every query.")] string? kind = null,
+        [Description(ScopeDescription)] string? scope = null,
+        CancellationToken ct = default) =>
+        ToolMetrics.TrackAsync(
+            "search_symbols_batch",
+            new { queries, topK, kind, scope },
+            () => ScopedExecution.RunAsync(router, scope, async host =>
+            {
+                if (queries is null || queries.Count is < 1 or > 20)
+                {
+                    return DiagnosticResult.Error(
+                        "search_symbols_batch `queries` must contain between 1 and 20 items.");
+                }
+                if (queries.Any(string.IsNullOrWhiteSpace))
+                {
+                    return DiagnosticResult.Error(
+                        "search_symbols_batch queries must be non-empty.");
+                }
+                if (topK is < 1 or > 100)
+                {
+                    return DiagnosticResult.Error(
+                        "search_symbols_batch `topK` must be between 1 and 100.");
+                }
+
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                var kindFilter = NormaliseKindFilter(kind);
+                var batches = new List<SearchSymbolsBatchQueryResult>(queries.Count);
+                foreach (var query in queries)
+                {
+                    var hits = await host.Store.SearchSymbolsAsync(
+                        query,
+                        kindFilter,
+                        topK,
+                        ct).ConfigureAwait(false);
+                    batches.Add(new SearchSymbolsBatchQueryResult(
+                        query,
+                        hits.Select(MapSearchSymbolHit).ToList()));
+                }
+
+                var sb = new StringBuilder();
+                sb.AppendLine(
+                    $"{batches.Sum(batch => batch.Hits.Count)} hits across {batches.Count} queries:");
+                foreach (var batch in batches)
+                {
+                    sb.Append("- **")
+                      .Append(batch.Query)
+                      .Append("**: ");
+                    if (batch.Hits.Count == 0)
+                    {
+                        sb.AppendLine("(none)");
+                        continue;
+                    }
+                    sb.AppendLine(string.Join(
+                        ", ",
+                        batch.Hits.Select(hit =>
+                            $"{hit.Fqn} ({Format.Location(hit.FilePath, hit.StartLine, hit.StartColumn)})")));
+                }
+
+                return new CallToolResult
+                {
+                    Content =
+                    [
+                        new TextContentBlock { Text = sb.ToString() },
+                        AudienceMetadata.Build(
+                            host.Scope.Id,
+                            sw.ElapsedMilliseconds,
+                            ("queries", batches.Count.ToString()),
+                            ("hits", batches.Sum(batch => batch.Hits.Count).ToString())),
+                    ],
+                    StructuredContent = JsonSerializer.SerializeToElement(
+                        new SearchSymbolsBatchResult(batches),
+                        ToolOutputJsonContext.Default.SearchSymbolsBatchResult),
+                };
+            }, ct));
+
+    private static SearchSymbolHit MapSearchSymbolHit(SymbolHit hit) =>
+        new(
+            SymbolId: hit.Id,
+            CanonicalKey: hit.CanonicalKey,
+            Fqn: hit.Fqn,
+            Kind: hit.Kind,
+            Relation: "defines",
+            Confidence: "exact",
+            FilePath: hit.FilePath,
+            StartLine: hit.StartLine,
+            StartColumn: hit.StartCol,
+            EndLine: hit.EndLine,
+            EndColumn: hit.EndCol,
+            Signature: string.IsNullOrEmpty(hit.Signature) ? null : hit.Signature,
+            XmlSummary: string.IsNullOrEmpty(hit.XmlSummary) ? null : hit.XmlSummary);
+
+    private static async Task<IReadOnlyList<SymbolHit>> CollectLexicalCandidatesAsync(
+        IGraphStore store,
+        string query,
+        string? kindFilter,
+        int limit,
+        CancellationToken ct)
+    {
+        var candidates = new List<SymbolHit>(limit);
+        var seen = new HashSet<long>();
+
+        async Task AddAsync(string probe)
+        {
+            if (candidates.Count >= limit) return;
+            var hits = await store.SearchSymbolsAsync(
+                probe,
+                kindFilter,
+                limit - candidates.Count,
+                ct).ConfigureAwait(false);
+            foreach (var hit in hits)
+            {
+                if (seen.Add(hit.Id)) candidates.Add(hit);
+            }
+        }
+
+        await AddAsync(query).ConfigureAwait(false);
+        foreach (var token in SemanticTokens(query))
+        {
+            await AddAsync(token).ConfigureAwait(false);
+            if (candidates.Count >= limit) break;
+        }
+        return candidates;
+    }
+
+    private static IReadOnlyList<string> SemanticTokens(string query)
+    {
+        var stopWords = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "and", "the", "for", "with", "from", "that", "this", "code", "find",
+            "show", "does", "how", "into", "using", "where",
+        };
+        return query
+            .Split(
+                [' ', '\t', '\r', '\n', '.', ',', ':', ';', '(', ')', '[', ']', '{', '}', '/', '\\', '-', '_'],
+                StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Where(token => token.Length >= 3 && !stopWords.Contains(token))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Take(12)
+            .ToList();
+    }
+
+    private static double LexicalRerankBonus(string query, SymbolHit symbol)
+    {
+        var haystack = string.Join(
+            ' ',
+            symbol.Fqn,
+            symbol.Signature ?? string.Empty,
+            symbol.XmlSummary ?? string.Empty);
+        var matches = SemanticTokens(query).Count(token =>
+            haystack.Contains(token, StringComparison.OrdinalIgnoreCase));
+        return Math.Min(0.10, matches * 0.02);
+    }
+
+    private static IReadOnlyList<SemanticRankedRow> DiversifySemanticRows(
+        IReadOnlyList<SemanticRankedRow> rows,
+        int k)
+    {
+        var ordered = rows
+            .OrderByDescending(row => row.Score)
+            .ThenBy(row => row.Symbol.Fqn, StringComparer.Ordinal)
+            .ToList();
+        var result = new List<SemanticRankedRow>(Math.Min(k, ordered.Count));
+        var perFile = new Dictionary<string, int>(
+            OperatingSystem.IsWindows()
+                ? StringComparer.OrdinalIgnoreCase
+                : StringComparer.Ordinal);
+        var deferred = new List<SemanticRankedRow>();
+        foreach (var row in ordered)
+        {
+            perFile.TryGetValue(row.Symbol.FilePath, out var count);
+            if (count >= 2)
+            {
+                deferred.Add(row);
+                continue;
+            }
+            result.Add(row);
+            perFile[row.Symbol.FilePath] = count + 1;
+            if (result.Count == k) return result;
+        }
+        foreach (var row in deferred)
+        {
+            result.Add(row);
+            if (result.Count == k) break;
+        }
+        return result;
+    }
+
+    private static string BuildSemanticProse(
+        string query,
+        IReadOnlyList<SemanticRankedRow> rows,
+        string mode,
+        string note)
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine($"{rows.Count} {mode} hits for '{query}' ({note}):");
+        foreach (var row in rows)
+        {
+            sb.AppendLine(
+                $"- score {row.Score:F3} — **{row.Symbol.Fqn}** "
+                + $"({Format.KindWithAttrs(row.Symbol)}) at "
+                + Format.Location(
+                    row.Symbol.FilePath,
+                    row.Symbol.StartLine,
+                    row.Symbol.StartCol));
+        }
+        return sb.ToString();
+    }
+
+    private static bool IsTestSymbol(SymbolHit symbol) =>
+        !string.IsNullOrEmpty(symbol.TestFramework)
+        || symbol.FilePath.Contains("/test", StringComparison.OrdinalIgnoreCase)
+        || symbol.FilePath.Contains("\\test", StringComparison.OrdinalIgnoreCase)
+        || symbol.FilePath.Contains(".Tests", StringComparison.OrdinalIgnoreCase);
+
+    private sealed record SemanticRankedRow(
+        double Score,
+        double? VectorScore,
+        SymbolHit Symbol);
+
+    private static bool LooksLikeIdentifierQuery(string query)
+    {
+        var value = query.Trim();
+        if (value.Length is 0 or > 160) return false;
+        if (value.Any(char.IsWhiteSpace)) return false;
+        return value.All(ch =>
+            char.IsLetterOrDigit(ch)
+            || ch is '_' or '.' or ':' or '#' or '`' or '<' or '>' or '(' or ')' or ',');
     }
 
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(GraphStatsResult))]
@@ -2691,7 +3549,7 @@ public static class GraphTools
         _ => string.IsNullOrEmpty(kind) ? "?" : kind,
     };
 
-    private static string RefKindLabel(ReferenceKind kind) => kind switch
+    internal static string RefKindLabel(ReferenceKind kind) => kind switch
     {
         ReferenceKind.Definition => "def",
         ReferenceKind.Reference => "ref",
@@ -2975,13 +3833,16 @@ public static class GraphTools
                     ("annotation_flavors", annotationFlavors.Count.ToString())),
             };
 
-            return new CallToolResult
+            var result = new CallToolResult
             {
                 Content = content,
                 StructuredContent = JsonSerializer.SerializeToElement(
                     dto,
                     ToolOutputJsonContext.Default.DescribeSchemaResult),
             };
+            return IndexFreshnessMetadata.Attach(
+                result,
+                await ReadAttachedFreshnessAsync(connection, ct).ConfigureAwait(false));
         }
         finally
         {
@@ -3011,6 +3872,59 @@ public static class GraphTools
             }
         }
         return values;
+    }
+
+    private static async Task<IReadOnlyList<IndexFreshnessSnapshot>> ReadAttachedFreshnessAsync(
+        SqliteConnection connection,
+        CancellationToken ct)
+    {
+        var scopes = new List<string>();
+        await using (var list = connection.CreateCommand())
+        {
+            list.CommandText = "PRAGMA database_list;";
+            await using var reader = await list.ExecuteReaderAsync(ct).ConfigureAwait(false);
+            while (await reader.ReadAsync(ct).ConfigureAwait(false))
+            {
+                var name = reader.GetString(1);
+                if (name is not ("main" or "temp" or "meta")) scopes.Add(name);
+            }
+        }
+
+        var snapshots = new List<IndexFreshnessSnapshot>(scopes.Count);
+        foreach (var scopeId in scopes.OrderBy(value => value, StringComparer.Ordinal))
+        {
+            var quoted = '"' + scopeId.Replace("\"", "\"\"", StringComparison.Ordinal) + '"';
+            await using var command = connection.CreateCommand();
+            command.CommandText = $"""
+                SELECT
+                    state.generation,
+                    state.indexed_at,
+                    state.source_changed_at,
+                    COALESCE((SELECT status FROM v_scopes WHERE scope = @scope), 'ok')
+                FROM {quoted}.index_state AS state
+                WHERE state.singleton = 1;
+                """;
+            command.Parameters.AddWithValue("@scope", scopeId);
+            await using var reader = await command.ExecuteReaderAsync(ct).ConfigureAwait(false);
+            if (!await reader.ReadAsync(ct).ConfigureAwait(false)) continue;
+
+            var generation = reader.GetInt64(0);
+            var indexedMs = reader.IsDBNull(1) ? (long?)null : reader.GetInt64(1);
+            var changedMs = reader.IsDBNull(2) ? (long?)null : reader.GetInt64(2);
+            var status = reader.GetString(3);
+            var caughtUp = changedMs is null || indexedMs >= changedMs;
+            snapshots.Add(new IndexFreshnessSnapshot(
+                scopeId,
+                generation,
+                status,
+                indexedMs is null ? null : DateTimeOffset.FromUnixTimeMilliseconds(indexedMs.Value),
+                caughtUp
+                    ? 0
+                    : Math.Max(
+                        0,
+                        DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - changedMs!.Value)));
+        }
+        return snapshots;
     }
 
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(QueryGraphResult))]
@@ -3224,7 +4138,7 @@ public static class GraphTools
                 sb.Append("_(truncated at ").Append(rowCap).AppendLine(" rows; add a tighter LIMIT or WHERE)_");
             }
 
-            return new CallToolResult
+            var result = new CallToolResult
             {
                 Content = new List<ContentBlock>
                 {
@@ -3239,6 +4153,9 @@ public static class GraphTools
                     dto,
                     ToolOutputJsonContext.Default.QueryGraphResult),
             };
+            return IndexFreshnessMetadata.Attach(
+                result,
+                await ReadAttachedFreshnessAsync(connection, ct).ConfigureAwait(false));
         }
         catch (MultiStatementRejectedException ex)
         {

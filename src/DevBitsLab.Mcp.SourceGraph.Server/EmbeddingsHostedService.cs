@@ -85,44 +85,54 @@ public sealed class EmbeddingsHostedService : BackgroundService
                     continue;
                 }
 
-                // Skip already-up-to-date rows (hash match) before paying the ONNX cost.
-                var pending = new List<EmbedRequest>(batch.Count);
-                foreach (var req in batch)
-                {
-                    if (await _store.ShouldReembedAsync(req.SymbolId, req.ContentHash, modelVersion, stoppingToken).ConfigureAwait(false))
-                    {
-                        pending.Add(req);
-                    }
-                }
-                if (pending.Count == 0)
-                {
-                    // Optional small wait so we don't spin on a stream of unchanged hashes.
-                    try { await Task.Delay(FlushInterval, stoppingToken).ConfigureAwait(false); } catch (OperationCanceledException) { }
-                    continue;
-                }
-
-                IReadOnlyList<float[]> vectors;
+                var failed = 0;
                 try
                 {
+                    // Skip already-up-to-date rows (hash match) before paying the ONNX cost.
+                    var pending = new List<EmbedRequest>(batch.Count);
+                    foreach (var req in batch)
+                    {
+                        if (await _store.ShouldReembedAsync(req.SymbolId, req.ContentHash, modelVersion, stoppingToken).ConfigureAwait(false))
+                        {
+                            pending.Add(req);
+                        }
+                    }
+                    if (pending.Count == 0)
+                    {
+                        // Optional small wait so we don't spin on a stream of unchanged hashes.
+                        try { await Task.Delay(FlushInterval, stoppingToken).ConfigureAwait(false); } catch (OperationCanceledException) { }
+                        continue;
+                    }
+
                     var inputs = pending.Select(r => r.Text).ToList();
-                    vectors = await _generator.EmbedAsync(inputs, stoppingToken).ConfigureAwait(false);
+                    var vectors = await _generator.EmbedAsync(inputs, stoppingToken).ConfigureAwait(false);
+                    if (vectors.Count != pending.Count)
+                    {
+                        throw new InvalidOperationException(
+                            $"Embedding generator returned {vectors.Count} vectors for {pending.Count} inputs.");
+                    }
+
+                    for (var i = 0; i < pending.Count; i++)
+                    {
+                        try
+                        {
+                            await _store.UpsertAsync(pending[i].SymbolId, pending[i].ContentHash, vectors[i], modelVersion, stoppingToken).ConfigureAwait(false);
+                        }
+                        catch (Exception ex) when (ex is not OperationCanceledException)
+                        {
+                            failed++;
+                            _logger.LogWarning(ex, "Persist failed for symbol {Id}", pending[i].SymbolId);
+                        }
+                    }
                 }
                 catch (Exception ex) when (ex is not OperationCanceledException)
                 {
-                    _logger.LogWarning(ex, "Batch embed failed (size={Size}); dropping batch", pending.Count);
-                    continue;
+                    failed = batch.Count;
+                    _logger.LogWarning(ex, "Batch embed failed (size={Size}); producer checkpoint will remain incomplete", batch.Count);
                 }
-
-                for (var i = 0; i < pending.Count; i++)
+                finally
                 {
-                    try
-                    {
-                        await _store.UpsertAsync(pending[i].SymbolId, pending[i].ContentHash, vectors[i], modelVersion, stoppingToken).ConfigureAwait(false);
-                    }
-                    catch (Exception ex) when (ex is not OperationCanceledException)
-                    {
-                        _logger.LogWarning(ex, "Persist failed for symbol {Id}", pending[i].SymbolId);
-                    }
+                    _sink.MarkProcessed(batch.Count, failed);
                 }
             }
         }

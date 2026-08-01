@@ -730,6 +730,8 @@ public static class BinaryExportVerifier
         {
             cancellationToken.ThrowIfCancellationRequested();
             EnsureRange(offset, destination.Length);
+            // The parser follows offsets declared by untrusted PE bytes. Account for every
+            // request before issuing I/O so cyclic or oversized tables cannot amplify reads.
             if (_bytesRequested > _readBudget - destination.Length)
             {
                 throw Invalid("PE inspection read budget exceeded.");
@@ -740,6 +742,8 @@ public static class BinaryExportVerifier
             while (read < destination.Length)
             {
                 cancellationToken.ThrowIfCancellationRequested();
+                // Positional reads avoid mutable stream-position state while nested PE tables
+                // are mapped, and make the requested offset explicit for range validation.
                 var count = await RandomAccess.ReadAsync(
                         _stream.SafeFileHandle,
                         destination[read..],

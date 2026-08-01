@@ -62,7 +62,11 @@ public sealed class LanguageIndexerRegistry
         }
     }
 
-    /// <summary>Snapshot of every registered (extension, indexer) pair for diagnostics / CLI.</summary>
+    /// <summary>
+    /// Snapshot of every registered (extension, indexer) pair for diagnostics / CLI. Materialize
+    /// it under the lock so plugin registration cannot mutate the dictionary while a caller is
+    /// enumerating the diagnostic result.
+    /// </summary>
     public IReadOnlyList<KeyValuePair<string, ILanguageIndexer>> All()
     {
         lock (_lock)

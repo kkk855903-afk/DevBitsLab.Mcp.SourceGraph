@@ -1,4 +1,5 @@
 using Dapper;
+using System.Security.Cryptography;
 using DevBitsLab.Mcp.SourceGraph.Core;
 using DevBitsLab.Mcp.SourceGraph.Interop;
 using DevBitsLab.Mcp.SourceGraph.Storage;
@@ -123,6 +124,36 @@ public sealed class NativeInteropSnapshotReplacementTests : IAsyncLifetime
         (await InteropFactStoreReader.ReadAbiRecordsAsync(_store))
             .Facts.Should().BeEmpty();
         (await _store.GetSymbolByIdAsync(old.SymbolId)).Should().NotBeNull();
+    }
+
+    [Fact]
+    public async Task Native_snapshot_indexes_matching_source_content_forCoverageAndSearch()
+    {
+        var candidate = NativeFile(
+            "native/export.cpp",
+            NativeExportFact(
+                "cpp:E:native/export.cpp::run",
+                PathFor("native/export.cpp")));
+        candidate = candidate with
+        {
+            ContentSha256 = SHA256.HashData(
+                await File.ReadAllBytesAsync(candidate.Path)),
+        };
+
+        await _store!.ReplaceNativeInteropSnapshotAsync(Replacement(candidate));
+
+        var coverage = await _store.GetSourceDocumentCoverageAsync();
+        coverage.EligibleGraphFiles.Should().ContainSingle(candidate.Path);
+        coverage.IndexedSourceDocuments.Should().ContainSingle(candidate.Path);
+        coverage.MissingSourceDocuments.Should().BeEmpty();
+        var search = await _store.SearchSourceTextAsync(
+            "candidate",
+            SourceTextSearchMode.Literal,
+            caseSensitive: true,
+            fileGlob: "*.cpp",
+            contextLines: 0,
+            maxResults: 10);
+        search.Hits.Should().ContainSingle(hit => hit.FilePath == candidate.Path);
     }
 
     [Fact]

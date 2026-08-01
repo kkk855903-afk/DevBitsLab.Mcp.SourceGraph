@@ -1199,9 +1199,9 @@ public sealed class XamlLanguageIndexer : ILanguageIndexer
             if (!IsLikelyEventName(attr.LocalName)) return;
             if (string.IsNullOrEmpty(_xClass)) return;
 
-            var handler = _semanticResolver?.ResolveEventHandler(_xClass, value!);
-            if (handler is null) return;
-            var handlerKey = XamlSemanticResolver.CanonicalKey(handler);
+            var resolution = _semanticResolver?.ResolveEventHandler(_xClass, value!);
+            if (resolution is null) return;
+            var handlerKey = XamlSemanticResolver.CanonicalKey(resolution.Method);
             if (handlerKey is null) return;
             var meta = new Dictionary<string, string>(StringComparer.Ordinal)
             {
@@ -1216,7 +1216,7 @@ public sealed class XamlLanguageIndexer : ILanguageIndexer
             {
                 Evidence = CreateAttributeEvidence(
                     attr,
-                    EvidenceConfidence.Semantic,
+                    resolution.Confidence,
                     meta),
             });
         }

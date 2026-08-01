@@ -18,6 +18,11 @@ namespace DevBitsLab.Mcp.SourceGraph.Server.Scoping;
 public sealed class ScopeHost : IAsyncDisposable
 {
     private readonly TaskCompletionSource<bool> _readiness = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly TaskCompletionSource<bool> _embeddingsReadiness =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private long _indexGeneration;
+    private long _lastIndexedUnixMs;
+    private long _lastSourceChangeUnixMs;
 
     public ScopeHost(
         Scope scope,
@@ -58,6 +63,16 @@ public sealed class ScopeHost : IAsyncDisposable
     /// always see the host's terminal status rather than hang).
     /// </summary>
     public void MarkReady() => _readiness.TrySetResult(true);
+
+    /// <summary>
+    /// Completes after every embedding request from the initial index has settled. The boolean is
+    /// false when at least one request failed; only semantic search waits on this task, so normal
+    /// graph queries are not delayed by model inference.
+    /// </summary>
+    public Task<bool> EmbeddingsReady => _embeddingsReadiness.Task;
+
+    public void MarkEmbeddingsReady(bool complete) =>
+        _embeddingsReadiness.TrySetResult(complete);
 
     public Scope Scope { get; }
     public SqliteGraphStore Store { get; }
@@ -112,10 +127,56 @@ public sealed class ScopeHost : IAsyncDisposable
     /// Time of the most recent successful initial / live reindex. Surfaced by <c>list_scopes</c>;
     /// updated alongside the registry every time the scope settles into a new state.
     /// </summary>
-    public DateTimeOffset LastIndexedAt { get; set; }
+    public DateTimeOffset LastIndexedAt
+    {
+        get => FromUnixMilliseconds(Interlocked.Read(ref _lastIndexedUnixMs)) ?? default;
+        set => Interlocked.Exchange(ref _lastIndexedUnixMs, value.ToUnixTimeMilliseconds());
+    }
+    public DateTimeOffset? LastSourceChangeAt =>
+        FromUnixMilliseconds(Interlocked.Read(ref _lastSourceChangeUnixMs));
+    public long IndexGeneration => Interlocked.Read(ref _indexGeneration);
+    public long WatcherLagMs
+    {
+        get
+        {
+            var changed = Interlocked.Read(ref _lastSourceChangeUnixMs);
+            if (changed <= 0) return 0;
+            var indexed = Interlocked.Read(ref _lastIndexedUnixMs);
+            if (indexed >= changed) return 0;
+            return Math.Max(
+                0,
+                DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - changed);
+        }
+    }
+
+    internal void ApplyIndexState(IndexStateRow state)
+    {
+        Interlocked.Exchange(ref _indexGeneration, state.Generation);
+        Interlocked.Exchange(ref _lastIndexedUnixMs, state.IndexedAt ?? 0);
+        Interlocked.Exchange(ref _lastSourceChangeUnixMs, state.SourceChangedAt ?? 0);
+    }
+
+    internal async Task RefreshIndexStateAsync(CancellationToken ct)
+    {
+        ApplyIndexState(await Store.GetIndexStateAsync(ct).ConfigureAwait(false));
+    }
+
+    internal async Task RecordSourceChangeAsync(
+        DateTimeOffset changedAt,
+        CancellationToken ct)
+    {
+        ApplyIndexState(await Store.RecordSourceChangedAsync(changedAt, ct).ConfigureAwait(false));
+    }
+
+    internal async Task CompleteIndexGenerationAsync(
+        DateTimeOffset indexedAt,
+        CancellationToken ct)
+    {
+        ApplyIndexState(await Store.CompleteIndexGenerationAsync(indexedAt, ct).ConfigureAwait(false));
+    }
     /// <summary>
     /// Per-scope embed-request channel the indexer writes to. Null when embeddings are disabled
-    /// for this scope (no model, no vec extension, or <c>--no-embeddings</c>).
+    /// for this scope (not enabled, no model, or no vec extension).
     /// </summary>
     public ChannelEmbeddingsRequestSink? EmbeddingsSink { get; set; }
     /// <summary>
@@ -123,6 +184,10 @@ public sealed class ScopeHost : IAsyncDisposable
     /// Started by <c>LiveIndexService.OpenScopeAsync</c> and stopped by <see cref="DisposeAsync"/>.
     /// </summary>
     public EmbeddingsHostedService? EmbeddingsService { get; set; }
+    internal string? EmbeddingProducerName { get; set; }
+
+    private static DateTimeOffset? FromUnixMilliseconds(long value) =>
+        value <= 0 ? null : DateTimeOffset.FromUnixTimeMilliseconds(value);
 
     /// <summary>
     /// Per-scope file-path → <see cref="ILanguageProject"/> map populated at scope startup by
@@ -152,8 +217,20 @@ public sealed class ScopeHost : IAsyncDisposable
     /// </summary>
     public bool ProjectMapReady { get; internal set; }
 
+    /// <summary>Stable, user-facing identities of language/relation indexers loaded for this scope.</summary>
+    public IReadOnlyList<string> LoadedIndexers { get; internal set; } = ["roslyn"];
+
+    /// <summary>
+    /// Complete source-file universe observed by the registered non-Roslyn dispatcher during its
+    /// latest full walk, incrementally maintained by watcher batches. Keeping this separately from
+    /// the graph is what lets completeness reporting detect an eligible file that produced no row.
+    /// </summary>
+    public IReadOnlyCollection<string> RegisteredLanguageEligibleFiles { get; internal set; } =
+        Array.Empty<string>();
+
     public async ValueTask DisposeAsync()
     {
+        MarkEmbeddingsReady(false);
         // Stop the embeddings drain first so any in-flight upserts complete before the underlying
         // SQLite store is disposed. Best-effort with a short bound — losing a few queued requests
         // on shutdown is preferable to hanging the process. BackgroundService implements

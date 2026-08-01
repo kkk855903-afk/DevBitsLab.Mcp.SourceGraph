@@ -15,6 +15,11 @@ namespace DevBitsLab.Mcp.SourceGraph.Server.Scoping;
 /// </summary>
 public static class ScopeDiff
 {
+    /// <summary>
+    /// Compare two authored configurations without observing runtime state. Preserving the input
+    /// list order for plugin comparison is deliberate: plugin load order determines which
+    /// first-registered extension handler wins.
+    /// </summary>
     public static ScopeDiffResult Compute(
         IReadOnlyList<Scope> currentScopes,
         IReadOnlyList<Scope> newScopes,
@@ -151,4 +156,9 @@ public sealed record ScopeDiffResult(
     }
 }
 
+/// <summary>
+/// A scope retaining the same id but requiring host replacement because its authored indexing
+/// inputs changed. The old host remains available only long enough for the live-service grace
+/// period to let in-flight tool calls complete.
+/// </summary>
 public sealed record ScopeReplacement(Scope Old, Scope New);

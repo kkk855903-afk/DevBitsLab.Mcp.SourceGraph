@@ -103,6 +103,8 @@ public static class PathPluginBundleFingerprint
 
             foreach (var file in manifest.Entries.Where(entry => !entry.IsDirectory))
             {
+                // Stat before and after reading each file so the digest is never advertised as
+                // an identity for a bundle that changed while it was being fingerprinted.
                 var beforeRead = CaptureSingleEntry(rootPath, file.FullPath);
                 if (beforeRead.Reason != ExecutionTrustReason.Allowed
                     || beforeRead.Entry is null
@@ -162,6 +164,8 @@ public static class PathPluginBundleFingerprint
                 }
             }
 
+            // Per-file checks do not detect a newly added or removed sibling, so re-capture the
+            // whole manifest before returning a fingerprint to the trust boundary.
             var finalManifest = CaptureBundleManifest(rootPath);
             if (finalManifest.Reason != ExecutionTrustReason.Allowed
                 || finalManifest.Manifest is null

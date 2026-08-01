@@ -137,6 +137,18 @@ public sealed class WpfWindowsFixtureContractTests
                     "SampleWpfWindows.ViewModels.MainViewModel",
                     "QueryText"));
 
+            var codeBehindStatus = (await store.FindSymbolsAsync(
+                    "CodeBehindStatusText"))
+                .Single(symbol => symbol.Kind == "xaml-element");
+            (await store.ListCalleesAsync(
+                    codeBehindStatus.Id,
+                    limit: 10,
+                    edgeKind: "binds-path"))
+                .Should().ContainSingle(target =>
+                    target.CanonicalKey == CanonicalKeys.ForProperty(
+                        "SampleWpfWindows.ViewModels.MainViewModel",
+                        "Status"));
+
             var runButton = (await store.FindSymbolsAsync("RunButton"))
                 .Single(symbol => symbol.Kind == "xaml-element");
             (await store.ListCalleesAsync(
@@ -151,8 +163,9 @@ public sealed class WpfWindowsFixtureContractTests
                     runButton.Id,
                     limit: 10,
                     edgeKind: "handles-event"))
-                .Should().BeEmpty(
-                    "positive-only safety does not authorize event-handler inference");
+                .Should().ContainSingle(target =>
+                    target.Name == "OnRunClick"
+                    && target.Kind == "method");
 
             var missing = (await store.FindSymbolsAsync("MissingBinding"))
                 .Single(symbol => symbol.Kind == "xaml-element");

@@ -96,11 +96,15 @@ priority: `--db` if given, then `<solution-dir>/.sourcegraph/graph.db` if
 - **THEN** the DB lands at the per-user cache path; CWD is never used
 
 ### Requirement: Embedding-related CLI flags
-The CLI SHALL accept `--model <id>` to override the embedding model, `--no-embeddings` to disable the embedding pipeline entirely, `--allow-model-download` to authorize automatic download, and `--no-model-download` as an explicit/legacy fail-closed switch while still using a pre-populated cache. These flags apply to `serve` and `index`. Automatic model download SHALL be disabled by default. `SOURCEGRAPH_ALLOW_MODEL_DOWNLOAD=1` SHALL be equivalent to the allow flag; `SOURCEGRAPH_NO_MODEL_DOWNLOAD=1` SHALL force offline mode and take precedence.
+The CLI SHALL keep the embedding pipeline disabled by default and accept `--enable-embeddings` as the explicit opt-in for `serve`, `index`, `benchmark`, and generated `init` configurations. `--no-embeddings` SHALL remain accepted as a compatibility opt-out; combining it with `--enable-embeddings` SHALL fail. `--allow-model-download` SHALL require the positive embedding flag and authorize automatic download, while `--no-model-download` remains an explicit/legacy fail-closed switch. `SOURCEGRAPH_ALLOW_MODEL_DOWNLOAD=1` SHALL authorize downloads only after embeddings are enabled; `SOURCEGRAPH_NO_MODEL_DOWNLOAD=1` SHALL force offline mode and take precedence.
 
-#### Scenario: Disable embeddings
-- **WHEN** `sourcegraph-mcp serve --solution <sln> --no-embeddings` is invoked
+#### Scenario: Embeddings disabled by default
+- **WHEN** `sourcegraph-mcp serve --solution <sln>` is invoked without `--enable-embeddings`
 - **THEN** no per-scope embeddings drain is started, the model is not downloaded, and `semantic_search` returns the disabled-message
+
+#### Scenario: Explicitly enable embeddings
+- **WHEN** `sourcegraph-mcp serve --solution <sln> --enable-embeddings` is invoked with a populated model cache
+- **THEN** the per-scope embedding drain starts and semantic vector search is available
 
 #### Scenario: Override model
 - **WHEN** the user passes `--model nomic-ai/CodeRankEmbed`
@@ -111,16 +115,31 @@ The CLI SHALL accept `--model <id>` to override the embedding model, `--no-embed
 - **THEN** no HTTP request is issued, non-embedding indexing continues, and semantic search is disabled for that session
 
 #### Scenario: Explicitly allow automatic download
-- **WHEN** the user passes `--allow-model-download` or sets `SOURCEGRAPH_ALLOW_MODEL_DOWNLOAD=1` and the model cache is empty
+- **WHEN** the user passes `--enable-embeddings --allow-model-download` or enables embeddings while `SOURCEGRAPH_ALLOW_MODEL_DOWNLOAD=1` is set and the model cache is empty
 - **THEN** the server downloads the selected model best-effort and starts the embedding pipeline when the files are ready
 
 #### Scenario: Disable auto-download with empty cache
 - **WHEN** the user passes `--no-model-download` and the cache directory has no `model.onnx` or `tokenizer.json`
-- **THEN** no HTTP request is issued, the embedding pipeline is disabled for this session (same payload as `--no-embeddings`), and the warning text names the cache path so the operator can pre-populate it
+- **THEN** no HTTP request is issued, the embedding pipeline is unavailable for this session, and the warning text names the cache path so the operator can pre-populate it
 
 #### Scenario: Disable auto-download with populated cache
 - **WHEN** the user passes `--no-model-download` and the cache directory already contains valid `model.onnx` + `tokenizer.json`
 - **THEN** the cached model is loaded and embeddings run normally; no HTTP request is issued
+
+### Requirement: Serve process lifecycle
+The `serve` process SHALL continue to exit when its stdio input closes, SHALL stop when its direct launcher process exits when that parent can be observed, and SHALL exit after 30 minutes without a tool call or resource read. `--idle-timeout-minutes <n>` SHALL override the default and zero SHALL disable idle exit. Protocol keep-alives, initialization, and catalog-list messages SHALL NOT reset the idle window. Active tool calls and resource reads SHALL finish without idle interruption. Every shutdown SHALL use the existing host cleanup path, with a five-second forced-exit deadline.
+
+#### Scenario: Idle server exits
+- **WHEN** `serve` receives no tool call or resource read for 30 minutes
+- **THEN** it requests host shutdown and releases index, watcher, database, Roslyn, and embedding resources
+
+#### Scenario: Active request prevents idle exit
+- **WHEN** a tool call remains active beyond the configured idle timeout
+- **THEN** the process stays alive and starts a fresh idle window after the call completes
+
+#### Scenario: Idle exit disabled
+- **WHEN** `serve --idle-timeout-minutes 0` is invoked
+- **THEN** inactivity alone does not terminate the process, while stdin closure and parent exit still do
 
 #### Scenario: Disable auto-download via environment variable
 - **WHEN** the user starts the server with `SOURCEGRAPH_NO_MODEL_DOWNLOAD=1` and no `--no-model-download` flag
@@ -257,7 +276,7 @@ The subcommand SHALL accept the following flags:
 - `--user-<client>` — write a supported client's config to its user-scope path instead of the project-scope path. Codex is project-only and `--user-codex` is rejected.
 - `--claude-desktop` — required to wire Claude Desktop (no project-scope option exists for that client).
 - `--solution <path>` (repeatable) — override solution-discovery; passes through to `init-scopes` core logic when multiple solutions are configured.
-- `--no-embeddings` / `--no-history` — propagate the corresponding `serve` flag into the written `args` array.
+- `--enable-embeddings` / `--no-history` — propagate the corresponding `serve` flag into the written `args` array; embedding enablement remains absent by default.
 - `--prewarm` / `--no-prewarm` — opt in to / out of running `RoslynIndexer.IndexSolutionOnceAsync` after writing configs.
 - `--install-mode {global,local-tool,in-repo}` — choose the resulting `command`/`args` shape: `global` invokes `sourcegraph-mcp` directly (default); `local-tool` emits `command: "dotnet"`, `args: ["sourcegraph-mcp", ...]` and assumes the repo already has a `.config/dotnet-tools.json` listing the tool (created via `dotnet new tool-manifest && dotnet tool install DevBitsLab.Mcp.SourceGraph.Tool`; `init` does not create or merge the manifest in v1); `in-repo` emits `command: "dotnet"`, `args: ["run", "--project", "<server csproj>", "--no-build", "--", "serve", ...]`.
 - `--print-only` — print the per-client config snippets to stdout with `# would write to: <path>` comment lines; write no files.

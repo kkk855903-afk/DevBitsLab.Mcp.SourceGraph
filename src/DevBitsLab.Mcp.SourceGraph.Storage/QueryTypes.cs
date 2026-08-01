@@ -81,6 +81,34 @@ public sealed record EdgeTraversalHit(
     string Relation,
     string? PayloadJson);
 
+public enum SourceTextSearchMode
+{
+    Literal,
+    Regex,
+}
+
+public sealed record SourceTextSearchHit(
+    string FilePath,
+    int Line,
+    int Column,
+    int EndColumn,
+    int MatchCount,
+    string LineText,
+    IReadOnlyList<string> BeforeContext,
+    IReadOnlyList<string> AfterContext);
+
+public sealed record SourceTextSearchPage(
+    IReadOnlyList<SourceTextSearchHit> Hits,
+    long TotalMatches,
+    long TotalMatchingLines,
+    int CandidateDocuments,
+    bool Truncated);
+
+public sealed record SourceDocumentCoverage(
+    IReadOnlyList<string> EligibleGraphFiles,
+    IReadOnlyList<string> IndexedSourceDocuments,
+    IReadOnlyList<string> MissingSourceDocuments);
+
 /// <summary>
 /// One persisted annotation together with its declaration owner. <see cref="AnnotationId"/> is
 /// the stable, store-local cursor used by <see cref="IGraphStore.ListAnnotationsByFlavorAsync"/>.

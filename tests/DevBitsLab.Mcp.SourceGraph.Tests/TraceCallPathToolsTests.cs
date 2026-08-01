@@ -82,6 +82,17 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
         var backwardImport = await SeedSymbolAsync(store, "BackwardImport");
         var backwardExport = await SeedSymbolAsync(store, "BackwardExport");
         var backwardNative = await SeedSymbolAsync(store, "BackwardNative");
+        var eventElement = await SeedSymbolAsync(store, "EventElement");
+        var eventHandler = await SeedSymbolAsync(store, "EventHandler");
+        var interfaceMember = await SeedSymbolAsync(store, "InterfaceMember");
+        var interfaceImplementation = await SeedSymbolAsync(
+            store,
+            "InterfaceImplementation");
+        var directImport = await SeedSymbolAsync(store, "DirectImport");
+        var directExport = await SeedSymbolAsync(store, "DirectExport");
+        var directImplementation = await SeedSymbolAsync(
+            store,
+            "DirectImplementation");
 
         await store.BulkInsertEdgesAsync(new[]
         {
@@ -119,6 +130,12 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
             Edge(backwardServer, backwardImport, 43, CoreEvidenceConfidence.Exact, "backward-call"),
             Edge(backwardImport, backwardExport, 44, CoreEvidenceConfidence.Exact, "backward-pinvoke", EdgeKinds.PInvokeMapsTo),
             Edge(backwardExport, backwardNative, 45, CoreEvidenceConfidence.Exact, "backward-native"),
+            Edge(eventElement, eventHandler, 46, CoreEvidenceConfidence.Semantic, "xaml-event", EdgeKinds.HandlesEvent),
+            Edge(eventHandler, interfaceMember, 47, CoreEvidenceConfidence.Exact, "interface-call"),
+            Edge(interfaceMember, interfaceImplementation, 48, CoreEvidenceConfidence.Semantic, "interface-dispatch", EdgeKinds.InterfaceDispatchesTo),
+            Edge(interfaceImplementation, directImport, 49, CoreEvidenceConfidence.Exact, "implementation-call"),
+            Edge(directImport, directExport, 50, CoreEvidenceConfidence.Exact, "direct-pinvoke", EdgeKinds.PInvokeMapsTo),
+            Edge(directExport, directImplementation, 51, CoreEvidenceConfidence.Semantic, "native-implementation", EdgeKinds.NativeImplementation),
         });
 
         // This raw legacy edge sorts before ZDirectTarget but has no occurrence evidence. An
@@ -336,9 +353,12 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
             "binds-path",
             EdgeKinds.CommandExecutes,
             EdgeKinds.Calls,
+            EdgeKinds.InterfaceDispatchesTo,
+            EdgeKinds.HandlesEvent,
             EdgeKinds.GrpcCalls,
             EdgeKinds.RpcDispatchesTo,
-            EdgeKinds.PInvokeMapsTo);
+            EdgeKinds.PInvokeMapsTo,
+            EdgeKinds.NativeImplementation);
         var scope = dto.Scopes.Should().ContainSingle().Which;
         scope.ExecutionState.Should().NotBeNull();
         scope.ExecutionState!.Status.Should().Be("partial");
@@ -378,6 +398,77 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
             projection => projection.Name == "query-bounds"
                 && projection.Status == "truncated"
                 && !projection.Authoritative);
+    }
+
+    [Fact]
+    public async Task ExecutionProfile_connectsXamlEvent_interfaceDispatch_andDirectPInvoke()
+    {
+        var result = await TraceCallPathTools.TraceCallPathWithProfileAsync(
+            _router!,
+            from: "csharp:M:Graph.EventElement",
+            to: "csharp:M:Graph.DirectImplementation",
+            profile: "execution",
+            maxDepth: 6,
+            maxPaths: 10,
+            maxNodes: 100);
+
+        result.IsError.Should().NotBe(true);
+        var path = result.StructuredContent!.Value.Deserialize(
+                ToolOutputJsonContext.Default.TraceCallPathResult)!
+            .Scopes.Should().ContainSingle().Which
+            .Paths.Should().ContainSingle().Which;
+        path.Hops.Select(hop => hop.Relation).Should().Equal(
+            EdgeKinds.HandlesEvent,
+            EdgeKinds.Calls,
+            EdgeKinds.InterfaceDispatchesTo,
+            EdgeKinds.Calls,
+            EdgeKinds.PInvokeMapsTo,
+            EdgeKinds.NativeImplementation);
+    }
+
+    [Fact]
+    public async Task ExecutionProfile_canStartAtManagedHandler()
+    {
+        var result = await TraceCallPathTools.TraceCallPathWithProfileAsync(
+            _router!,
+            from: "csharp:M:Graph.EventHandler",
+            to: "csharp:M:Graph.DirectImplementation",
+            profile: "execution",
+            maxDepth: 5,
+            maxPaths: 10,
+            maxNodes: 100);
+
+        var path = result.StructuredContent!.Value.Deserialize(
+                ToolOutputJsonContext.Default.TraceCallPathResult)!
+            .Scopes.Should().ContainSingle().Which
+            .Paths.Should().ContainSingle().Which;
+        path.Hops.Select(hop => hop.Relation).Should().Equal(
+            EdgeKinds.Calls,
+            EdgeKinds.InterfaceDispatchesTo,
+            EdgeKinds.Calls,
+            EdgeKinds.PInvokeMapsTo,
+            EdgeKinds.NativeImplementation);
+    }
+
+    [Fact]
+    public async Task Trace_acceptsResolvedFromIdAndToId()
+    {
+        var from = (await _host!.Store.FindSymbolsAsync("Graph.A")).Single();
+        var to = (await _host.Store.FindSymbolsAsync("Graph.C")).Single();
+
+        var result = await TraceCallPathTools.TraceCallPathWithProfileAsync(
+            _router!,
+            fromId: from.Id,
+            toId: to.Id,
+            maxDepth: 4,
+            maxPaths: 10,
+            maxNodes: 100);
+        var dto = result.StructuredContent!.Value.Deserialize(
+            ToolOutputJsonContext.Default.TraceCallPathResult)!;
+
+        dto.FromId.Should().Be(from.Id);
+        dto.ToId.Should().Be(to.Id);
+        dto.Scopes.Single().Paths.Should().HaveCount(2);
     }
 
     [Theory]
@@ -608,7 +699,6 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
         var complete = new TraceCallPathExecutionState(
             "complete",
             Partial: false,
-            AbsenceAuthoritative: true,
             RetainedLastGood: false,
             Projections:
             [
@@ -620,7 +710,19 @@ public sealed class TraceCallPathToolsTests : IAsyncLifetime
                     RetainedLastGood: false,
                     FailureCount: 0),
             ],
-            Failures: []);
+            Failures: [],
+            SourceCoverageComplete: true,
+            LanguageProjectionComplete: true,
+            RelationProjectionComplete: true,
+            QueryTraversalComplete: true,
+            IndexedFiles: 1,
+            EligibleFiles: 1,
+            MissingFiles: [],
+            MissingFileCount: 0,
+            MissingFilesTruncated: false,
+            LoadedIndexers: ["roslyn"],
+            IndexGeneration: 1,
+            IndexedAt: "2026-08-01T00:00:00.0000000+00:00");
         var version = new GraphReadVersion(10, 3);
 
         TraceCallPathTools.ReconcileExecutionState(

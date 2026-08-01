@@ -53,6 +53,10 @@ public static partial class InteropFactPayloadCodec
     private const string MatchKindToken = "match";
     private const string FindingKindToken = "finding";
 
+    /// <summary>
+    /// Serializes a validated match using the current wire version. Validation before writing
+    /// keeps producers from persisting a status/snapshot combination consumers must reject.
+    /// </summary>
     public static string EncodeMatch(InteropMatchProjection match)
     {
         ArgumentNullException.ThrowIfNull(match);
@@ -204,6 +208,8 @@ public static partial class InteropFactPayloadCodec
         var managedKey = RequireString(
             payload.ManagedSymbolCanonicalKey,
             "finding.managed_symbol_canonical_key");
+        // Version 1 deliberately lacked this field. Reject an explicitly supplied value rather
+        // than silently accepting a producer that labels a version-2 shape as version 1.
         if (payload.Version == 1
             && payload.BoundaryManagedSymbolCanonicalKeyWasSpecified)
         {

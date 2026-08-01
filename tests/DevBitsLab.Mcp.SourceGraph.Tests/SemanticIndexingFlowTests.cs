@@ -31,8 +31,14 @@ public sealed class SemanticIndexingFlowTests : IAsyncLifetime
 
     private sealed class CapturingSink : IEmbeddingsRequestSink
     {
+        public CapturingSink(bool requiresFullRefresh = false)
+        {
+            RequiresFullRefresh = requiresFullRefresh;
+        }
+
         public ConcurrentBag<EmbedRequest> Captured { get; } = new();
         public bool IsEnabled => true;
+        public bool RequiresFullRefresh { get; }
         public void Enqueue(EmbedRequest request) => Captured.Add(request);
     }
 
@@ -83,6 +89,26 @@ public sealed class SemanticIndexingFlowTests : IAsyncLifetime
         });
         // At least one request's text mentions Calculator (the fixture's flagship class).
         sink.Captured.Any(r => r.Text.Contains("Calculator")).Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task MissingProducerCheckpoint_requeuesEmbeddings_forUnchangedFiles()
+    {
+        var slnPath = LocateSolution();
+        await RoslynIndexer.IndexSolutionOnceAsync(
+            slnPath,
+            _store!,
+            embeddingsSink: new CapturingSink());
+
+        var refresh = new CapturingSink(requiresFullRefresh: true);
+        await RoslynIndexer.IndexSolutionOnceAsync(
+            slnPath,
+            _store!,
+            embeddingsSink: refresh);
+
+        refresh.Captured.Should().NotBeEmpty(
+            "an absent/stale embedding producer checkpoint must backfill unchanged source files");
+        refresh.Captured.Any(r => r.Text.Contains("Calculator")).Should().BeTrue();
     }
 
     [Fact]

@@ -341,6 +341,26 @@ internal sealed class InteropQueryService
             return SelectionOutcome.From(exact);
         }
 
+        // Native export names are part of the persisted interop fact and are the spelling users
+        // normally have at hand (for example `pg_camera_start`). Resolve them directly instead
+        // of depending on general symbol search to rediscover a native-only declaration.
+        var nativeNameMatches = selectables
+            .Where(item => item.Native is { } nativeFact
+                && (string.Equals(
+                        nativeFact.Fact.ExportName,
+                        query,
+                        StringComparison.Ordinal)
+                    || (!string.IsNullOrWhiteSpace(nativeFact.Fact.LibraryName)
+                        && string.Equals(
+                            $"{nativeFact.Fact.LibraryName}!{nativeFact.Fact.ExportName}",
+                            query,
+                            StringComparison.Ordinal))))
+            .ToArray();
+        if (nativeNameMatches.Length > 0)
+        {
+            return SelectionOutcome.From(nativeNameMatches);
+        }
+
         var byKeyAndType = selectables.ToDictionary(
             item => (item.CanonicalKey, item.SymbolType));
         var hits = await store.FindSymbolsAsync(

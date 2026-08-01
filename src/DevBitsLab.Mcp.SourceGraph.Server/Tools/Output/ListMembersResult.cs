@@ -8,6 +8,7 @@ namespace DevBitsLab.Mcp.SourceGraph.Server.Tools.Output;
 /// </summary>
 public sealed record ListMembersResult(
     [property: JsonPropertyName("container_symbol_id")] long ContainerSymbolId,
+    [property: JsonPropertyName("container_canonical_key")] string? ContainerCanonicalKey,
     [property: JsonPropertyName("container_fqn")] string ContainerFqn,
     [property: JsonPropertyName("container_kind")] string ContainerKind,
     IReadOnlyList<ListMembersRow> Members);
@@ -20,6 +21,7 @@ public sealed record ListMembersResult(
 /// </summary>
 public sealed record ListMembersRow(
     [property: JsonPropertyName("symbol_id")] long SymbolId,
+    [property: JsonPropertyName("canonical_key")] string? CanonicalKey,
     string Name,
     string Fqn,
     string Kind,

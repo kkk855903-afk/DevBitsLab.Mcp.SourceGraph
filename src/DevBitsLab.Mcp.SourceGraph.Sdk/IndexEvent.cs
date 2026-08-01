@@ -167,10 +167,15 @@ public abstract record IndexEvent
             Metadata = metadata;
         }
 
+        /// <summary>Canonical key of the edge origin; it must resolve in the same scope.</summary>
         public string SourceCanonicalKey { get; }
+        /// <summary>Canonical key of the edge destination; unresolved targets are host-handled.</summary>
         public string TargetCanonicalKey { get; }
+        /// <summary>Kebab-case relationship vocabulary used for graph queries and deduplication.</summary>
         public string EdgeKindName { get; }
+        /// <summary>Optional JSON-ready facts about this logical relationship, not its source location.</summary>
         public IReadOnlyDictionary<string, string>? Metadata { get; }
+        /// <summary>Optional occurrence proof kept separately because one logical edge may have many sites.</summary>
         public EdgeEvidence? Evidence { get; init; }
     }
 

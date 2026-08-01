@@ -38,6 +38,16 @@ public interface IEmbeddingsStore
     /// </summary>
     Task<IReadOnlyList<EmbeddingHit>> SearchAsync(IReadOnlyList<float> queryEmbedding, int k, string? kindFilter = null, CancellationToken ct = default);
 
+    /// <summary>
+    /// Rank only the supplied symbol ids. Intended for hybrid retrieval where FTS first narrows
+    /// the candidate universe and vector scoring reranks that bounded set.
+    /// </summary>
+    Task<IReadOnlyList<EmbeddingHit>> SearchCandidatesAsync(
+        IReadOnlyList<float> queryEmbedding,
+        IReadOnlyList<long> candidateSymbolIds,
+        int k,
+        CancellationToken ct = default);
+
     /// <summary>Total number of stored embeddings (count of rows in <c>symbol_embeddings</c>).</summary>
     Task<long> CountAsync(CancellationToken ct = default);
 
@@ -47,8 +57,8 @@ public interface IEmbeddingsStore
     /// with, not a synthetic rowid; matching by <c>symbol_id</c> is the correct invariant.
     /// The companion <c>embedding_meta</c> bookkeeping table is pruned in the same round-trip
     /// so a re-embed after later symbol resurrection doesn't see stale meta. Returns the number
-    /// of <c>symbol_embeddings</c> rows removed. Cheap (single DELETE), reversible (embeddings
-    /// regenerate on next semantic_search call). Safe to call when the underlying vector
+    /// of <c>symbol_embeddings</c> rows removed. Cheap (single DELETE), reversible (the next
+    /// producer-checkpoint backfill regenerates missing rows). Safe to call when the underlying vector
     /// extension is unavailable — the implementation MAY return 0 without error.
     /// </summary>
     Task<int> PruneOrphanedAsync(CancellationToken ct = default);

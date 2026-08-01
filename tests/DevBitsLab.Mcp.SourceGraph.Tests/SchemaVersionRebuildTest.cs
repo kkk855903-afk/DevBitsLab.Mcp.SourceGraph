@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Security.Cryptography;
 using System.Threading.Tasks;
 using Dapper;
 using DevBitsLab.Mcp.SourceGraph.Storage;
@@ -252,8 +253,9 @@ public sealed class SchemaVersionRebuildTest
     {
         var tmp = CreateTempDirectory("current-idempotent");
         var dbPath = Path.Join(tmp, "graph.db");
-        var contentHash = new byte[] { 9, 8, 7, 6 };
-        const string sourcePath = "C:/repo/src/KeepIndexed.cs";
+        var sourcePath = Path.Join(tmp, "KeepIndexed.cs");
+        await File.WriteAllTextAsync(sourcePath, "internal sealed class KeepIndexed { }");
+        var contentHash = SHA256.HashData(await File.ReadAllBytesAsync(sourcePath));
         try
         {
             await using (var store = new SqliteGraphStore(dbPath))
@@ -266,6 +268,8 @@ public sealed class SchemaVersionRebuildTest
                 (await store.GetFileContentHashAsync(sourcePath))
                     .Should().BeEquivalentTo(contentHash);
                 (await store.GetStatsAsync()).FileCount.Should().Be(1);
+                (await store.GetSourceDocumentCoverageAsync())
+                    .IndexedSourceDocuments.Should().ContainSingle(sourcePath);
             }
 
             await using var conn = new SqliteConnection($"Data Source={dbPath}");

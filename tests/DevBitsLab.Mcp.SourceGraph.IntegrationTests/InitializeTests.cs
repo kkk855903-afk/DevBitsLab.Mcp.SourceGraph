@@ -23,7 +23,6 @@ public sealed class InitializeTests
     /// </summary>
     private static readonly string[] CommonServeArgs =
     [
-        "--no-embeddings",
         "--no-history",
     ];
 

@@ -17,7 +17,6 @@ public sealed class MultiScopeTests
 {
     private static readonly string[] CommonServeArgs =
     [
-        "--no-embeddings",
         "--no-history",
     ];
 

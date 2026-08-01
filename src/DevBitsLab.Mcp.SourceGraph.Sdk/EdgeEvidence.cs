@@ -30,6 +30,10 @@ public sealed record SourceLocation(
 /// it when mapping this SDK value into storage, so plugins cannot attribute evidence to another
 /// indexed file.
 /// </summary>
+/// <param name="Metadata">
+/// Optional producer-defined details for this one source occurrence. They must not be treated as
+/// graph-wide edge identity because multiple occurrences can support the same logical edge.
+/// </param>
 public sealed record EdgeEvidence(
     SourceLocation Location,
     EvidenceConfidence Confidence,

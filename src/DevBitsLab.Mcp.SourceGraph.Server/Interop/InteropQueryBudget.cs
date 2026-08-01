@@ -7,6 +7,11 @@ internal static class InteropQueryBudget
 {
     public const int MaximumSerializedCharacters = 50_000;
 
+    /// <summary>
+    /// Progressively reduce optional detail until the actual serialized response fits the MCP
+    /// transport budget. This measures the final JSON instead of estimating object sizes, because
+    /// escaped paths and metadata can make otherwise similar rows materially different in size.
+    /// </summary>
     public static BoundedInteropScopeQuery Apply(
         InteropScopeQueryResult result,
         int maximumSerializedCharacters = MaximumSerializedCharacters)

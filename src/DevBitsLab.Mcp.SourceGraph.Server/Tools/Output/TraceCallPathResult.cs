@@ -9,6 +9,8 @@ namespace DevBitsLab.Mcp.SourceGraph.Server.Tools.Output;
 public sealed record TraceCallPathResult(
     [property: JsonPropertyName("from_query")] string FromQuery,
     [property: JsonPropertyName("to_query")] string? ToQuery,
+    [property: JsonPropertyName("from_id")] long? FromId,
+    [property: JsonPropertyName("to_id")] long? ToId,
     string Profile,
     [property: JsonPropertyName("destination_mode")] string DestinationMode,
     [property: JsonPropertyName("terminal_definition")] string? TerminalDefinition,
@@ -36,12 +38,42 @@ public sealed record TraceCallPathScopeResult(
 public sealed record TraceCallPathExecutionState(
     string Status,
     bool Partial,
-    [property: JsonPropertyName("absence_authoritative")]
-    bool AbsenceAuthoritative,
     [property: JsonPropertyName("retained_last_good")]
     bool RetainedLastGood,
     IReadOnlyList<TraceCallPathProjectionState> Projections,
-    IReadOnlyList<string> Failures);
+    IReadOnlyList<string> Failures,
+    [property: JsonPropertyName("source_coverage_complete")]
+    bool SourceCoverageComplete,
+    [property: JsonPropertyName("language_projection_complete")]
+    bool LanguageProjectionComplete,
+    [property: JsonPropertyName("relation_projection_complete")]
+    bool RelationProjectionComplete,
+    [property: JsonPropertyName("query_traversal_complete")]
+    bool QueryTraversalComplete,
+    [property: JsonPropertyName("indexed_files")]
+    int IndexedFiles,
+    [property: JsonPropertyName("eligible_files")]
+    int EligibleFiles,
+    [property: JsonPropertyName("missing_files")]
+    IReadOnlyList<string> MissingFiles,
+    [property: JsonPropertyName("missing_file_count")]
+    int MissingFileCount,
+    [property: JsonPropertyName("missing_files_truncated")]
+    bool MissingFilesTruncated,
+    [property: JsonPropertyName("loaded_indexers")]
+    IReadOnlyList<string> LoadedIndexers,
+    [property: JsonPropertyName("index_generation")]
+    long IndexGeneration,
+    [property: JsonPropertyName("indexed_at")]
+    string? IndexedAt)
+{
+    [JsonPropertyName("absence_authoritative")]
+    public bool AbsenceAuthoritative =>
+        SourceCoverageComplete
+        && LanguageProjectionComplete
+        && RelationProjectionComplete
+        && QueryTraversalComplete;
+}
 
 public sealed record TraceCallPathProjectionState(
     string Name,
@@ -86,4 +118,5 @@ public sealed record TraceCallPathEvidence(
     [property: JsonPropertyName("end_column")] int EndColumn,
     string Confidence,
     string Producer,
-    IReadOnlyDictionary<string, string>? Metadata);
+    IReadOnlyDictionary<string, string>? Metadata,
+    SourceSnippet? Snippet = null);

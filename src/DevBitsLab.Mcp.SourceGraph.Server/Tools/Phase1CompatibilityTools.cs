@@ -74,8 +74,20 @@ public static class Phase1CompatibilityTools
         [Description("Maximum number of references to return (default 50)")] int limit = 50,
         [Description("Include references from source-generated files (default false)")] bool includeGenerated = false,
         [Description(ScopeDescription)] string? scope = null,
+        [Description("Output detail: summary | locations | evidence (default) | audit.")] string detail = "evidence",
+        [Description("Source context lines before and after each occurrence (0-20).")] int contextLines = 0,
+        [Description("Attach bounded source excerpts to structured evidence.")] bool includeSnippet = false,
         CancellationToken ct = default) =>
-        GraphTools.FindReferencesAsync(router, symbol, limit, includeGenerated, scope, ct);
+        GraphTools.FindReferencesAsync(
+            router: router,
+            symbol: symbol,
+            limit: limit,
+            includeGenerated: includeGenerated,
+            scope: scope,
+            detail: detail,
+            contextLines: contextLines,
+            includeSnippet: includeSnippet,
+            ct: ct);
 
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(ListCallersResult))]
     [ToolAnnotation(ReadOnlyHint = true, IdempotentHint = true)]
@@ -87,8 +99,20 @@ public static class Phase1CompatibilityTools
         [Description("Maximum number of results to return (default 50)")] int limit = 50,
         [Description("Edge kind to walk (default calls); pass all to walk every indexed edge kind")] string? kind = null,
         [Description(ScopeDescription)] string? scope = null,
+        [Description("Output detail: summary | locations | evidence (default) | audit.")] string detail = "evidence",
+        [Description("Source context lines before and after each occurrence (0-20).")] int contextLines = 0,
+        [Description("Attach bounded source excerpts to structured evidence.")] bool includeSnippet = false,
         CancellationToken ct = default) =>
-        GraphTools.ListCallersAsync(router, symbol, limit, kind, scope, ct);
+        GraphTools.ListCallersAsync(
+            router: router,
+            symbol: symbol,
+            limit: limit,
+            kind: kind,
+            scope: scope,
+            detail: detail,
+            contextLines: contextLines,
+            includeSnippet: includeSnippet,
+            ct: ct);
 
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(ListCalleesResult))]
     [ToolAnnotation(ReadOnlyHint = true, IdempotentHint = true)]
@@ -100,8 +124,20 @@ public static class Phase1CompatibilityTools
         [Description("Maximum number of results to return (default 50)")] int limit = 50,
         [Description("Edge kind to walk (default calls); pass all to walk every indexed edge kind")] string? kind = null,
         [Description(ScopeDescription)] string? scope = null,
+        [Description("Output detail: summary | locations | evidence (default) | audit.")] string detail = "evidence",
+        [Description("Source context lines before and after each occurrence (0-20).")] int contextLines = 0,
+        [Description("Attach bounded source excerpts to structured evidence.")] bool includeSnippet = false,
         CancellationToken ct = default) =>
-        GraphTools.ListCalleesAsync(router, symbol, limit, kind, scope, ct);
+        GraphTools.ListCalleesAsync(
+            router: router,
+            symbol: symbol,
+            limit: limit,
+            kind: kind,
+            scope: scope,
+            detail: detail,
+            contextLines: contextLines,
+            includeSnippet: includeSnippet,
+            ct: ct);
 
     /// <summary>
     /// Source-compatible entry point for the original Phase 1 alias signature.
@@ -155,29 +191,43 @@ public static class Phase1CompatibilityTools
         [Description(ScopeDescription)] string? scope = null,
         CancellationToken ct = default) =>
         TraceCallPathTools.TraceCallPathWithProfileAsync(
-            router,
-            from,
-            to,
-            kind,
-            profile,
-            maxDepth,
-            maxPaths,
-            maxNodes,
-            scope,
-            ct);
+            router: router,
+            from: from,
+            to: to,
+            kind: kind,
+            profile: profile,
+            maxDepth: maxDepth,
+            maxPaths: maxPaths,
+            maxNodes: maxNodes,
+            scope: scope,
+            ct: ct);
 
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(ImpactOfChangeResult))]
     [ToolAnnotation(ReadOnlyHint = true, IdempotentHint = true)]
     [ToolTrigger("\"analyze the impact of changing X\"")]
-    [Description("Compute bounded evidence-backed upstream impact. Compatibility name for impact_of_change; every row includes its BFS predecessor and a source-to-target path whose hops carry real occurrence evidence.")]
+    [Description("Compute bounded evidence-backed upstream impact. Compatibility name for impact_of_change; defaults to a compact summary while structured output retains auditable paths.")]
     public static Task<CallToolResult> ImpactAnalysisAsync(
         ScopeRouter router,
         [Description("Symbol name or FQN")] string symbol,
         [Description("Maximum traversal depth (default 4)")] int maxDepth = 4,
         [Description("Maximum results (default 100)")] int limit = 100,
         [Description("Edge kind to walk (default calls); pass all to walk every indexed edge kind")] string? kind = null,
+        [Description("Output detail: summary (default) | locations | evidence | audit; legacy paths is accepted.")] string detail = "summary",
+        [Description("Optional file-path hint used to disambiguate symbols with the same name.")] string? file = null,
+        [Description("Optional kebab-case symbol kind used to disambiguate the target.")] string? symbolKind = null,
         [Description(ScopeDescription)] string? scope = null,
         IProgress<ProgressNotificationValue>? progress = null,
         CancellationToken ct = default) =>
-        GraphTools.ImpactOfChangeAsync(router, symbol, maxDepth, limit, kind, scope, progress, ct);
+        GraphTools.ImpactOfChangeAsync(
+            router,
+            symbol,
+            maxDepth,
+            limit,
+            kind,
+            detail,
+            file,
+            symbolKind,
+            scope,
+            progress,
+            ct);
 }

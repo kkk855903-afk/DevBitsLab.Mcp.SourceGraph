@@ -32,11 +32,20 @@ public sealed class ScopeRouter
         get { lock (_lock) return _defaultScope; }
     }
 
+    /// <summary>
+    /// Set the preferred implicit scope. The id is intentionally not validated here because
+    /// configuration is loaded before all hosts are registered; <see cref="Resolve"/> reports a
+    /// missing configured id when a tool later needs to use it.
+    /// </summary>
     public void SetDefaultScope(string? id)
     {
         lock (_lock) _defaultScope = id;
     }
 
+    /// <summary>
+    /// Publish a host for routing. Registration replaces an existing mapping so startup recovery
+    /// can install a rebuilt host without leaving a stale entry visible to concurrent readers.
+    /// </summary>
     public void Register(ScopeHost host)
     {
         lock (_lock) _hosts[host.Scope.Id] = host;
@@ -75,11 +84,20 @@ public sealed class ScopeRouter
         }
     }
 
+    /// <summary>
+    /// Look up the host currently published for an id. The returned reference is a point-in-time
+    /// snapshot; a later replacement may publish another host, while in-flight callers keep this
+    /// one until the replacement grace period disposes it.
+    /// </summary>
     public bool TryGet(string id, out ScopeHost host)
     {
         lock (_lock) return _hosts.TryGetValue(id, out host!);
     }
 
+    /// <summary>
+    /// Return a deterministic copy of the current host set rather than the mutable registry view,
+    /// allowing callers to fan out after releasing the router lock.
+    /// </summary>
     public IReadOnlyList<ScopeHost> All()
     {
         lock (_lock) return _hosts.Values.OrderBy(h => h.Scope.Id, StringComparer.Ordinal).ToList();

@@ -125,6 +125,50 @@ public sealed class ScopeReconciliationOnBootTests : IDisposable
     }
 
     [Fact]
+    public async Task InterruptedShadow_isQuarantinedWithSidecars_withoutChangingPrimary()
+    {
+        var scopeId = $"reconcile-test-shadow-{Guid.NewGuid():N}";
+        var primary = ScopeLayout.ScopeDbPath(_repoRoot, scopeId);
+        var primaryBytes = new byte[] { 1, 2, 3, 4 };
+        await File.WriteAllBytesAsync(primary, primaryBytes);
+        var shadow = primary + ".shadow-interrupted";
+        await File.WriteAllBytesAsync(shadow, [5, 6, 7]);
+        await File.WriteAllBytesAsync(shadow + "-wal", [8, 9]);
+        await File.WriteAllBytesAsync(shadow + "-shm", [10]);
+
+        await using var registry = await NewRegistryAsync();
+        await registry.UpsertAsync(NewRow(
+            scopeId,
+            status: "indexing",
+            lastIndexedAt: DateTimeOffset.UtcNow.AddMinutes(-10)));
+
+        await BootReconciler.ReconcileAsync(
+            registry,
+            _repoRoot,
+            DateTimeOffset.UtcNow.AddMinutes(-1),
+            NullLogger.Instance,
+            CancellationToken.None);
+
+        (await File.ReadAllBytesAsync(primary)).Should().Equal(primaryBytes);
+        File.Exists(shadow).Should().BeFalse();
+        File.Exists(shadow + "-wal").Should().BeFalse();
+        File.Exists(shadow + "-shm").Should().BeFalse();
+        var archived = Path.Join(ScopeLayout.OrphansDirectory(_repoRoot), Path.GetFileName(shadow));
+        (await File.ReadAllBytesAsync(archived)).Should().Equal(5, 6, 7);
+        File.Exists(archived + "-wal").Should().BeTrue();
+        File.Exists(archived + "-shm").Should().BeTrue();
+
+        var post = await registry.GetAsync(scopeId);
+        post!.Status.Should().Be("degraded");
+        post.StatusMessage.Should().Contain("previous index interrupted");
+        var events = HealLinesForScope(scopeId).ToList();
+        events.Select(line => line.GetProperty("kind").GetString()).Should().Contain([
+            "interrupted-shadow-archived",
+            "stuck-indexing-detected",
+        ]);
+    }
+
+    [Fact]
     public async Task InFlightIndexing_isLeftAlone()
     {
         // Registry says indexing AND last_indexed_at is AFTER process start — the current process
@@ -202,5 +246,16 @@ public sealed class ScopeReconciliationOnBootTests : IDisposable
             }
         }
         return null;
+    }
+
+    private IEnumerable<JsonElement> HealLinesForScope(string scopeId)
+    {
+        if (!File.Exists(_healPath)) yield break;
+        foreach (var raw in File.ReadAllLines(_healPath))
+        {
+            using var doc = JsonDocument.Parse(raw);
+            if (doc.RootElement.GetProperty("scope").GetString() == scopeId)
+                yield return doc.RootElement.Clone();
+        }
     }
 }

@@ -26,9 +26,13 @@ public sealed record NativeWorkerClientOptions
             isolationRequirements ?? new NativeWorkerIsolationRequirements();
     }
 
+    /// <summary>Wall-clock limit covering process start, request I/O, and child completion.</summary>
     public TimeSpan RequestTimeout { get; }
+
+    /// <summary>Sandbox properties that must be available before a worker can be launched.</summary>
     public NativeWorkerIsolationRequirements IsolationRequirements { get; }
 
+    /// <summary>Production timeout and the baseline set of optional isolation requirements.</summary>
     public static NativeWorkerClientOptions Default { get; } =
         new(TimeSpan.FromSeconds(30));
 }
@@ -190,6 +194,11 @@ public sealed class NativeWorkerClient
         _processLauncher = processLauncher;
     }
 
+    /// <summary>
+    /// Execute one trusted native extraction in a fresh child process. Operational failures are
+    /// returned as stable <see cref="NativeWorkerFailure"/> values; caller cancellation remains
+    /// cancellation so request shutdown cannot be mistaken for an analysis result.
+    /// </summary>
     public async Task<NativeWorkerClientResult> ExtractAsync(
         string repositoryRoot,
         ClangNativeExtractionRequest request,
@@ -547,6 +556,8 @@ public sealed class NativeWorkerClient
         }
         startInfo.ArgumentList.Add(NativeWorkerEntrypoint.InvocationArgument);
 
+        // The worker inherits no ambient credentials, proxy settings, or loader knobs. Keep only
+        // the runtime-location variables required to start the same .NET host reliably.
         startInfo.Environment.Clear();
         foreach (var name in _allowedEnvironmentVariables)
         {
@@ -626,6 +637,8 @@ public sealed class NativeWorkerClient
             }
         }
 
+        // Do not wait indefinitely for a killed child: cleanup runs while propagating a timeout
+        // or cancellation and must not delay that outcome forever.
         using var cleanup = new CancellationTokenSource(TimeSpan.FromSeconds(2));
         try
         {

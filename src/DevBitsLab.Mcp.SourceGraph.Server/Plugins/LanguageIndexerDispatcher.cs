@@ -400,18 +400,22 @@ public sealed class LanguageIndexerDispatcher
             fileIdByPath,
             ct).ConfigureAwait(false);
 
+        var eligiblePaths = OrderDispatchFiles(
+                EnumerateFiles(
+                    host.Scope.Root,
+                    extensions,
+                    pathPolicy,
+                    projectSetMatcher),
+                host.ProjectByFilePath,
+                host.LanguageProjects)
+            .ToArray();
+        host.RegisteredLanguageEligibleFiles = eligiblePaths;
+
         var indexedPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var usableOutputPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var skipped = staleDeletion.FailedFiles.Count;
         var failedFiles = new List<FileFailure>(staleDeletion.FailedFiles);
-        foreach (var file in OrderDispatchFiles(
-                     EnumerateFiles(
-                         host.Scope.Root,
-                         extensions,
-                         pathPolicy,
-                         projectSetMatcher),
-                     host.ProjectByFilePath,
-                     host.LanguageProjects))
+        foreach (var file in eligiblePaths)
         {
             ct.ThrowIfCancellationRequested();
             var ext = Path.GetExtension(file);
@@ -557,6 +561,24 @@ public sealed class LanguageIndexerDispatcher
                 indexerHit.Value.Owner,
                 state));
         }
+
+        var updatedEligiblePaths = host.RegisteredLanguageEligibleFiles
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        foreach (var candidate in candidates)
+        {
+            if (candidate.State == SourcePathState.File)
+            {
+                updatedEligiblePaths.Add(candidate.Path);
+            }
+            else if (candidate.State == SourcePathState.Missing)
+            {
+                updatedEligiblePaths.Remove(candidate.Path);
+            }
+        }
+        host.RegisteredLanguageEligibleFiles = updatedEligiblePaths
+            .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(path => path, StringComparer.Ordinal)
+            .ToArray();
 
         if (projectAnchorChanged)
         {

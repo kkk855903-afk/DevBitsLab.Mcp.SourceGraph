@@ -4,8 +4,8 @@ namespace DevBitsLab.Mcp.SourceGraph.Server.Interop;
 
 /// <summary>
 /// Controls which persisted interop declarations may satisfy a symbol query. The two modes map
-/// directly to the Phase 2 tools: <c>match_pinvoke</c> accepts managed imports only, while
-/// <c>analyze_native_boundary</c> also accepts one uniquely selected native export.
+/// to the query contract: callers may either restrict selection to managed imports or accept
+/// one uniquely selected managed import or native export.
 /// </summary>
 public enum InteropQuerySelectionMode
 {

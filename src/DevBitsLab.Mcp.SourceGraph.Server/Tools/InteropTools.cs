@@ -31,13 +31,13 @@ public static class InteropTools
         "\"match this P/Invoke\", \"which native export does this DllImport call?\", "
         + "\"resolve this LibraryImport boundary\"")]
     [Description(
-        "Match one uniquely selected managed DllImport or LibraryImport to persisted native "
-        + "exports. Exact canonical keys take precedence; zero or multiple managed imports "
+        "Match one uniquely selected managed DllImport, LibraryImport, or native export to "
+        + "persisted interop boundaries. Exact canonical keys take precedence; zero or multiple declarations "
         + "are reported without guessing. Returns explicit target, status, candidate count, "
         + "reasons, and stored evidence for every selected scope.")]
     public static Task<CallToolResult> MatchPInvokeAsync(
         ScopeRouter router,
-        [Description("Managed import name, FQN, or exact canonical key.")] string symbol,
+        [Description("Managed import or native export name, FQN, or exact canonical key.")] string symbol,
         [Description("Optional scope id, '*', or comma-separated scope ids.")] string? scope = null,
         CancellationToken ct = default) =>
         ToolMetrics.TrackAsync(
@@ -47,7 +47,7 @@ public static class InteropTools
                 router,
                 symbol,
                 scope,
-                InteropQuerySelectionMode.ManagedImportOnly,
+                InteropQuerySelectionMode.ManagedOrNativeBoundary,
                 includeFindings: false,
                 "match_pinvoke",
                 ct));

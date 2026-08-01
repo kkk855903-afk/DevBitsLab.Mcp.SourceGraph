@@ -16,6 +16,7 @@ public sealed record FindByAnnotationResult(IReadOnlyList<FindByAnnotationHit> H
 /// </summary>
 public sealed record FindByAnnotationHit(
     [property: JsonPropertyName("symbol_id")] long SymbolId,
+    [property: JsonPropertyName("canonical_key")] string? CanonicalKey,
     string Fqn,
     string Kind,
     [property: JsonPropertyName("file_path")] string FilePath,

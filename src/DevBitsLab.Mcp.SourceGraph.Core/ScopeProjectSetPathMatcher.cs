@@ -102,6 +102,9 @@ public sealed class ScopeProjectSetPathMatcher
             {
                 return false;
             }
+            // Lexical containment enforces the configured project boundary, while physical
+            // containment prevents a symlink below that boundary from importing a sibling or
+            // external project.
             return _projectRoots.Any(projectRoot =>
                 IsSameOrDescendant(projectRoot.Lexical, fullPath)
                 && IsSameOrDescendant(projectRoot.Physical, physicalPath));
@@ -205,6 +208,8 @@ public sealed class ScopeProjectSetPathMatcher
         {
             var directory = stack.Pop();
             if (pathPolicy.IsExcluded(directory)) continue;
+            // A project-root glob must not make traversal follow a link into another tree. The
+            // physical-directory set additionally breaks cycles formed by distinct link paths.
             if (!ScopePathPolicy.TryResolvePhysicalPath(directory, out var physicalDirectory)
                 || !visitedPhysicalDirectories.Add(physicalDirectory))
             {

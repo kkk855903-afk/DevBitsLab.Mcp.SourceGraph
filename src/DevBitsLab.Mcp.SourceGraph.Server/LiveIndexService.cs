@@ -166,11 +166,14 @@ public sealed class LiveIndexService : BackgroundService
             return;
         }
 
-        // Run the cold index for every prepared scope concurrently. Each call settles its own
-        // host status to "ok", "partial", or "degraded" and calls MarkReady so tools waiting on
-        // ScopeHost.Ready can proceed.
-        var indexTasks = _preparedHosts.Select(host => RunInitialIndexAsync(host, stoppingToken)).ToArray();
-        await Task.WhenAll(indexTasks).ConfigureAwait(false);
+        // Each Roslyn cold pass can retain hundreds of MB while constructing compilations. Run
+        // scopes serially so startup peak is bounded by one active compilation universe rather
+        // than the number of configured scopes. Prepared hosts remain visible as "indexing" and
+        // settle independently as their turn completes.
+        foreach (var host in _preparedHosts)
+        {
+            await RunInitialIndexAsync(host, stoppingToken).ConfigureAwait(false);
+        }
 
         // Start watching every clean or partially successful scope. An empty but clean `ok` scope
         // still needs a watcher so the first future source file is indexed. `degraded` scopes have
@@ -420,6 +423,138 @@ public sealed class LiveIndexService : BackgroundService
         }
     }
 
+    private async Task UpgradeSchemaThroughShadowAsync(
+        Scope scope,
+        string primaryPath,
+        CancellationToken ct)
+    {
+        var oldVersion = await GraphSchemaProbe.ReadVersionAsync(primaryPath, ct).ConfigureAwait(false);
+        var oldGeneration = await GraphSchemaProbe.ReadIndexGenerationAsync(primaryPath, ct)
+            .ConfigureAwait(false);
+        _logger.LogInformation(
+            "Scope `{Id}` graph schema v{Old} requires v{New}; building a shadow index",
+            scope.Id,
+            oldVersion,
+            Schema.Version);
+
+        var shadowPath = await BuildValidatedShadowIndexAsync(
+            scope,
+            primaryPath,
+            oldGeneration,
+            ct).ConfigureAwait(false);
+        PromoteShadowDatabase(scope, primaryPath, shadowPath, "schema-v" + oldVersion);
+    }
+
+    private async Task<string> BuildValidatedShadowIndexAsync(
+        Scope scope,
+        string primaryPath,
+        long baseGeneration,
+        CancellationToken ct)
+    {
+        var shadowPath = primaryPath + $".shadow-{Guid.NewGuid():N}";
+        ScopeHost? shadowHost = null;
+        try
+        {
+            shadowHost = await PrepareScopeAsync(
+                    scope,
+                    ct,
+                    registerWithRouter: false,
+                    databasePathOverride: shadowPath,
+                    persistRegistry: false,
+                    allowShadowUpgrade: false)
+                .ConfigureAwait(false);
+            if (shadowHost is null)
+            {
+                throw new InvalidOperationException(
+                    $"Scope `{scope.Id}` shadow database could not be prepared.");
+            }
+
+            await shadowHost.Store.SeedIndexGenerationAsync(baseGeneration, ct)
+                .ConfigureAwait(false);
+            shadowHost.ApplyIndexState(
+                await shadowHost.Store.GetIndexStateAsync(ct).ConfigureAwait(false));
+
+            await RunInitialIndexAsync(shadowHost, ct, persistRegistry: false)
+                .ConfigureAwait(false);
+            if (shadowHost.Status != "ok")
+            {
+                throw new InvalidOperationException(
+                    $"Scope `{scope.Id}` shadow index settled to {shadowHost.Status}: "
+                    + (shadowHost.StatusMessage ?? "no diagnostic"));
+            }
+
+            var integrity = await shadowHost.Store.IntegrityCheckAsync(ct).ConfigureAwait(false);
+            if (!string.Equals(integrity, "ok", StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException(
+                    $"Scope `{scope.Id}` shadow integrity check failed: {integrity}");
+            }
+
+            var counts = await shadowHost.Store.RowCountsAsync(ct).ConfigureAwait(false);
+            await shadowHost.Store.CheckpointForActivationAsync(ct).ConfigureAwait(false);
+            _logger.LogInformation(
+                "Scope `{Id}` shadow index validated ({Files} files, {Symbols} symbols, {Edges} edges)",
+                scope.Id,
+                counts.Files,
+                counts.Symbols,
+                counts.Edges);
+
+            await shadowHost.DisposeAsync().ConfigureAwait(false);
+            shadowHost = null;
+            Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+            return shadowPath;
+        }
+        catch
+        {
+            if (shadowHost is not null)
+            {
+                await shadowHost.DisposeAsync().ConfigureAwait(false);
+            }
+            Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+            DeleteShadowArtifacts(shadowPath);
+            throw;
+        }
+    }
+
+    private void PromoteShadowDatabase(
+        Scope scope,
+        string primaryPath,
+        string shadowPath,
+        string archiveDiscriminator)
+    {
+        Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
+        var archive = ShadowDatabaseActivator.Activate(
+            primaryPath,
+            shadowPath,
+            ScopeLayout.OrphansDirectory(scope.Root),
+            archiveDiscriminator);
+        _logger.LogInformation(
+            "Scope `{Id}` atomically promoted shadow index; previous database retained at {Archive}",
+            scope.Id,
+            archive);
+        HealLog.Append(
+            kind: "shadow-index-promoted",
+            scope: scope.Id,
+            ok: true,
+            ms: 0,
+            details: $"archive={archive}");
+    }
+
+    private static void DeleteShadowArtifacts(string shadowPath)
+    {
+        foreach (var path in new[] { shadowPath, shadowPath + "-wal", shadowPath + "-shm" })
+        {
+            try
+            {
+                if (File.Exists(path)) File.Delete(path);
+            }
+            catch (IOException)
+            {
+                // Best effort: a uniquely named rejected shadow is never opened on next boot.
+            }
+        }
+    }
+
     /// <summary>
     /// Phase 1 of scope bring-up. Runs during <see cref="StartAsync"/> before MCP starts accepting
     /// requests: opens the graph store, prepares the embeddings drain (if available), constructs
@@ -429,10 +564,16 @@ public sealed class LiveIndexService : BackgroundService
     /// </summary>
     [SuppressMessage("Design", "CA1031:DoNotCatchGeneralExceptionTypes",
         Justification = "Bring-up of any single scope must not crash the host: a per-scope failure (Roslyn workspace, plugin embeddings, malformed config, transient I/O) marks that scope `degraded` in the registry and lets every other scope and the MCP transport keep running. The exception is logged + persisted before the catch returns.")]
-    private async Task<ScopeHost?> PrepareScopeAsync(Scope scope, CancellationToken ct, bool registerWithRouter = true)
+    private async Task<ScopeHost?> PrepareScopeAsync(
+        Scope scope,
+        CancellationToken ct,
+        bool registerWithRouter = true,
+        string? databasePathOverride = null,
+        bool persistRegistry = true,
+        bool allowShadowUpgrade = true)
     {
         var solutionPath = ResolvePrimarySolution(scope);
-        var dbPath = ScopeLayout.ScopeDbPath(scope.Root, scope.Id);
+        var dbPath = databasePathOverride ?? ScopeLayout.ScopeDbPath(scope.Root, scope.Id);
         Directory.CreateDirectory(Path.GetDirectoryName(dbPath)!);
 
         SqliteGraphStore? store = null;
@@ -441,6 +582,13 @@ public sealed class LiveIndexService : BackgroundService
         EmbeddingsHostedService? scopeEmbeddings = null;
         try
         {
+            if (allowShadowUpgrade
+                && await GraphSchemaProbe.RequiresUpgradeAsync(dbPath, ct).ConfigureAwait(false))
+            {
+                await UpgradeSchemaThroughShadowAsync(scope, dbPath, ct)
+                    .ConfigureAwait(false);
+            }
+
             store = new SqliteGraphStore(dbPath, _loggerFactory.CreateLogger<SqliteGraphStore>());
             store.TryLoadVectorExtension(_modelInfo.Dimension);
             await store.EnsureSchemaAsync(ct).ConfigureAwait(false);
@@ -459,7 +607,7 @@ public sealed class LiveIndexService : BackgroundService
             // Await the model-download gate before checking IsAvailable. The generator's first
             // IsAvailable probe is sticky (it caches the answer of its initial cache check), so
             // probing before the download lands would permanently disable embeddings for this
-            // session. Bypassed installs (--no-embeddings or --no-model-download with empty
+            // session. Bypassed installs (default-disabled embeddings or offline mode with empty
             // cache) wire an already-completed gate, so this await is free. WaitAsync(ct)
             // honours scope-prep cancellation so a shutdown during cold-start doesn't block on
             // the in-flight download.
@@ -467,7 +615,19 @@ public sealed class LiveIndexService : BackgroundService
             IEmbeddingsRequestSink indexerSink;
             if (embeddingsStore.IsAvailable && _embeddingGenerator.IsAvailable)
             {
-                scopeSink = new ChannelEmbeddingsRequestSink();
+                var embeddingProducer =
+                    SymbolTextBuilder.ProducerName(_embeddingGenerator.Model.Version);
+                var storedEmbeddingVersion = await store
+                    .GetProjectionVersionAsync(embeddingProducer, ct)
+                    .ConfigureAwait(false);
+                scopeSink = new ChannelEmbeddingsRequestSink(
+                    requiresFullRefresh:
+                        storedEmbeddingVersion != SymbolTextBuilder.ProducerVersion);
+                // Publish-on-success: remove the previous completion marker before indexing.
+                // A crash after file hashes change but before embeddings drain will therefore
+                // force a complete backfill on the next startup.
+                await store.ClearProjectionVersionAsync(embeddingProducer, ct)
+                    .ConfigureAwait(false);
                 scopeEmbeddings = new EmbeddingsHostedService(
                     scopeSink,
                     _embeddingGenerator,
@@ -489,7 +649,7 @@ public sealed class LiveIndexService : BackgroundService
                 scope.Root,
                 scope.ProjectSet.Exclude,
                 scope.Interop?.Target);
-            if (!_historyOptions.Disabled)
+            if (persistRegistry && !_historyOptions.Disabled)
             {
                 indexer.OnFileIndexed = (fileId, path, sha) =>
                     _historyQueue.Writer.WriteAsync(new HistoryRequest(fileId, path, sha, scope.Id)).AsTask();
@@ -499,7 +659,12 @@ public sealed class LiveIndexService : BackgroundService
             {
                 EmbeddingsSink = scopeSink,
                 EmbeddingsService = scopeEmbeddings,
+                EmbeddingProducerName = scopeSink is null
+                    ? null
+                    : SymbolTextBuilder.ProducerName(_embeddingGenerator.Model.Version),
+                LoadedIndexers = LoadedIndexerNames(scope),
             };
+            host.ApplyIndexState(await store.GetIndexStateAsync(ct).ConfigureAwait(false));
             if (scope.Interop is not null)
             {
                 host.NativeInteropCoordinator = new NativeInteropCoordinator(
@@ -518,7 +683,10 @@ public sealed class LiveIndexService : BackgroundService
             // "indexing" (which would hang any tool waiting on ScopeHost.Ready and trip a
             // double-dispose during StopAsync). Once the upsert succeeds, registration is a
             // pure dictionary insert under a lock and is the last fallible step here.
-            await _registry.UpsertAsync(ToRow(scope, host.Status, null), ct).ConfigureAwait(false);
+            if (persistRegistry)
+            {
+                await _registry.UpsertAsync(ToRow(scope, host.Status, null), ct).ConfigureAwait(false);
+            }
             // The live-modify path passes registerWithRouter=false because it needs to atomically
             // swap this freshly-prepared host into the slot via ScopeRouter.Replace, capturing the
             // displaced *old* host. Registering here would cause Replace to return the new host as
@@ -552,7 +720,10 @@ public sealed class LiveIndexService : BackgroundService
             // registry is recoverable on next bring-up.
             try
             {
-                await _registry.UpsertAsync(ToRow(scope, "degraded", ex.Message), ct).ConfigureAwait(false);
+                if (persistRegistry)
+                {
+                    await _registry.UpsertAsync(ToRow(scope, "degraded", ex.Message), ct).ConfigureAwait(false);
+                }
             }
             catch (Exception upsertEx)
             {
@@ -572,7 +743,10 @@ public sealed class LiveIndexService : BackgroundService
     /// </summary>
     [SuppressMessage("Design", "CA1031:DoNotCatchGeneralExceptionTypes",
         Justification = "Cold-indexing surface area spans Roslyn workspace open, MSBuild project load, our own indexer, and arbitrary plugin analyzers — any of which can throw any exception type. The broad catch logs, marks the scope `degraded`, persists the message to the registry, and signals readiness via the finally so waiting tools see the failure rather than hang. The host stays up to serve healthy scopes.")]
-    private async Task RunInitialIndexAsync(ScopeHost host, CancellationToken ct)
+    private async Task RunInitialIndexAsync(
+        ScopeHost host,
+        CancellationToken ct,
+        bool persistRegistry = true)
     {
         var scope = host.Scope;
         var solutionPath = host.SolutionPath;
@@ -820,34 +994,42 @@ public sealed class LiveIndexService : BackgroundService
                     failedFileCount,
                     status.UsesRetainedGraph);
             }
-            host.LastIndexedAt = DateTimeOffset.UtcNow;
-            await _registry.UpsertAsync(
-                ToRow(scope, host.Status, host.StatusMessage, host.FailedProjects, host.FailedFiles),
-                ct).ConfigureAwait(false);
-
-            // Autonomous embeddings prune: cold-index can leave behind embeddings for symbols
-            // that were deleted (refactors, file renames, generator-output drift). Prune is
-            // cheap (one DELETE) and reversible (embeddings regenerate on next semantic_search).
-            // Best-effort: a failure here does NOT revert the scope to degraded — the cold-index
-            // outcome is what counts; the prune is opportunistic cleanup.
-            try
+            await host.CompleteIndexGenerationAsync(DateTimeOffset.UtcNow, ct)
+                .ConfigureAwait(false);
+            if (persistRegistry)
             {
-                var sw = System.Diagnostics.Stopwatch.StartNew();
-                var pruned = await host.EmbeddingsStore.PruneOrphanedAsync(ct).ConfigureAwait(false);
-                sw.Stop();
-                if (pruned > 0)
-                {
-                    Observability.HealLog.Append(kind: "embeddings-pruned", scope: scope.Id, ok: true,
-                        ms: sw.Elapsed.TotalMilliseconds, details: $"removed {pruned} orphan rows");
-                }
-                // Zero-noise convention: don't log a heal event when nothing was pruned.
+                await _registry.UpsertAsync(
+                    ToRow(scope, host.Status, host.StatusMessage, host.FailedProjects, host.FailedFiles),
+                    ct).ConfigureAwait(false);
             }
-            catch (OperationCanceledException) { throw; }
-            catch (Exception pruneEx)
+
+            // Autonomous embeddings prune only belongs to an active embedding pipeline. Keeping
+            // this branch behind the sink check means the default-disabled mode performs no
+            // writes at all against symbol_embeddings and preserves existing vectors for a later
+            // opt-in run.
+            if (host.EmbeddingsSink is not null)
             {
-                _logger.LogWarning(pruneEx, "Scope `{Id}`: embeddings prune after cold-index failed; ignoring", scope.Id);
-                Observability.HealLog.Append(kind: "embeddings-pruned", scope: scope.Id, ok: false,
-                    ms: 0, details: pruneEx.Message);
+                // Best-effort: a failure here does NOT revert the scope to degraded — the
+                // cold-index outcome is what counts; the prune is opportunistic cleanup.
+                try
+                {
+                    var sw = System.Diagnostics.Stopwatch.StartNew();
+                    var pruned = await host.EmbeddingsStore.PruneOrphanedAsync(ct).ConfigureAwait(false);
+                    sw.Stop();
+                    if (pruned > 0)
+                    {
+                        Observability.HealLog.Append(kind: "embeddings-pruned", scope: scope.Id, ok: true,
+                            ms: sw.Elapsed.TotalMilliseconds, details: $"removed {pruned} orphan rows");
+                    }
+                    // Zero-noise convention: don't log a heal event when nothing was pruned.
+                }
+                catch (OperationCanceledException) { throw; }
+                catch (Exception pruneEx)
+                {
+                    _logger.LogWarning(pruneEx, "Scope `{Id}`: embeddings prune after cold-index failed; ignoring", scope.Id);
+                    Observability.HealLog.Append(kind: "embeddings-pruned", scope: scope.Id, ok: false,
+                        ms: 0, details: pruneEx.Message);
+                }
             }
         }
         catch (OperationCanceledException) { throw; }
@@ -856,7 +1038,12 @@ public sealed class LiveIndexService : BackgroundService
             _logger.LogError(ex, "Scope `{Id}` initial indexing failed; marking degraded", scope.Id);
             host.Status = "degraded";
             host.StatusMessage = ex.Message;
-            await _registry.UpsertAsync(ToRow(scope, host.Status, host.StatusMessage, host.FailedProjects, host.FailedFiles), ct).ConfigureAwait(false);
+            if (persistRegistry)
+            {
+                await _registry.UpsertAsync(
+                    ToRow(scope, host.Status, host.StatusMessage, host.FailedProjects, host.FailedFiles),
+                    ct).ConfigureAwait(false);
+            }
         }
         finally
         {
@@ -866,6 +1053,41 @@ public sealed class LiveIndexService : BackgroundService
             // (because the Ready task completed) sees the final 1.0 first.
             host.ProgressSource.MarkReady();
             host.MarkReady();
+
+            if (host.EmbeddingsSink is null)
+            {
+                host.MarkEmbeddingsReady(false);
+            }
+            else
+            {
+                try
+                {
+                    var complete = await host.EmbeddingsSink
+                        .WaitForDrainAsync(ct)
+                        .ConfigureAwait(false);
+                    if (complete && host.EmbeddingProducerName is not null)
+                    {
+                        await host.Store.SetProjectionVersionAsync(
+                                host.EmbeddingProducerName,
+                                SymbolTextBuilder.ProducerVersion,
+                                ct)
+                            .ConfigureAwait(false);
+                    }
+                    host.MarkEmbeddingsReady(complete);
+                }
+                catch (OperationCanceledException)
+                {
+                    host.MarkEmbeddingsReady(false);
+                }
+                catch (Exception embeddingEx)
+                {
+                    _logger.LogWarning(
+                        embeddingEx,
+                        "Scope `{Id}` embedding backfill did not complete; semantic search will fail closed",
+                        scope.Id);
+                    host.MarkEmbeddingsReady(false);
+                }
+            }
         }
     }
 
@@ -889,10 +1111,10 @@ public sealed class LiveIndexService : BackgroundService
     }
 
     /// <summary>
-    /// Drives a full rebuild of the named scope: archives the existing DB to
-    /// <c>orphans/&lt;id&gt;-&lt;archiveDiscriminator&gt;-&lt;utc-iso&gt;.db</c> (if present), disposes the existing
-    /// <see cref="ScopeHost"/>, runs <see cref="PrepareScopeAsync"/> + <see cref="RunInitialIndexAsync"/>
-    /// for the scope, and registers the new host with the router (the call to
+    /// Drives a full rebuild of the named scope through a shadow database. The existing host
+    /// remains queryable while the shadow is indexed and validated. Only then is the old host
+    /// disposed, the database atomically replaced (with the old file retained under
+    /// <c>orphans/</c>), and a new host registered with the router. The call to
     /// <see cref="ScopeRouter.Register"/> overwrites the prior entry by id, so the rebuild is
     /// transparent to other components). Used by the <c>repair_scope</c> tool's <c>rebuild</c>
     /// mode and (in Phase 3) by the autonomous corrupt-DB recovery path.
@@ -912,41 +1134,68 @@ public sealed class LiveIndexService : BackgroundService
         var scope = oldHost.Scope;
         var dbPath = ScopeLayout.ScopeDbPath(_repoRoot.Path, scopeId);
 
-        // Step 1 — archive the existing DB if present. We dispose the host first to release SQLite
-        // handles; otherwise the move would race with the running connection.
-        await oldHost.DisposeAsync().ConfigureAwait(false);
-        // Drop SQLite's connection pool so any other handle on this DB gets reaped before the move.
-        Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
-
-        if (File.Exists(dbPath))
+        // Build and validate without touching the active database. A failure returns null while
+        // the router continues serving oldHost, so callers never observe a cleared graph.
+        string shadowPath;
+        try
         {
-            try
-            {
-                var orphansDir = ScopeLayout.OrphansDirectory(_repoRoot.Path);
-                Directory.CreateDirectory(orphansDir);
-                var ts = DateTimeOffset.UtcNow.ToString("yyyy-MM-ddTHH-mm-ssZ");
-                var dest = Path.Join(orphansDir, $"{scopeId}-{archiveDiscriminator}-{ts}.db");
-                File.Move(dbPath, dest);
-                foreach (var suffix in new[] { "-wal", "-shm" })
-                {
-                    var s = dbPath + suffix;
-                    var d = dest + suffix;
-                    if (File.Exists(s) && !File.Exists(d))
-                    {
-                        try { File.Move(s, d); } catch (IOException) { /* best-effort */ }
-                    }
-                }
-                _logger.LogInformation("Archived scope `{Id}` DB to {Dest} ahead of rebuild", scopeId, dest);
-            }
-            catch (IOException ex)
-            {
-                _logger.LogWarning(ex, "Failed to archive scope `{Id}` DB before rebuild; continuing", scopeId);
-            }
+            shadowPath = await BuildValidatedShadowIndexAsync(
+                    scope,
+                    dbPath,
+                    oldHost.IndexGeneration,
+                    ct)
+                .ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            _logger.LogError(
+                ex,
+                "Scope `{Id}` shadow rebuild failed validation; existing index remains active",
+                scopeId);
+            HealLog.Append(
+                kind: "shadow-index-rejected",
+                scope: scopeId,
+                ok: false,
+                ms: 0,
+                details: ex.Message);
+            return null;
         }
 
-        // Step 2 — re-prepare + cold-index. PrepareScopeAsync registers the new host with the
+        // The activation window is deliberately short: all expensive indexing and validation is
+        // complete. Close the active connection, atomically replace the main file, then reopen.
+        // From this point onward the operation is independent of the request token: honoring a
+        // client disconnect after disposing oldHost could leave the router pointing at a
+        // disposed host even though the database promotion succeeded. Host shutdown may still
+        // interrupt the work; the boot reconciler handles that process-level recovery case.
+        var activationToken = _hostStoppingToken.CanBeCanceled
+            ? _hostStoppingToken
+            : CancellationToken.None;
+        await oldHost.DisposeAsync().ConfigureAwait(false);
+        try
+        {
+            PromoteShadowDatabase(scope, dbPath, shadowPath, archiveDiscriminator);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Scope `{Id}` shadow promotion failed", scopeId);
+            DeleteShadowArtifacts(shadowPath);
+            // File.Replace is atomic, so the primary still points at the old database on
+            // failure. Reopen it to replace the disposed router entry whenever possible.
+            var restored = await PrepareScopeAsync(scope, activationToken).ConfigureAwait(false);
+            if (restored is not null)
+            {
+                await RunInitialIndexAsync(restored, activationToken).ConfigureAwait(false);
+                if (IsWatchable(restored)) StartWatcher(restored, _hostStoppingToken);
+            }
+            return null;
+        }
+
+        // Re-prepare + cold-index. The second cold pass is incremental against the promoted DB;
+        // it restores the Roslyn workspace and live-indexer state required by the watcher.
+        // PrepareScopeAsync registers the new host with the
         // router (overwriting the disposed entry by id). RunInitialIndexAsync settles status.
-        var newHost = await PrepareScopeAsync(scope, ct).ConfigureAwait(false);
+        var newHost = await PrepareScopeAsync(scope, activationToken).ConfigureAwait(false);
         if (newHost is null)
         {
             // Prepare failed — registry already reflects degraded state, the old entry has been
@@ -955,7 +1204,7 @@ public sealed class LiveIndexService : BackgroundService
             // diagnostic.
             return null;
         }
-        await RunInitialIndexAsync(newHost, ct).ConfigureAwait(false);
+        await RunInitialIndexAsync(newHost, activationToken).ConfigureAwait(false);
 
         // Re-attach the watcher so live updates resume after the rebuild. The watcher's loop
         // runs as a `Task.Run(..., stoppingToken)` and is bound to whatever token we pass; if we
@@ -968,6 +1217,28 @@ public sealed class LiveIndexService : BackgroundService
         }
 
         return newHost;
+    }
+
+    private IReadOnlyList<string> LoadedIndexerNames(Scope scope)
+    {
+        var names = _languageDispatcher.Indexers.All()
+            .Select(pair => pair.Value.GetType().Name switch
+            {
+                "BuiltInRoslynLanguageIndexerStub" => "roslyn",
+                "ProtobufLanguageIndexer" => "protobuf",
+                "XamlLanguageIndexer" => "xaml",
+                "TypeScriptLanguageIndexer" => "typescript",
+                "CppSyntaxLanguageIndexer" => "cpp-syntax",
+                var name => name,
+            })
+            .Distinct(StringComparer.Ordinal)
+            .OrderBy(name => name, StringComparer.Ordinal)
+            .ToList();
+        if (scope.Interop is not null && !names.Contains("interop", StringComparer.Ordinal))
+        {
+            names.Add("interop");
+        }
+        return names;
     }
 
     private LanguageIndexerDispatcher CreateScopeLanguageDispatcher(ScopeHost host)
@@ -1170,6 +1441,8 @@ public sealed class LiveIndexService : BackgroundService
                 {
                     try
                     {
+                        await host.RecordSourceChangeAsync(DateTimeOffset.UtcNow, stoppingToken)
+                            .ConfigureAwait(false);
                         if (batch.Reason == FileChangeReason.GitHeadChanged)
                         {
                             _logger.LogInformation("Scope `{Id}`: git HEAD changed; running full reindex", host.Scope.Id);
@@ -1229,7 +1502,10 @@ public sealed class LiveIndexService : BackgroundService
                                     host,
                                     stoppingToken)
                                 .ConfigureAwait(false);
-                            host.LastIndexedAt = DateTimeOffset.UtcNow;
+                            await host.CompleteIndexGenerationAsync(
+                                    DateTimeOffset.UtcNow,
+                                    stoppingToken)
+                                .ConfigureAwait(false);
                             _logger.LogInformation(
                                 "Scope `{Id}`: full reindex complete ({CSharpFiles} C# files, {OtherFiles} registered-language files)",
                                 host.Scope.Id,
@@ -1371,7 +1647,10 @@ public sealed class LiveIndexService : BackgroundService
                                         stoppingToken)
                                     .ConfigureAwait(false);
                             }
-                            host.LastIndexedAt = DateTimeOffset.UtcNow;
+                            await host.CompleteIndexGenerationAsync(
+                                    DateTimeOffset.UtcNow,
+                                    stoppingToken)
+                                .ConfigureAwait(false);
                             _logger.LogInformation(
                                 "Scope `{Id}`: applied live batch ({CSharpFiles} C# indexed, {OtherFiles} registered-language indexed, {DeletedFiles} deleted)",
                                 host.Scope.Id,

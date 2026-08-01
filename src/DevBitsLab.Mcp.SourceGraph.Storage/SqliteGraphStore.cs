@@ -121,6 +121,22 @@ public sealed partial class SqliteGraphStore : IGraphStore
             var current = await _connection.ExecuteScalarAsync<int?>(
                 new CommandDefinition("SELECT MAX(version) FROM schema_version;", cancellationToken: ct)).ConfigureAwait(false);
 
+            if (current == Schema.Version)
+            {
+                // Replaying the full DDL against a populated external-content FTS5 table can
+                // make SQLite re-validate its trigger/table relationship and fail with the
+                // unhelpful "SQL logic error". A committed current-version marker proves the
+                // core schema transaction completed, so only the optional vec0 table may still
+                // need to be attached by a process that loaded the extension later.
+                if (_vectorExtensionLoaded && _embeddingDimension > 0)
+                {
+                    await _connection.ExecuteAsync(new CommandDefinition(
+                        Schema.V7Embeddings(_embeddingDimension),
+                        cancellationToken: ct)).ConfigureAwait(false);
+                }
+                return;
+            }
+
             if (current is not null && current < Schema.Version)
             {
                 _logger.LogInformation("On-disk graph schema is v{Old}; rebuilding to v{New}", current, Schema.Version);
@@ -163,8 +179,163 @@ public sealed partial class SqliteGraphStore : IGraphStore
             new CommandDefinition(sql, cancellationToken: ct));
     }
 
+    public Task<IndexStateRow> GetIndexStateAsync(CancellationToken ct = default) =>
+        _connection.QuerySingleAsync<IndexStateRow>(new CommandDefinition(
+            """
+            SELECT
+                generation AS Generation,
+                indexed_at AS IndexedAt,
+                source_changed_at AS SourceChangedAt
+            FROM index_state
+            WHERE singleton = 1;
+            """,
+            cancellationToken: ct));
+
+    public async Task<IndexStateRow> RecordSourceChangedAsync(
+        DateTimeOffset changedAt,
+        CancellationToken ct = default)
+    {
+        var unixMs = changedAt.ToUnixTimeMilliseconds();
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            return await _connection.QuerySingleAsync<IndexStateRow>(new CommandDefinition(
+                """
+                UPDATE index_state
+                SET source_changed_at = MAX(COALESCE(source_changed_at, 0), @unixMs)
+                WHERE singleton = 1
+                RETURNING
+                    generation AS Generation,
+                    indexed_at AS IndexedAt,
+                    source_changed_at AS SourceChangedAt;
+                """,
+                new { unixMs },
+                cancellationToken: ct)).ConfigureAwait(false);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public async Task<IndexStateRow> CompleteIndexGenerationAsync(
+        DateTimeOffset indexedAt,
+        CancellationToken ct = default)
+    {
+        var unixMs = indexedAt.ToUnixTimeMilliseconds();
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            return await _connection.QuerySingleAsync<IndexStateRow>(new CommandDefinition(
+                """
+                UPDATE index_state
+                SET generation = generation + 1,
+                    indexed_at = @unixMs
+                WHERE singleton = 1
+                RETURNING
+                    generation AS Generation,
+                    indexed_at AS IndexedAt,
+                    source_changed_at AS SourceChangedAt;
+                """,
+                new { unixMs },
+                cancellationToken: ct)).ConfigureAwait(false);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public async Task SeedIndexGenerationAsync(
+        long minimumGeneration,
+        CancellationToken ct = default)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(minimumGeneration);
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await _connection.ExecuteAsync(new CommandDefinition(
+                """
+                UPDATE index_state
+                SET generation = MAX(generation, @minimumGeneration)
+                WHERE singleton = 1;
+                """,
+                new { minimumGeneration },
+                cancellationToken: ct)).ConfigureAwait(false);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public Task<int?> GetProjectionVersionAsync(
+        string producer,
+        CancellationToken ct = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(producer);
+        return _connection.ExecuteScalarAsync<int?>(new CommandDefinition(
+            "SELECT version FROM projection_versions WHERE producer = @producer;",
+            new { producer },
+            cancellationToken: ct));
+    }
+
+    public async Task SetProjectionVersionAsync(
+        string producer,
+        int version,
+        CancellationToken ct = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(producer);
+        ArgumentOutOfRangeException.ThrowIfLessThan(version, 1);
+        const string sql = """
+            INSERT INTO projection_versions(producer, version, completed_at)
+            VALUES (@producer, @version, @completedAt)
+            ON CONFLICT(producer) DO UPDATE SET
+                version = excluded.version,
+                completed_at = excluded.completed_at;
+            """;
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await _connection.ExecuteAsync(new CommandDefinition(
+                sql,
+                new
+                {
+                    producer,
+                    version,
+                    completedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                },
+                cancellationToken: ct)).ConfigureAwait(false);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    public async Task ClearProjectionVersionAsync(
+        string producer,
+        CancellationToken ct = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(producer);
+        await _writeLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await _connection.ExecuteAsync(new CommandDefinition(
+                "DELETE FROM projection_versions WHERE producer = @producer;",
+                new { producer },
+                cancellationToken: ct)).ConfigureAwait(false);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
     public async Task<long> UpsertFileAsync(string path, byte[] contentSha256, DateTimeOffset indexedAt, bool isGenerated = false, CancellationToken ct = default)
     {
+        var sourceDocument = await SourceDocumentReader.TryReadAsync(path, indexedAt, ct)
+            .ConfigureAwait(false);
         const string sql = """
             INSERT INTO files(path, content_sha256, last_indexed_at, is_generated)
             VALUES (@path, @sha, @at, @gen)
@@ -177,10 +348,20 @@ public sealed partial class SqliteGraphStore : IGraphStore
         await _writeLock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
-            return await _connection.ExecuteScalarAsync<long>(new CommandDefinition(
+            using var tx = _connection.BeginTransaction();
+            var fileId = await _connection.ExecuteScalarAsync<long>(new CommandDefinition(
                 sql,
                 new { path, sha = contentSha256, at = indexedAt.ToUnixTimeMilliseconds(), gen = isGenerated ? 1 : 0 },
+                transaction: tx,
                 cancellationToken: ct)).ConfigureAwait(false);
+            await ReplaceSourceDocumentAsync(
+                fileId,
+                contentSha256,
+                sourceDocument,
+                transaction: tx,
+                ct).ConfigureAwait(false);
+            tx.Commit();
+            return fileId;
         }
         finally
         {
@@ -1400,6 +1581,10 @@ public sealed partial class SqliteGraphStore : IGraphStore
         ArgumentNullException.ThrowIfNull(replacement.Edges);
         ArgumentNullException.ThrowIfNull(replacement.Annotations);
         ArgumentNullException.ThrowIfNull(replacement.References);
+        var sourceDocument = await SourceDocumentReader.TryReadAsync(
+            replacement.Path,
+            replacement.IndexedAt,
+            ct).ConfigureAwait(false);
 
         const string upsertFileSql = """
             INSERT INTO files(path, content_sha256, last_indexed_at, is_generated)
@@ -1474,6 +1659,12 @@ public sealed partial class SqliteGraphStore : IGraphStore
                 },
                 transaction: tx,
                 cancellationToken: ct)).ConfigureAwait(false);
+            await ReplaceSourceDocumentAsync(
+                fileId,
+                replacement.ContentSha256,
+                sourceDocument,
+                tx,
+                ct).ConfigureAwait(false);
 
             // Remove only facts produced by the prior pass for this file, retaining logical
             // edges that still have evidence from another producer file.
@@ -1831,6 +2022,47 @@ public sealed partial class SqliteGraphStore : IGraphStore
         }
     }
 
+    private async Task ReplaceSourceDocumentAsync(
+        long fileId,
+        byte[] expectedSha256,
+        SourceDocumentSnapshot? document,
+        SqliteTransaction? transaction,
+        CancellationToken ct)
+    {
+        if (document is null || !document.Sha256.AsSpan().SequenceEqual(expectedSha256))
+        {
+            await _connection.ExecuteAsync(new CommandDefinition(
+                "DELETE FROM source_documents WHERE file_id = @fileId;",
+                new { fileId },
+                transaction: transaction,
+                cancellationToken: ct)).ConfigureAwait(false);
+            return;
+        }
+
+        await _connection.ExecuteAsync(new CommandDefinition(
+            """
+            INSERT INTO source_documents(file_id, path, content, byte_length, line_count, indexed_at)
+            VALUES (@FileId, @Path, @Content, @ByteLength, @LineCount, @IndexedAt)
+            ON CONFLICT(file_id) DO UPDATE SET
+                path = excluded.path,
+                content = excluded.content,
+                byte_length = excluded.byte_length,
+                line_count = excluded.line_count,
+                indexed_at = excluded.indexed_at;
+            """,
+            new
+            {
+                FileId = fileId,
+                document.Path,
+                document.Content,
+                document.ByteLength,
+                document.LineCount,
+                IndexedAt = document.IndexedAt.ToUnixTimeMilliseconds(),
+            },
+            transaction: transaction,
+            cancellationToken: ct)).ConfigureAwait(false);
+    }
+
     private async Task<bool> DeleteFileCoreAsync(
         long fileId,
         SqliteTransaction tx,
@@ -1968,7 +2200,10 @@ public sealed partial class SqliteGraphStore : IGraphStore
         }
 
         await _connection.ExecuteAsync(new CommandDefinition(
-            "DELETE FROM symbols WHERE file_id = @id;",
+            """
+            DELETE FROM source_documents WHERE file_id = @id;
+            DELETE FROM symbols WHERE file_id = @id;
+            """,
             parameters,
             transaction: tx,
             cancellationToken: ct)).ConfigureAwait(false);
@@ -2507,6 +2742,16 @@ public sealed partial class SqliteGraphStore : IGraphStore
             JOIN files f ON f.id = r.file_id
             WHERE r.symbol_id = @id
               {(includeGenerated ? "" : "AND f.is_generated = 0")}
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM refs earlier
+                  WHERE earlier.symbol_id = r.symbol_id
+                    AND earlier.file_id = r.file_id
+                    AND earlier.line = r.line
+                    AND earlier.col = r.col
+                    AND earlier.kind = r.kind
+                    AND earlier.id < r.id
+              )
             ORDER BY f.path, r.line, r.col
             LIMIT @limit;
             """;
@@ -3278,6 +3523,31 @@ public sealed partial class SqliteGraphStore : IGraphStore
         return new GraphStats(files, symbols, refs, edges);
     }
 
+    public Task<long> CountEmbeddingEligibleSymbolsAsync(CancellationToken ct = default)
+    {
+        // Keep this predicate aligned with RoslynIndexer.EnqueueEmbedRequest and
+        // SymbolTextBuilder.ShouldSkip. The producer only walks indexable C# symbols, skips
+        // generated files, and has a body excerpt for declarations whose kind is listed below;
+        // fields/events/enum members/namespaces enter the queue only when documented.
+        const string sql = """
+            SELECT COUNT(*)
+            FROM symbols s
+            JOIN files f ON f.id = s.file_id
+            WHERE s.canonical_key LIKE 'csharp:%'
+              AND f.is_generated = 0
+              AND LOWER(f.path) NOT LIKE '%.g.cs'
+              AND LOWER(f.path) NOT LIKE '%.designer.cs'
+              AND (
+                    s.kind_name IN (
+                        'class', 'struct', 'interface', 'enum', 'delegate',
+                        'method', 'constructor', 'property')
+                    OR NULLIF(TRIM(COALESCE(s.xml_summary, '')), '') IS NOT NULL
+                  );
+            """;
+        return _connection.ExecuteScalarAsync<long>(
+            new CommandDefinition(sql, cancellationToken: ct));
+    }
+
     public async Task<RowCountsRow> RowCountsAsync(CancellationToken ct = default)
     {
         // One round-trip; subselects are cheap on indexed COUNT(*).
@@ -3344,6 +3614,32 @@ public sealed partial class SqliteGraphStore : IGraphStore
         }
 
         return "ok";
+    }
+
+    /// <summary>
+    /// Flushes the WAL into the main database before a validated shadow file is promoted.
+    /// </summary>
+    public Task CheckpointForActivationAsync(CancellationToken ct = default) =>
+        _connection.ExecuteAsync(new CommandDefinition(
+            "PRAGMA wal_checkpoint(TRUNCATE);",
+            cancellationToken: ct));
+
+    /// <summary>
+    /// Returns this connection's configured SQLite page-cache capacity. SQLite does not expose
+    /// exact live cache residency through SQL, so callers must label this as a limit rather than
+    /// current memory usage.
+    /// </summary>
+    public async Task<long> GetCacheCapacityBytesAsync(CancellationToken ct = default)
+    {
+        var cacheSize = await _connection.ExecuteScalarAsync<long>(new CommandDefinition(
+            "PRAGMA cache_size;",
+            cancellationToken: ct)).ConfigureAwait(false);
+        if (cacheSize < 0) return -cacheSize * 1024L;
+
+        var pageSize = await _connection.ExecuteScalarAsync<long>(new CommandDefinition(
+            "PRAGMA page_size;",
+            cancellationToken: ct)).ConfigureAwait(false);
+        return cacheSize * pageSize;
     }
 
     public async Task BulkInsertAnnotationsAsync(IEnumerable<AnnotationRecord> annotations, CancellationToken ct = default)

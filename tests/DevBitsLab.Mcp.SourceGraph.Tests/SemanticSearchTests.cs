@@ -98,6 +98,29 @@ public sealed class SemanticSearchTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task CandidateSearch_ranksOnlyFtsCandidateIds()
+    {
+        if (!_vec0Loaded) return;
+        var embStore = _store!.CreateEmbeddingsStore(Dim);
+        var query = DeterministicMockEmbeddingGenerator.Embed("calculator add", Dim);
+        var bestButExcluded = DeterministicMockEmbeddingGenerator.Embed("calculator add", Dim);
+        var candidateA = DeterministicMockEmbeddingGenerator.Embed("calculator subtract", Dim);
+        var candidateB = DeterministicMockEmbeddingGenerator.Embed("logger warning", Dim);
+
+        await embStore.UpsertAsync(201, [1], bestButExcluded, "test/v1");
+        await embStore.UpsertAsync(202, [2], candidateA, "test/v1");
+        await embStore.UpsertAsync(203, [3], candidateB, "test/v1");
+
+        var hits = await embStore.SearchCandidatesAsync(
+            query,
+            candidateSymbolIds: [202, 203],
+            k: 10);
+
+        hits.Select(hit => hit.SymbolId).Should().Equal(202, 203);
+        hits.Should().NotContain(hit => hit.SymbolId == 201);
+    }
+
+    [Fact]
     public async Task ShouldReembed_returnsFalseForUnchangedHashAndModel()
     {
         if (!_vec0Loaded) return;
@@ -111,4 +134,69 @@ public sealed class SemanticSearchTests : IAsyncLifetime
         (await embStore.ShouldReembedAsync(99, hash, "model/v2")).Should().BeTrue("different model invalidates the row");
         (await embStore.ShouldReembedAsync(symbolId: 100, contentHash: hash, modelVersion: "model/v1")).Should().BeTrue("missing row -> re-embed");
     }
+
+    [Fact]
+    public async Task EmbeddingEligibilityCount_matchesRoslynProducerScope()
+    {
+        var sourcePath = Path.Combine(Path.GetDirectoryName(_dbPath)!, "Main.cs");
+        var generatedPath = Path.Combine(Path.GetDirectoryName(_dbPath)!, "Generated.g.cs");
+        var designerPath = Path.Combine(Path.GetDirectoryName(_dbPath)!, "Form.Designer.cs");
+        var sourceFileId = await _store!.UpsertFileAsync(
+            sourcePath,
+            [1],
+            DateTimeOffset.UtcNow);
+        var generatedFileId = await _store.UpsertFileAsync(
+            generatedPath,
+            [2],
+            DateTimeOffset.UtcNow,
+            isGenerated: true);
+        var designerFileId = await _store.UpsertFileAsync(
+            designerPath,
+            [3],
+            DateTimeOffset.UtcNow);
+
+        await _store.UpsertSymbolAsync(
+            "csharp:T:Fixture.View",
+            Symbol("View", "Fixture.View", "class", sourceFileId));
+        await _store.UpsertSymbolAsync(
+            "csharp:F:Fixture.View._field",
+            Symbol("_field", "Fixture.View._field", "field", sourceFileId));
+        await _store.UpsertSymbolAsync(
+            "csharp:F:Fixture.View.Documented",
+            Symbol("Documented", "Fixture.View.Documented", "field", sourceFileId, "A documented field."));
+        await _store.UpsertSymbolAsync(
+            "xaml:view:View.xaml",
+            Symbol("View.xaml", "View.xaml", "xaml-view", sourceFileId));
+        await _store.UpsertSymbolAsync(
+            "cpp:function:fixture_view",
+            Symbol("fixture_view", "fixture_view", "function", sourceFileId));
+        await _store.UpsertSymbolAsync(
+            "csharp:T:Fixture.Generated",
+            Symbol("Generated", "Fixture.Generated", "class", generatedFileId));
+        await _store.UpsertSymbolAsync(
+            "csharp:T:Fixture.Designer",
+            Symbol("Designer", "Fixture.Designer", "class", designerFileId));
+
+        (await _store.CountEmbeddingEligibleSymbolsAsync()).Should().Be(2);
+    }
+
+    private static Symbol Symbol(
+        string name,
+        string fqn,
+        string kind,
+        long fileId,
+        string? xmlSummary = null) =>
+        new(
+            Id: 0,
+            Name: name,
+            Fqn: fqn,
+            Kind: kind,
+            FileId: fileId,
+            StartLine: 1,
+            StartCol: 1,
+            EndLine: 1,
+            EndCol: 2,
+            Signature: null,
+            ContainerId: null,
+            XmlSummary: xmlSummary);
 }

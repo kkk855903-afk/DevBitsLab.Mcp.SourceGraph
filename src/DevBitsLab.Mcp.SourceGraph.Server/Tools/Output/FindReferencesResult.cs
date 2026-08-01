@@ -14,6 +14,7 @@ public sealed record FindReferencesResult(
     [property: JsonPropertyName("target_fqn")] string TargetFqn,
     [property: JsonPropertyName("target_kind")] string TargetKind,
     [property: JsonPropertyName("target_symbol_id")] long TargetSymbolId,
+    [property: JsonPropertyName("target_canonical_key")] string? TargetCanonicalKey,
     IReadOnlyList<FindReferenceHit> References);
 
 /// <summary>
@@ -24,6 +25,7 @@ public sealed record FindReferencesResult(
 /// </summary>
 public sealed record FindReferenceHit(
     [property: JsonPropertyName("symbol_id")] long SymbolId,
+    [property: JsonPropertyName("canonical_key")] string? CanonicalKey,
     [property: JsonPropertyName("target_fqn")] string TargetFqn,
     string Kind,
     string Relation,
@@ -31,4 +33,5 @@ public sealed record FindReferenceHit(
     [property: JsonPropertyName("file_path")] string FilePath,
     int Line,
     int Column,
-    [property: JsonPropertyName("is_generated")] bool IsGenerated);
+    [property: JsonPropertyName("is_generated")] bool IsGenerated,
+    SourceSnippet? Snippet = null);

@@ -31,6 +31,7 @@ public sealed record FindDefinitionResult(IReadOnlyList<FindDefinitionHit> Hits)
 /// </summary>
 public sealed record FindDefinitionHit(
     [property: JsonPropertyName("symbol_id")] long SymbolId,
+    [property: JsonPropertyName("canonical_key")] string? CanonicalKey,
     string Fqn,
     string Kind,
     [property: JsonPropertyName("file_path")] string FilePath,
@@ -41,4 +42,5 @@ public sealed record FindDefinitionHit(
     string Relation,
     string Confidence,
     string? Signature,
-    [property: JsonPropertyName("xml_summary")] string? XmlSummary);
+    [property: JsonPropertyName("xml_summary")] string? XmlSummary,
+    SourceSnippet? Snippet = null);

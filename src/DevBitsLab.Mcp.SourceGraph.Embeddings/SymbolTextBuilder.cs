@@ -17,6 +17,16 @@ namespace DevBitsLab.Mcp.SourceGraph.Embeddings;
 /// </summary>
 public static class SymbolTextBuilder {
     /// <summary>
+    /// Bump when the synthesised-text or eligibility policy changes. The host records this only
+    /// after the complete embedding queue drains, so upgrades and interrupted runs backfill
+    /// unchanged source files safely.
+    /// </summary>
+    public const int ProducerVersion = 1;
+
+    public static string ProducerName(string modelVersion) =>
+        $"semantic-embeddings:{modelVersion}";
+
+    /// <summary>
     /// Build the synthesised text. <paramref name="bodyExcerpt"/> may be null (callers without
     /// a parsed body — types, namespaces — pass null and only the first three rows are emitted).
     /// </summary>

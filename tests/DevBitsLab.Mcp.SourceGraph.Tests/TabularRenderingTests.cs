@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using DevBitsLab.Mcp.SourceGraph.Core;
@@ -11,6 +12,7 @@ using DevBitsLab.Mcp.SourceGraph.Indexing;
 using DevBitsLab.Mcp.SourceGraph.Server;
 using DevBitsLab.Mcp.SourceGraph.Server.Scoping;
 using DevBitsLab.Mcp.SourceGraph.Server.Tools;
+using DevBitsLab.Mcp.SourceGraph.Server.Tools.Output;
 using DevBitsLab.Mcp.SourceGraph.Storage;
 using FluentAssertions;
 using ModelContextProtocol.Protocol;
@@ -153,9 +155,11 @@ public sealed class TabularRenderingTests : IAsyncLifetime, IDisposable
     public async Task ListCallees_multipleHits_rendersTable()
     {
         // Greeter.Greet's body calls Bump and TrySet — at least 2 outbound `calls` edges. We
-        // pin to the full FQN to avoid the name-resolver picking up the Greeter constructor
-        // (whose name shares the "Greet" prefix).
-        var output = CallToolResultHelpers.ProseText(await GraphTools.ListCalleesAsync(_router!, "Sample.Domain.Greeter.Greet"));
+        // pin to the canonical key: strict resolution intentionally refuses the still-ambiguous
+        // FQN prefix instead of silently selecting the method over the constructor.
+        var output = CallToolResultHelpers.ProseText(await GraphTools.ListCalleesAsync(
+            _router!,
+            "csharp:M:Sample.Domain.Greeter.Greet(System.String)"));
         output.Should().Contain("Outbound `calls` from **");
         var firstLine = output.Split('\n')[0];
         firstLine.Should().NotStartWith("|");
@@ -304,6 +308,50 @@ public sealed class TabularRenderingTests : IAsyncLifetime, IDisposable
             // Score column is right-aligned: separator row contains `---:` for that column.
             output.Should().Contain("|---:|");
         }
+    }
+
+    [Fact]
+    public async Task SemanticSearch_identifierQuery_skipsUnavailableEncoder()
+    {
+        using var generator = new DisabledEmbeddingGenerator(
+            new EmbeddingModelInfo("disabled/test", 384));
+
+        var result = await GraphTools.SemanticSearchAsync(
+            _router!,
+            generator,
+            "Calculator");
+        var output = CallToolResultHelpers.ProseText(result);
+
+        output.Should().Contain("lexical hits");
+        output.Should().Contain("semantic encoding skipped");
+        output.Should().Contain("strategy_used=lexical");
+        output.Should().Contain("candidate_source=fts");
+        output.Should().Contain("embedding_coverage=");
+        output.Should().Contain("model=disabled/test");
+        output.Should().NotContain("semantic_search disabled");
+        var dto = JsonSerializer.Deserialize(
+            result.StructuredContent!.Value,
+            ToolOutputJsonContext.Default.SemanticSearchResult)!;
+        dto.StrategyUsed.Should().Be("lexical");
+        dto.CandidateSource.Should().Be("fts");
+        dto.EligibleSymbols.Should().BeGreaterThan(0);
+        dto.EmbeddingCoverage.Should().BeInRange(0, 1);
+        dto.Model.Should().Be("disabled/test");
+    }
+
+    [Fact]
+    public async Task SearchSymbolsBatch_combinesIndependentQueries()
+    {
+        var result = await GraphTools.SearchSymbolsBatchAsync(
+            _router!,
+            ["Calculator", "Greeter"],
+            topK: 3);
+        var output = CallToolResultHelpers.ProseText(result);
+
+        output.Should().Contain("across 2 queries");
+        output.Should().Contain("**Calculator**");
+        output.Should().Contain("**Greeter**");
+        result.StructuredContent.Should().NotBeNull();
     }
 
     [Fact]

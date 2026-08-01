@@ -1,0 +1,83 @@
+using Dapper;
+using Microsoft.Data.Sqlite;
+
+namespace DevBitsLab.Mcp.SourceGraph.Storage;
+
+/// <summary>
+/// Reads graph schema metadata without opening a writable <see cref="SqliteGraphStore"/>.
+/// Live indexing uses this probe before <c>EnsureSchemaAsync</c> so an outdated production
+/// database can be rebuilt beside the active file instead of being cleared in place.
+/// </summary>
+public static class GraphSchemaProbe
+{
+    /// <summary>
+    /// Returns the persisted graph schema version, or <c>null</c> when the database is absent
+    /// or predates version tracking. This deliberately opens read-only so an upgrade decision
+    /// cannot create or modify the production database it is evaluating.
+    /// </summary>
+    public static async Task<int?> ReadVersionAsync(
+        string databasePath,
+        CancellationToken ct = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(databasePath);
+        if (!File.Exists(databasePath)) return null;
+
+        var builder = new SqliteConnectionStringBuilder
+        {
+            DataSource = databasePath,
+            Mode = SqliteOpenMode.ReadOnly,
+            Pooling = false,
+        };
+        await using var connection = new SqliteConnection(builder.ConnectionString);
+        await connection.OpenAsync(ct).ConfigureAwait(false);
+        var hasVersionTable = await connection.ExecuteScalarAsync<long>(new CommandDefinition(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='schema_version';",
+            cancellationToken: ct)).ConfigureAwait(false);
+        if (hasVersionTable == 0) return null;
+
+        return await connection.ExecuteScalarAsync<int?>(new CommandDefinition(
+            "SELECT MAX(version) FROM schema_version;",
+            cancellationToken: ct)).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Returns whether an existing versioned graph needs a schema upgrade. An unversioned or
+    /// missing database returns <c>false</c>; its creation/rebuild path owns initialization.
+    /// </summary>
+    public static async Task<bool> RequiresUpgradeAsync(
+        string databasePath,
+        CancellationToken ct = default)
+    {
+        var version = await ReadVersionAsync(databasePath, ct).ConfigureAwait(false);
+        return version is not null && version < Schema.Version;
+    }
+
+    /// <summary>
+    /// Reads the completed index generation without initializing schema state. Missing legacy
+    /// state is reported as zero so callers can safely compare a shadow candidate with a graph
+    /// that has never completed an index pass.
+    /// </summary>
+    public static async Task<long> ReadIndexGenerationAsync(
+        string databasePath,
+        CancellationToken ct = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(databasePath);
+        if (!File.Exists(databasePath)) return 0;
+
+        var builder = new SqliteConnectionStringBuilder
+        {
+            DataSource = databasePath,
+            Mode = SqliteOpenMode.ReadOnly,
+            Pooling = false,
+        };
+        await using var connection = new SqliteConnection(builder.ConnectionString);
+        await connection.OpenAsync(ct).ConfigureAwait(false);
+        var hasState = await connection.ExecuteScalarAsync<long>(new CommandDefinition(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='index_state';",
+            cancellationToken: ct)).ConfigureAwait(false);
+        if (hasState == 0) return 0;
+        return await connection.ExecuteScalarAsync<long>(new CommandDefinition(
+            "SELECT generation FROM index_state WHERE singleton = 1;",
+            cancellationToken: ct)).ConfigureAwait(false);
+    }
+}

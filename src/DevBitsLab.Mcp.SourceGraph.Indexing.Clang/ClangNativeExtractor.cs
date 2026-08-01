@@ -1725,7 +1725,8 @@ public static class ClangNativeExtractor
 
         private void AddRecord(RecordDecl record)
         {
-            if (string.IsNullOrWhiteSpace(record.Name)
+            if (record.IsInjectedClassName
+                || string.IsNullOrWhiteSpace(record.Name)
                 || !TryCreateEvidence(
                     record.SourceRange,
                     record.IsUnion ? "union" : "record",

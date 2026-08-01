@@ -194,6 +194,27 @@ internal static class EvidenceTraversal
         }
     }
 
+    internal static void AppendImpactPredecessors(
+        StringBuilder sb,
+        IReadOnlyList<AuditableImpact> rows)
+    {
+        if (rows.Count == 0) return;
+        sb.AppendLine();
+        sb.AppendLine("Predecessor chains:");
+        foreach (var row in rows)
+        {
+            sb.Append("- d")
+              .Append(row.Depth)
+              .Append(" `")
+              .Append(CanonicalIdentity(TraceCallPathTools.MapSymbol(row.Symbol)))
+              .Append("` via `")
+              .Append(CanonicalIdentity(TraceCallPathTools.MapSymbol(row.Predecessor)))
+              .Append("` [")
+              .Append(row.Confidence)
+              .AppendLine("]");
+        }
+    }
+
     private static void AppendHop(
         StringBuilder sb,
         TraceCallPathHop hop,

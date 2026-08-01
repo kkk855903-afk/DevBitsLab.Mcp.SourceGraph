@@ -193,6 +193,27 @@ public sealed class FindDefinitionStructuredOutputTests : IAsyncLifetime, IDispo
     }
 
     [Fact]
+    public async Task FindDefinition_canAttachBoundedSourceContext()
+    {
+        var result = await GraphTools.FindDefinitionAsync(
+            _router!,
+            "Calculator.Add",
+            detail: "evidence",
+            contextLines: 1,
+            includeSnippet: true);
+
+        var dto = DeserializeStructured(result);
+        dto.Hits.Should().NotBeEmpty();
+        dto.Hits.All(hit => hit.Snippet != null).Should().BeTrue();
+        dto.Hits.Should().OnlyContain(hit =>
+            hit.Snippet!.StartLine <= hit.Line
+            && hit.Snippet.EndLine >= hit.EndLine);
+        dto.Hits.Should().OnlyContain(hit =>
+            hit.Snippet!.EndLine - hit.Snippet.StartLine
+            <= hit.EndLine - hit.Line + 2);
+    }
+
+    [Fact]
     public async Task FindDefinition_emptyResult_stillShipsStructuredContentWithEmptyHitsArray()
     {
         // No matches case: the tool's "No matches for 'X'." prose still flows through the

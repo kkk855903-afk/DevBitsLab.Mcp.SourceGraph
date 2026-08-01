@@ -195,6 +195,12 @@ internal sealed class NativeInteropSnapshotBuilder
         _maximumNestedFactsPerSnapshot = maximumNestedFactsPerSnapshot;
     }
 
+    /// <summary>
+    /// Build a candidate from a consistent set of translation-unit observations. A returned
+    /// snapshot may be incomplete and still carries its failures; publishing policy belongs to
+    /// the coordinator so a transient extraction failure never becomes evidence that a symbol is
+    /// absent.
+    /// </summary>
     public async Task<NativeInteropSnapshot> BuildAsync(
         string scopeRoot,
         ScopeInteropConfig configuration,
@@ -252,6 +258,9 @@ internal sealed class NativeInteropSnapshotBuilder
              index++)
         {
             cancellationToken.ThrowIfCancellationRequested();
+            // Enforce aggregate limits while contributions are still isolated. This avoids doing
+            // the costly merge and retaining a partially unbounded snapshot after one malformed
+            // translation unit has already exhausted the scope-wide budget.
             var contribution = await BuildContributionAsync(
                     lexicalRoot,
                     effectivePolicy,
