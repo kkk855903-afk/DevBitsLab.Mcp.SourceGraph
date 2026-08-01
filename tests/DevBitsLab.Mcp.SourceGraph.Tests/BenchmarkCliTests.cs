@@ -156,4 +156,18 @@ public sealed class BenchmarkCliTests : IAsyncLifetime
         results[0].Status.Should().Be("passed", results[0].Message);
         results[0].ResultCount.Should().Be(2);
     }
+
+    [Fact]
+    public async Task BuiltInSemanticProbe_checksPipelineHealthWithoutInventingRecallGolden()
+    {
+        var runner = new BenchmarkRunner(_dbPath, cold: true, embeddingsEnabled: false);
+
+        var results = await runner.RunBuiltInAsync(CancellationToken.None);
+
+        var semantic = results.Single(result => result.Name == "semantic-probe");
+        semantic.Status.Should().Be("passed", semantic.Message);
+        semantic.ResultCount.Should().BeGreaterThan(0);
+        semantic.Recall.Should().BeNull(
+            "an arbitrary sampled symbol is not a semantic relevance golden");
+    }
 }

@@ -3306,6 +3306,11 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
 
                     var root = await tree.GetRootAsync(ct).ConfigureAwait(false);
                     var refBatch = new List<SymbolReference>(capacity: 256);
+                    var emittedReferences = new HashSet<(
+                        long SymbolId,
+                        int Line,
+                        int Column,
+                        ReferenceKind Kind)>();
                     var edgeBatch = new List<Edge>(capacity: 64);
                 // Dedupe duplicate syntax visits while retaining distinct occurrences between the
                 // same logical endpoints. Roslyn can surface one generic/member-access name through
@@ -3368,7 +3373,7 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
 
                     switch (node)
                     {
-                        case IdentifierNameSyntax id when id.Parent is not (NamespaceDeclarationSyntax or BaseTypeDeclarationSyntax or MethodDeclarationSyntax or PropertyDeclarationSyntax or VariableDeclaratorSyntax or ParameterSyntax or TypeParameterSyntax):
+                        case IdentifierNameSyntax id when id.Parent is not (NamespaceDeclarationSyntax or BaseTypeDeclarationSyntax or MethodDeclarationSyntax or PropertyDeclarationSyntax or VariableDeclaratorSyntax or TypeParameterSyntax):
                             referenced = ResolveReferencedSymbol(
                                 id.Parent is InvocationExpressionSyntax invocationId
                                 && invocationId.Expression == id
@@ -3452,13 +3457,18 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
                     var emit = SplitReadWrite(kind, refNode, referenced);
                     foreach (var rk in emit)
                     {
-                        refBatch.Add(new SymbolReference(
-                            Id: 0,
-                            SymbolId: symId,
-                            FileId: fileId,
-                            Line: pos.Line + 1,
-                            Col: pos.Character + 1,
-                            Kind: rk));
+                        var line = pos.Line + 1;
+                        var column = pos.Character + 1;
+                        if (emittedReferences.Add((symId, line, column, rk)))
+                        {
+                            refBatch.Add(new SymbolReference(
+                                Id: 0,
+                                SymbolId: symId,
+                                FileId: fileId,
+                                Line: line,
+                                Col: column,
+                                Kind: rk));
+                        }
                     }
 
                     // Calls edge: source = enclosing named member, target = referenced

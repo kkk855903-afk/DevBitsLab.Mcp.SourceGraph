@@ -202,7 +202,6 @@ internal sealed class BenchmarkRunner
 
             results.Add(await ExecuteAsync(new BenchmarkGoldenTask(
                 Name: "semantic-probe", Kind: "semantic", Query: sample?.Name,
-                ExpectedCanonicalKeys: sample?.CanonicalKey is null ? [] : [sample.CanonicalKey],
                 MinResults: 1, TopK: 10), ct).ConfigureAwait(false));
         }
 

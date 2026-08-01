@@ -1,7 +1,9 @@
 using System;
 using System.IO;
 using System.Linq;
+using System.Security.Cryptography;
 using System.Threading.Tasks;
+using DevBitsLab.Mcp.SourceGraph.Core;
 using DevBitsLab.Mcp.SourceGraph.Indexing;
 using DevBitsLab.Mcp.SourceGraph.Sdk;
 using DevBitsLab.Mcp.SourceGraph.Storage;
@@ -232,6 +234,43 @@ public sealed class IndexFixtureTests : IAsyncLifetime
             expectedFileName: "Greeter.cs",
             expectedLine: 3,
             expectedText: "IGreeter");
+    }
+
+    [Fact]
+    public async Task InterfaceReferences_includeConstructorParameterTypes_andHideDuplicateRows()
+    {
+        var target = (await _store!.FindSymbolsAsync("FixtureReminderService"))
+            .Should().ContainSingle(hit =>
+                hit.CanonicalKey == CanonicalKeys.ForType("Sample.Domain.IFixtureReminderService"))
+            .Which;
+
+        var references = await _store.FindReferencesAsync(target.Id);
+        references.Should().HaveCount(3);
+        references.Select(reference => (reference.FilePath, reference.Line, reference.Col, reference.Kind))
+            .Should().OnlyHaveUniqueItems();
+        references.Should().Contain(reference =>
+            reference.Line == 12,
+            "a constructor parameter type is a semantic reference to its interface");
+
+        var duplicate = references[0];
+        var bytes = await File.ReadAllBytesAsync(duplicate.FilePath);
+        var fileId = await _store.UpsertFileAsync(
+            duplicate.FilePath,
+            SHA256.HashData(bytes),
+            DateTimeOffset.UtcNow);
+        await _store.BulkInsertReferencesAsync(
+        [
+            new SymbolReference(
+                0,
+                target.Id,
+                fileId,
+                duplicate.Line,
+                duplicate.Col,
+                duplicate.Kind),
+        ]);
+
+        (await _store.FindReferencesAsync(target.Id)).Should().HaveCount(3,
+            "historical duplicate rows must not surface through find_references");
     }
 
     private async Task AssertTypeRelationEvidenceAsync(

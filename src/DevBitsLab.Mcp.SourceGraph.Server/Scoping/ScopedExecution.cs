@@ -53,6 +53,7 @@ public static class ScopedExecution
                 return BoundDiagnostic(
                     $"scope `{host.Scope.Id}` is degraded: {host.StatusMessage ?? "(no message)"}");
             }
+            await host.RefreshIndexStateAsync(ct).ConfigureAwait(false);
             var body = await onResolved(host).ConfigureAwait(false);
             return body.TrimEnd() + Environment.NewLine + Environment.NewLine
                 + IndexFreshnessMetadata.BuildText(new[] { host });
@@ -73,6 +74,7 @@ public static class ScopedExecution
             }
             try
             {
+                await h.RefreshIndexStateAsync(ct).ConfigureAwait(false);
                 var body = await onResolved(h).ConfigureAwait(false);
                 return (h.Scope.Id, body);
             }
@@ -200,6 +202,7 @@ public static class ScopedExecution
             }
             try
             {
+                await host.RefreshIndexStateAsync(ct).ConfigureAwait(false);
                 var result = await onResolved(host, 0, 1).ConfigureAwait(false);
                 return IndexFreshnessMetadata.Attach(result, new[] { host });
             }
@@ -230,6 +233,7 @@ public static class ScopedExecution
             }
             try
             {
+                await h.RefreshIndexStateAsync(ct).ConfigureAwait(false);
                 var body = await onResolved(h, index, hosts.Count).ConfigureAwait(false);
                 return new ScopedCallToolResult(h.Scope.Id, h.Status, h.StatusMessage, body);
             }

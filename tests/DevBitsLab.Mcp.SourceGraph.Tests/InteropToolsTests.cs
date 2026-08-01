@@ -207,14 +207,17 @@ public sealed class InteropToolsTests : IAsyncLifetime, IDisposable
 
         var nativeOnlyCall = await InteropTools.MatchPInvokeAsync(
             _router,
-            NativeKey,
+            "run",
             scope: "interop");
         var nativeOnly = Deserialize<MatchPInvokeResult>(
             nativeOnlyCall,
             InteropToolJsonContext.Default.MatchPInvokeResult);
-        nativeOnly.Scopes[0].Status.Should().Be("not_found");
-        nativeOnly.Scopes[0].Matches.Should().BeEmpty(
-            "match_pinvoke selects managed imports only");
+        nativeOnly.Scopes[0].Status.Should().Be("ok");
+        nativeOnly.Scopes[0].Matches.Should().ContainSingle();
+        nativeOnly.Scopes[0].Matches[0].ManagedSymbol.Should().Be(ManagedKey);
+        nativeOnly.Scopes[0].Matches[0].NativeSymbol.Should().Be(NativeKey);
+        nativeOnly.Scopes[0].Findings.Should().BeEmpty(
+            "match_pinvoke resolves either side of a boundary but does not analyze it");
 
         var analyzeBefore = MetricCount("analyze_native_boundary");
         var analysisCall = await InteropTools.AnalyzeNativeBoundaryAsync(

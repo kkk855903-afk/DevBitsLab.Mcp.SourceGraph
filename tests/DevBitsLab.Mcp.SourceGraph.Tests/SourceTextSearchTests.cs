@@ -155,6 +155,66 @@ public sealed class SourceTextSearchTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task ToolMaxResults_limitsStructuredHits_withoutConfusingProsePreviewWithTruncation()
+    {
+        var lines = Enumerable.Range(1, 25)
+            .Select(index => $"public sealed class PublicType{index} {{ }}");
+        await File.WriteAllTextAsync(_csPath, string.Join(Environment.NewLine, lines));
+        var replacementBytes = await File.ReadAllBytesAsync(_csPath);
+        await _store!.ReplaceFileFactsAsync(new FileFactsReplacement(
+            _csPath,
+            SHA256.HashData(replacementBytes),
+            DateTimeOffset.UtcNow,
+            IsGenerated: false,
+            Symbols: [],
+            Edges: [],
+            Annotations: [],
+            References: []));
+
+        var scope = new Scope(
+            "default", "default", _tempDir,
+            new ScopeProjectSet.Paths(["**/*.cs"], []),
+            false, DateTimeOffset.UtcNow);
+        var host = new ScopeHost(
+            scope,
+            _store,
+            _store.CreateEmbeddingsStore(384),
+            new RoslynIndexer(_store),
+            "");
+        host.ApplyIndexState(await _store.CompleteIndexGenerationAsync(DateTimeOffset.UtcNow));
+        host.MarkReady();
+        var router = new ScopeRouter();
+        router.Register(host);
+        router.SetDefaultScope("default");
+
+        var limitedCall = await GraphTools.SearchTextAsync(
+            router, "public", maxResults: 5);
+        var limited = JsonSerializer.Deserialize(
+            limitedCall.StructuredContent!.Value,
+            ToolOutputJsonContext.Default.SearchTextResult)!;
+        limited.Hits.Should().HaveCount(5);
+        limited.ReturnedLines.Should().Be(5);
+        limited.TotalMatchingLines.Should().Be(25);
+        limited.Truncated.Should().BeTrue();
+
+        var completeCall = await GraphTools.SearchTextAsync(
+            router, "public", maxResults: 500);
+        var complete = JsonSerializer.Deserialize(
+            completeCall.StructuredContent!.Value,
+            ToolOutputJsonContext.Default.SearchTextResult)!;
+        complete.Hits.Should().HaveCount(25);
+        complete.ReturnedLines.Should().Be(25);
+        complete.TotalMatchingLines.Should().Be(25);
+        complete.Truncated.Should().BeFalse();
+        completeCall.Content!.OfType<TextContentBlock>().First().Text.Should()
+            .Contain("Prose preview shows 20 of 25 returned matching lines")
+            .And.Contain("all 25 returned lines are present in structured content");
+
+        await host.DisposeAsync();
+        _store = null;
+    }
+
+    [Fact]
     public async Task RoslynColdIndex_populatesFirstPartySourceDocuments()
     {
         var solution = LocateSampleSolution();

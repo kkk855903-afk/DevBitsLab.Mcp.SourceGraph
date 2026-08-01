@@ -2742,6 +2742,16 @@ public sealed partial class SqliteGraphStore : IGraphStore
             JOIN files f ON f.id = r.file_id
             WHERE r.symbol_id = @id
               {(includeGenerated ? "" : "AND f.is_generated = 0")}
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM refs earlier
+                  WHERE earlier.symbol_id = r.symbol_id
+                    AND earlier.file_id = r.file_id
+                    AND earlier.line = r.line
+                    AND earlier.col = r.col
+                    AND earlier.kind = r.kind
+                    AND earlier.id < r.id
+              )
             ORDER BY f.path, r.line, r.col
             LIMIT @limit;
             """;

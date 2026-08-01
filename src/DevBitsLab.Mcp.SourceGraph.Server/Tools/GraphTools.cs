@@ -1700,7 +1700,8 @@ public static class GraphTools
                     .Append("`");
                 if (page.Truncated) sb.Append(" (truncated)");
                 sb.AppendLine(".");
-                foreach (var hit in page.Hits.Take(20))
+                const int prosePreviewLimit = 20;
+                foreach (var hit in page.Hits.Take(prosePreviewLimit))
                 {
                     sb.Append("- ").Append(Format.Location(hit.FilePath, hit.Line, hit.Column))
                         .Append(": ").AppendLine(hit.LineText.Trim());
@@ -1717,8 +1718,12 @@ public static class GraphTools
                             sb.Append("    ").AppendLine(line);
                     }
                 }
-                if (page.Hits.Count > 20)
-                    sb.AppendLine($"- … {page.Hits.Count - 20} more matching lines are available in structured content.");
+                if (page.Hits.Count > prosePreviewLimit)
+                {
+                    sb.AppendLine(
+                        $"- Prose preview shows {prosePreviewLimit} of {page.Hits.Count} returned matching lines; "
+                        + $"all {page.Hits.Count} returned lines are present in structured content.");
+                }
 
                 var structuredHits = page.Hits.Select(hit => new SearchTextHit(
                     hit.FilePath,

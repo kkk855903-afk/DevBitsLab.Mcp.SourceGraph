@@ -156,6 +156,11 @@ public sealed class ScopeHost : IAsyncDisposable
         Interlocked.Exchange(ref _lastSourceChangeUnixMs, state.SourceChangedAt ?? 0);
     }
 
+    internal async Task RefreshIndexStateAsync(CancellationToken ct)
+    {
+        ApplyIndexState(await Store.GetIndexStateAsync(ct).ConfigureAwait(false));
+    }
+
     internal async Task RecordSourceChangeAsync(
         DateTimeOffset changedAt,
         CancellationToken ct)
