@@ -163,8 +163,9 @@ public sealed class WpfWindowsFixtureContractTests
                     runButton.Id,
                     limit: 10,
                     edgeKind: "handles-event"))
-                .Should().BeEmpty(
-                    "positive-only safety does not authorize event-handler inference");
+                .Should().ContainSingle(target =>
+                    target.Name == "OnRunClick"
+                    && target.Kind == "method");
 
             var missing = (await store.FindSymbolsAsync("MissingBinding"))
                 .Single(symbol => symbol.Kind == "xaml-element");
