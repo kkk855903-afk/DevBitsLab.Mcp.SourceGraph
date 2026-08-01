@@ -1704,6 +1704,18 @@ public static class GraphTools
                 {
                     sb.Append("- ").Append(Format.Location(hit.FilePath, hit.Line, hit.Column))
                         .Append(": ").AppendLine(hit.LineText.Trim());
+                    if (hit.BeforeContext.Count > 0)
+                    {
+                        sb.AppendLine("  context before:");
+                        foreach (var line in hit.BeforeContext)
+                            sb.Append("    ").AppendLine(line);
+                    }
+                    if (hit.AfterContext.Count > 0)
+                    {
+                        sb.AppendLine("  context after:");
+                        foreach (var line in hit.AfterContext)
+                            sb.Append("    ").AppendLine(line);
+                    }
                 }
                 if (page.Hits.Count > 20)
                     sb.AppendLine($"- … {page.Hits.Count - 20} more matching lines are available in structured content.");
@@ -2785,9 +2797,15 @@ public static class GraphTools
         string model = "unknown",
         string? modelHash = null)
     {
+        var provenance =
+            $"retrieval: strategy_used={strategyUsed}; candidate_source={candidateSource}; " +
+            $"embedded_symbols={embeddedSymbols}; eligible_symbols={eligibleSymbols}; " +
+            $"embedding_coverage={embeddingCoverage:F3}; model={model}; " +
+            $"model_hash={modelHash ?? "unknown"}";
+        var visibleProse = prose.TrimEnd() + Environment.NewLine + provenance + Environment.NewLine;
         var content = new List<ContentBlock>(capacity: 2 + rows.Count)
         {
-            new TextContentBlock { Text = prose },
+            new TextContentBlock { Text = visibleProse },
         };
 
         foreach (var row in rows)

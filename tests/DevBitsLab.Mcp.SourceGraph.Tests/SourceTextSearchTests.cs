@@ -143,6 +143,10 @@ public sealed class SourceTextSearchTests : IAsyncLifetime
         dto.ExcludedDirectories.Should().Contain(["bin/**", "obj/**", "**/.git/**"]);
         dto.IndexGeneration.Should().Be(1);
         dto.Hits.Should().OnlyContain(hit => hit.FilePath == _csPath);
+        var prose = result.Content!.OfType<TextContentBlock>().First().Text;
+        prose.Should().Contain("context before:");
+        prose.Should().Contain("context after:");
+        prose.Should().Contain("camera camera");
         result.Content!.OfType<TextContentBlock>().Last().Text.Should().Contain("generation=1");
 
         // The host owns the shared store, so prevent test teardown from disposing it twice.

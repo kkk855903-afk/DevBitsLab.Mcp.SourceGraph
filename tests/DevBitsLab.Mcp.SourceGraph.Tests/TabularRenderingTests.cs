@@ -324,6 +324,10 @@ public sealed class TabularRenderingTests : IAsyncLifetime, IDisposable
 
         output.Should().Contain("lexical hits");
         output.Should().Contain("semantic encoding skipped");
+        output.Should().Contain("strategy_used=lexical");
+        output.Should().Contain("candidate_source=fts");
+        output.Should().Contain("embedding_coverage=");
+        output.Should().Contain("model=disabled/test");
         output.Should().NotContain("semantic_search disabled");
         var dto = JsonSerializer.Deserialize(
             result.StructuredContent!.Value,
