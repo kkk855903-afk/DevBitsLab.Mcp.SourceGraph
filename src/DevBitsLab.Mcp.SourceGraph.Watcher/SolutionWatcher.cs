@@ -26,6 +26,8 @@ public sealed class SolutionWatcher : IAsyncDisposable
     private readonly HashSet<string> _sourceExtensions;
     private readonly FileSystemWatcher _sourceWatcher;
     private readonly FileSystemWatcher? _gitHeadWatcher;
+    // File-system callbacks can overlap, but only the processor consumes raw events. Keeping
+    // batching single-reader makes debounce state deterministic without locking callback paths.
     private readonly Channel<RawEvent> _raw = Channel.CreateUnbounded<RawEvent>(new UnboundedChannelOptions
     {
         SingleReader = true,
@@ -338,6 +340,8 @@ public sealed class SolutionWatcher : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
+        // Stop native callbacks before cancellation so no new raw events race with channel
+        // completion while the processor drains its cooperative shutdown path.
         _sourceWatcher.EnableRaisingEvents = false;
         _sourceWatcher.Dispose();
         _gitHeadWatcher?.Dispose();

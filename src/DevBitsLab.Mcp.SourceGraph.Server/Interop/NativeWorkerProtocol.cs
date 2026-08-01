@@ -19,6 +19,10 @@ public sealed record NativeWorkerIsolationCapabilities(
     bool NetworkIsolation,
     bool ReducedPrivilege)
 {
+    /// <summary>
+    /// Capabilities actually enforced by this implementation. This fixed value is also validated
+    /// on worker responses so an untrusted child cannot claim sandbox guarantees it did not have.
+    /// </summary>
     public static NativeWorkerIsolationCapabilities Baseline { get; } = new(
         SeparateProcess: true,
         SanitizedEnvironment: true,
@@ -46,6 +50,10 @@ public sealed record NativeWorkerClientResult(
     NativeWorkerFailure? Failure,
     NativeWorkerIsolationCapabilities Isolation)
 {
+    /// <summary>
+    /// True only for a protocol-valid extraction with no structured worker failure. Callers must
+    /// not infer success solely from a child exit code because the protocol checks both signals.
+    /// </summary>
     public bool IsSuccess => Extraction is not null && Failure is null;
 }
 
@@ -263,6 +271,8 @@ internal static class NativeWorkerProtocol
         var payload = new byte[length];
         await ReadExactlyAsync(input, payload, cancellationToken).ConfigureAwait(false);
 
+        // EOF is part of the one-request/one-response contract. Reject trailing bytes so a
+        // confused or malicious child cannot smuggle a second response into the same stream.
         var trailing = new byte[1];
         if (await input.ReadAsync(trailing, cancellationToken).ConfigureAwait(false) != 0)
         {

@@ -6,6 +6,12 @@ namespace DevBitsLab.Mcp.SourceGraph.Storage;
 /// </summary>
 public static class ShadowDatabaseActivator
 {
+    /// <summary>
+    /// Atomically promotes <paramref name="shadowPath"/> over <paramref name="primaryPath"/>,
+    /// placing the displaced primary database in <paramref name="archiveDirectory"/>. The
+    /// shadow and primary must share a directory because atomic rename/replace is only a
+    /// filesystem-local guarantee; callers can use the returned archive path for rollback.
+    /// </summary>
     public static string Activate(
         string primaryPath,
         string shadowPath,

@@ -16,6 +16,11 @@ public sealed class AbiStructCompatibilityEngine
     private const int MaximumChecks = 65_536;
     private const int MaximumResultEvidence = 4096;
 
+    /// <summary>
+    /// Compares one managed/native record pair for the same target ABI. Incomplete facts and
+    /// bounded-work limits produce warnings rather than errors, so an error remains evidence of
+    /// a concrete incompatibility instead of an artifact of unavailable analysis input.
+    /// </summary>
     public AbiCompatibilityResult Compare(
         AbiRecordLayout managed,
         AbiRecordLayout native,
@@ -184,6 +189,9 @@ public sealed class AbiStructCompatibilityEngine
         var pairKey = new LayoutPairKey(
             managed.SymbolCanonicalKey,
             native.SymbolCanonicalKey);
+        // Active-pair tracking is intentionally stack-scoped (removed in finally below): it
+        // detects recursive inline layouts without suppressing a legitimate repeated type in a
+        // separate field branch.
         if (!activePairs.Add(pairKey))
         {
             context.Add(

@@ -27,6 +27,11 @@ internal sealed class ProcessActivityTracker
         _lastActivity = _timeProvider.GetTimestamp();
     }
 
+    /// <summary>
+    /// Mark a user-visible operation as active until the returned lease is disposed. The active
+    /// count prevents the idle monitor from terminating a long-running request even if its start
+    /// timestamp predates the configured idle timeout.
+    /// </summary>
     public IDisposable BeginActivity()
     {
         lock (_sync)
@@ -37,6 +42,10 @@ internal sealed class ProcessActivityTracker
         return new ActivityLease(this);
     }
 
+    /// <summary>
+    /// Return true only when no activity lease remains and the most recent completed-or-started
+    /// operation is older than <paramref name="timeout"/>.
+    /// </summary>
     public bool IsIdleFor(TimeSpan timeout)
     {
         lock (_sync)

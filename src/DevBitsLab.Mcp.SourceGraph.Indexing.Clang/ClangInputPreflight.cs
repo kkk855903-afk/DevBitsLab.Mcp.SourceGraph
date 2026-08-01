@@ -62,6 +62,11 @@ internal static class ClangInputPreflight
         "/Fd",
     ];
 
+    /// <summary>
+    /// Accepts only compiler arguments whose file-system effects can be constrained to the scope
+    /// policy. The normalized result preserves explicit include order, which matters because
+    /// changing it can cause the same header name to resolve to different declarations.
+    /// </summary>
     public static bool TryNormalizeCompilerArguments(
         IReadOnlyList<string> arguments,
         ScopePathPolicy pathPolicy,
@@ -157,6 +162,12 @@ internal static class ClangInputPreflight
         return true;
     }
 
+    /// <summary>
+    /// Walks literal <c>#include</c>/<c>#import</c> directives before invoking libclang and
+    /// rejects any dependency that cannot be proven to stay within the approved input set.
+    /// This fail-closed pass avoids letting compiler search paths or macro expansion read files
+    /// outside the indexing scope.
+    /// </summary>
     public static bool TryValidateExplicitIncludeGraph(
         string sourceFilePath,
         IReadOnlyList<string> includeDirectories,
@@ -341,6 +352,10 @@ internal static class ClangInputPreflight
             ? new[] { Path.GetDirectoryName(includingFilePath)! }
                 .Concat(includeDirectories)
             : includeDirectories;
+        // Match the meaningful safety distinction in C/C++ include lookup: quoted headers may
+        // resolve beside the including file, while angle headers may use only validated include
+        // directories. Searching extra locations would make preflight approve a different graph
+        // from the compiler invocation it is meant to constrain.
         foreach (var directory in searchDirectories)
         {
             string candidate;

@@ -584,6 +584,11 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         }
     }
 
+    /// <summary>
+    /// Reconciles the currently open solution against the graph. If a preceding incremental
+    /// pass detected an incomplete semantic universe, this automatically reloads the workspace
+    /// first so stale facts are not preserved merely because a partial pass succeeded.
+    /// </summary>
     public async Task<IndexResult> IndexAllAsync(CancellationToken ct = default)
     {
         await _lock.WaitAsync(ct).ConfigureAwait(false);
@@ -605,6 +610,12 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         }
     }
 
+    /// <summary>
+    /// Incrementally indexes changed C# files while preserving graph consistency across Roslyn's
+    /// immutable solution snapshot, generated documents, and managed interop fanout. Changes
+    /// that add, remove, or rename compile items are escalated to a full reload because a
+    /// document-text update alone cannot reconcile that structural change.
+    /// </summary>
     public async Task<IndexResult> IndexChangedFilesAsync(IReadOnlyCollection<string> paths, CancellationToken ct = default)
     {
         await _lock.WaitAsync(ct).ConfigureAwait(false);
@@ -921,6 +932,10 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         _probedFailedProjectIds = new HashSet<ProjectId>();
     }
 
+    /// <summary>
+    /// Forces a workspace reload followed by full graph reconciliation. Use after changes that
+    /// may alter MSBuild evaluation, project references, or generated-document membership.
+    /// </summary>
     public async Task<IndexResult> ReloadAndIndexAllAsync(CancellationToken ct = default)
     {
         await _lock.WaitAsync(ct).ConfigureAwait(false);

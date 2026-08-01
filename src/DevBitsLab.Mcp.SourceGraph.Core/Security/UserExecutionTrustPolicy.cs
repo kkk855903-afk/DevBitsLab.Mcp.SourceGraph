@@ -114,6 +114,10 @@ public sealed class UserExecutionTrustPolicy : IExecutionTrustPolicy
                     fingerprint.Fingerprint,
                     StringComparison.OrdinalIgnoreCase)
                 && grant.Capabilities.Contains(capability));
+        // A matching persistent grant authorizes the bundle identity, but deliberately does
+        // not execute it. The caller must present that exact fingerprint in a separate snapshot
+        // approval step, preventing a freshly changed on-disk bundle from being run on the
+        // strength of a stale discovery-time decision.
         return allowed
             ? Deny(
                 ExecutionTrustReason.PathPluginSnapshotRequired,

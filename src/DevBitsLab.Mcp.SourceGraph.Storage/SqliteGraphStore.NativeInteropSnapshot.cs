@@ -15,6 +15,12 @@ public sealed partial class SqliteGraphStore
     private const int MaximumNativeInteropEdges = 200_000;
     private const string NativeCallProducer = "clang-native-call";
 
+    /// <summary>
+    /// Replaces the complete native interop projection as one transaction. Validation and source
+    /// capture happen before any stored facts are removed; after publication, every supplied
+    /// file, symbol, annotation, and clang call occurrence belongs to the same snapshot, while
+    /// unrelated evidence on shared logical edges remains intact.
+    /// </summary>
     public async Task<NativeInteropSnapshotReplacementResult>
         ReplaceNativeInteropSnapshotAsync(
             NativeInteropSnapshotReplacement replacement,
@@ -92,6 +98,9 @@ public sealed partial class SqliteGraphStore
         try
         {
             using var tx = _connection.BeginTransaction();
+            // Capture the prior projection before upserting current facts. The final stale-key
+            // cleanup must compare against this stable universe, not against rows modified by
+            // the replacement itself.
             var priorKeys = (await _connection.QueryAsync<string>(
                     new CommandDefinition(
                         """

@@ -12,6 +12,11 @@ public sealed partial class SqliteGraphStore
     private const string NativeTypeStaleKind = "native-type";
     private const string NativeTypeAliasStaleKind = "native-type-alias";
 
+    /// <summary>
+    /// Removes stale native declarations only when they are isolated from every persisted graph
+    /// fact. Retained keys are intentional: deleting a native symbol still referenced by another
+    /// projection would either lose independent evidence or violate graph consistency.
+    /// </summary>
     public async Task<NativeInteropStaleSymbolCleanupResult>
         DeleteOrphanedNativeInteropSymbolsAsync(
             IReadOnlyCollection<string> staleCanonicalKeys,
@@ -286,6 +291,8 @@ public sealed partial class SqliteGraphStore
             keys.Add(new StaleNativeInteropKey(key, expectedKind));
         }
 
+        // Stable ordering makes the temporary-table join and returned cleanup result repeatable,
+        // independent of the caller's collection implementation.
         return keys
             .OrderBy(item => item.CanonicalKey, StringComparer.Ordinal)
             .ToArray();

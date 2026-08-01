@@ -40,8 +40,13 @@ public sealed class CppSyntaxLanguageIndexer : ILanguageIndexer, IBoundedSourceL
     public CppSyntaxLanguageIndexer(ILogger? logger = null) =>
         _logger = logger ?? NullLogger.Instance;
 
+    /// <summary>Extensions handled by the grammar-only native indexer.</summary>
     public IReadOnlyCollection<string> FileExtensions => _extensions;
 
+    /// <summary>
+    /// Upper bound for grammar-only parsing. The limit prevents large generated or vendored
+    /// native files from monopolizing the incremental indexer.
+    /// </summary>
     public int MaximumSourceSizeBytes => 10 * 1024 * 1024;
 
     public Task<IReadOnlyList<IndexEvent>> IndexAsync(
@@ -349,6 +354,9 @@ public sealed class CppSyntaxLanguageIndexer : ILanguageIndexer, IBoundedSourceL
                 out var candidates)
             || candidates.Length != 1)
         {
+            // Without semantic overload resolution, a leaf name and argument count are the
+            // strongest syntax-only signal available. Suppress ambiguous calls rather than
+            // emitting a plausible-but-wrong edge that downstream impact queries treat as fact.
             return;
         }
 

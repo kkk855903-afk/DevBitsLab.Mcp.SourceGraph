@@ -10,6 +10,11 @@ namespace DevBitsLab.Mcp.SourceGraph.Storage;
 /// </summary>
 public static class GraphSchemaProbe
 {
+    /// <summary>
+    /// Returns the persisted graph schema version, or <c>null</c> when the database is absent
+    /// or predates version tracking. This deliberately opens read-only so an upgrade decision
+    /// cannot create or modify the production database it is evaluating.
+    /// </summary>
     public static async Task<int?> ReadVersionAsync(
         string databasePath,
         CancellationToken ct = default)
@@ -35,6 +40,10 @@ public static class GraphSchemaProbe
             cancellationToken: ct)).ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// Returns whether an existing versioned graph needs a schema upgrade. An unversioned or
+    /// missing database returns <c>false</c>; its creation/rebuild path owns initialization.
+    /// </summary>
     public static async Task<bool> RequiresUpgradeAsync(
         string databasePath,
         CancellationToken ct = default)
@@ -43,6 +52,11 @@ public static class GraphSchemaProbe
         return version is not null && version < Schema.Version;
     }
 
+    /// <summary>
+    /// Reads the completed index generation without initializing schema state. Missing legacy
+    /// state is reported as zero so callers can safely compare a shadow candidate with a graph
+    /// that has never completed an index pass.
+    /// </summary>
     public static async Task<long> ReadIndexGenerationAsync(
         string databasePath,
         CancellationToken ct = default)

@@ -241,6 +241,8 @@ public sealed class JinaCodeEmbeddingGenerator : ICodeEmbeddingGenerator, IManag
             if (_initialised) return;
             try
             {
+                // Initialization is sticky by design: repeated embedding attempts must not keep
+                // retrying a missing/corrupt model and repeatedly pay native-runtime load cost.
                 if (!File.Exists(_modelOnnxPath))
                 {
                     _logger.LogWarning("Embedding model {Path} not found; semantic search disabled", _modelOnnxPath);

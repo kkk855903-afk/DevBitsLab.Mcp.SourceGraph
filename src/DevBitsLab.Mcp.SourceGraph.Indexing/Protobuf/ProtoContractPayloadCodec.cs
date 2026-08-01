@@ -11,6 +11,7 @@ public static class ProtoContractAnnotations
     public const string Flavor = "proto-contract";
 }
 
+/// <summary>Discriminates the protobuf declaration variant carried by a contract fact.</summary>
 public enum ProtoContractKind
 {
     Message,
@@ -18,12 +19,14 @@ public enum ProtoContractKind
     Rpc,
 }
 
+/// <summary>Indicates whether import-dependent compiler information was fully available.</summary>
 public enum ProtoContractStatus
 {
     Complete,
     Partial,
 }
 
+/// <summary>Source-level protobuf field cardinality, retained independently of CLR defaults.</summary>
 public enum ProtoFieldCardinality
 {
     Singular,
@@ -32,10 +35,12 @@ public enum ProtoFieldCardinality
     Required,
 }
 
+/// <summary>Message-specific contract fields; present only for <see cref="ProtoContractKind.Message"/> facts.</summary>
 public sealed record ProtoMessageContract(
     string? ParentFullName,
     int NestingDepth);
 
+/// <summary>Field-specific contract fields; present only for <see cref="ProtoContractKind.Field"/> facts.</summary>
 public sealed record ProtoFieldContract(
     string ContainingMessageFullName,
     string Type,
@@ -43,6 +48,7 @@ public sealed record ProtoFieldContract(
     ProtoFieldCardinality Cardinality,
     string? OneofName);
 
+/// <summary>RPC-specific contract fields; present only for <see cref="ProtoContractKind.Rpc"/> facts.</summary>
 public sealed record ProtoRpcContract(
     string ServiceFullName,
     string InputType,

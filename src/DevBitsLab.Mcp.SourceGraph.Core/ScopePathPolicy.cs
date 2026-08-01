@@ -305,6 +305,9 @@ public sealed class ScopePathPolicy
     /// </summary>
     public static bool TryResolvePhysicalPath(string path, out string physicalPath)
     {
+        // Keep the visited set across recursive link-target resolution: checking only the
+        // immediate target would allow an indirect junction/symlink cycle to evade the depth
+        // limit and turn a policy check into unbounded traversal.
         var visitedLinks = new HashSet<string>(_pathComparer);
         return TryResolvePhysicalPath(path, visitedLinks, depth: 0, out physicalPath);
     }
@@ -523,6 +526,8 @@ public sealed class ScopePathPolicy
             var pathSegments = relativePath.Split(
                 '/',
                 StringSplitOptions.RemoveEmptyEntries);
+            // An exclude for a directory also excludes every descendant. Trying each prefix
+            // preserves that glob semantics without implicitly rewriting user patterns.
             for (var pathLength = pathSegments.Length; pathLength >= 0; pathLength--)
             {
                 if (MatchesPrefix(pathLength)) return true;
@@ -531,6 +536,8 @@ public sealed class ScopePathPolicy
 
             bool MatchesPrefix(int pathLength)
             {
+                // `**` has two transitions (consume nothing or one segment). Memoization turns
+                // that NFA-style search into a bounded pattern-index/path-index calculation.
                 var memo = new Dictionary<(int Pattern, int Path), bool>();
                 return Match(patternIndex: 0, pathIndex: 0);
 

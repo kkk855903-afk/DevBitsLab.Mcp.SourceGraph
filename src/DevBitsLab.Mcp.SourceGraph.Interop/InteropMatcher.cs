@@ -9,6 +9,11 @@ namespace DevBitsLab.Mcp.SourceGraph.Interop;
 /// </summary>
 public sealed class InteropMatcher
 {
+    /// <summary>
+    /// Matches against a complete export universe. Use the overload with
+    /// <paramref name="isExportUniverseComplete"/> when native analysis omitted any artifact;
+    /// an incomplete snapshot is never sufficient to prove absence or unique ownership.
+    /// </summary>
     public InteropMatch Match(
         ManagedImport managed,
         IEnumerable<NativeExport> nativeExports) =>
@@ -130,6 +135,8 @@ public sealed class InteropMatcher
                         && native.ModuleIdentitySource
                             == NativeModuleIdentitySource.Unknown))
                 .ToArray();
+            // Unknown ownership must participate in this lookup step. Choosing the sole known
+            // module candidate would turn an unproven uniqueness claim into a false match.
             var libraryMatches = candidatesWithLibrary
                 .Where(native => SameLibrary(
                     managed.LibraryName,
@@ -301,6 +308,8 @@ public sealed class InteropMatcher
                 $"_{spelling}@{stackBytes}",
             })
             .ToArray();
+        // Preserve each runtime spelling before its calculated decoration: candidate ordering
+        // represents the loader's lookup sequence and therefore affects which export is selected.
         return new EntryPointLookupPlan(
             spellings,
             description

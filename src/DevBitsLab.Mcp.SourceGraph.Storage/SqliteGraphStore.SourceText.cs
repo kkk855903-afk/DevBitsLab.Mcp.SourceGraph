@@ -9,6 +9,11 @@ public sealed partial class SqliteGraphStore
 {
     private static readonly TimeSpan SourceRegexTimeout = TimeSpan.FromSeconds(2);
 
+    /// <summary>
+    /// Searches source snapshots retained by the graph store. Literal searches use the trigram
+    /// index only as a candidate filter; every candidate is scanned again to preserve exact
+    /// substring and line-context semantics when FTS cannot express punctuation-heavy input.
+    /// </summary>
     public async Task<SourceTextSearchPage> SearchSourceTextAsync(
         string query,
         SourceTextSearchMode mode,
@@ -112,6 +117,11 @@ public sealed partial class SqliteGraphStore
             totalMatchingLines > hits.Count);
     }
 
+    /// <summary>
+    /// Reports which non-generated graph files have a persisted, searchable source snapshot.
+    /// Generated files are excluded because their content is reconstructed by the indexer and
+    /// would not be a stable representation of a user-owned document.
+    /// </summary>
     public async Task<SourceDocumentCoverage> GetSourceDocumentCoverageAsync(
         CancellationToken ct = default)
     {
@@ -168,6 +178,8 @@ public sealed partial class SqliteGraphStore
             }
         }
 
+        // Regexes and short literals have no safe or useful trigram query. Use a streaming
+        // reader so fallback correctness costs at most one source document in memory at a time.
         var fallbackConnection = await OpenReaderAsync(ct).ConfigureAwait(false);
         var fallbackCommand = fallbackConnection.CreateCommand();
         fallbackCommand.CommandText = """
