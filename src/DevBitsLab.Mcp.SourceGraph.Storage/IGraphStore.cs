@@ -439,6 +439,16 @@ public interface IGraphStore : IAsyncDisposable
     Task<GraphStats> GetStatsAsync(CancellationToken ct = default);
 
     /// <summary>
+    /// Counts symbols that the built-in C# embedding producer can actually enqueue. XAML, C++,
+    /// and other language projections are intentionally excluded; generated files and C# symbols
+    /// with neither documentation nor a body excerpt are also outside the producer's scope. The
+    /// default keeps older graph-store implementations source-compatible and falls back to the
+    /// historical all-symbol count.
+    /// </summary>
+    async Task<long> CountEmbeddingEligibleSymbolsAsync(CancellationToken ct = default) =>
+        (await GetStatsAsync(ct).ConfigureAwait(false)).SymbolCount;
+
+    /// <summary>
     /// Detailed row counts for the graph's main tables. Returned to <c>verify_scope</c> as part
     /// of its structured health snapshot. Counts are taken in a single round-trip via subselect.
     /// </summary>

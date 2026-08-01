@@ -3513,6 +3513,31 @@ public sealed partial class SqliteGraphStore : IGraphStore
         return new GraphStats(files, symbols, refs, edges);
     }
 
+    public Task<long> CountEmbeddingEligibleSymbolsAsync(CancellationToken ct = default)
+    {
+        // Keep this predicate aligned with RoslynIndexer.EnqueueEmbedRequest and
+        // SymbolTextBuilder.ShouldSkip. The producer only walks indexable C# symbols, skips
+        // generated files, and has a body excerpt for declarations whose kind is listed below;
+        // fields/events/enum members/namespaces enter the queue only when documented.
+        const string sql = """
+            SELECT COUNT(*)
+            FROM symbols s
+            JOIN files f ON f.id = s.file_id
+            WHERE s.canonical_key LIKE 'csharp:%'
+              AND f.is_generated = 0
+              AND LOWER(f.path) NOT LIKE '%.g.cs'
+              AND LOWER(f.path) NOT LIKE '%.designer.cs'
+              AND (
+                    s.kind_name IN (
+                        'class', 'struct', 'interface', 'enum', 'delegate',
+                        'method', 'constructor', 'property')
+                    OR NULLIF(TRIM(COALESCE(s.xml_summary, '')), '') IS NOT NULL
+                  );
+            """;
+        return _connection.ExecuteScalarAsync<long>(
+            new CommandDefinition(sql, cancellationToken: ct));
+    }
+
     public async Task<RowCountsRow> RowCountsAsync(CancellationToken ct = default)
     {
         // One round-trip; subselects are cheap on indexed COUNT(*).

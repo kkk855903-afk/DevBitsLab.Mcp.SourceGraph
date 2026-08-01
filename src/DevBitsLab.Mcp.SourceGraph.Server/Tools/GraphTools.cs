@@ -2585,8 +2585,9 @@ public static class GraphTools
                         "semantic_search `strategy` must be auto, hybrid, semantic, or lexical.");
                 }
 
-                var stats = await host.Store.GetStatsAsync(ct).ConfigureAwait(false);
-                var eligibleSymbols = stats.SymbolCount;
+                var eligibleSymbols = await host.Store
+                    .CountEmbeddingEligibleSymbolsAsync(ct)
+                    .ConfigureAwait(false);
                 var embeddedSymbols = host.EmbeddingsStore.IsAvailable
                     ? await host.EmbeddingsStore.CountAsync(ct).ConfigureAwait(false)
                     : 0;
