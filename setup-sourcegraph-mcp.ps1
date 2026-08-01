@@ -80,6 +80,8 @@ if (-not (Test-Path -LiteralPath $ProjectRoot -PathType Container)) {
 
 $resolvedRoot = (Resolve-Path -LiteralPath $ProjectRoot).Path
 $resolvedSolution = Resolve-SolutionPath -Root $resolvedRoot -RequestedSolution $Solution
+$sourceGraphConfigPath = Join-Path $resolvedRoot ".sourcegraph.json"
+$hasSourceGraphConfig = Test-Path -LiteralPath $sourceGraphConfigPath -PathType Leaf
 
 if (-not (Get-Command dotnet -ErrorAction SilentlyContinue)) {
     throw "dotnet was not found on PATH. Install the .NET SDK first."
@@ -114,10 +116,17 @@ $initArguments = @(
     "init",
     "--yes",
     "--client", "codex",
-    "--solution", $resolvedSolution,
     "--root", $resolvedRoot,
     "--force"
 )
+# A configured repository owns its scope metadata (including interop settings). Passing
+# --solution here would intentionally synthesize an implicit scope and bypass that metadata,
+# which makes native interop queries report `interop-not-configured` after the next rebuild.
+# Keep --solution only for the zero-config path; configured scopes are pre-warmed explicitly
+# below so setup retains the same first-run indexing behavior.
+if (-not $hasSourceGraphConfig) {
+    $initArguments += @("--solution", $resolvedSolution)
+}
 $initArguments += if ($SkipPrewarm) { "--no-prewarm" } else { "--prewarm" }
 if ($NoEmbeddings) {
     $initArguments += "--no-embeddings"
@@ -126,9 +135,21 @@ if ($NoEmbeddings) {
 Write-Host "Configuring SourceGraph MCP for:"
 Write-Host "  root:     $resolvedRoot"
 Write-Host "  solution: $resolvedSolution"
+Write-Host "  scope mode: $(if ($hasSourceGraphConfig) { 'configured (.sourcegraph.json)' } else { 'single-solution' })"
 Invoke-CheckedCommand -Command "sourcegraph-mcp" -Arguments $initArguments
 
 if (-not $SkipPrewarm) {
+    if ($hasSourceGraphConfig) {
+        Write-Host "Pre-warming index against $resolvedSolution..."
+        $indexArguments = @(
+            "index", $resolvedSolution,
+            "--root", $resolvedRoot
+        )
+        if ($NoEmbeddings) {
+            $indexArguments += "--no-embeddings"
+        }
+        Invoke-CheckedCommand -Command "sourcegraph-mcp" -Arguments $indexArguments
+    }
     Write-Host "Verifying the generated graph..."
     Invoke-CheckedCommand -Command "sourcegraph-mcp" -Arguments @(
         "demo", "--root", $resolvedRoot

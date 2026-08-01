@@ -274,6 +274,27 @@ public sealed class OnboardingCliTests : IDisposable
     }
 
     [Fact]
+    public async Task Init_existingSourceGraphConfig_emitsRootMode_andPreservesScopeMetadata()
+    {
+        // A configured scope may carry interop/enrichment metadata that the implicit
+        // --solution scope cannot represent. Init must keep the server in root mode so the
+        // runtime loads that metadata from .sourcegraph.json.
+        File.WriteAllText(Path.Join(_tempRoot, "MySolution.slnx"), "<Solution/>");
+        File.WriteAllText(
+            Path.Join(_tempRoot, ".sourcegraph.json"),
+            "{\"scopes\":[{\"name\":\"default\",\"solutions\":[\"MySolution.slnx\"]}]}");
+
+        var cli = ParseInit("--print-only", "--client", "codex");
+        var rc = await InitCli.RunAsync(cli);
+        rc.Should().Be(0);
+
+        var output = _stdout.ToString();
+        output.Should().Contain("\"--root\"");
+        output.Should().NotContain("\"--solution\"");
+        output.Should().NotContain("MySolution.slnx");
+    }
+
+    [Fact]
     public async Task Init_malformedSourcegraphJson_failsFast()
     {
         File.WriteAllText(Path.Join(_tempRoot, ".sourcegraph.json"), "{ broken");
