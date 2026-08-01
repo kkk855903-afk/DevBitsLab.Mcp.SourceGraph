@@ -621,7 +621,7 @@ public sealed class XamlBindingOutcomeTests
     }
 
     [Fact]
-    public async Task BuildGeneratedOmissionDoesNotAuthorizeEventHandlerInference()
+    public async Task BuildGeneratedOmissionResolvesUniqueDirectEventHandlerWithInferredEvidence()
     {
         var xaml = $$"""
             <Window xmlns="{{PresentationNamespace}}"
@@ -648,11 +648,14 @@ public sealed class XamlBindingOutcomeTests
             semanticInputComplete: false,
             semanticPositiveResolutionSafe: true);
 
-        events.OfType<IndexEvent.EdgeEmitted>().Should().NotContain(edge =>
-            edge.SourceCanonicalKey.EndsWith(
+        var edge = events.OfType<IndexEvent.EdgeEmitted>().Should().ContainSingle(item =>
+            item.SourceCanonicalKey.EndsWith(
                 "#UnsafeEvent",
                 StringComparison.Ordinal)
-            && edge.EdgeKindName == "handles-event");
+            && item.EdgeKindName == "handles-event").Subject;
+        edge.TargetCanonicalKey.Should().Be("csharp:M:Test.View.OnClick(System.Object,System.EventArgs)");
+        edge.Evidence.Should().NotBeNull();
+        edge.Evidence!.Confidence.Should().Be(EvidenceConfidence.Inferred);
     }
 
     [Fact]

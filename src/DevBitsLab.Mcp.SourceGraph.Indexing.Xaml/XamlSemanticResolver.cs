@@ -318,12 +318,10 @@ internal sealed class XamlSemanticResolver
             ? associations
             : Array.Empty<XamlViewModelAssociation>();
 
-    public IMethodSymbol? ResolveEventHandler(string? xClass, string handlerName)
+    public XamlEventHandlerResolution? ResolveEventHandler(
+        string? xClass,
+        string handlerName)
     {
-        if (!_semanticResolutionIsSafe || _directBindingMembersOnly)
-        {
-            return null;
-        }
         if (string.IsNullOrWhiteSpace(xClass) || string.IsNullOrWhiteSpace(handlerName))
         {
             return null;
@@ -332,8 +330,19 @@ internal sealed class XamlSemanticResolver
         var type = _compilation.GetTypeByMetadataName(xClass.Trim());
         if (type is null) return null;
 
+        // A unique event-handler declaration on the x:Class type is still directly provable
+        // when the broader compilation is incomplete (for example, a missing generated file or
+        // a referenced project diagnostic). In that state do not walk base types: doing so could
+        // select a handler from an unavailable/inconsistent semantic universe. The direct lookup
+        // mirrors the restricted binding path above and emits lower-confidence evidence.
+        var directMembersOnly = !_semanticResolutionIsSafe || _directBindingMembersOnly;
+        var confidence = directMembersOnly
+            ? EvidenceConfidence.Inferred
+            : EvidenceConfidence.Semantic;
         var candidates = new List<IMethodSymbol>();
-        for (var current = type; current is not null; current = current.BaseType)
+        for (var current = type;
+             current is not null && (!directMembersOnly || SymbolEqualityComparer.Default.Equals(current, type));
+             current = current.BaseType)
         {
             foreach (var method in current.GetMembers(handlerName).OfType<IMethodSymbol>())
             {
@@ -350,7 +359,9 @@ internal sealed class XamlSemanticResolver
             }
         }
 
-        return candidates.Count == 1 ? candidates[0] : null;
+        return candidates.Count == 1
+            ? new XamlEventHandlerResolution(candidates[0], confidence)
+            : null;
     }
 
     private bool IsCompatibleEventHandler(IMethodSymbol method)
@@ -1080,6 +1091,10 @@ internal sealed record XamlViewModelAssociation(
     int Line,
     int Column,
     int Length);
+
+internal sealed record XamlEventHandlerResolution(
+    IMethodSymbol Method,
+    EvidenceConfidence Confidence);
 
 internal sealed record XamlBindingTarget(
     IPropertySymbol Property,
