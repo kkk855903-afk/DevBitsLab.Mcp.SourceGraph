@@ -215,6 +215,8 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
     /// </summary>
     public Solution? SanitizedSolution => _sanitizedSolution;
 
+    internal int RetainedCompilationCount => _probedCompilations.Count;
+
     /// <summary>
     /// Returns whether every Roslyn input for all target-framework iterations of
     /// <paramref name="projectFilePath"/> survived the scope privacy sanitizer. XAML semantic
@@ -577,6 +579,7 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         }
         finally
         {
+            ReleasePassCompilationCaches();
             _lock.Release();
         }
     }
@@ -597,6 +600,7 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         }
         finally
         {
+            ReleasePassCompilationCaches();
             _lock.Release();
         }
     }
@@ -902,8 +906,19 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         }
         finally
         {
+            ReleasePassCompilationCaches();
             _lock.Release();
         }
+    }
+
+    private void ReleasePassCompilationCaches()
+    {
+        // Compilations are needed only between the pre-flight probe and Pass 3 diagnostics.
+        // Keeping them in this long-lived indexer pins complete syntax/semantic graphs between
+        // watcher updates and doubles that retention while a shadow host is rebuilding.
+        _probedCompilations = new Dictionary<ProjectId, Compilation>();
+        _probedFailures = Array.Empty<ProjectFailure>();
+        _probedFailedProjectIds = new HashSet<ProjectId>();
     }
 
     public async Task<IndexResult> ReloadAndIndexAllAsync(CancellationToken ct = default)
@@ -920,6 +935,7 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
         }
         finally
         {
+            ReleasePassCompilationCaches();
             _lock.Release();
         }
     }
@@ -4776,6 +4792,7 @@ public sealed class RoslynIndexer : IAsyncDisposable, ILanguageIndexer
             var workspace = _workspace;
             _workspace = null;
             _sanitizedSolution = null;
+            ReleasePassCompilationCaches();
             _analyzerReferenceLoadCompleteByProject =
                 new Dictionary<ProjectId, bool>();
             _pathPolicy = null;

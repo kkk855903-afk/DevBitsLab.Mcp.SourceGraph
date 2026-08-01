@@ -194,8 +194,12 @@ public sealed class SourceTextSearchTests : IAsyncLifetime
             ToolOutputJsonContext.Default.SearchTextResult)!;
         limited.Hits.Should().HaveCount(5);
         limited.ReturnedLines.Should().Be(5);
+        limited.OmittedLines.Should().Be(20);
         limited.TotalMatchingLines.Should().Be(25);
         limited.Truncated.Should().BeTrue();
+        limited.TruncationReasons.Should().Equal("max_results");
+        limited.PreviewedLines.Should().Be(5);
+        limited.ProsePreviewTruncated.Should().BeFalse();
 
         var completeCall = await GraphTools.SearchTextAsync(
             router, "public", maxResults: 500);
@@ -206,6 +210,10 @@ public sealed class SourceTextSearchTests : IAsyncLifetime
         complete.ReturnedLines.Should().Be(25);
         complete.TotalMatchingLines.Should().Be(25);
         complete.Truncated.Should().BeFalse();
+        complete.OmittedLines.Should().Be(0);
+        complete.TruncationReasons.Should().BeEmpty();
+        complete.PreviewedLines.Should().Be(20);
+        complete.ProsePreviewTruncated.Should().BeTrue();
         completeCall.Content!.OfType<TextContentBlock>().First().Text.Should()
             .Contain("Prose preview shows 20 of 25 returned matching lines")
             .And.Contain("all 25 returned lines are present in structured content");
@@ -215,10 +223,73 @@ public sealed class SourceTextSearchTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task ToolLargeResultSet_truncatesToWireBudgetWithExplicitSemantics()
+    {
+        var lines = Enumerable.Range(1, 300)
+            .Select(index => $"needle-{index:D3} {new string('x', 400)}");
+        await File.WriteAllTextAsync(_csPath, string.Join(Environment.NewLine, lines));
+        var replacementBytes = await File.ReadAllBytesAsync(_csPath);
+        await _store!.ReplaceFileFactsAsync(new FileFactsReplacement(
+            _csPath,
+            SHA256.HashData(replacementBytes),
+            DateTimeOffset.UtcNow,
+            IsGenerated: false,
+            Symbols: [],
+            Edges: [],
+            Annotations: [],
+            References: []));
+
+        var scope = new Scope(
+            "default", "default", _tempDir,
+            new ScopeProjectSet.Paths(["**/*.cs"], []),
+            false, DateTimeOffset.UtcNow);
+        var host = new ScopeHost(
+            scope,
+            _store,
+            _store.CreateEmbeddingsStore(384),
+            new RoslynIndexer(_store),
+            "");
+        host.ApplyIndexState(await _store.CompleteIndexGenerationAsync(DateTimeOffset.UtcNow));
+        host.MarkReady();
+        var router = new ScopeRouter();
+        router.Register(host);
+        router.SetDefaultScope("default");
+
+        var call = await GraphTools.SearchTextAsync(router, "needle", maxResults: 500);
+        var dto = JsonSerializer.Deserialize(
+            call.StructuredContent!.Value,
+            ToolOutputJsonContext.Default.SearchTextResult)!;
+
+        dto.TotalMatchingLines.Should().Be(300);
+        dto.ReturnedLines.Should().Be(dto.Hits.Count);
+        dto.ReturnedLines.Should().BeLessThan(300);
+        dto.OmittedLines.Should().Be(300 - dto.ReturnedLines);
+        dto.Truncated.Should().BeTrue();
+        dto.TruncationReasons.Should().Equal("output_budget");
+        dto.PreviewedLines.Should().Be(Math.Min(20, dto.ReturnedLines));
+        dto.ProsePreviewTruncated.Should().Be(dto.ReturnedLines > 20);
+
+        var estimatedWireChars = call.StructuredContent.Value.GetRawText().Length
+            + call.Content!.OfType<TextContentBlock>().Sum(block => block.Text.Length)
+            + OutputBudget.BaseOverheadChars;
+        estimatedWireChars.Should().BeLessThanOrEqualTo(OutputBudget.DefaultBudgetChars);
+        call.Content.OfType<TextContentBlock>().First().Text.Should()
+            .Contain($"returned {dto.ReturnedLines}, omitted {dto.OmittedLines} (output_budget)");
+
+        await host.DisposeAsync();
+        _store = null;
+    }
+
+    [Fact]
     public async Task RoslynColdIndex_populatesFirstPartySourceDocuments()
     {
         var solution = LocateSampleSolution();
-        await RoslynIndexer.IndexSolutionOnceAsync(solution, _store!);
+        await using var indexer = new RoslynIndexer(_store!);
+        await indexer.OpenAsync(solution);
+        await indexer.IndexAllAsync();
+
+        indexer.RetainedCompilationCount.Should().Be(0,
+            "project compilations are pass-local and must not be pinned by the live indexer");
 
         var page = await _store!.SearchSourceTextAsync(
             "class Calculator", SourceTextSearchMode.Literal, true,

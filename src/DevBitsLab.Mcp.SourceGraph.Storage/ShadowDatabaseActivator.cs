@@ -10,7 +10,15 @@ public static class ShadowDatabaseActivator
         string primaryPath,
         string shadowPath,
         string archiveDirectory,
-        string archiveDiscriminator)
+        string archiveDiscriminator) =>
+        Activate(primaryPath, shadowPath, archiveDirectory, archiveDiscriminator, null);
+
+    internal static string Activate(
+        string primaryPath,
+        string shadowPath,
+        string archiveDirectory,
+        string archiveDiscriminator,
+        Action<ShadowActivationStage>? injectFault)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(primaryPath);
         ArgumentException.ThrowIfNullOrWhiteSpace(shadowPath);
@@ -49,6 +57,7 @@ public static class ShadowDatabaseActivator
 
         if (!File.Exists(primary))
         {
+            injectFault?.Invoke(ShadowActivationStage.BeforeAtomicPromotion);
             File.Move(shadow, primary);
             return archive;
         }
@@ -56,7 +65,13 @@ public static class ShadowDatabaseActivator
         // File.Replace is a single-filesystem atomic replacement on supported platforms. The
         // backup is created by the same operation, so a failed promotion leaves the primary in
         // place instead of exposing a half-built or missing database.
+        injectFault?.Invoke(ShadowActivationStage.BeforeAtomicPromotion);
         File.Replace(shadow, primary, archive, ignoreMetadataErrors: true);
         return archive;
     }
+}
+
+internal enum ShadowActivationStage
+{
+    BeforeAtomicPromotion,
 }

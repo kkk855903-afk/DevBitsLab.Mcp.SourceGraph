@@ -121,44 +121,51 @@ public sealed class JinaCodeEmbeddingGenerator : ICodeEmbeddingGenerator, IManag
     private float[][] EncodeBatch(IReadOnlyList<string> inputs, CancellationToken ct)
     {
         var batch = inputs.Count;
-        var maxTokens = Math.Min(_maxTokens, 512); // 512 is a safer default for v2-base-code's typical pretraining window
-        var totalTokens = batch * maxTokens;
+        var tokenLimit = Math.Min(_maxTokens, 512); // 512 is a safer default for v2-base-code's typical pretraining window
+        var encodedInputs = new IReadOnlyList<int>[batch];
+        var sequenceLength = 1;
+        for (var b = 0; b < batch; b++)
+        {
+            ct.ThrowIfCancellationRequested();
+            var ids = _tokenizer!.EncodeToIds(
+                inputs[b] ?? string.Empty,
+                maxTokenCount: tokenLimit,
+                out string? _,
+                out int _,
+                considerPreTokenization: true,
+                considerNormalization: true);
+            encodedInputs[b] = ids;
+            sequenceLength = Math.Max(sequenceLength, Math.Min(ids.Count, tokenLimit));
+        }
+        var totalTokens = checked(batch * sequenceLength);
 
         var inputIds = ArrayPool<long>.Shared.Rent(totalTokens);
         var attentionMask = ArrayPool<long>.Shared.Rent(totalTokens);
         try
         {
-            // Per-string encode. Microsoft.ML.Tokenizers doesn't expose a batch encode that fills
-            // a caller-provided buffer; per-string is fine for our typical batch (32 × ≤512 tokens)
-            // since the ONNX run that follows dwarfs tokenisation cost.
+            // Pad only to this batch's longest input. Fixed 512-token padding made ORT allocate a
+            // (batch, 512, hidden) output even when every symbol description was only a few dozen
+            // tokens, creating a large avoidable memory spike during cold indexing.
             for (var b = 0; b < batch; b++)
             {
-                ct.ThrowIfCancellationRequested();
-                var text = inputs[b] ?? string.Empty;
-                var ids = _tokenizer!.EncodeToIds(
-                    text,
-                    maxTokenCount: maxTokens,
-                    out string? _,
-                    out int _,
-                    considerPreTokenization: true,
-                    considerNormalization: true);
-                var realLen = Math.Min(ids.Count, maxTokens);
-                var rowOffset = b * maxTokens;
+                var ids = encodedInputs[b];
+                var realLen = Math.Min(ids.Count, sequenceLength);
+                var rowOffset = b * sequenceLength;
                 for (var t = 0; t < realLen; t++)
                 {
                     inputIds[rowOffset + t] = ids[t];
                     attentionMask[rowOffset + t] = 1;
                 }
-                for (var t = realLen; t < maxTokens; t++)
+                for (var t = realLen; t < sequenceLength; t++)
                 {
                     inputIds[rowOffset + t] = _padId;
                     attentionMask[rowOffset + t] = 0;
                 }
             }
 
-            // Build the input tensors. Both shapes are (batch, maxTokens). DenseTensor's
+            // Build the input tensors. Both shapes are (batch, sequenceLength). DenseTensor's
             // wrap-existing-buffer ctor takes Memory<T> + ReadOnlySpan<int> for dims.
-            var dims = new int[] { batch, maxTokens };
+            var dims = new int[] { batch, sequenceLength };
             var idsTensor = new DenseTensor<long>(new Memory<long>(inputIds, 0, totalTokens),
                 (ReadOnlySpan<int>)dims);
             var maskTensor = new DenseTensor<long>(new Memory<long>(attentionMask, 0, totalTokens),
@@ -189,9 +196,9 @@ public sealed class JinaCodeEmbeddingGenerator : ICodeEmbeddingGenerator, IManag
             {
                 var pooled = new float[dim];
                 long maskSum = 0;
-                for (var t = 0; t < maxTokens; t++)
+                for (var t = 0; t < sequenceLength; t++)
                 {
-                    var m = attentionMask[b * maxTokens + t];
+                    var m = attentionMask[b * sequenceLength + t];
                     if (m == 0) continue;
                     maskSum++;
                     for (var d = 0; d < dim; d++)
@@ -246,7 +253,15 @@ public sealed class JinaCodeEmbeddingGenerator : ICodeEmbeddingGenerator, IManag
                 }
                 else if (TryLoadTokenizer(_tokenizerJsonPath, out var tokenizer, out var padId, out var loadError))
                 {
-                    var options = new SessionOptions { GraphOptimizationLevel = GraphOptimizationLevel.ORT_ENABLE_ALL };
+                    // The CPU arena and static memory pattern retain large slabs sized for the
+                    // worst batch shape. This server embeds short, variably shaped batches and
+                    // values a bounded resident set over allocator reuse between calls.
+                    using var options = new SessionOptions
+                    {
+                        GraphOptimizationLevel = GraphOptimizationLevel.ORT_ENABLE_ALL,
+                        EnableCpuMemArena = false,
+                        EnableMemoryPattern = false,
+                    };
                     _session = new InferenceSession(_modelOnnxPath, options);
                     _tokenizer = tokenizer;
                     _padId = padId;

@@ -1691,6 +1691,73 @@ public static class GraphTools
                     return DiagnosticResult.Error($"search_text: {ex.Message}");
                 }
 
+                var allStructuredHits = page.Hits.Select(hit => new SearchTextHit(
+                    hit.FilePath,
+                    hit.Line,
+                    hit.Column,
+                    hit.EndColumn,
+                    hit.MatchCount,
+                    hit.LineText,
+                    hit.BeforeContext,
+                    hit.AfterContext)).ToList();
+                var excludedDirectories = PrivacyPathPolicy.MandatoryExcludePatterns
+                    .Concat(host.Scope.ProjectSet.Exclude)
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .ToList();
+                var truncationReasons = new List<string>();
+                if (page.Truncated) truncationReasons.Add("max_results");
+
+                // Reserve the prose preview and protocol wrapper, then account for each hit's
+                // actual JSON representation. This keeps a single unusually long line/context
+                // from defeating a fixed rows-per-response estimate.
+                const int prosePreviewLimit = 20;
+                var previewReserve = EstimateSearchTextProseChars(
+                    query,
+                    page.TotalMatchingLines,
+                    page.TotalMatches,
+                    allStructuredHits.Take(prosePreviewLimit));
+                var budgetProbe = new SearchTextResult(
+                    query,
+                    normalizedMode,
+                    caseSensitive,
+                    string.IsNullOrWhiteSpace(fileGlob) ? null : fileGlob,
+                    contextLines,
+                    maxResults,
+                    page.TotalMatches,
+                    page.TotalMatchingLines,
+                    0,
+                    page.TotalMatchingLines,
+                    page.CandidateDocuments,
+                    page.TotalMatchingLines > 0,
+                    ["max_results", "output_budget"],
+                    0,
+                    false,
+                    excludedDirectories,
+                    host.IndexGeneration,
+                    []);
+                var usedChars = OutputBudget.BaseOverheadChars
+                    + previewReserve
+                    + JsonSerializer.Serialize(
+                        budgetProbe,
+                        ToolOutputJsonContext.Default.SearchTextResult).Length;
+                var structuredHits = new List<SearchTextHit>(allStructuredHits.Count);
+                foreach (var hit in allStructuredHits)
+                {
+                    var hitChars = JsonSerializer.Serialize(
+                        hit,
+                        ToolOutputJsonContext.Default.SearchTextHit).Length + 1;
+                    if (usedChars + hitChars > OutputBudget.DefaultBudgetChars) break;
+                    structuredHits.Add(hit);
+                    usedChars += hitChars;
+                }
+                if (structuredHits.Count < allStructuredHits.Count)
+                    truncationReasons.Add("output_budget");
+
+                var omittedLines = Math.Max(0, page.TotalMatchingLines - structuredHits.Count);
+                var truncated = omittedLines > 0;
+                var previewedLines = Math.Min(prosePreviewLimit, structuredHits.Count);
+                var prosePreviewTruncated = structuredHits.Count > previewedLines;
+
                 var sb = new StringBuilder();
                 sb.Append(page.TotalMatchingLines)
                     .Append(" matching lines / ")
@@ -1698,10 +1765,18 @@ public static class GraphTools
                     .Append(" matches for `")
                     .Append(query.Replace("`", "\\`", StringComparison.Ordinal))
                     .Append("`");
-                if (page.Truncated) sb.Append(" (truncated)");
+                if (truncated)
+                {
+                    sb.Append("; returned ")
+                        .Append(structuredHits.Count)
+                        .Append(", omitted ")
+                        .Append(omittedLines)
+                        .Append(" (")
+                        .Append(string.Join(", ", truncationReasons))
+                        .Append(')');
+                }
                 sb.AppendLine(".");
-                const int prosePreviewLimit = 20;
-                foreach (var hit in page.Hits.Take(prosePreviewLimit))
+                foreach (var hit in structuredHits.Take(prosePreviewLimit))
                 {
                     sb.Append("- ").Append(Format.Location(hit.FilePath, hit.Line, hit.Column))
                         .Append(": ").AppendLine(hit.LineText.Trim());
@@ -1718,22 +1793,13 @@ public static class GraphTools
                             sb.Append("    ").AppendLine(line);
                     }
                 }
-                if (page.Hits.Count > prosePreviewLimit)
+                if (prosePreviewTruncated)
                 {
                     sb.AppendLine(
-                        $"- Prose preview shows {prosePreviewLimit} of {page.Hits.Count} returned matching lines; "
-                        + $"all {page.Hits.Count} returned lines are present in structured content.");
+                        $"- Prose preview shows {previewedLines} of {structuredHits.Count} returned matching lines; "
+                        + $"all {structuredHits.Count} returned lines are present in structured content.");
                 }
 
-                var structuredHits = page.Hits.Select(hit => new SearchTextHit(
-                    hit.FilePath,
-                    hit.Line,
-                    hit.Column,
-                    hit.EndColumn,
-                    hit.MatchCount,
-                    hit.LineText,
-                    hit.BeforeContext,
-                    hit.AfterContext)).ToList();
                 var dto = new SearchTextResult(
                     query,
                     normalizedMode,
@@ -1744,12 +1810,13 @@ public static class GraphTools
                     page.TotalMatches,
                     page.TotalMatchingLines,
                     structuredHits.Count,
+                    omittedLines,
                     page.CandidateDocuments,
-                    page.Truncated,
-                    PrivacyPathPolicy.MandatoryExcludePatterns
-                        .Concat(host.Scope.ProjectSet.Exclude)
-                        .Distinct(StringComparer.OrdinalIgnoreCase)
-                        .ToList(),
+                    truncated,
+                    truncationReasons,
+                    previewedLines,
+                    prosePreviewTruncated,
+                    excludedDirectories,
                     host.IndexGeneration,
                     structuredHits);
                 return new CallToolResult
@@ -1762,13 +1829,35 @@ public static class GraphTools
                             sw.ElapsedMilliseconds,
                             ("matching_lines", page.TotalMatchingLines.ToString()),
                             ("matches", page.TotalMatches.ToString()),
-                            ("truncated", page.Truncated.ToString().ToLowerInvariant())),
+                            ("returned_lines", structuredHits.Count.ToString()),
+                            ("omitted_lines", omittedLines.ToString()),
+                            ("truncated", truncated.ToString().ToLowerInvariant()),
+                            ("truncation_reasons", string.Join(",", truncationReasons))),
                     ],
                     StructuredContent = JsonSerializer.SerializeToElement(
                         dto,
                         ToolOutputJsonContext.Default.SearchTextResult),
                 };
             }, ct));
+
+    private static int EstimateSearchTextProseChars(
+        string query,
+        long totalMatchingLines,
+        long totalMatches,
+        IEnumerable<SearchTextHit> hits)
+    {
+        var chars = JsonSerializer.Serialize(query).Length + totalMatchingLines.ToString().Length
+            + totalMatches.ToString().Length + 128;
+        foreach (var hit in hits)
+        {
+            // The prose lives inside JSON too. Reusing the hit's escaped JSON length is a
+            // conservative proxy for paths/source lines dominated by quotes or backslashes.
+            chars += JsonSerializer.Serialize(
+                hit,
+                ToolOutputJsonContext.Default.SearchTextHit).Length + 64;
+        }
+        return chars;
+    }
 
     [McpServerTool(UseStructuredContent = true, OutputSchemaType = typeof(SearchSymbolsResult))]
     [ToolTrigger("\"I only have a fragment of the name (e.g. 'Calc', 'Greet', 'Async')\"")]

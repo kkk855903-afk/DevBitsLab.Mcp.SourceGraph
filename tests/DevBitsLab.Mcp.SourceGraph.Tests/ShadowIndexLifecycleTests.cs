@@ -94,6 +94,37 @@ public sealed class ShadowIndexLifecycleTests
         }
     }
 
+    [Fact]
+    public async Task Activate_faultBeforeAtomicPromotion_keepsPrimaryAndShadowRecoverable()
+    {
+        var directory = CreateTempDirectory();
+        var primary = Path.Join(directory, "default.db");
+        var shadow = primary + ".shadow-test";
+        try
+        {
+            await CreateMarkerDatabaseAsync(primary, "old");
+            await CreateMarkerDatabaseAsync(shadow, "new");
+
+            var act = () => ShadowDatabaseActivator.Activate(
+                primary,
+                shadow,
+                Path.Join(directory, "orphans"),
+                "rebuild",
+                stage => throw new InjectedShadowFailureException(stage));
+
+            act.Should().Throw<InjectedShadowFailureException>();
+            (await ReadMarkerAsync(primary)).Should().Be("old");
+            (await ReadMarkerAsync(shadow)).Should().Be("new");
+            Directory.EnumerateFiles(Path.Join(directory, "orphans"), "*.db")
+                .Should().BeEmpty();
+        }
+        finally
+        {
+            SqliteConnection.ClearAllPools();
+            Directory.Delete(directory, recursive: true);
+        }
+    }
+
     private static async Task CreateMarkerDatabaseAsync(string path, string marker)
     {
         await using var connection = new SqliteConnection($"Data Source={path};Pooling=False");
@@ -116,4 +147,7 @@ public sealed class ShadowIndexLifecycleTests
         Directory.CreateDirectory(path);
         return path;
     }
+
+    private sealed class InjectedShadowFailureException(ShadowActivationStage stage)
+        : Exception($"Injected failure at {stage}");
 }

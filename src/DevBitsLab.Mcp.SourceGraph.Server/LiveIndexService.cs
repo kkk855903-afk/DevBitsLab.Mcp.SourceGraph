@@ -166,11 +166,14 @@ public sealed class LiveIndexService : BackgroundService
             return;
         }
 
-        // Run the cold index for every prepared scope concurrently. Each call settles its own
-        // host status to "ok", "partial", or "degraded" and calls MarkReady so tools waiting on
-        // ScopeHost.Ready can proceed.
-        var indexTasks = _preparedHosts.Select(host => RunInitialIndexAsync(host, stoppingToken)).ToArray();
-        await Task.WhenAll(indexTasks).ConfigureAwait(false);
+        // Each Roslyn cold pass can retain hundreds of MB while constructing compilations. Run
+        // scopes serially so startup peak is bounded by one active compilation universe rather
+        // than the number of configured scopes. Prepared hosts remain visible as "indexing" and
+        // settle independently as their turn completes.
+        foreach (var host in _preparedHosts)
+        {
+            await RunInitialIndexAsync(host, stoppingToken).ConfigureAwait(false);
+        }
 
         // Start watching every clean or partially successful scope. An empty but clean `ok` scope
         // still needs a watcher so the first future source file is indexed. `degraded` scopes have
@@ -1158,6 +1161,13 @@ public sealed class LiveIndexService : BackgroundService
 
         // The activation window is deliberately short: all expensive indexing and validation is
         // complete. Close the active connection, atomically replace the main file, then reopen.
+        // From this point onward the operation is independent of the request token: honoring a
+        // client disconnect after disposing oldHost could leave the router pointing at a
+        // disposed host even though the database promotion succeeded. Host shutdown may still
+        // interrupt the work; the boot reconciler handles that process-level recovery case.
+        var activationToken = _hostStoppingToken.CanBeCanceled
+            ? _hostStoppingToken
+            : CancellationToken.None;
         await oldHost.DisposeAsync().ConfigureAwait(false);
         try
         {
@@ -1169,10 +1179,10 @@ public sealed class LiveIndexService : BackgroundService
             DeleteShadowArtifacts(shadowPath);
             // File.Replace is atomic, so the primary still points at the old database on
             // failure. Reopen it to replace the disposed router entry whenever possible.
-            var restored = await PrepareScopeAsync(scope, ct).ConfigureAwait(false);
+            var restored = await PrepareScopeAsync(scope, activationToken).ConfigureAwait(false);
             if (restored is not null)
             {
-                await RunInitialIndexAsync(restored, ct).ConfigureAwait(false);
+                await RunInitialIndexAsync(restored, activationToken).ConfigureAwait(false);
                 if (IsWatchable(restored)) StartWatcher(restored, _hostStoppingToken);
             }
             return null;
@@ -1182,7 +1192,7 @@ public sealed class LiveIndexService : BackgroundService
         // it restores the Roslyn workspace and live-indexer state required by the watcher.
         // PrepareScopeAsync registers the new host with the
         // router (overwriting the disposed entry by id). RunInitialIndexAsync settles status.
-        var newHost = await PrepareScopeAsync(scope, ct).ConfigureAwait(false);
+        var newHost = await PrepareScopeAsync(scope, activationToken).ConfigureAwait(false);
         if (newHost is null)
         {
             // Prepare failed — registry already reflects degraded state, the old entry has been
@@ -1191,7 +1201,7 @@ public sealed class LiveIndexService : BackgroundService
             // diagnostic.
             return null;
         }
-        await RunInitialIndexAsync(newHost, ct).ConfigureAwait(false);
+        await RunInitialIndexAsync(newHost, activationToken).ConfigureAwait(false);
 
         // Re-attach the watcher so live updates resume after the rebuild. The watcher's loop
         // runs as a `Task.Run(..., stoppingToken)` and is bound to whatever token we pass; if we

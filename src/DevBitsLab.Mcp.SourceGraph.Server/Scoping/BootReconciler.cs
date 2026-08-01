@@ -42,6 +42,11 @@ internal static class BootReconciler
             }
         }
 
+        // A hard stop during shadow build leaves uniquely named files that are intentionally
+        // never opened on the next boot. Quarantine them instead of silently accumulating them
+        // beside live databases. Preserve sidecars for diagnosis/recovery.
+        await ArchiveInterruptedShadowsAsync(repoRoot, scopesDir, logger).ConfigureAwait(false);
+
         // Branch 1 — orphan DB files: in fileIds but not in registry. Move to orphans/<id>-<ts>.db.
         foreach (var id in fileIds.Except(registryIds, StringComparer.Ordinal).ToArray())
         {
@@ -71,6 +76,76 @@ internal static class BootReconciler
                 logger,
                 ct).ConfigureAwait(false);
         }
+    }
+
+    private static Task ArchiveInterruptedShadowsAsync(
+        string repoRoot,
+        string scopesDir,
+        ILogger logger)
+    {
+        if (!Directory.Exists(scopesDir)) return Task.CompletedTask;
+
+        var shadowPaths = Directory.EnumerateFiles(scopesDir, "*.db.shadow-*")
+            .Select(path => path.EndsWith("-wal", StringComparison.Ordinal)
+                || path.EndsWith("-shm", StringComparison.Ordinal)
+                    ? path[..^4]
+                    : path)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        foreach (var shadowPath in shadowPaths)
+        {
+            var fileName = Path.GetFileName(shadowPath);
+            var marker = fileName.IndexOf(".db.shadow-", StringComparison.Ordinal);
+            if (marker <= 0) continue;
+            var scopeId = fileName[..marker];
+            var sw = Stopwatch.StartNew();
+            try
+            {
+                var artifacts = new[] { shadowPath, shadowPath + "-wal", shadowPath + "-shm" }
+                    .Where(File.Exists)
+                    .ToArray();
+                if (artifacts.Length == 0) continue;
+                var orphansDir = ScopeLayout.OrphansDirectory(repoRoot);
+                Directory.CreateDirectory(orphansDir);
+                var destination = Path.Join(orphansDir, fileName);
+                if (File.Exists(destination)
+                    || File.Exists(destination + "-wal")
+                    || File.Exists(destination + "-shm"))
+                {
+                    destination += "." + Guid.NewGuid().ToString("N")[..8];
+                }
+                foreach (var artifact in artifacts)
+                {
+                    var suffix = artifact.Length == shadowPath.Length
+                        ? string.Empty
+                        : artifact[shadowPath.Length..];
+                    File.Move(artifact, destination + suffix);
+                }
+                sw.Stop();
+                logger.LogWarning(
+                    "Quarantined interrupted shadow database for scope `{Id}` to {Destination}",
+                    scopeId,
+                    destination);
+                HealLog.Append(
+                    kind: "interrupted-shadow-archived",
+                    scope: scopeId,
+                    ok: true,
+                    ms: sw.Elapsed.TotalMilliseconds,
+                    details: $"moved to orphans/{Path.GetFileName(destination)}");
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                sw.Stop();
+                logger.LogWarning(ex, "Failed to quarantine interrupted shadow for scope `{Id}`", scopeId);
+                HealLog.Append(
+                    kind: "interrupted-shadow-archived",
+                    scope: scopeId,
+                    ok: false,
+                    ms: sw.Elapsed.TotalMilliseconds,
+                    details: ex.Message);
+            }
+        }
+        return Task.CompletedTask;
     }
 
     private static Task ArchiveOrphanDbAsync(string repoRoot, string id, ILogger logger)

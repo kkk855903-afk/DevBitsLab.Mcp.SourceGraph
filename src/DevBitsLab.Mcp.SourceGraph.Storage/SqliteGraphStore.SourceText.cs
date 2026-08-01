@@ -37,59 +37,70 @@ public sealed partial class SqliteGraphStore
             ? null
             : CompileGlob(fileGlob.Trim());
 
-        var documents = await LoadSourceCandidatesAsync(
-            mode == SourceTextSearchMode.Literal ? query : null,
-            ct).ConfigureAwait(false);
         var hits = new List<SourceTextSearchHit>(Math.Min(maxResults, 256));
         long totalMatches = 0;
         long totalMatchingLines = 0;
+        var candidateDocuments = 0;
         var comparison = caseSensitive ? StringComparison.Ordinal : StringComparison.OrdinalIgnoreCase;
 
-        foreach (var document in documents)
+        var (connection, command, reader) = await OpenSourceCandidateReaderAsync(
+            mode == SourceTextSearchMode.Literal ? query : null,
+            ct).ConfigureAwait(false);
+        await using (connection.ConfigureAwait(false))
+        await using (command.ConfigureAwait(false))
+        await using (reader.ConfigureAwait(false))
         {
-            ct.ThrowIfCancellationRequested();
-            var normalizedPath = document.Path.Replace('\\', '/');
-            if (globRegex is not null && !globRegex.IsMatch(normalizedPath)) continue;
-
-            var lines = SplitLines(document.Content);
-            for (var lineIndex = 0; lineIndex < lines.Length; lineIndex++)
+            while (await reader.ReadAsync(ct).ConfigureAwait(false))
             {
                 ct.ThrowIfCancellationRequested();
-                var line = lines[lineIndex];
-                int firstIndex;
-                int firstLength;
-                int matchCount;
-                if (contentRegex is null)
-                {
-                    firstIndex = line.IndexOf(query, comparison);
-                    if (firstIndex < 0) continue;
-                    firstLength = query.Length;
-                    matchCount = CountLiteral(line, query, comparison, firstIndex);
-                }
-                else
-                {
-                    var matches = contentRegex.Matches(line);
-                    if (matches.Count == 0) continue;
-                    firstIndex = matches[0].Index;
-                    firstLength = matches[0].Length;
-                    matchCount = matches.Count;
-                }
+                candidateDocuments++;
+                var path = reader.GetString(1);
+                var normalizedPath = path.Replace('\\', '/');
+                if (globRegex is not null && !globRegex.IsMatch(normalizedPath)) continue;
 
-                totalMatches += matchCount;
-                totalMatchingLines++;
-                if (hits.Count >= maxResults) continue;
+                // Read and split one source document at a time. Previously Dapper buffered every
+                // candidate's full content before scanning, making peak memory proportional to
+                // the entire repository rather than its largest source file.
+                var lines = SplitLines(reader.GetString(2));
+                for (var lineIndex = 0; lineIndex < lines.Length; lineIndex++)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    var line = lines[lineIndex];
+                    int firstIndex;
+                    int firstLength;
+                    int matchCount;
+                    if (contentRegex is null)
+                    {
+                        firstIndex = line.IndexOf(query, comparison);
+                        if (firstIndex < 0) continue;
+                        firstLength = query.Length;
+                        matchCount = CountLiteral(line, query, comparison, firstIndex);
+                    }
+                    else
+                    {
+                        var matches = contentRegex.Matches(line);
+                        if (matches.Count == 0) continue;
+                        firstIndex = matches[0].Index;
+                        firstLength = matches[0].Length;
+                        matchCount = matches.Count;
+                    }
 
-                var beforeStart = Math.Max(0, lineIndex - contextLines);
-                var afterEnd = Math.Min(lines.Length - 1, lineIndex + contextLines);
-                hits.Add(new SourceTextSearchHit(
-                    document.Path,
-                    lineIndex + 1,
-                    firstIndex + 1,
-                    firstIndex + firstLength + 1,
-                    matchCount,
-                    line,
-                    lines[beforeStart..lineIndex],
-                    lines[(lineIndex + 1)..(afterEnd + 1)]));
+                    totalMatches += matchCount;
+                    totalMatchingLines++;
+                    if (hits.Count >= maxResults) continue;
+
+                    var beforeStart = Math.Max(0, lineIndex - contextLines);
+                    var afterEnd = Math.Min(lines.Length - 1, lineIndex + contextLines);
+                    hits.Add(new SourceTextSearchHit(
+                        path,
+                        lineIndex + 1,
+                        firstIndex + 1,
+                        firstIndex + firstLength + 1,
+                        matchCount,
+                        line,
+                        lines[beforeStart..lineIndex],
+                        lines[(lineIndex + 1)..(afterEnd + 1)]));
+                }
             }
         }
 
@@ -97,7 +108,7 @@ public sealed partial class SqliteGraphStore
             hits,
             totalMatches,
             totalMatchingLines,
-            documents.Count,
+            candidateDocuments,
             totalMatchingLines > hits.Count);
     }
 
@@ -124,45 +135,57 @@ public sealed partial class SqliteGraphStore
         return new SourceDocumentCoverage(eligible, indexed, missing);
     }
 
-    private async Task<IReadOnlyList<SourceDocumentRow>> LoadSourceCandidatesAsync(
+    private async Task<(SqliteConnection Connection, SqliteCommand Command, SqliteDataReader Reader)>
+        OpenSourceCandidateReaderAsync(
         string? literalQuery,
         CancellationToken ct)
     {
         if (literalQuery is not null && literalQuery.EnumerateRunes().Count() >= 3)
         {
+            var connection = await OpenReaderAsync(ct).ConfigureAwait(false);
+            var command = connection.CreateCommand();
             try
             {
-                await using var reader = await OpenReaderAsync(ct).ConfigureAwait(false);
                 var ftsQuery = "content : \"" + literalQuery.Replace("\"", "\"\"") + "\"";
-                var rows = await reader.QueryAsync<SourceDocumentRow>(new CommandDefinition(
-                    """
+                command.CommandText = """
                     SELECT d.file_id AS FileId, d.path AS Path, d.content AS Content
                     FROM source_text_fts f
                     JOIN source_documents d ON d.file_id = f.rowid
                     WHERE source_text_fts MATCH @query
                     ORDER BY d.path;
-                    """,
-                    new { query = ftsQuery },
-                    cancellationToken: ct)).ConfigureAwait(false);
-                return rows.AsList();
+                    """;
+                command.Parameters.AddWithValue("@query", ftsQuery);
+                var reader = await command.ExecuteReaderAsync(ct).ConfigureAwait(false);
+                return (connection, command, reader);
             }
             catch (SqliteException)
             {
+                await command.DisposeAsync().ConfigureAwait(false);
+                await connection.DisposeAsync().ConfigureAwait(false);
                 // Some punctuation-only phrases cannot be represented by the trigram MATCH
                 // grammar. A full scan preserves correctness; it is still entirely in-process
                 // and backed by SourceGraph's own persisted source document store.
             }
         }
 
-        await using var fallbackReader = await OpenReaderAsync(ct).ConfigureAwait(false);
-        var fallback = await fallbackReader.QueryAsync<SourceDocumentRow>(new CommandDefinition(
-            """
+        var fallbackConnection = await OpenReaderAsync(ct).ConfigureAwait(false);
+        var fallbackCommand = fallbackConnection.CreateCommand();
+        fallbackCommand.CommandText = """
             SELECT file_id AS FileId, path AS Path, content AS Content
             FROM source_documents
             ORDER BY path;
-            """,
-            cancellationToken: ct)).ConfigureAwait(false);
-        return fallback.AsList();
+            """;
+        try
+        {
+            var fallbackReader = await fallbackCommand.ExecuteReaderAsync(ct).ConfigureAwait(false);
+            return (fallbackConnection, fallbackCommand, fallbackReader);
+        }
+        catch
+        {
+            await fallbackCommand.DisposeAsync().ConfigureAwait(false);
+            await fallbackConnection.DisposeAsync().ConfigureAwait(false);
+            throw;
+        }
     }
 
     private static string[] SplitLines(string content) =>
@@ -231,6 +254,5 @@ public sealed partial class SqliteGraphStore
             SourceRegexTimeout);
     }
 
-    private sealed record SourceDocumentRow(long FileId, string Path, string Content);
     private sealed record SourceCoverageRow(string Path, long HasSourceDocument);
 }
