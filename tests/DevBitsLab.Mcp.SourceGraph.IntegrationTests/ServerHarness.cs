@@ -96,9 +96,9 @@ internal sealed class ServerHarness : IAsyncDisposable
     /// <summary>
     /// Spawn the server and connect a client to it. <paramref name="serveArgs"/> is the rest
     /// of the command line after the implicit <c>serve</c> verb: e.g.
-    /// <c>new[] { "--solution", "/abs/path/Sample.sln", "--no-history", "--no-embeddings" }</c>.
-    /// We always force <c>--no-history</c> + <c>--no-embeddings</c> at the call site so the
-    /// integration suite never touches git or downloads ONNX models in CI; this method takes
+    /// <c>new[] { "--solution", "/abs/path/Sample.sln", "--no-history" }</c>.
+    /// Callers force <c>--no-history</c>; embeddings are disabled by default so the integration
+    /// suite never downloads ONNX models in CI. This method takes
     /// the caller's flags as-is.
     ///
     /// <para>Cancellation: <paramref name="cancellationToken"/> cancels the

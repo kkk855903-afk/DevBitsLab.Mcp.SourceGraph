@@ -23,7 +23,7 @@ namespace DevBitsLab.Mcp.SourceGraph.Server.Tools.Output;
 ///     ok=true — symmetric with the historical <c>Task&lt;string&gt;</c> behavior.</item>
 ///   <item><see cref="Error"/> — IsError = true. Use for input validation failures (unknown
 ///     severity / accessibility / edge kind), disabled subsystems (<c>--no-history</c>,
-///     <c>--no-embeddings</c>), scope-routing failures (no scopes registered, scope degraded,
+///     default-disabled embeddings), scope-routing failures (no scopes registered, scope degraded,
 ///     exception thrown inside the scope query), and any other condition where the request
 ///     itself failed to run. Telemetry counts these as ok=false; clients see <c>isError</c> on
 ///     the wire.</item>

@@ -87,7 +87,7 @@ internal static class DoctorCli
         else
         {
             checks.Add(new("embedding-cache", DoctorStatus.Warn,
-                $"embedding model cache absent at {modelCachePath} — `semantic_search` will return its disabled-message until model files are placed there (or pass --no-embeddings to silence)"));
+                $"embedding model cache absent at {modelCachePath} — semantic embeddings remain unavailable until the model is cached and serve starts with --enable-embeddings"));
         }
 
         // 7. Per-scope DB writability.

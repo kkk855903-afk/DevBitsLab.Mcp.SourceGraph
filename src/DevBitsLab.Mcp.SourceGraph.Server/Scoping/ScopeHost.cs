@@ -176,7 +176,7 @@ public sealed class ScopeHost : IAsyncDisposable
     }
     /// <summary>
     /// Per-scope embed-request channel the indexer writes to. Null when embeddings are disabled
-    /// for this scope (no model, no vec extension, or <c>--no-embeddings</c>).
+    /// for this scope (not enabled, no model, or no vec extension).
     /// </summary>
     public ChannelEmbeddingsRequestSink? EmbeddingsSink { get; set; }
     /// <summary>

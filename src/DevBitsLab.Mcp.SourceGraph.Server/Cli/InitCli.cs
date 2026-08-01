@@ -108,7 +108,8 @@ internal static class InitCli
                 InstallMode: installMode,
                 SolutionPath: useRootMode ? null : solutionPath,
                 ServerProjectPath: null,
-                NoEmbeddings: cli.NoEmbeddings,
+                EmbeddingsEnabled: cli.EmbeddingsEnabled,
+                AllowModelDownload: cli.EmbeddingsEnabled && !cli.NoModelDownload,
                 NoHistory: noHistory,
                 Force: cli.Force,
                 ExistingContent: existing);

@@ -179,7 +179,7 @@ internal abstract class JsonMcpServerWriter : IClientConfigWriter
 /// <summary>
 /// Builds the <c>command</c> + <c>args</c> array shared by every JSON-based writer. Picks a
 /// shape based on <see cref="WriterContext.InstallMode"/> and threads through
-/// <see cref="WriterContext.NoEmbeddings"/>/<see cref="WriterContext.NoHistory"/>.
+/// <see cref="WriterContext.EmbeddingsEnabled"/>/<see cref="WriterContext.NoHistory"/>.
 /// </summary>
 internal static class WriterCommandLine
 {
@@ -240,7 +240,8 @@ internal static class WriterCommandLine
             args.Add("--solution");
             args.Add(ctx.SolutionPath);
         }
-        if (ctx.NoEmbeddings) args.Add("--no-embeddings");
+        if (ctx.EmbeddingsEnabled) args.Add("--enable-embeddings");
+        if (ctx.AllowModelDownload) args.Add("--allow-model-download");
         if (ctx.NoHistory) args.Add("--no-history");
         return args.ToArray();
     }

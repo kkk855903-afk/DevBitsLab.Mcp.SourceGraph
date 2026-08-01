@@ -23,7 +23,6 @@ public sealed class PayloadToolingTests
 
     private static readonly string[] CommonServeArgs =
     [
-        "--no-embeddings",
         "--no-history",
     ];
 

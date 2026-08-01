@@ -87,6 +87,16 @@ static async Task<int> RunServeAsync(CommandLine cli)
 
     var repoRoot = cli.ResolvedRepoRoot();
 
+    var processActivity = new ProcessActivityTracker();
+    builder.Services.AddSingleton(processActivity);
+    builder.Services.AddSingleton(new ProcessLifetimeOptions(
+        IdleTimeout: TimeSpan.FromMinutes(cli.IdleTimeoutMinutes),
+        ShutdownGracePeriod: TimeSpan.FromSeconds(5),
+        IdleCheckInterval: TimeSpan.FromSeconds(5)));
+    builder.Services.AddSingleton<IProcessTerminator, EnvironmentProcessTerminator>();
+    builder.Services.AddSingleton<ProcessLifetimeManager>();
+    builder.Services.AddHostedService(sp => sp.GetRequiredService<ProcessLifetimeManager>());
+
     // One-shot migration of the legacy `.sourcegraph/graph.db` to `.sourcegraph/scopes/default.db`.
     // Runs before scope wiring so the synthesised default scope picks up the moved DB.
     try
@@ -131,9 +141,9 @@ static async Task<int> RunServeAsync(CommandLine cli)
     ToolMetrics.Configure(Path.Join(dbDir, "usage.jsonl"));
     HealLog.Configure(Path.Join(dbDir, "heals.jsonl"));
 
-    var embeddingsEnabled = !cli.NoEmbeddings;
+    var embeddingsEnabled = cli.EmbeddingsEnabled;
     // Always know the active model identity so the vec0 table can be sized consistently
-    // even when --no-embeddings is set: the table still exists (empty), and re-enabling
+    // even when embeddings are disabled: the table still exists (empty), and opting in
     // embeddings later will populate it without a schema rebuild.
     var modelInfo = new EmbeddingModelInfo(cli.Model ?? DefaultEmbeddingModel.ModelId, DefaultEmbeddingModel.Dimension);
 
@@ -394,6 +404,19 @@ static async Task<int> RunServeAsync(CommandLine cli)
         .WithStdioServerTransport()
         .WithToolsFromAssembly()
         .WithResourcesFromAssembly();
+    mcpBuilder.WithRequestFilters(filters =>
+    {
+        filters.AddCallToolFilter(next => async (request, cancellationToken) =>
+        {
+            using var activity = processActivity.BeginActivity();
+            return await next(request, cancellationToken).ConfigureAwait(false);
+        });
+        filters.AddReadResourceFilter(next => async (request, cancellationToken) =>
+        {
+            using var activity = processActivity.BeginActivity();
+            return await next(request, cancellationToken).ConfigureAwait(false);
+        });
+    });
     if (CodexCompatibility.Enabled)
     {
         // Run after any built-in or plugin tool and before the SDK serialises CallToolResult.
@@ -556,8 +579,8 @@ static async Task<int> RunIndexAsync(CommandLine cli)
 
     await using var store = new SqliteGraphStore(cli.ResolvedDbPath(), loggerFactory.CreateLogger<SqliteGraphStore>());
 
-    // Load the vec0 extension regardless of --no-embeddings so the schema can stand up an
-    // empty `symbol_embeddings` table. --no-embeddings only disables the *pipeline*; the
+    // Load the vec0 extension regardless of embedding opt-in so the schema can stand up an
+    // empty `symbol_embeddings` table. The default only disables the *pipeline*; the
     // table is created so re-enabling embeddings on a later run doesn't require a schema
     // rebuild.
     var modelInfo = new EmbeddingModelInfo(cli.Model ?? DefaultEmbeddingModel.ModelId, DefaultEmbeddingModel.Dimension);
@@ -570,7 +593,7 @@ static async Task<int> RunIndexAsync(CommandLine cli)
     ChannelEmbeddingsRequestSink? channelSink = null;
     EmbeddingsHostedService? embedService = null;
     JinaCodeEmbeddingGenerator? generator = null;
-    var embeddingsEnabled = !cli.NoEmbeddings;
+    var embeddingsEnabled = cli.EmbeddingsEnabled;
     if (embeddingsEnabled && store.VectorExtensionLoaded)
     {
         channelSink = new ChannelEmbeddingsRequestSink();

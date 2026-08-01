@@ -160,10 +160,20 @@ public sealed class BenchmarkCliTests : IAsyncLifetime
     [Fact]
     public async Task BuiltInSemanticProbe_checksPipelineHealthWithoutInventingRecallGolden()
     {
-        var runner = new BenchmarkRunner(_dbPath, cold: true, embeddingsEnabled: false);
+        var generatorFactoryCalls = 0;
+        var runner = new BenchmarkRunner(
+            _dbPath,
+            cold: true,
+            embeddingsEnabled: false,
+            embeddingGeneratorFactory: () =>
+            {
+                generatorFactoryCalls++;
+                throw new InvalidOperationException("Disabled benchmarks must not construct a generator.");
+            });
 
         var results = await runner.RunBuiltInAsync(CancellationToken.None);
 
+        generatorFactoryCalls.Should().Be(0);
         var semantic = results.Single(result => result.Name == "semantic-probe");
         semantic.Status.Should().Be("passed", semantic.Message);
         semantic.ResultCount.Should().BeGreaterThan(0);

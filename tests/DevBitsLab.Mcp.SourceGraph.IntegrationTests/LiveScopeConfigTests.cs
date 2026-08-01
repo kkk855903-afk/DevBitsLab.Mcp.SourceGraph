@@ -27,7 +27,6 @@ public sealed class LiveScopeConfigTests
     private static string[] WithRoot(string rootAbsolutePath) =>
     [
         "--root", rootAbsolutePath,
-        "--no-embeddings",
         "--no-history",
     ];
 

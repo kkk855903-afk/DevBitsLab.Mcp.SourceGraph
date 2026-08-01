@@ -61,7 +61,7 @@ internal static class BenchmarkCli
             }
         }
 
-        var runner = new BenchmarkRunner(dbPath, cli.Cold, cli.Model, embeddingsEnabled: !cli.NoEmbeddings);
+        var runner = new BenchmarkRunner(dbPath, cli.Cold, cli.Model, embeddingsEnabled: cli.EmbeddingsEnabled);
         var results = golden is null
             ? await runner.RunBuiltInAsync(ct).ConfigureAwait(false)
             : await runner.RunGoldenAsync(golden.Tasks, ct).ConfigureAwait(false);
@@ -139,13 +139,15 @@ internal sealed class BenchmarkRunner
     private readonly bool _cold;
     private readonly EmbeddingModelInfo _model;
     private readonly bool _embeddingsEnabled;
+    private readonly Func<ICodeEmbeddingGenerator> _embeddingGeneratorFactory;
     private SqliteGraphStore? _warmStore;
 
     public BenchmarkRunner(
         string dbPath,
         bool cold,
         string? modelId = null,
-        bool embeddingsEnabled = true)
+        bool embeddingsEnabled = false,
+        Func<ICodeEmbeddingGenerator>? embeddingGeneratorFactory = null)
     {
         _dbPath = dbPath;
         _cold = cold;
@@ -153,6 +155,7 @@ internal sealed class BenchmarkRunner
             modelId ?? DefaultEmbeddingModel.ModelId,
             DefaultEmbeddingModel.Dimension);
         _embeddingsEnabled = embeddingsEnabled;
+        _embeddingGeneratorFactory = embeddingGeneratorFactory ?? CreateGenerator;
     }
 
     public async Task<IReadOnlyList<BenchmarkTaskResult>> RunBuiltInAsync(CancellationToken ct)
@@ -345,8 +348,8 @@ internal sealed class BenchmarkRunner
             var strategy = "lexical";
             store.TryLoadVectorExtension(_model.Dimension);
             var embeddings = store.CreateEmbeddingsStore(_model.Dimension);
-            using var generator = CreateGenerator();
-            if (_embeddingsEnabled
+            using var generator = _embeddingsEnabled ? _embeddingGeneratorFactory() : null;
+            if (generator is not null
                 && embeddings.IsAvailable
                 && generator.IsAvailable
                 && await embeddings.CountAsync(ct).ConfigureAwait(false) > 0)

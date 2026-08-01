@@ -42,7 +42,8 @@ public sealed class ClientConfigWritersTests : IDisposable
             InstallMode: InstallMode.Global,
             SolutionPath: "${workspaceFolder}/MyApp.slnx",
             ServerProjectPath: null,
-            NoEmbeddings: false,
+            EmbeddingsEnabled: false,
+            AllowModelDownload: false,
             NoHistory: false,
             Force: force,
             ExistingContent: existingContent);
@@ -564,7 +565,8 @@ public sealed class ClientConfigWritersTests : IDisposable
             InstallMode: InstallMode.Global,
             SolutionPath: "${workspaceFolder}/MyApp.slnx",
             ServerProjectPath: null,
-            NoEmbeddings: false,
+            EmbeddingsEnabled: false,
+            AllowModelDownload: false,
             NoHistory: false,
             Force: false,
             ExistingContent: null);
@@ -685,14 +687,31 @@ public sealed class ClientConfigWritersTests : IDisposable
     }
 
     [Fact]
-    public void NoEmbeddings_isPropagatedToArgs()
+    public void EmbeddingsEnabled_isPropagatedToArgs()
     {
         var w = new ClaudeCodeWriter();
-        var ctx = MakeContext(w, existingContent: null) with { NoEmbeddings = true };
+        var ctx = MakeContext(w, existingContent: null) with { EmbeddingsEnabled = true };
         var plan = w.Plan(ctx);
         var json = JsonNode.Parse(plan.ContentBytes)!.AsObject();
         var args = json["mcpServers"]!["sourcegraph"]!["args"]!.AsArray()
             .Select(a => a!.GetValue<string>()).ToArray();
-        args.Should().Contain("--no-embeddings");
+        args.Should().Contain("--enable-embeddings");
+    }
+
+    [Fact]
+    public void AllowModelDownload_isPropagatedToArgs()
+    {
+        var w = new ClaudeCodeWriter();
+        var ctx = MakeContext(w, existingContent: null) with
+        {
+            EmbeddingsEnabled = true,
+            AllowModelDownload = true,
+        };
+        var plan = w.Plan(ctx);
+        var json = JsonNode.Parse(plan.ContentBytes)!.AsObject();
+        var args = json["mcpServers"]!["sourcegraph"]!["args"]!.AsArray()
+            .Select(a => a!.GetValue<string>()).ToArray();
+        args.Should().Contain("--enable-embeddings");
+        args.Should().Contain("--allow-model-download");
     }
 }

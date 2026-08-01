@@ -29,7 +29,7 @@ public sealed class CommandLineNoInstructionsTests
         var cli = CommandLine.Parse(new[] { "serve", "--no-history", "--no-instructions", "--no-embeddings" });
         cli.NoInstructions.Should().BeTrue();
         cli.NoHistory.Should().BeTrue();
-        cli.NoEmbeddings.Should().BeTrue();
+        cli.EmbeddingsEnabled.Should().BeFalse();
     }
 
     [Fact]

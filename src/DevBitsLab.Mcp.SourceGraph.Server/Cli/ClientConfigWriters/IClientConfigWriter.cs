@@ -49,7 +49,8 @@ internal sealed record WriterContext(
     InstallMode InstallMode,
     string? SolutionPath,
     string? ServerProjectPath,
-    bool NoEmbeddings,
+    bool EmbeddingsEnabled,
+    bool AllowModelDownload,
     bool NoHistory,
     bool Force,
     byte[]? ExistingContent);

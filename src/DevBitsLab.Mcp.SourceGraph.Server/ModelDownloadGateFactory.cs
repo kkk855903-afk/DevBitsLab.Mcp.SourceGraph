@@ -10,7 +10,7 @@ namespace DevBitsLab.Mcp.SourceGraph.Server;
 /// <para>
 /// Decision matrix:
 /// <list type="bullet">
-///   <item><c>!embeddingsEnabled</c> (i.e. <c>--no-embeddings</c>): pre-completed gate.</item>
+///   <item><c>!embeddingsEnabled</c> (the default, or <c>--no-embeddings</c>): pre-completed gate.</item>
 ///   <item><c>noModelDownload</c> + empty cache: pre-completed gate, warn naming the cache path
 ///         so an operator can pre-populate it.</item>
 ///   <item><c>noModelDownload</c> + populated cache: pre-completed gate, no warning, the
@@ -73,7 +73,7 @@ internal static class ModelDownloadGateFactory
                 // unexpected runtime error inside the chunked-copy path, etc.) and log it.
                 logger.LogWarning(ex,
                     "Failed to download embedding model {Model} into {Dir}; embeddings disabled for this session. " +
-                    "Set --no-embeddings to silence this warning, or pre-populate the cache and retry.",
+                    "Pre-populate the cache and retry, or omit --enable-embeddings.",
                     modelInfo.ModelId, store.DirectoryFor(modelInfo.ModelId));
             }
         }, cancellationToken);

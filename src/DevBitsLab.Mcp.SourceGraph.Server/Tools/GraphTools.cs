@@ -2783,7 +2783,7 @@ public static class GraphTools
                 if (!host.EmbeddingsStore.IsAvailable || !generator.IsAvailable)
                 {
                     return DiagnosticResult.Error(
-                        "semantic_search disabled: no lexical match was found and semantic embeddings are unavailable. Install the embedding model or remove `--no-embeddings`; exact identifier queries can still use strategy=lexical.");
+                        "semantic_search disabled: no lexical match was found and semantic embeddings are unavailable. Start the server with `--enable-embeddings` and install the embedding model; exact identifier queries can still use strategy=lexical.");
                 }
 
                 progress?.Report(Format.Progress(0.0, "waiting for embedding index"));

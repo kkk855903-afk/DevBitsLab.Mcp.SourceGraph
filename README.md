@@ -131,10 +131,11 @@ calls with a single structured tool call:
   directory resolved by `ModelStore.DefaultCacheDir()` (honours `XDG_CACHE_HOME` /
   `LOCALAPPDATA` / `~/.cache` per platform — e.g. `~/.cache/devbitslab.sourcegraph/models/`
   on Linux/macOS, `%LOCALAPPDATA%\devbitslab.sourcegraph\models\` on Windows).
-  `serve` and `index` make no model-download network request by default. Populate the
-  cache explicitly with `embeddings pull`, or opt into first-run fetching with
-  `--allow-model-download`. Disable the pipeline entirely with `--no-embeddings`;
-  `--no-model-download` remains as an explicit/legacy fail-closed switch.
+  The embedding pipeline is disabled by default. Enable it with `--enable-embeddings`;
+  a populated cache is then used without network access. Populate the cache explicitly
+  with `embeddings pull`, or additionally authorize first-run fetching with
+  `--allow-model-download`. `--no-embeddings` remains a compatibility opt-out and
+  `--no-model-download` remains an explicit/legacy fail-closed switch.
 - **Attribute search.** Find every symbol carrying a given attribute, optionally
   filtered by serialised argument substring.
 - **Roslyn diagnostics indexing.** Query analyzer warnings/errors captured at
@@ -1045,9 +1046,10 @@ Common flags:
 | `--db <path>` | Override the database path for the **one-shot** commands (`index`, `stats`, `clear`). Ignored by `serve`, which always uses the per-scope layout under `<root>/.sourcegraph/scopes/<id>.db`. |
 | `--root <path>` | Repository root used for `.sourcegraph.json` discovery and scope databases. Defaults to the directory holding `--solution`, then CWD. |
 | `--model <id>` | Override the embedding model identity (default `jinaai/jina-embeddings-v2-base-code`). Applies to `serve` and `index`. |
-| `--no-embeddings` | Skip the embedding pipeline entirely (no model download, no `vec0` writes). `semantic_search` returns a disabled message; every other tool works as before. |
-| `--allow-model-download` | Explicitly allow `serve`/`index` to fetch the embedding model from Hugging Face when the local cache is empty. Automatic network access is disabled by default. Equivalent to `SOURCEGRAPH_ALLOW_MODEL_DOWNLOAD=1`. |
-| `--no-model-download` | Explicitly retain the default offline mode. A populated cache remains usable; an empty cache degrades to the same shape as `--no-embeddings`. `SOURCEGRAPH_NO_MODEL_DOWNLOAD=1` is retained as a fail-closed operator setting and takes precedence over the allow flag/environment variable. |
+| `--enable-embeddings` | Enable the embedding pipeline, which is disabled by default. A populated cache is used without network access. `--no-embeddings` remains accepted as a compatibility opt-out. |
+| `--allow-model-download` | With `--enable-embeddings`, explicitly allow `serve`/`index` to fetch the model from Hugging Face when the local cache is empty. Equivalent to `SOURCEGRAPH_ALLOW_MODEL_DOWNLOAD=1`. |
+| `--no-model-download` | Explicitly retain offline mode. A populated cache remains usable after `--enable-embeddings`; an empty cache leaves semantic embeddings unavailable. `SOURCEGRAPH_NO_MODEL_DOWNLOAD=1` remains the fail-closed operator setting. |
+| `--idle-timeout-minutes <n>` | Exit `serve` after this many minutes without a tool call or resource read (default `30`). Set `0` to disable idle exit. |
 | `--no-history` | Disable the git-blame history pipeline. Use in environments without `git` on `PATH` or in CI where per-symbol history isn't needed. |
 | `--no-instructions` | Don't publish server-side usage guidance in the MCP `initialize` response. By default the server tells the connected model to prefer source-graph tools over `Grep` + `Read` for symbol-level questions and to call `usage_stats` at end-of-turn to verify. Equivalent to setting `SOURCEGRAPH_NO_INSTRUCTIONS=1`. |
 | `--no-leaf` | Don't prefix the brand mark `🌿` onto any of the three surfaces the server stamps: per-call response prose (the first user-visible text block of every built-in tool's result), the published `ServerInstructions` string, and the per-tool catalog identity (`Tool.Title` becomes `🌿 <name>` and `Tool.Description` is prefixed with `🌿 ` in `tools/list`). By default the brand mark surfaces in all three places so the agent (and the human reading the chat) can tell at a glance that the answer came from this server. Use this knob if your terminal renders emoji as monospaced fallback boxes or if you simply prefer unbranded output. Equivalent to setting `SOURCEGRAPH_NO_LEAF=1`. Independent of `--no-instructions`. |
@@ -1058,7 +1060,7 @@ Examples:
 ```bash
 sourcegraph-mcp index ./MySln.sln
 sourcegraph-mcp serve --solution ./MySln.sln
-sourcegraph-mcp serve --root ./repo --no-embeddings
+sourcegraph-mcp serve --root ./repo --enable-embeddings
 sourcegraph-mcp init-scopes
 sourcegraph-mcp scopes add backend --solution ./backend.slnx
 sourcegraph-mcp stats --db ./.sourcegraph/scopes/default.db
@@ -1204,7 +1206,8 @@ database per scope. The current limits are:
 | Default `SearchSymbols` / `find_references` / `list_members` result limit | 25 / 50 / 100 rows | Pass `limit` on the MCP tool call. A soft serialized-size cap (~50K chars) trims further if a larger `limit` would exceed Claude Code's per-call ceiling; trim is signalled via `omitted_size=N` in the audience-restricted `_meta:` block. |
 | `impact_of_change` max depth | 4 hops | Pass `maxDepth` on the tool call. |
 | `semantic_search` top-k default | 10 | Pass `k` on the tool call. |
-| Embedding model download | ~640 MB, automatic download disabled by default | Populate deliberately with `embeddings pull`, or opt in with `--allow-model-download`; use `--no-embeddings` to disable the pipeline. |
+| Embedding pipeline | disabled | Opt in with `--enable-embeddings`; populate deliberately with `embeddings pull`, or also pass `--allow-model-download` to authorize fetching. |
+| MCP process idle exit | 30 minutes | Pass `--idle-timeout-minutes <n>`; use `0` to disable. Tool calls and resource reads reset the timer, protocol keep-alives do not. |
 | Per-symbol `git blame` shellout | enabled | Disable with `--no-history`. |
 | MCP `initialize` instructions payload | enabled | Disable with `--no-instructions` or `SOURCEGRAPH_NO_INSTRUCTIONS=1`. |
 | Green-leaf brand mark on tool responses, `ServerInstructions`, and per-tool `Title`/`Description` in `tools/list` | enabled | Disable with `--no-leaf` or `SOURCEGRAPH_NO_LEAF=1`. |

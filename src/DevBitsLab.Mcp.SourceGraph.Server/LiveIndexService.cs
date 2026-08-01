@@ -607,7 +607,7 @@ public sealed class LiveIndexService : BackgroundService
             // Await the model-download gate before checking IsAvailable. The generator's first
             // IsAvailable probe is sticky (it caches the answer of its initial cache check), so
             // probing before the download lands would permanently disable embeddings for this
-            // session. Bypassed installs (--no-embeddings or --no-model-download with empty
+            // session. Bypassed installs (default-disabled embeddings or offline mode with empty
             // cache) wire an already-completed gate, so this await is free. WaitAsync(ct)
             // honours scope-prep cancellation so a shutdown during cold-start doesn't block on
             // the in-flight download.
@@ -1003,30 +1003,33 @@ public sealed class LiveIndexService : BackgroundService
                     ct).ConfigureAwait(false);
             }
 
-            // Autonomous embeddings prune: cold-index can leave behind embeddings for symbols
-            // that were deleted (refactors, file renames, generator-output drift). Prune is
-            // cheap (one DELETE) and reversible (the next producer-checkpoint backfill
-            // regenerates missing rows).
-            // Best-effort: a failure here does NOT revert the scope to degraded — the cold-index
-            // outcome is what counts; the prune is opportunistic cleanup.
-            try
+            // Autonomous embeddings prune only belongs to an active embedding pipeline. Keeping
+            // this branch behind the sink check means the default-disabled mode performs no
+            // writes at all against symbol_embeddings and preserves existing vectors for a later
+            // opt-in run.
+            if (host.EmbeddingsSink is not null)
             {
-                var sw = System.Diagnostics.Stopwatch.StartNew();
-                var pruned = await host.EmbeddingsStore.PruneOrphanedAsync(ct).ConfigureAwait(false);
-                sw.Stop();
-                if (pruned > 0)
+                // Best-effort: a failure here does NOT revert the scope to degraded — the
+                // cold-index outcome is what counts; the prune is opportunistic cleanup.
+                try
                 {
-                    Observability.HealLog.Append(kind: "embeddings-pruned", scope: scope.Id, ok: true,
-                        ms: sw.Elapsed.TotalMilliseconds, details: $"removed {pruned} orphan rows");
+                    var sw = System.Diagnostics.Stopwatch.StartNew();
+                    var pruned = await host.EmbeddingsStore.PruneOrphanedAsync(ct).ConfigureAwait(false);
+                    sw.Stop();
+                    if (pruned > 0)
+                    {
+                        Observability.HealLog.Append(kind: "embeddings-pruned", scope: scope.Id, ok: true,
+                            ms: sw.Elapsed.TotalMilliseconds, details: $"removed {pruned} orphan rows");
+                    }
+                    // Zero-noise convention: don't log a heal event when nothing was pruned.
                 }
-                // Zero-noise convention: don't log a heal event when nothing was pruned.
-            }
-            catch (OperationCanceledException) { throw; }
-            catch (Exception pruneEx)
-            {
-                _logger.LogWarning(pruneEx, "Scope `{Id}`: embeddings prune after cold-index failed; ignoring", scope.Id);
-                Observability.HealLog.Append(kind: "embeddings-pruned", scope: scope.Id, ok: false,
-                    ms: 0, details: pruneEx.Message);
+                catch (OperationCanceledException) { throw; }
+                catch (Exception pruneEx)
+                {
+                    _logger.LogWarning(pruneEx, "Scope `{Id}`: embeddings prune after cold-index failed; ignoring", scope.Id);
+                    Observability.HealLog.Append(kind: "embeddings-pruned", scope: scope.Id, ok: false,
+                        ms: 0, details: pruneEx.Message);
+                }
             }
         }
         catch (OperationCanceledException) { throw; }

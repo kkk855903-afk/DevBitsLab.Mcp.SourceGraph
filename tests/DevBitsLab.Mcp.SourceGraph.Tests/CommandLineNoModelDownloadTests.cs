@@ -44,7 +44,7 @@ public sealed class CommandLineNoModelDownloadTests : IDisposable
     [Fact]
     public void AllowFlag_explicitlyEnablesAutomaticDownload()
     {
-        var cli = CommandLine.Parse(new[] { "serve", "--allow-model-download" });
+        var cli = CommandLine.Parse(new[] { "serve", "--enable-embeddings", "--allow-model-download" });
         cli.NoModelDownload.Should().BeFalse();
     }
 
@@ -85,7 +85,7 @@ public sealed class CommandLineNoModelDownloadTests : IDisposable
     public void LegacyNoDownloadEnvVar_winsOverAllowFlag()
     {
         Environment.SetEnvironmentVariable("SOURCEGRAPH_NO_MODEL_DOWNLOAD", "1");
-        var cli = CommandLine.Parse(new[] { "serve", "--allow-model-download" });
+        var cli = CommandLine.Parse(new[] { "serve", "--enable-embeddings", "--allow-model-download" });
         cli.NoModelDownload.Should().BeTrue();
     }
 
@@ -93,7 +93,7 @@ public sealed class CommandLineNoModelDownloadTests : IDisposable
     public void Flag_doesNotConflictWithNoEmbeddings()
     {
         var cli = CommandLine.Parse(new[] { "serve", "--no-embeddings", "--no-model-download" });
-        cli.NoEmbeddings.Should().BeTrue();
+        cli.EmbeddingsEnabled.Should().BeFalse();
         cli.NoModelDownload.Should().BeTrue();
     }
 

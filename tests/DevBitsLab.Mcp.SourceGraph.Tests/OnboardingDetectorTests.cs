@@ -276,7 +276,8 @@ public sealed class WriterContractTests : IDisposable
             InstallMode: DevBitsLab.Mcp.SourceGraph.Server.Cli.ClientConfigWriters.InstallMode.Global,
             SolutionPath: "${workspaceFolder}/MyApp.slnx",
             ServerProjectPath: null,
-            NoEmbeddings: false,
+            EmbeddingsEnabled: false,
+            AllowModelDownload: false,
             NoHistory: false,
             Force: force,
             ExistingContent: existingContent);

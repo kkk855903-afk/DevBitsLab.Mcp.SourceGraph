@@ -16,8 +16,8 @@ internal sealed class CommandLine
     public CliHelpLanguage HelpLanguage { get; private init; } = CliHelpLanguage.English;
     /// <summary>Override the default embedding model identity (Hugging Face-style id).</summary>
     public string? Model { get; private init; }
-    /// <summary>Disable the embedding pipeline (no model download, no vec0 writes, semantic_search returns disabled-message).</summary>
-    public bool NoEmbeddings { get; private init; }
+    /// <summary>Enable the opt-in embedding pipeline. Disabled by default.</summary>
+    public bool EmbeddingsEnabled { get; private init; }
     /// <summary>Disables automatic model downloads. Defaults to <see langword="true"/>; callers
     /// must opt in with <c>--allow-model-download</c> or
     /// <c>SOURCEGRAPH_ALLOW_MODEL_DOWNLOAD=1</c>. A populated local cache remains usable.</summary>
@@ -51,6 +51,8 @@ internal sealed class CommandLine
     /// <summary>Maximum row count returned per <c>query_graph</c> call. Null when not set; resolution
     /// falls back to <c>SOURCEGRAPH_QUERY_ROW_LIMIT</c> then the built-in default.</summary>
     public int? QueryRowLimit { get; private init; }
+    /// <summary>Minutes without a tool call or resource read before <c>serve</c> exits. Zero disables idle exit.</summary>
+    public int IdleTimeoutMinutes { get; private init; } = 30;
     /// <summary>Positional rest args (used by `scopes add`, `scopes remove`, etc.).</summary>
     public IReadOnlyList<string> Positional { get; private init; } = Array.Empty<string>();
     /// <summary>True when <c>--yes</c>/<c>-y</c> was passed; consumed by <c>init</c> to skip every interactive prompt.</summary>
@@ -139,7 +141,9 @@ internal sealed class CommandLine
         string? db = null;
         string? model = null;
         string? root = null;
-        var noEmbeddings = false;
+        var embeddingsEnabled = false;
+        var sawEnableEmbeddings = false;
+        var sawNoEmbeddings = false;
         var noModelDownload = forceNoModelDownload || !allowModelDownload;
         var sawAllowModelDownload = false;
         var sawNoModelDownload = false;
@@ -153,6 +157,7 @@ internal sealed class CommandLine
         string? scopeId = null;
         int? queryTimeoutSeconds = null;
         int? queryRowLimit = null;
+        var idleTimeoutMinutes = 30;
         var positional = new List<string>();
         var yes = false;
         var force = false;
@@ -209,8 +214,13 @@ internal sealed class CommandLine
                 case "--root":
                     root = ExpandTokens(RequireArg(args, ref i, a));
                     break;
+                case "--enable-embeddings":
+                    embeddingsEnabled = true;
+                    sawEnableEmbeddings = true;
+                    break;
                 case "--no-embeddings":
-                    noEmbeddings = true;
+                    embeddingsEnabled = false;
+                    sawNoEmbeddings = true;
                     break;
                 case "--no-model-download":
                     noModelDownload = true;
@@ -249,6 +259,9 @@ internal sealed class CommandLine
                     break;
                 case "--query-row-limit":
                     queryRowLimit = RequirePositiveInt(args, ref i, a);
+                    break;
+                case "--idle-timeout-minutes":
+                    idleTimeoutMinutes = RequireNonNegativeInt(args, ref i, a);
                     break;
                 case "--yes" or "-y":
                     yes = true;
@@ -324,6 +337,16 @@ internal sealed class CommandLine
             throw new ArgumentException(
                 "--allow-model-download and --no-model-download cannot be used together.");
         }
+        if (sawEnableEmbeddings && sawNoEmbeddings)
+        {
+            throw new ArgumentException(
+                "--enable-embeddings and --no-embeddings cannot be used together.");
+        }
+        if (sawAllowModelDownload && !embeddingsEnabled)
+        {
+            throw new ArgumentException(
+                "--allow-model-download requires --enable-embeddings.");
+        }
         if (forceNoModelDownload)
         {
             // Preserve the legacy environment variable as an operator-controlled fail-closed
@@ -338,7 +361,7 @@ internal sealed class CommandLine
             DatabasePath = db,
             RepoRoot = root,
             Model = model,
-            NoEmbeddings = noEmbeddings,
+            EmbeddingsEnabled = embeddingsEnabled,
             NoModelDownload = noModelDownload,
             NoHistory = noHistory,
             NoInstructions = noInstructions,
@@ -350,6 +373,7 @@ internal sealed class CommandLine
             ScopeId = scopeId,
             QueryTimeoutSeconds = queryTimeoutSeconds,
             QueryRowLimit = queryRowLimit,
+            IdleTimeoutMinutes = idleTimeoutMinutes,
             Positional = positional,
             Yes = yes,
             Force = force,
@@ -425,6 +449,16 @@ internal sealed class CommandLine
         return n;
     }
 
+    private static int RequireNonNegativeInt(string[] args, ref int i, string flag)
+    {
+        var raw = RequireArg(args, ref i, flag);
+        if (!int.TryParse(raw, out var n) || n < 0)
+        {
+            throw new ArgumentException($"{flag} requires a non-negative integer; got '{raw}'");
+        }
+        return n;
+    }
+
     /// <summary>
     /// Expand <c>${VAR}</c> placeholders in a CLI value. Handles the special <c>${workspaceFolder}</c>
     /// token that some MCP clients (Claude Code, Cursor) substitute themselves; if the client
@@ -472,12 +506,12 @@ internal sealed class CommandLine
           sourcegraph-mcp --help [--lang <en|zh>]
               Print this help in English (`en`) or Simplified Chinese (`zh`).
 
-          sourcegraph-mcp serve [--solution <path>] [--db <path>] [--root <repo>] [--model <id>] [--no-embeddings] [--allow-model-download|--no-model-download] [--no-history] [--codex-compat]
+          sourcegraph-mcp serve [--solution <path>] [--db <path>] [--root <repo>] [--model <id>] [--enable-embeddings] [--allow-model-download|--no-model-download] [--idle-timeout-minutes <n>] [--no-history] [--codex-compat]
               Run the MCP stdio server. With --solution given, registers an implicit single-scope
               `default` mapped to that solution. Otherwise reads `.sourcegraph.json` from --root
               (or CWD) for multi-scope configuration.
 
-          sourcegraph-mcp index <solution-path> [--scope <id>] [--db <path>] [--model <id>] [--no-embeddings] [--allow-model-download|--no-model-download] [--no-history]
+          sourcegraph-mcp index <solution-path> [--scope <id>] [--db <path>] [--model <id>] [--enable-embeddings] [--allow-model-download|--no-model-download] [--no-history]
               Build/refresh the graph database from the given .sln file, then exit. When multiple
               configured scopes contain the solution, --scope is required.
 
@@ -487,7 +521,7 @@ internal sealed class CommandLine
           sourcegraph-mcp clear [--db <path>]
               Delete all rows from the graph database (schema preserved).
 
-          sourcegraph-mcp benchmark [--scope <id>] [--root <path>] [--db <path>] [--cold] [--golden <tasks.json>] [--json]
+          sourcegraph-mcp benchmark [--scope <id>] [--root <path>] [--db <path>] [--model <id>] [--enable-embeddings] [--cold] [--golden <tasks.json>] [--json]
               Run graph health/performance probes. --golden adds assertion-backed definition,
               reference, implementation, edge-kind, semantic Top-K, and call-path tasks.
               --cold reopens the database for every task. Any failed task exits 2.
@@ -495,7 +529,7 @@ internal sealed class CommandLine
           sourcegraph-mcp init [--yes] [--client <id>] [--no-<client>] [--user-<client>]
                                 [--claude-desktop] [--solution <path>] [--install-mode <mode>]
                                 [--print-only] [--force] [--prewarm | --no-prewarm]
-                                [--no-embeddings] [--no-history] [--root <path>]
+                                [--enable-embeddings] [--no-history] [--root <path>]
               Interactive (default) or flag-driven onboarding flow. Detects environment, picks
               MCP clients, writes per-client config files (project-scoped by default), and
               optionally pre-warms the index. First-class clients: claude-code, codex, copilot,
@@ -563,18 +597,23 @@ internal sealed class CommandLine
           --root <path>     Repository root used for `.sourcegraph.json` discovery and scope DBs.
                             Defaults to the directory holding `--solution`, then CWD.
           --model <id>      Override the embedding model identity (default:
-                            jinaai/jina-embeddings-v2-base-code). Applies to serve/index.
-          --no-embeddings   Skip the embedding pipeline entirely. semantic_search can still
-                            return lexical identifier hits; intent queries report disabled.
+                            jinaai/jina-embeddings-v2-base-code). Applies to serve/index/benchmark.
+          --enable-embeddings
+                            Enable the embedding pipeline, which is off by default. A populated
+                            local cache is used without network access. --no-embeddings remains
+                            accepted as a backwards-compatible explicit opt-out.
           --allow-model-download
                             Explicitly allow serve/index to auto-fetch the embedding model from
                             Hugging Face when the local cache is empty. Automatic network access is
                             disabled by default. Equivalent to SOURCEGRAPH_ALLOW_MODEL_DOWNLOAD=1.
           --no-model-download
                             Explicitly retain the default offline mode. The pipeline uses an
-                            already-populated cache or degrades to the same shape as
-                            --no-embeddings. SOURCEGRAPH_NO_MODEL_DOWNLOAD=1 is retained for
+                            already-populated cache or leaves semantic embeddings unavailable.
+                            SOURCEGRAPH_NO_MODEL_DOWNLOAD=1 is retained for
                             backwards-compatible fail-closed deployments.
+          --idle-timeout-minutes <n>
+                            Exit serve after this many minutes without a tool call or resource
+                            read (default: 30). Set to 0 to disable idle exit.
           --no-history      Disable the git-blame history pipeline. Use in environments without
                             git on PATH or in CI runs where per-symbol history isn't needed.
           --no-instructions Don't publish server-side usage guidance in the MCP `initialize`
@@ -622,12 +661,12 @@ internal sealed class CommandLine
           sourcegraph-mcp --help [--lang <en|zh>]
               使用英文 (`en`) 或简体中文 (`zh`) 显示本帮助。
 
-          sourcegraph-mcp serve [--solution <path>] [--db <path>] [--root <repo>] [--model <id>] [--no-embeddings] [--allow-model-download|--no-model-download] [--no-history] [--codex-compat]
+          sourcegraph-mcp serve [--solution <path>] [--db <path>] [--root <repo>] [--model <id>] [--enable-embeddings] [--allow-model-download|--no-model-download] [--idle-timeout-minutes <n>] [--no-history] [--codex-compat]
               运行 MCP stdio 服务器。指定 --solution 时，将创建映射到该解决方案的隐式
               `default` 单作用域；否则从 --root（或当前工作目录）读取 `.sourcegraph.json`
               多作用域配置。
 
-          sourcegraph-mcp index <solution-path> [--scope <id>] [--db <path>] [--model <id>] [--no-embeddings] [--allow-model-download|--no-model-download] [--no-history]
+          sourcegraph-mcp index <solution-path> [--scope <id>] [--db <path>] [--model <id>] [--enable-embeddings] [--allow-model-download|--no-model-download] [--no-history]
               构建或刷新指定 .sln/.slnx 的图数据库，然后退出。当多个已配置作用域包含
               该解决方案时，必须指定 --scope。
 
@@ -637,7 +676,7 @@ internal sealed class CommandLine
           sourcegraph-mcp clear [--db <path>]
               删除数据库中的所有数据行，但保留架构。
 
-          sourcegraph-mcp benchmark [--scope <id>] [--root <path>] [--db <path>] [--cold] [--golden <tasks.json>] [--json]
+          sourcegraph-mcp benchmark [--scope <id>] [--root <path>] [--db <path>] [--model <id>] [--enable-embeddings] [--cold] [--golden <tasks.json>] [--json]
               运行图健康度与性能探针。--golden 可增加带断言的定义、引用、实现、边类型、
               语义 Top-K 和调用路径任务；--cold 会为每项任务重新打开数据库。
               任一任务失败时退出码为 2。
@@ -645,7 +684,7 @@ internal sealed class CommandLine
           sourcegraph-mcp init [--yes] [--client <id>] [--no-<client>] [--user-<client>]
                                 [--claude-desktop] [--solution <path>] [--install-mode <mode>]
                                 [--print-only] [--force] [--prewarm | --no-prewarm]
-                                [--no-embeddings] [--no-history] [--root <path>]
+                                [--enable-embeddings] [--no-history] [--root <path>]
               运行交互式（默认）或参数驱动的初始化流程。检测环境、选择 MCP 客户端、
               写入客户端配置文件（默认写入项目级配置），并可预热索引。首选客户端包括
               claude-code、codex、copilot、cursor、continue 和 claude-desktop。使用
@@ -710,17 +749,21 @@ internal sealed class CommandLine
           --root <path>     `.sourcegraph.json` 发现和作用域数据库使用的仓库根目录。
                             默认为 --solution 所在目录，其次为当前工作目录。
           --model <id>      覆盖嵌入模型标识（默认：
-                            jinaai/jina-embeddings-v2-base-code），用于 serve/index。
-          --no-embeddings   完全跳过嵌入流程，不下载模型、不写入 vec0。
-                            semantic_search 仍可返回标识符词法命中；意图查询会报告禁用。
+                            jinaai/jina-embeddings-v2-base-code），用于 serve/index/benchmark。
+          --enable-embeddings
+                            启用默认关闭的嵌入流程。本地缓存存在时不会联网。
+                            --no-embeddings 继续作为向后兼容的显式关闭参数。
           --allow-model-download
                             显式允许 serve/index 在本地缓存为空时从 Hugging Face
                             自动下载模型。默认禁止自动联网。等价于
                             SOURCEGRAPH_ALLOW_MODEL_DOWNLOAD=1。
           --no-model-download
-                            显式保持默认离线模式。使用已有缓存；缓存为空时退化为
-                            --no-embeddings。保留 SOURCEGRAPH_NO_MODEL_DOWNLOAD=1
+                            显式保持默认离线模式。使用已有缓存；缓存为空时语义嵌入不可用。
+                            保留 SOURCEGRAPH_NO_MODEL_DOWNLOAD=1
                             作为向后兼容的故障关闭设置。
+          --idle-timeout-minutes <n>
+                            serve 连续指定分钟没有工具调用或资源读取后退出（默认 30）。
+                            设置为 0 可禁用空闲退出。
           --no-history      禁用 git-blame 历史流程，适用于 PATH 中没有 git
                             或不需要逐符号历史信息的 CI 环境。
           --no-instructions 不在 MCP `initialize` 响应中发布服务器端使用指引。

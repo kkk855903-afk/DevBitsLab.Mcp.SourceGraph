@@ -13,7 +13,7 @@ graceful degradation when the model or extension is unavailable.
 The system SHALL compute and persist a code-aware embedding for every indexed symbol whose synthesized text passes the skip rules, gated on a SHA-256 hash of that text so reindexing only re-embeds changed symbols.
 
 #### Scenario: Cold index produces embeddings
-- **WHEN** a fresh `sourcegraph-mcp index <sln>` runs against a solution and the model is available
+- **WHEN** a fresh `sourcegraph-mcp index <sln> --enable-embeddings` runs against a solution and the model is available
 - **THEN** every non-skipped symbol has a row in `symbol_embeddings` with a 768-dim vector and a `content_hash` that matches the SHA-256 of its synthesized text
 
 #### Scenario: Comment-only edit doesn't re-embed
@@ -28,22 +28,22 @@ The server SHALL expose a `semantic_search(query, k = 20, kind?)` tool that retu
 - **THEN** that method appears in the top-k with a `score` between 0.0 (no relation) and 1.0 (identical)
 
 ### Requirement: Graceful disable when embeddings unavailable
-The semantic-search subsystem SHALL degrade safely when the model isn't cached and automatic download was not explicitly enabled, a permitted fetch fails, the `sqlite-vec` extension isn't loadable, or `--no-embeddings` was passed.
+The semantic-search subsystem SHALL be disabled by default and SHALL degrade safely when the model isn't cached, a permitted fetch fails, the `sqlite-vec` extension isn't loadable, or `--no-embeddings` was passed.
 
-#### Scenario: Disable via flag
-- **WHEN** the server is started with `--no-embeddings`
+#### Scenario: Disabled by default
+- **WHEN** the server is started without `--enable-embeddings`, including with the compatibility `--no-embeddings` flag
 - **THEN** the embedding pipeline never runs, no `symbol_embeddings` rows are written, and `semantic_search` responds with the "semantic search disabled" hint while every other tool works as before
 
 #### Scenario: Model not yet downloaded in the default offline mode
-- **WHEN** the server starts with an empty model cache and no explicit download opt-in
+- **WHEN** the server starts with `--enable-embeddings`, an empty model cache, and no explicit download opt-in
 - **THEN** no HTTP request is issued, the server logs a one-time warning naming the cache path and the explicit `embeddings pull` / `--allow-model-download` choices, the pipeline is disabled, and the rest of the index proceeds normally
 
 #### Scenario: Air-gapped via --no-model-download with empty cache
-- **WHEN** the server is started with `--no-model-download` and the cache is empty
+- **WHEN** the server is started with `--enable-embeddings --no-model-download` and the cache is empty
 - **THEN** no HTTP request is issued, the embedding pipeline is disabled for this session, the warning text names the cache path so the operator can pre-populate it, and `semantic_search` returns the disabled-message
 
 #### Scenario: Air-gapped via --no-model-download with populated cache
-- **WHEN** the server is started with `--no-model-download` and the cache is already populated
+- **WHEN** the server is started with `--enable-embeddings --no-model-download` and the cache is already populated
 - **THEN** no HTTP request is issued, the cached model is used, and the embedding pipeline runs normally
 
 ### Requirement: Model identity tracked per row
@@ -57,15 +57,15 @@ Each embedding row SHALL carry a `model_version` so that swapping the embedding 
 `serve` and `index` SHALL NOT fetch an embedding model by default. The operator MAY populate the cache with the explicit `embeddings pull` command or opt into automatic bootstrap with `--allow-model-download` / `SOURCEGRAPH_ALLOW_MODEL_DOWNLOAD=1`. A permitted fetch SHALL be idempotent: subsequent runs detect the cached files and skip the download. When automatic bootstrap is enabled, the bulk indexer SHALL run concurrently with the download — embed requests queue on the channel and drain once the model is ready.
 
 #### Scenario: Default cold-start stays offline
-- **WHEN** `sourcegraph-mcp serve` is started with embeddings enabled, an empty cache, and no download opt-in
+- **WHEN** `sourcegraph-mcp serve --enable-embeddings` is started with an empty cache and no download opt-in
 - **THEN** no HTTP request is issued and semantic search is disabled for the session while all non-embedding indexing continues
 
 #### Scenario: Opted-in cold-start populates cache
-- **WHEN** `sourcegraph-mcp serve --allow-model-download` is started with embeddings enabled and the cache directory `~/.cache/devbitslab.sourcegraph/models/<id>/` is empty
+- **WHEN** `sourcegraph-mcp serve --enable-embeddings --allow-model-download` is started and the cache directory `~/.cache/devbitslab.sourcegraph/models/<id>/` is empty
 - **THEN** the server fetches `model.onnx` and `tokenizer.json` from `https://huggingface.co/<id>/resolve/main/`, the indexer's bulk pass runs in parallel, and once the download completes the embedding worker drains queued requests and writes vectors
 
 #### Scenario: Warm cache skips download
-- **WHEN** `sourcegraph-mcp serve` is started with embeddings enabled and the cache already contains valid `model.onnx` + `tokenizer.json`
+- **WHEN** `sourcegraph-mcp serve --enable-embeddings` is started and the cache already contains valid `model.onnx` + `tokenizer.json`
 - **THEN** no HTTP request is issued, the worker initialises immediately, and the cache is reused as-is
 
 #### Scenario: SHA mismatch refuses partial file
@@ -83,7 +83,7 @@ The model manifest SHALL represent each file as `(RemotePath, LocalName, Expecte
 When the user supplies a non-default `--model <id>` (no pinned manifest available), the server SHALL only attempt a network download when that run also has explicit download authorization or when the user invokes `embeddings pull`. An authorized download SHALL use the same atomic-rename behaviour but without SHA-256 verification.
 
 #### Scenario: Custom model fetched without hash check
-- **WHEN** the user passes `--model someorg/some-other-code-embed --allow-model-download` and the cache is empty
+- **WHEN** the user passes `--enable-embeddings --model someorg/some-other-code-embed --allow-model-download` and the cache is empty
 - **THEN** the server downloads `model.onnx` and `tokenizer.json` from that HF repo, writes them atomically, skips hash verification, and the embedding pipeline starts normally
 
 ### Requirement: Tokenizer-format detection

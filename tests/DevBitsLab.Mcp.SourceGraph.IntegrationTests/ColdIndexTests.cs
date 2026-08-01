@@ -23,7 +23,6 @@ public sealed class ColdIndexTests
 
     private static readonly string[] CommonServeArgs =
     [
-        "--no-embeddings",
         "--no-history",
     ];
 
